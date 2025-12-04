@@ -1,0 +1,21 @@
+[package]
+name = "obix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+[dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[workspace]
+resolver = "2"
+members = [
+  "obix-macros",
+]
+
+[workspace.dependencies]
+
+anyhow = "1.0.100"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+thiserror = "2.0"
