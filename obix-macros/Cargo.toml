@@ -1,6 +1,17 @@
 [package]
 name = "obix-macros"
-version = "0.1.0"
+version = "0.1.0-dev"
 edition = "2024"
 
+[lib]
+proc-macro = true
+
+[features]
+
+fail-on-warnings = []
+
 [dependencies]
+proc-macro2 = "1.0"
+syn = "2.0"
+quote = "1.0"
+darling = "0.21"
