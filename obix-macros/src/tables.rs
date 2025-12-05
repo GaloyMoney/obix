@@ -99,13 +99,15 @@ impl ToTokens for MailboxTables {
                     }
                 }
 
-                fn persist_events<P>(
-                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                fn persist_events<'a, P>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
                     events: impl Iterator<Item = P>,
                 ) -> impl Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
                 {
+                    let executor = op.into_executor();
+
                     let mut payloads = Vec::new();
                     let serialized_events = events
                         .map(|e| {
@@ -122,13 +124,11 @@ impl ToTokens for MailboxTables {
                         if payloads.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let rows = sqlx::query!(
+                        let rows = executor.fetch_all(sqlx::query!(
                             #persist_events_query,
                             &serialized_events as _,
                             tracing_json
-                        )
-                            .fetch_all(op.as_executor())
-                            .await?;
+                        )).await?;
                         let events = rows
                             .into_iter()
                             .zip(payloads.into_iter())
@@ -144,13 +144,14 @@ impl ToTokens for MailboxTables {
                     }
                 }
 
-                fn persist_ephemeral_event<P>(
-                    op: &mut impl es_entity::AtomicOperation,
+                fn persist_ephemeral_event<'a, P>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
                     event_type: #crate_name::out::EphemeralEventType,
                     payload: P,
                 ) -> impl Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    let executor = op.into_executor();
 
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
@@ -158,14 +159,12 @@ impl ToTokens for MailboxTables {
                     #extract_tracing
                 
                     async move {
-                        let row = sqlx::query!(
+                        let row = executor.fetch_one(sqlx::query!(
                             #persist_ephemeral_events_query,
                             event_type.as_str(),
                             serialized_payload,
                             tracing_json
-                        )
-                        .fetch_one(op.as_executor())
-                        .await?;
+                        )).await?;
                 
                         Ok(#crate_name::out::EphemeralOutboxEvent {
                             event_type,

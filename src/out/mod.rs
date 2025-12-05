@@ -17,6 +17,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
 {
+    pool: sqlx::PgPool,
     event_sender: broadcast::Sender<OutboxEvent<P>>,
     highest_known_sequence: Arc<AtomicU64>,
     _listener_handle: Arc<OwnedTaskHandle>,
@@ -30,10 +31,11 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            pool: self.pool.clone(),
             event_sender: self.event_sender.clone(),
             highest_known_sequence: self.highest_known_sequence.clone(),
             _listener_handle: self._listener_handle.clone(),
-            _phantom: self._phantom.clone(),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -51,15 +53,20 @@ where
         ));
 
         let handle =
-            Self::spawn_pg_listener(pool, sender.clone(), Arc::clone(&highest_known_sequence))
+            Self::spawn_pg_listener(&pool, sender.clone(), Arc::clone(&highest_known_sequence))
                 .await?;
 
         Ok(Self {
+            pool,
             event_sender: sender,
             highest_known_sequence,
             _listener_handle: Arc::new(handle),
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
+        es_entity::DbOp::init(&self.pool).await
     }
 
     pub async fn publish_persisted(
@@ -80,11 +87,11 @@ where
     }
 
     async fn spawn_pg_listener(
-        pool: sqlx::PgPool,
+        pool: &sqlx::PgPool,
         sender: broadcast::Sender<OutboxEvent<P>>,
         highest_known_sequence: Arc<AtomicU64>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
-        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+        let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
         listener
             .listen_all([
                 Tables::persistent_outbox_events_channel(),

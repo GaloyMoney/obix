@@ -11,15 +11,15 @@ pub trait MailboxTables {
         op: impl es_entity::IntoOneTimeExecutor<'a>,
     ) -> impl Future<Output = Result<EventSequence, sqlx::Error>> + Send;
 
-    fn persist_events<P>(
-        op: &mut impl es_entity::AtomicOperation,
+    fn persist_events<'a, P>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
         events: impl Iterator<Item = P>,
     ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
 
-    fn persist_ephemeral_event<P>(
-        op: &mut impl es_entity::AtomicOperation,
+    fn persist_ephemeral_event<'a, P>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
         event_type: EphemeralEventType,
         payload: P,
     ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
