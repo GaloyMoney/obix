@@ -9,6 +9,7 @@ proc-macro = true
 [features]
 
 fail-on-warnings = []
+tracing = []
 
 [dependencies]
 proc-macro2 = "1.0"

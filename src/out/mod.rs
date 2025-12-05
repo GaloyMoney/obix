@@ -8,9 +8,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::{config::*, tables::*};
+use crate::{config::*, handle::OwnedTaskHandle, tables::*};
 pub use event::*;
 
+#[allow(dead_code)]
 pub struct Outbox<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -18,8 +19,23 @@ where
 {
     event_sender: broadcast::Sender<OutboxEvent<P>>,
     highest_known_sequence: Arc<AtomicU64>,
-    config: MailboxConfig,
+    _listener_handle: Arc<OwnedTaskHandle>,
     _phantom: std::marker::PhantomData<Tables>,
+}
+
+impl<P, Tables> Clone for Outbox<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    Tables: MailboxTables,
+{
+    fn clone(&self) -> Self {
+        Self {
+            event_sender: self.event_sender.clone(),
+            highest_known_sequence: self.highest_known_sequence.clone(),
+            _listener_handle: self._listener_handle.clone(),
+            _phantom: self._phantom.clone(),
+        }
+    }
 }
 
 impl<P, Tables> Outbox<P, Tables>
@@ -31,54 +47,52 @@ where
         let pool = pool.clone();
         let (sender, _) = broadcast::channel(config.event_buffer_size);
         let highest_known_sequence = Arc::new(AtomicU64::from(
-            <Tables as MailboxTables>::highest_known_persistent_sequence(&pool).await?,
+            Tables::highest_known_persistent_sequence(&pool).await?,
         ));
 
-        Self::spawn_pg_listeners(pool, sender.clone(), Arc::clone(&highest_known_sequence)).await?;
+        let handle =
+            Self::spawn_pg_listener(pool, sender.clone(), Arc::clone(&highest_known_sequence))
+                .await?;
+
         Ok(Self {
             event_sender: sender,
             highest_known_sequence,
-            config,
+            _listener_handle: Arc::new(handle),
             _phantom: std::marker::PhantomData,
         })
     }
 
-    async fn spawn_pg_listeners(
+    async fn spawn_pg_listener(
         pool: sqlx::PgPool,
         sender: broadcast::Sender<OutboxEvent<P>>,
         highest_known_sequence: Arc<AtomicU64>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
-        listener.listen("persistent_outbox_events").await?;
-        let persistent_sender = sender.clone();
-        tokio::spawn(async move {
+        listener
+            .listen_all([
+                Tables::persistent_outbox_events_channel(),
+                Tables::ephemeral_outbox_events_channel(),
+            ])
+            .await?;
+        let handle = tokio::spawn(async move {
             loop {
-                if let Ok(notification) = listener.recv().await
-                    && let Ok(event) =
-                        serde_json::from_str::<PersistentOutboxEvent<P>>(notification.payload())
-                {
-                    let new_highest_sequence = u64::from(event.sequence);
-                    highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
-                    if persistent_sender.send(event.into()).is_err() {
-                        break;
+                if let Ok(notification) = listener.recv().await {
+                    if notification.channel() == Tables::persistent_outbox_events_channel()
+                        && let Ok(event) =
+                            serde_json::from_str::<PersistentOutboxEvent<P>>(notification.payload())
+                    {
+                        let new_highest_sequence = u64::from(event.sequence);
+                        highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
+                        let _ = sender.send(event.into());
+                    } else if let Ok(event) =
+                        serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
+                    {
+                        let _ = sender.send(event.into());
                     }
                 }
             }
         });
 
-        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
-        listener.listen("ephemeral_outbox_events").await?;
-        tokio::spawn(async move {
-            loop {
-                if let Ok(notification) = listener.recv().await
-                    && let Ok(event) =
-                        serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
-                    && sender.send(event.into()).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        Ok(())
+        Ok(OwnedTaskHandle::new(handle))
     }
 }

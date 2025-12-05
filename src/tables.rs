@@ -1,84 +1,33 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{out::event::*, sequence::*};
 
+#[derive(obix_macros::MailboxTables)]
+#[obix(crate = "crate")]
 pub struct DefaultMailboxTables;
-
-impl MailboxTables for DefaultMailboxTables {}
 
 pub trait MailboxTables {
     fn highest_known_persistent_sequence<'a>(
         op: impl es_entity::IntoOneTimeExecutor<'a>,
-    ) -> impl Future<Output = Result<EventSequence, sqlx::Error>> + Send {
-        let executor = op.into_executor();
-        async {
-            let row = executor
-                .fetch_one(sqlx::query!(
-                    r#"SELECT COALESCE(MAX(sequence), 0) AS "max!" FROM persistent_outbox_events"#
-                ))
-                .await?;
-            Ok(EventSequence::from(row.max as u64))
-        }
-    }
+    ) -> impl Future<Output = Result<EventSequence, sqlx::Error>> + Send;
 
     fn persist_events<P>(
         op: &mut impl es_entity::AtomicOperation,
         events: impl Iterator<Item = P>,
     ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
     where
-        P: Serialize + DeserializeOwned + Send,
-    {
-        let mut payloads = Vec::new();
-        let serialized_events = events
-            .map(|e| {
-                let serialized_event =
-                    serde_json::to_value(&e).expect("Could not serialize payload");
-                payloads.push(e);
-                serialized_event
-            })
-            .collect::<Vec<_>>();
+        P: Serialize + DeserializeOwned + Send;
 
-        #[cfg(feature = "tracing")]
-        let tracing_context = es_entity::context::TracingContext::current();
-        #[cfg(feature = "tracing")]
-        let tracing_json =
-            serde_json::to_value(&tracing_context).expect("Could not serialize tracing context");
+    fn persist_ephemeral_event<P>(
+        op: &mut impl es_entity::AtomicOperation,
+        event_type: EphemeralEventType,
+        payload: P,
+    ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
 
-        #[cfg(not(feature = "tracing"))]
-        let tracing_json = None::<serde_json::Value>;
-
-        async move {
-            if payloads.is_empty() {
-                return Ok(Vec::new());
-            }
-            let rows = sqlx::query!(
-                r#"WITH new_events AS (
-             INSERT INTO persistent_outbox_events (payload, tracing_context)
-             SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context
-             RETURNING id AS "id: OutboxEventId", sequence AS "sequence: EventSequence", recorded_at
-            )
-            SELECT * FROM new_events
-        "#,
-                &serialized_events as _,
-                tracing_json
-            )
-            .fetch_all(op.as_executor())
-            .await?;
-            let events = rows
-                .into_iter()
-                .zip(payloads.into_iter())
-                .map(|(row, payload)| PersistentOutboxEvent {
-                    id: row.id,
-                    sequence: row.sequence,
-                    recorded_at: row.recorded_at,
-                    #[cfg(feature = "tracing")]
-                    tracing_context: Some(tracing_context.clone()),
-                    payload: Some(payload),
-                })
-                .collect::<Vec<_>>();
-            Ok(events)
-        }
-    }
+    fn persistent_outbox_events_channel() -> &'static str;
+    fn ephemeral_outbox_events_channel() -> &'static str;
 }
 
 // #[tracing::instrument(

@@ -21,6 +21,6 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 async fn mailbox() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, Default::default()).await?;
+    let _outbox = Outbox::<TestEvent, TestTables>::init(&pool, Default::default()).await?;
     Ok(())
 }

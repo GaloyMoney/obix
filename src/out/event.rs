@@ -47,13 +47,13 @@ impl EphemeralEventType {
         Self(Cow::Borrowed(name))
     }
 
-    pub(crate) fn from_owned(name: String) -> Self {
-        Self(Cow::Owned(name))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    // pub(crate) fn from_owned(name: String) -> Self {
+    //     Self(Cow::Owned(name))
+    // }
 }
 
 impl std::fmt::Display for EphemeralEventType {
@@ -71,7 +71,7 @@ where
     pub event_type: EphemeralEventType,
     pub payload: T,
     #[cfg(feature = "tracing")]
-    pub(crate) tracing_context: Option<es_entity::context::TracingContext>,
+    pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -106,7 +106,7 @@ where
     #[serde(bound = "T: DeserializeOwned")]
     pub payload: Option<T>,
     #[cfg(feature = "tracing")]
-    pub(crate) tracing_context: Option<es_entity::context::TracingContext>,
+    pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
