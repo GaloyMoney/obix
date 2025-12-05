@@ -62,6 +62,23 @@ where
         })
     }
 
+    pub async fn publish_persisted(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        event: impl Into<P>,
+    ) -> Result<(), sqlx::Error> {
+        self.publish_all_persisted(op, std::iter::once(event)).await
+    }
+
+    pub async fn publish_all_persisted(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        events: impl IntoIterator<Item = impl Into<P>>,
+    ) -> Result<(), sqlx::Error> {
+        Tables::persist_events(op, events.into_iter().map(Into::into)).await?;
+        Ok(())
+    }
+
     async fn spawn_pg_listener(
         pool: sqlx::PgPool,
         sender: broadcast::Sender<OutboxEvent<P>>,
