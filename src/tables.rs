@@ -1,18 +1,20 @@
 use serde::{Serialize, de::DeserializeOwned};
 
+use es_entity::hooks::HookOperation;
+
 use crate::{out::event::*, sequence::*};
 
 #[derive(obix_macros::MailboxTables)]
 #[obix(crate = "crate")]
 pub struct DefaultMailboxTables;
 
-pub trait MailboxTables {
+pub trait MailboxTables: Send + 'static {
     fn highest_known_persistent_sequence<'a>(
         op: impl es_entity::IntoOneTimeExecutor<'a>,
     ) -> impl Future<Output = Result<EventSequence, sqlx::Error>> + Send;
 
     fn persist_events<'a, P>(
-        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        op: &mut HookOperation<'a>,
         events: impl Iterator<Item = P>,
     ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
     where

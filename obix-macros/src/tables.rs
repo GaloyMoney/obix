@@ -100,13 +100,13 @@ impl ToTokens for MailboxTables {
                 }
 
                 fn persist_events<'a, P>(
-                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                    op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
                     events: impl Iterator<Item = P>,
                 ) -> impl Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
                 {
-                    let executor = op.into_executor();
+                    use #crate_name::prelude::es_entity::AtomicOperation;
 
                     let mut payloads = Vec::new();
                     let serialized_events = events
@@ -124,11 +124,11 @@ impl ToTokens for MailboxTables {
                         if payloads.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let rows = executor.fetch_all(sqlx::query!(
+                        let rows = sqlx::query!(
                             #persist_events_query,
                             &serialized_events as _,
                             tracing_json
-                        )).await?;
+                        ).fetch_all(op.as_executor()).await?;
                         let events = rows
                             .into_iter()
                             .zip(payloads.into_iter())

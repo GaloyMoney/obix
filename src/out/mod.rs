@@ -1,4 +1,5 @@
 pub(crate) mod event;
+mod persist_events_hook;
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
@@ -82,7 +83,12 @@ where
         op: &mut impl es_entity::AtomicOperation,
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Result<(), sqlx::Error> {
-        Tables::persist_events(op, events.into_iter().map(Into::into)).await?;
+        let hook =
+            persist_events_hook::PersistEvents::<P, Tables>::new(self.event_sender.clone(), events);
+        if let Err(hook) = op.add_commit_hook(hook) {
+            use es_entity::hooks::CommitHook;
+            hook.force_execute_pre_commit(op).await?;
+        }
         Ok(())
     }
 
