@@ -56,8 +56,8 @@ impl ToTokens for MailboxTables {
 
         let persist_events_query = format!(
             r#"WITH new_events AS (
-                   INSERT INTO {}persistent_outbox_events (payload, tracing_context)
-                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context
+                   INSERT INTO {}persistent_outbox_events (payload, tracing_context, recorded_at)
+                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
                    RETURNING id, sequence, recorded_at
                )
                SELECT * FROM new_events"#,
@@ -66,12 +66,12 @@ impl ToTokens for MailboxTables {
 
         let persist_ephemeral_events_query = format!(
             r#"
-            INSERT INTO {}ephemeral_outbox_events (event_type, payload, tracing_context)
-            VALUES ($1, $2, $3)
+            INSERT INTO {}ephemeral_outbox_events (event_type, payload, tracing_context, recorded_at)
+            VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
             ON CONFLICT (event_type) DO UPDATE
             SET payload = EXCLUDED.payload,
                 tracing_context = EXCLUDED.tracing_context,
-                recorded_at = NOW()
+                recorded_at = COALESCE($4::timestamptz, NOW())
             RETURNING recorded_at"#,
             table_prefix
         );
@@ -108,6 +108,8 @@ impl ToTokens for MailboxTables {
                 {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
+                    let now = op.now();
+
                     let mut payloads = Vec::new();
                     let serialized_events = events
                         .map(|e| {
@@ -127,7 +129,8 @@ impl ToTokens for MailboxTables {
                         let rows = sqlx::query!(
                             #persist_events_query,
                             &serialized_events as _,
-                            tracing_json
+                            tracing_json,
+                            now
                         ).fetch_all(op.as_executor()).await?;
                         let events = rows
                             .into_iter()
@@ -152,6 +155,7 @@ impl ToTokens for MailboxTables {
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
                     let executor = op.into_executor();
+                    let now = executor.now();
 
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
@@ -163,7 +167,8 @@ impl ToTokens for MailboxTables {
                             #persist_ephemeral_events_query,
                             event_type.as_str(),
                             serialized_payload,
-                            tracing_json
+                            tracing_json,
+                            now
                         )).await?;
                 
                         Ok(#crate_name::out::EphemeralOutboxEvent {
