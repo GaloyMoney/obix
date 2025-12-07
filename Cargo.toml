@@ -10,6 +10,7 @@ tracing = [
   "es-entity/tracing-context",
   "obix-macros/tracing"
 ]
+custom-tables = []
 
 [dependencies]
 obix-macros = { workspace = true }

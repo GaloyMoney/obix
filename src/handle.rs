@@ -1,5 +1,6 @@
 use tokio::task::JoinHandle;
 
+#[derive(Debug)]
 pub(crate) struct OwnedTaskHandle(Option<JoinHandle<()>>);
 
 impl OwnedTaskHandle {

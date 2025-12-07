@@ -2,10 +2,13 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use es_entity::hooks::HookOperation;
 
-use crate::{out::event::*, sequence::*};
+use crate::{
+    out::{EphemeralEventType, EphemeralOutboxEvent, PersistentOutboxEvent},
+    sequence::*,
+};
 
-#[derive(obix_macros::MailboxTables)]
-#[obix(crate = "crate")]
+#[cfg_attr(not(feature = "custom-tables"), derive(obix_macros::MailboxTables))]
+#[cfg_attr(not(feature = "custom-tables"), obix(crate = "crate"))]
 pub struct DefaultMailboxTables;
 
 pub trait MailboxTables: Send + 'static {

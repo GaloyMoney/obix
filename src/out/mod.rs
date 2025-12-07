@@ -1,4 +1,4 @@
-pub(crate) mod event;
+mod event;
 mod persist_events_hook;
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -12,11 +12,11 @@ use std::sync::{
 use crate::{config::*, handle::OwnedTaskHandle, tables::*};
 pub use event::*;
 
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct Outbox<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    Tables: MailboxTables,
 {
     pool: sqlx::PgPool,
     event_sender: broadcast::Sender<OutboxEvent<P>>,

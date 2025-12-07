@@ -16,5 +16,6 @@ mod sequence;
 mod tables;
 
 pub use obix_macros::MailboxTables;
+pub use out::Outbox;
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

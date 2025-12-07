@@ -87,7 +87,7 @@ impl ToTokens for MailboxTables {
 
                 fn highest_known_persistent_sequence<'a>(
                     op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
-                ) -> impl Future<Output = Result<#crate_name::EventSequence, #crate_name::prelude::sqlx::Error>> + Send {
+                ) -> impl std::future::Future<Output = Result<#crate_name::EventSequence, #crate_name::prelude::sqlx::Error>> + Send {
                     let executor = op.into_executor();
                     async {
                         let row = executor
@@ -102,7 +102,7 @@ impl ToTokens for MailboxTables {
                 fn persist_events<'a, P>(
                     op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
                     events: impl Iterator<Item = P>,
-                ) -> impl Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
                 {
@@ -151,7 +151,7 @@ impl ToTokens for MailboxTables {
                     op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
                     event_type: #crate_name::out::EphemeralEventType,
                     payload: P,
-                ) -> impl Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
                     let executor = op.into_executor();
