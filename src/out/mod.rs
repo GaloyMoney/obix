@@ -1,6 +1,9 @@
+mod cache;
 mod event;
+mod listener;
 mod persist_events_hook;
 
+use futures::{StreamExt, stream::BoxStream};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
@@ -9,8 +12,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::{config::*, handle::OwnedTaskHandle, tables::*};
+use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use event::*;
+use listener::OutboxListener;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -19,8 +23,9 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    event_sender: broadcast::Sender<OutboxEvent<P>>,
+    persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     highest_known_sequence: Arc<AtomicU64>,
+    event_buffer_size: usize,
     _listener_handle: Arc<OwnedTaskHandle>,
     _phantom: std::marker::PhantomData<Tables>,
 }
@@ -33,8 +38,9 @@ where
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
-            event_sender: self.event_sender.clone(),
+            persistent_event_sender: self.persistent_event_sender.clone(),
             highest_known_sequence: self.highest_known_sequence.clone(),
+            event_buffer_size: self.event_buffer_size,
             _listener_handle: self._listener_handle.clone(),
             _phantom: std::marker::PhantomData,
         }
@@ -59,8 +65,9 @@ where
 
         Ok(Self {
             pool,
-            event_sender: sender,
+            persistent_event_sender: sender,
             highest_known_sequence,
+            event_buffer_size: config.event_buffer_size,
             _listener_handle: Arc::new(handle),
             _phantom: std::marker::PhantomData,
         })
@@ -83,8 +90,10 @@ where
         op: &mut impl es_entity::AtomicOperation,
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Result<(), sqlx::Error> {
-        let hook =
-            persist_events_hook::PersistEvents::<P, Tables>::new(self.event_sender.clone(), events);
+        let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
+            self.persistent_event_sender.clone(),
+            events,
+        );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
             hook.force_execute_pre_commit(op).await?;
@@ -92,9 +101,24 @@ where
         Ok(())
     }
 
+    pub async fn listen_persisted(
+        &self,
+        start_after: Option<EventSequence>,
+    ) -> Result<OutboxListener<P>, sqlx::Error> {
+        let sub = self.persistent_event_sender.subscribe();
+        let latest_known = EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed));
+        let start = start_after.unwrap_or(latest_known);
+        Ok(OutboxListener::new(
+            sub,
+            start,
+            latest_known,
+            self.event_buffer_size,
+        ))
+    }
+
     async fn spawn_pg_listener(
         pool: &sqlx::PgPool,
-        sender: broadcast::Sender<OutboxEvent<P>>,
+        persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         highest_known_sequence: Arc<AtomicU64>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
@@ -113,11 +137,11 @@ where
                     {
                         let new_highest_sequence = u64::from(event.sequence);
                         highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
-                        let _ = sender.send(event.into());
-                    } else if let Ok(event) =
+                        let _ = persistent_event_sender.send(event.into());
+                    } else if let Ok(_event) =
                         serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
                     {
-                        let _ = sender.send(event.into());
+                        unimplemented!();
                     }
                 }
             }

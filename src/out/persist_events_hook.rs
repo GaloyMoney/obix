@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
@@ -12,7 +12,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    sender: broadcast::Sender<OutboxEvent<P>>,
+    sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     pre_commit_events: Vec<P>,
     post_commit_events: Vec<PersistentOutboxEvent<P>>,
     _phantom: PhantomData<Tables>,
@@ -24,7 +24,7 @@ where
     Tables: MailboxTables,
 {
     pub fn new(
-        sender: broadcast::Sender<OutboxEvent<P>>,
+        sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Self {
         Self {
