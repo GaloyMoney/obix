@@ -24,6 +24,7 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
+im = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -48,3 +49,4 @@ sqlx = { version = "0.8", features = ["macros", "runtime-tokio-rustls", "postgre
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 tracing = { version = "0.1" }
 futures = "0.3"
+im = { version = "15.1", features = ["serde"] }

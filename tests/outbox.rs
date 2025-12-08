@@ -1,7 +1,7 @@
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use obix::out::Outbox;
+use obix::{EventSequence, out::Outbox};
 
 #[derive(Serialize, Deserialize)]
 enum TestEvent {
@@ -36,7 +36,7 @@ async fn events_are_short_circuited() -> anyhow::Result<()> {
     Ok(())
 }
 
-// #[tokio::test]
+#[tokio::test]
 async fn events_are_listened() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
@@ -48,6 +48,27 @@ async fn events_are_listened() -> anyhow::Result<()> {
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
         .await?;
     op.commit().await?;
+
+    let Some(event) = listener.next().await else {
+        anyhow::bail!("expected event from listener");
+    };
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn events_are_cached() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = Outbox::<TestEvent>::init(&pool, Default::default()).await?;
+
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
 
     let Some(event) = listener.next().await else {
         anyhow::bail!("expected event from listener");

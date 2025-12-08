@@ -13,6 +13,7 @@ use std::sync::{
 };
 
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+use cache::OutboxEventCache;
 pub use event::*;
 use listener::OutboxListener;
 
@@ -26,8 +27,7 @@ where
     persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     highest_known_sequence: Arc<AtomicU64>,
     event_buffer_size: usize,
-    _listener_handle: Arc<OwnedTaskHandle>,
-    _phantom: std::marker::PhantomData<Tables>,
+    cache: Arc<OutboxEventCache<P, Tables>>,
 }
 
 impl<P, Tables> Clone for Outbox<P, Tables>
@@ -41,8 +41,7 @@ where
             persistent_event_sender: self.persistent_event_sender.clone(),
             highest_known_sequence: self.highest_known_sequence.clone(),
             event_buffer_size: self.event_buffer_size,
-            _listener_handle: self._listener_handle.clone(),
-            _phantom: std::marker::PhantomData,
+            cache: self.cache.clone(),
         }
     }
 }
@@ -59,17 +58,20 @@ where
             Tables::highest_known_persistent_sequence(&pool).await?,
         ));
 
-        let handle =
-            Self::spawn_pg_listener(&pool, sender.clone(), Arc::clone(&highest_known_sequence))
-                .await?;
+        let cache = OutboxEventCache::init(
+            &pool,
+            config,
+            sender.clone(),
+            highest_known_sequence.clone(),
+        )
+        .await?;
 
         Ok(Self {
             pool,
             persistent_event_sender: sender,
             highest_known_sequence,
             event_buffer_size: config.event_buffer_size,
-            _listener_handle: Arc::new(handle),
-            _phantom: std::marker::PhantomData,
+            cache: Arc::new(cache),
         })
     }
 
@@ -101,44 +103,13 @@ where
         Ok(())
     }
 
-    pub fn listen_persisted(&self, start_after: Option<EventSequence>) -> OutboxListener<P> {
+    pub fn listen_persisted(
+        &self,
+        start_after: impl Into<Option<EventSequence>>,
+    ) -> OutboxListener<P> {
         let sub = self.persistent_event_sender.subscribe();
         let latest_known = EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed));
-        let start = start_after.unwrap_or(latest_known);
+        let start = start_after.into().unwrap_or(latest_known);
         OutboxListener::new(sub, start, latest_known, self.event_buffer_size)
-    }
-
-    async fn spawn_pg_listener(
-        pool: &sqlx::PgPool,
-        persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-        highest_known_sequence: Arc<AtomicU64>,
-    ) -> Result<OwnedTaskHandle, sqlx::Error> {
-        let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
-        listener
-            .listen_all([
-                Tables::persistent_outbox_events_channel(),
-                Tables::ephemeral_outbox_events_channel(),
-            ])
-            .await?;
-        let handle = tokio::spawn(async move {
-            loop {
-                if let Ok(notification) = listener.recv().await {
-                    if notification.channel() == Tables::persistent_outbox_events_channel()
-                        && let Ok(event) =
-                            serde_json::from_str::<PersistentOutboxEvent<P>>(notification.payload())
-                    {
-                        let new_highest_sequence = u64::from(event.sequence);
-                        highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
-                        let _ = persistent_event_sender.send(event.into());
-                    } else if let Ok(_event) =
-                        serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
-                    {
-                        unimplemented!();
-                    }
-                }
-            }
-        });
-
-        Ok(OwnedTaskHandle::new(handle))
     }
 }

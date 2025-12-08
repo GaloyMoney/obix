@@ -16,7 +16,7 @@ where
     latest_known: EventSequence,
     event_receiver: Pin<Box<BroadcastStream<Arc<PersistentOutboxEvent<P>>>>>,
     buffer_size: usize,
-    cache: BTreeMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+    local_cache: BTreeMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
 }
 
 impl<P> OutboxListener<P>
@@ -33,7 +33,7 @@ where
             last_returned_sequence: start_after,
             latest_known,
             event_receiver: Box::pin(BroadcastStream::new(event_receiver)),
-            cache: BTreeMap::new(),
+            local_cache: BTreeMap::new(),
             buffer_size: buffer,
         }
     }
@@ -42,10 +42,10 @@ where
         self.latest_known = self.latest_known.max(event.sequence);
 
         if event.sequence > self.last_returned_sequence
-            && self.cache.insert(event.sequence, event).is_none()
-            && self.cache.len() > self.buffer_size
+            && self.local_cache.insert(event.sequence, event).is_none()
+            && self.local_cache.len() > self.buffer_size
         {
-            self.cache.pop_last();
+            self.local_cache.pop_last();
         }
     }
 }
@@ -94,7 +94,7 @@ where
             }
         }
 
-        while let Some((seq, event)) = this.cache.pop_first() {
+        while let Some((seq, event)) = this.local_cache.pop_first() {
             if seq <= this.last_returned_sequence {
                 continue;
             }
@@ -105,7 +105,7 @@ where
                 // }
                 return Poll::Ready(Some(event));
             }
-            this.cache.insert(seq, event);
+            this.local_cache.insert(seq, event);
             break;
         }
 
