@@ -292,17 +292,17 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn load_ephemeral_events<P>(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
+                fn load_ephemeral_events<'a, P>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
-                    let pool = pool.clone();
+                    let executor = op.into_executor();
 
                     async move {
-                        let rows = sqlx::query!(
+                        let rows = executor.fetch_all(sqlx::query!(
                             #load_ephemeral_events_query
-                        ).fetch_all(&pool).await?;
+                        )).await?;
 
                         let events = rows
                             .into_iter()

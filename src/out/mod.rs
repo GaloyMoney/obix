@@ -82,6 +82,15 @@ where
         Ok(())
     }
 
+    pub async fn publish_ephemeral(
+        &self,
+        event_type: EphemeralEventType,
+        event: impl Into<P>,
+    ) -> Result<(), sqlx::Error> {
+        Tables::persist_ephemeral_event(&self.pool, event_type, event.into()).await?;
+        Ok(())
+    }
+
     pub fn listen_persisted(
         &self,
         start_after: impl Into<Option<EventSequence>>,

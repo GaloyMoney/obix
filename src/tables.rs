@@ -23,14 +23,6 @@ pub trait MailboxTables: Send + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    fn persist_ephemeral_event<'a, P>(
-        op: impl es_entity::IntoOneTimeExecutor<'a>,
-        event_type: EphemeralEventType,
-        payload: P,
-    ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
-    where
-        P: Serialize + DeserializeOwned + Send;
-
     fn load_next_page<P>(
         pool: &sqlx::PgPool,
         from_sequence: EventSequence,
@@ -39,8 +31,16 @@ pub trait MailboxTables: Send + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    fn load_ephemeral_events<P>(
-        pool: &sqlx::PgPool,
+    fn persist_ephemeral_event<'a, P>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        event_type: EphemeralEventType,
+        payload: P,
+    ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    fn load_ephemeral_events<'a, P>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
     ) -> impl Future<Output = Result<Vec<EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
