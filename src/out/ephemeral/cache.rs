@@ -1,6 +1,5 @@
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use std::sync::Arc;
 
@@ -12,8 +11,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_receiver: Option<broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>>,
-    backfill_request: mpsc::UnboundedSender<mpsc::Sender<Arc<EphemeralOutboxEvent<P>>>>,
-    backfill_buffer_size: usize,
+    backfill_request: mpsc::UnboundedSender<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
 }
 
 impl<P> CacheHandle<P>
@@ -26,10 +24,10 @@ where
             .expect("receiver already taken")
     }
 
-    pub fn request_current_ephemeral_events(&self) -> ReceiverStream<Arc<EphemeralOutboxEvent<P>>> {
-        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
+    pub fn request_current_ephemeral_events(&self) -> oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>> {
+        let (tx, rx) = oneshot::channel();
         let _ = self.backfill_request.send(tx);
-        ReceiverStream::new(rx)
+        rx
     }
 }
 
@@ -39,8 +37,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    backfill_request_send: mpsc::UnboundedSender<mpsc::Sender<Arc<EphemeralOutboxEvent<P>>>>,
-    backfill_buffer_size: usize,
+    backfill_request_send: mpsc::UnboundedSender<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
     cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     _cache_loop_handle: OwnedTaskHandle,
     _phantom: std::marker::PhantomData<Tables>,
@@ -55,7 +52,6 @@ where
         CacheHandle {
             ephemeral_event_receiver: Some(self.ephemeral_event_sender.subscribe()),
             backfill_request: self.backfill_request_send.clone(),
-            backfill_buffer_size: self.backfill_buffer_size,
         }
     }
 
@@ -86,7 +82,6 @@ where
         let ret = Self {
             backfill_request_send: backfill_send,
             ephemeral_event_sender,
-            backfill_buffer_size: config.event_buffer_size,
             cache_fill_sender: cache_fill_send,
             _cache_loop_handle: cache_loop_handle,
             _phantom: std::marker::PhantomData,
@@ -105,16 +100,6 @@ where
         cache
     }
 
-    async fn handle_backfill_request(
-        sender: mpsc::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        cache_snapshot: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
-    ) {
-        for (_, event) in cache_snapshot.iter() {
-            if sender.send(event.clone()).await.is_err() {
-                return;
-            }
-        }
-    }
 
     async fn fetch_event_by_type(
         pool: sqlx::PgPool,
@@ -182,7 +167,7 @@ where
         pool: &sqlx::PgPool,
         _config: MailboxConfig,
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut backfill_request: mpsc::UnboundedReceiver<mpsc::Sender<Arc<EphemeralOutboxEvent<P>>>>,
+        mut backfill_request: mpsc::UnboundedReceiver<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut ephemeral_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
@@ -200,11 +185,7 @@ where
                     result = backfill_request.recv() => {
                         match result {
                             Some(sender) => {
-                                let cache_snapshot = ephemeral_cache.clone();
-                                tokio::spawn(Self::handle_backfill_request(
-                                    sender,
-                                    cache_snapshot,
-                                ));
+                                let _ = sender.send(ephemeral_cache.clone());
                             }
                             None => {
                                 break;
