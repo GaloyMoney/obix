@@ -50,10 +50,6 @@ impl EphemeralEventType {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    // pub(crate) fn from_owned(name: String) -> Self {
-    //     Self(Cow::Owned(name))
-    // }
 }
 
 impl std::fmt::Display for EphemeralEventType {

@@ -25,19 +25,26 @@ impl ToTokens for MailboxTables {
         let ident = &self.ident;
         let crate_name: syn::Path = self.crate_name.parse().expect("invalid crate path");
         #[cfg(feature = "tracing")]
-        let (extract_tracing, set_context) = (
+        let (extract_tracing, set_context, deserialize_context) = (
             quote! {
                 let tracing_context = es_entity::context::TracingContext::current();
                 let tracing_json =
                     serde_json::to_value(&tracing_context).expect("Could not serialize tracing context");
             },
-            quote! { tracing_context: tracing_context.clone() },
+            quote! { tracing_context: tracing_context.clone(), },
+            quote! {
+                let tracing_context = row.tracing_context.map(|p| {
+                    #crate_name::prelude::serde_json::from_value(p)
+                        .expect("Could not deserialize tracing context")
+                });
+            },
         );
         #[cfg(not(feature = "tracing"))]
-        let (extract_tracing, set_context) = (
+        let (extract_tracing, set_context, deserialize_context) = (
             quote! {
                 let tracing_json = None::<serde_json::Value>;
             },
+            quote! {},
             quote! {},
         );
 
@@ -100,6 +107,14 @@ FROM {}persistent_outbox_events_sequence_seq",
                 g.seq ASC
             LIMIT $2"#,
             table_prefix, table_prefix
+        );
+
+        let load_ephemeral_events_query = format!(
+            r#"
+            SELECT event_type, payload, tracing_context, recorded_at
+            FROM {}ephemeral_outbox_events
+            ORDER BY recorded_at"#,
+            table_prefix
         );
 
         let fill_gaps_query = format!(
@@ -240,6 +255,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 empty_ids.push(row.sequence);
                                 continue;
                             }
+                            #deserialize_context
                             events.push(#crate_name::out::PersistentOutboxEvent {
                                 id: #crate_name::out::OutboxEventId::from(row.id.expect("already checked")),
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
@@ -258,6 +274,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             ).fetch_all(&pool).await?;
 
                             for row in gap_rows {
+                                #deserialize_context
                                 events.push(#crate_name::out::PersistentOutboxEvent {
                                     id: #crate_name::out::OutboxEventId::from(row.id),
                                     sequence: #crate_name::EventSequence::from(row.sequence as u64),
@@ -271,6 +288,39 @@ FROM {}persistent_outbox_events_sequence_seq",
                             events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
                         }
 
+                        Ok(events)
+                    }
+                }
+
+                fn load_ephemeral_events<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_ephemeral_events_query
+                        ).fetch_all(&pool).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                let payload = #crate_name::prelude::serde_json::from_value(row.payload)
+                                    .expect("Couldn't deserialize payload");
+                                let event_type = #crate_name::prelude::serde_json::from_value(
+                                    #crate_name::prelude::serde_json::Value::String(row.event_type)
+                                ).expect("Couldn't deserialize event_type");
+                                #deserialize_context
+                                #crate_name::out::EphemeralOutboxEvent {
+                                    event_type,
+                                    payload,
+                                    #set_context
+                                    recorded_at: row.recorded_at,
+                                }
+                            })
+                            .collect::<Vec<_>>();
                         Ok(events)
                     }
                 }

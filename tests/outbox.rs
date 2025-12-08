@@ -5,6 +5,9 @@ use serial_test::file_serial;
 
 use obix::{EventSequence, out::Outbox};
 
+#[derive(obix::MailboxTables)]
+pub struct TestTables;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
     Ping(u64),
@@ -24,7 +27,7 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 async fn events_via_short_circuit() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = outbox.begin_op().await?;
@@ -45,7 +48,7 @@ async fn events_via_short_circuit() -> anyhow::Result<()> {
 async fn events_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -66,7 +69,7 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
 async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
     let mut pre_listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -97,7 +100,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         event_cache_trim_percent: 50,
         ..Default::default()
     };
-    let outbox = Outbox::<TestEvent>::init(&pool, config).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config).await?;
 
     // Create listener before publish to track when all events are processed
     let mut pre_listener = outbox.listen_persisted(None);
@@ -139,7 +142,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
 #[file_serial]
 async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let large_string = "x".repeat(10_000);
