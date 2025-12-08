@@ -1,5 +1,5 @@
 mod cache;
 mod listener;
 
-pub use cache::PersistentOutboxEventCache;
+pub use cache::{CacheHandle, PersistentOutboxEventCache};
 pub use listener::PersistentOutboxListener;

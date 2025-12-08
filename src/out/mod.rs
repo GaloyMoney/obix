@@ -1,3 +1,4 @@
+mod all_listener;
 mod ephemeral;
 mod event;
 mod persist_events_hook;
@@ -9,6 +10,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+pub use all_listener::AllOutboxListener;
 use ephemeral::{EphemeralOutboxEventCache, EphemeralOutboxListener};
 pub use event::*;
 use persistent::{PersistentOutboxEventCache, PersistentOutboxListener};
@@ -129,5 +131,17 @@ where
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
         EphemeralOutboxListener::new(self.ephemeral_cache.handle())
+    }
+
+    pub fn listen_all(
+        &self,
+        start_after: impl Into<Option<EventSequence>>,
+    ) -> AllOutboxListener<P> {
+        all_listener::AllOutboxListener::new(
+            self.persistent_cache.handle(),
+            self.ephemeral_cache.handle(),
+            start_after,
+            self.event_buffer_size,
+        )
     }
 }
