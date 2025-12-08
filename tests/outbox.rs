@@ -199,8 +199,113 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let mut listener = outbox.listen_ephemeral();
+
+    // Publish an ephemeral event
+    let event_type = obix::out::EphemeralEventType::new("test_type");
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(42))
+        .await?;
+
+    // Should receive the event from the cache
+    let Some(event) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), listener.next()).await?
+    else {
+        anyhow::bail!("expected event from listener");
+    };
+    assert_eq!(event.event_type, event_type);
+    assert!(matches!(event.payload, TestEvent::Ping(42)));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+
+    // Publish events before creating listener
+    let type1 = obix::out::EphemeralEventType::new("type1");
+    let type2 = obix::out::EphemeralEventType::new("type2");
+
+    outbox.publish_ephemeral(type1.clone(), TestEvent::Ping(1)).await?;
+    outbox.publish_ephemeral(type2.clone(), TestEvent::Ping(2)).await?;
+
+    // Give the cache time to process
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Create listener - should receive backfill of current events
+    let mut listener = outbox.listen_ephemeral();
+
+    let mut received_events = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
+            .await?
+            .expect("should have event");
+        received_events.push(event);
+    }
+
+    // Should have received both events (order may vary since it's a HashMap)
+    assert_eq!(received_events.len(), 2);
+    let has_type1 = received_events.iter().any(|e| e.event_type == type1);
+    let has_type2 = received_events.iter().any(|e| e.event_type == type2);
+    assert!(has_type1, "should have received type1 event");
+    assert!(has_type2, "should have received type2 event");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+
+    // Publish events of the same type - later should replace earlier
+    let event_type = obix::out::EphemeralEventType::new("replaceable");
+
+    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(1)).await?;
+    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(2)).await?;
+    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(3)).await?;
+
+    // Give the cache time to process
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Create listener - should only receive the latest event for this type
+    let mut listener = outbox.listen_ephemeral();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
+        .await?
+        .expect("should have event");
+
+    assert_eq!(event.event_type, event_type);
+    assert!(matches!(event.payload, TestEvent::Ping(3)));
+
+    // Should not receive any more events from backfill
+    let timeout_result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        listener.next()
+    ).await;
+
+    assert!(timeout_result.is_err(), "should not have received additional events from backfill");
+
+    Ok(())
+}
+
 async fn wipeout_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")
+        .execute(pool)
+        .await?;
+    sqlx::query!("TRUNCATE ephemeral_outbox_events")
         .execute(pool)
         .await?;
     Ok(())

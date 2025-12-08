@@ -39,7 +39,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct EphemeralEventType(Cow<'static, str>);
 impl EphemeralEventType {

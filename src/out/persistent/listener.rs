@@ -3,7 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
-use crate::out::cache::CacheHandle;
+use super::cache::CacheHandle;
 use crate::out::event::PersistentOutboxEvent;
 use crate::sequence::EventSequence;
 

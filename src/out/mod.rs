@@ -1,6 +1,6 @@
-mod cache;
+mod ephemeral;
 mod event;
-mod listener;
+mod persistent;
 mod persist_events_hook;
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -8,9 +8,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 use crate::{config::*, sequence::EventSequence, tables::*};
-use cache::PersistentOutboxEventCache;
+use ephemeral::{EphemeralOutboxEventCache, EphemeralOutboxListener};
+use persistent::{PersistentOutboxEventCache, PersistentOutboxListener};
 pub use event::*;
-use listener::PersistentOutboxListener;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -20,7 +20,8 @@ where
 {
     pool: sqlx::PgPool,
     event_buffer_size: usize,
-    cache: Arc<PersistentOutboxEventCache<P, Tables>>,
+    persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
+    ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
 }
 
 impl<P, Tables> Clone for Outbox<P, Tables>
@@ -32,7 +33,8 @@ where
         Self {
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
-            cache: self.cache.clone(),
+            persistent_cache: self.persistent_cache.clone(),
+            ephemeral_cache: self.ephemeral_cache.clone(),
         }
     }
 }
@@ -45,12 +47,14 @@ where
     pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
         let pool = pool.clone();
 
-        let cache = PersistentOutboxEventCache::init(&pool, config).await?;
+        let persistent_cache = PersistentOutboxEventCache::init(&pool, config).await?;
+        let ephemeral_cache = EphemeralOutboxEventCache::init(&pool, config).await?;
 
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
-            cache: Arc::new(cache),
+            persistent_cache: Arc::new(persistent_cache),
+            ephemeral_cache: Arc::new(ephemeral_cache),
         })
     }
 
@@ -72,7 +76,7 @@ where
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Result<(), sqlx::Error> {
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
-            self.cache.cache_fill_sender(),
+            self.persistent_cache.cache_fill_sender(),
             events,
         );
         if let Err(hook) = op.add_commit_hook(hook) {
@@ -87,7 +91,8 @@ where
         event_type: EphemeralEventType,
         event: impl Into<P>,
     ) -> Result<(), sqlx::Error> {
-        Tables::persist_ephemeral_event(&self.pool, event_type, event.into()).await?;
+        let event = Tables::persist_ephemeral_event(&self.pool, event_type, event.into()).await?;
+        let _ = self.ephemeral_cache.cache_fill_sender().send(Arc::new(event));
         Ok(())
     }
 
@@ -95,6 +100,10 @@ where
         &self,
         start_after: impl Into<Option<EventSequence>>,
     ) -> PersistentOutboxListener<P> {
-        PersistentOutboxListener::new(self.cache.handle(), start_after, self.event_buffer_size)
+        PersistentOutboxListener::new(self.persistent_cache.handle(), start_after, self.event_buffer_size)
+    }
+
+    pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
+        EphemeralOutboxListener::new(self.ephemeral_cache.handle())
     }
 }
