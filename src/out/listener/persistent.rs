@@ -3,11 +3,11 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
-use super::cache::CacheHandle;
-use super::event::PersistentOutboxEvent;
+use crate::out::cache::CacheHandle;
+use crate::out::event::PersistentOutboxEvent;
 use crate::sequence::EventSequence;
 
-pub struct OutboxListener<P>
+pub struct PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -20,11 +20,11 @@ where
     backfill_receiver: Option<ReceiverStream<Arc<PersistentOutboxEvent<P>>>>,
 }
 
-impl<P> OutboxListener<P>
+impl<P> PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    pub(super) fn new(
+    pub(crate) fn new(
         mut cache_handle: CacheHandle<P>,
         start_after: impl Into<Option<EventSequence>>,
         buffer: usize,
@@ -62,7 +62,7 @@ where
     }
 }
 
-impl<P> Stream for OutboxListener<P>
+impl<P> Stream for PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {

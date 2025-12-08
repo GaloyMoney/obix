@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::{config::*, sequence::EventSequence, tables::*};
 use cache::OutboxEventCache;
 pub use event::*;
-use listener::OutboxListener;
+use listener::PersistentOutboxListener;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -94,7 +94,7 @@ where
     pub fn listen_persisted(
         &self,
         start_after: impl Into<Option<EventSequence>>,
-    ) -> OutboxListener<P> {
-        OutboxListener::new(self.cache.handle(), start_after, self.event_buffer_size)
+    ) -> PersistentOutboxListener<P> {
+        PersistentOutboxListener::new(self.cache.handle(), start_after, self.event_buffer_size)
     }
 }
