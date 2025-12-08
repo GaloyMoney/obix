@@ -50,7 +50,8 @@ impl ToTokens for MailboxTables {
         let persistent_outbox_events_channel = format!("{}persistent_outbox_events", table_prefix);
         let ephemeral_outbox_events_channel = format!("{}ephemeral_outbox_events", table_prefix);
         let highest_known_query = format!(
-            "SELECT COALESCE(MAX(sequence), 0) AS \"max!\" FROM {}persistent_outbox_events",
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
+FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
@@ -95,7 +96,7 @@ impl ToTokens for MailboxTables {
                                     #highest_known_query
                             ))
                             .await?;
-                        Ok(#crate_name::EventSequence::from(row.max as u64))
+                        Ok(#crate_name::EventSequence::from(row.last_returned as u64))
                     }
                 }
 

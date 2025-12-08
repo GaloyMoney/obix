@@ -4,7 +4,7 @@ use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
-use crate::out::event::{OutboxEvent, PersistentOutboxEvent};
+use crate::out::event::PersistentOutboxEvent;
 use crate::tables::MailboxTables;
 
 pub struct PersistEvents<P, Tables>

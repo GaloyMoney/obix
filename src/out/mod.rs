@@ -77,7 +77,7 @@ where
         es_entity::DbOp::init(&self.pool).await
     }
 
-    pub async fn publish_persisted(
+    pub async fn publish_persisted_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         event: impl Into<P>,
@@ -101,19 +101,11 @@ where
         Ok(())
     }
 
-    pub async fn listen_persisted(
-        &self,
-        start_after: Option<EventSequence>,
-    ) -> Result<OutboxListener<P>, sqlx::Error> {
+    pub fn listen_persisted(&self, start_after: Option<EventSequence>) -> OutboxListener<P> {
         let sub = self.persistent_event_sender.subscribe();
         let latest_known = EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed));
         let start = start_after.unwrap_or(latest_known);
-        Ok(OutboxListener::new(
-            sub,
-            start,
-            latest_known,
-            self.event_buffer_size,
-        ))
+        OutboxListener::new(sub, start, latest_known, self.event_buffer_size)
     }
 
     async fn spawn_pg_listener(
