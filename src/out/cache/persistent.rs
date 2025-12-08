@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use super::event::*;
+use crate::out::event::*;
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence};
 
 pub struct CacheHandle<P>
@@ -48,7 +48,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct OutboxEventCache<P, Tables>
+pub struct PersistentOutboxEventCache<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -62,7 +62,7 @@ where
     _phantom: std::marker::PhantomData<Tables>,
 }
 
-impl<P, Tables> OutboxEventCache<P, Tables>
+impl<P, Tables> PersistentOutboxEventCache<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: crate::tables::MailboxTables,

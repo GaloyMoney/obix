@@ -8,7 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 use crate::{config::*, sequence::EventSequence, tables::*};
-use cache::OutboxEventCache;
+use cache::PersistentOutboxEventCache;
 pub use event::*;
 use listener::PersistentOutboxListener;
 
@@ -20,7 +20,7 @@ where
 {
     pool: sqlx::PgPool,
     event_buffer_size: usize,
-    cache: Arc<OutboxEventCache<P, Tables>>,
+    cache: Arc<PersistentOutboxEventCache<P, Tables>>,
 }
 
 impl<P, Tables> Clone for Outbox<P, Tables>
@@ -45,7 +45,7 @@ where
     pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
         let pool = pool.clone();
 
-        let cache = OutboxEventCache::init(&pool, config).await?;
+        let cache = PersistentOutboxEventCache::init(&pool, config).await?;
 
         Ok(Self {
             pool,
