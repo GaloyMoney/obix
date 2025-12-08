@@ -3,7 +3,6 @@ mod event;
 mod listener;
 mod persist_events_hook;
 
-use futures::{StreamExt, stream::BoxStream};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
@@ -12,7 +11,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+use crate::{config::*, sequence::EventSequence, tables::*};
 use cache::OutboxEventCache;
 pub use event::*;
 use listener::OutboxListener;
@@ -110,6 +109,12 @@ where
         let sub = self.persistent_event_sender.subscribe();
         let latest_known = EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed));
         let start = start_after.into().unwrap_or(latest_known);
-        OutboxListener::new(sub, start, latest_known, self.event_buffer_size)
+        OutboxListener::new(
+            sub,
+            start,
+            latest_known,
+            self.event_buffer_size,
+            self.cache.handle(),
+        )
     }
 }

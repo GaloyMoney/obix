@@ -9,8 +9,13 @@ use std::sync::{
 use super::event::*;
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence};
 
-pub struct CacheHandle<P> {
-    _phantom: std::marker::PhantomData<P>,
+pub struct CacheHandle<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    backfill_request:
+        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<Arc<PersistentOutboxEvent<P>>>)>,
+    backfill_buffer_size: usize,
 }
 
 impl<P> CacheHandle<P>
@@ -21,7 +26,9 @@ where
         &self,
         start_after: EventSequence,
     ) -> mpsc::Receiver<Arc<PersistentOutboxEvent<P>>> {
-        unimplemented!()
+        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
+        let _ = self.backfill_request.send((start_after, tx));
+        rx
     }
 }
 
@@ -30,8 +37,10 @@ pub struct OutboxEventCache<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-    cache_loop_handle: OwnedTaskHandle,
+    _cache_loop_handle: OwnedTaskHandle,
+    backfill_request_send:
+        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<Arc<PersistentOutboxEvent<P>>>)>,
+    backfill_buffer_size: usize,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -40,22 +49,32 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: crate::tables::MailboxTables,
 {
+    pub fn handle(&self) -> CacheHandle<P> {
+        CacheHandle {
+            backfill_request: self.backfill_request_send.clone(),
+            backfill_buffer_size: self.backfill_buffer_size,
+        }
+    }
+
     pub async fn init(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
         persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         highest_known_sequence: Arc<AtomicU64>,
     ) -> Result<Self, sqlx::Error> {
+        let (send, recv) = mpsc::unbounded_channel();
         let handle = Self::spawn_cache_loop(
             pool,
             config,
             persistent_event_sender.clone(),
             highest_known_sequence,
+            recv,
         )
         .await?;
         let ret = Self {
-            persistent_event_sender,
-            cache_loop_handle: handle,
+            _cache_loop_handle: handle,
+            backfill_request_send: send,
+            backfill_buffer_size: config.event_buffer_size,
             _phantom: std::marker::PhantomData,
         };
         Ok(ret)
@@ -66,6 +85,10 @@ where
         config: MailboxConfig,
         persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         highest_known_sequence: Arc<AtomicU64>,
+        mut backfill_request: mpsc::UnboundedReceiver<(
+            EventSequence,
+            mpsc::Sender<Arc<PersistentOutboxEvent<P>>>,
+        )>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
         listener
@@ -108,6 +131,24 @@ where
                                 }
                             }
                             Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                    result = backfill_request.recv() => {
+                        match result {
+                            Some((start_after, sender)) => {
+                                let cache_snapshot = persistent_cache.clone();
+                                tokio::spawn(async move {
+                                    use std::ops::Bound;
+                                    for (_, event) in cache_snapshot.range((Bound::Excluded(start_after), Bound::Unbounded)) {
+                                        if sender.send(event.clone()).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                            None => {
                                 break;
                             }
                         }
