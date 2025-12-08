@@ -62,7 +62,7 @@ where
     pub async fn init(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
-        ephemeral_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
+        ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -170,7 +170,7 @@ where
         mut backfill_request: mpsc::UnboundedReceiver<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut ephemeral_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
+        mut ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 

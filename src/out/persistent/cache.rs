@@ -83,7 +83,7 @@ where
     pub async fn init(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
-        persistent_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
+        persistent_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -257,7 +257,7 @@ where
         )>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-        mut notification_receiver: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
+        mut notification_receiver: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 

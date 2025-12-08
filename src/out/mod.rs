@@ -51,9 +51,9 @@ where
         let pool = pool.clone();
 
         let (persistent_notification_tx, persistent_notification_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(config.event_buffer_size);
         let (ephemeral_notification_tx, ephemeral_notification_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(config.event_buffer_size);
         let pg_listener_handle = pg_notify::spawn_pg_listener::<Tables>(
             &pool,
             persistent_notification_tx,
