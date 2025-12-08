@@ -212,10 +212,10 @@ where
     }
 
     fn handle_persistent_notification(
-        pool: sqlx::PgPool,
+        pool: &sqlx::PgPool,
         payload: &str,
         cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
-        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     ) -> Option<PersistentOutboxEvent<P>> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
@@ -231,13 +231,35 @@ where
                 return None;
             }
             tokio::spawn(Self::fetch_event_by_sequence(
-                pool,
+                pool.clone(),
                 header.sequence,
-                cache_fill_sender,
+                cache_fill_sender.clone(),
             ));
             None
         } else {
             serde_json::from_str(payload).ok()
+        }
+    }
+
+    fn process_notification(
+        notification: &sqlx::postgres::PgNotification,
+        pool: &sqlx::PgPool,
+        cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    ) -> Option<PersistentOutboxEvent<P>> {
+        if notification.channel() == Tables::persistent_outbox_events_channel() {
+            Self::handle_persistent_notification(
+                pool,
+                notification.payload(),
+                cache,
+                cache_fill_sender,
+            )
+        } else if let Ok(_event) =
+            serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
+        {
+            unimplemented!();
+        } else {
+            None
         }
     }
 
@@ -277,60 +299,6 @@ where
                 tokio::select! {
                     biased;
 
-                    result = cache_fill_receiver.recv() => {
-                        match result {
-                            Ok(event) => {
-                                (persistent_cache, last_broadcast_sequence) =
-                                    Self::insert_into_cache_and_maybe_broadcast(
-                                        persistent_cache,
-                                        event,
-                                        &highest_known_sequence,
-                                        &persistent_event_sender,
-                                        last_broadcast_sequence,
-                                        cache_size,
-                                    );
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                continue;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                break;
-                            }
-                        }
-                    }
-
-                    result = listener.recv() => {
-                        match result {
-                            Ok(notification) => {
-                                if notification.channel() == Tables::persistent_outbox_events_channel() {
-                                    if let Some(event) = Self::handle_persistent_notification(
-                                        pool.clone(),
-                                        notification.payload(),
-                                        &persistent_cache,
-                                        cache_fill_sender.clone(),
-                                    ) {
-                                        (persistent_cache, last_broadcast_sequence) =
-                                            Self::insert_into_cache_and_maybe_broadcast(
-                                                persistent_cache,
-                                                Arc::new(event),
-                                                &highest_known_sequence,
-                                                &persistent_event_sender,
-                                                last_broadcast_sequence,
-                                                cache_size,
-                                            );
-                                    }
-                                } else if let Ok(_event) =
-                                    serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
-                                {
-                                    unimplemented!();
-                                }
-                            }
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
-
                     result = backfill_request.recv() => {
                         match result {
                             Some((start_after, sender)) => {
@@ -353,10 +321,89 @@ where
                                 break;
                             }
                         }
+                        continue;
+                    }
+
+                    result = cache_fill_receiver.recv() => {
+                        match result {
+                            Ok(event) => {
+                                (persistent_cache, last_broadcast_sequence) =
+                                    Self::insert_into_cache_and_maybe_broadcast(
+                                        persistent_cache,
+                                        event,
+                                        &highest_known_sequence,
+                                        &persistent_event_sender,
+                                        last_broadcast_sequence,
+                                        cache_size,
+                                    );
+
+                                while let Ok(event) = cache_fill_receiver.try_recv() {
+                                    (persistent_cache, last_broadcast_sequence) =
+                                        Self::insert_into_cache_and_maybe_broadcast(
+                                            persistent_cache,
+                                            event,
+                                            &highest_known_sequence,
+                                            &persistent_event_sender,
+                                            last_broadcast_sequence,
+                                            cache_size,
+                                        );
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
+                        }
+                    }
+
+                    result = listener.recv() => {
+                        match result {
+                            Ok(notification) => {
+                                if let Some(event) = Self::process_notification(
+                                    &notification,
+                                    &pool,
+                                    &persistent_cache,
+                                    &cache_fill_sender,
+                                ) {
+                                    (persistent_cache, last_broadcast_sequence) =
+                                        Self::insert_into_cache_and_maybe_broadcast(
+                                            persistent_cache,
+                                            Arc::new(event),
+                                            &highest_known_sequence,
+                                            &persistent_event_sender,
+                                            last_broadcast_sequence,
+                                            cache_size,
+                                        );
+                                }
+
+                                while let Some(notification) = listener.next_buffered() {
+                                    if let Some(event) = Self::process_notification(
+                                        &notification,
+                                        &pool,
+                                        &persistent_cache,
+                                        &cache_fill_sender,
+                                    ) {
+                                        (persistent_cache, last_broadcast_sequence) =
+                                            Self::insert_into_cache_and_maybe_broadcast(
+                                                persistent_cache,
+                                                Arc::new(event),
+                                                &highest_known_sequence,
+                                                &persistent_event_sender,
+                                                last_broadcast_sequence,
+                                                cache_size,
+                                            );
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                        }
                     }
                 }
 
-                // Purge old entries if cache exceeds high water mark
                 if persistent_cache.len() > high_water {
                     let to_remove = persistent_cache.len() - low_water;
                     if let Some((&split_key, _)) = persistent_cache.iter().nth(to_remove) {
