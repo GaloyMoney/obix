@@ -157,7 +157,10 @@ where
                         match result {
                             Ok(event) => {
                                 let sequence = event.sequence;
-                                persistent_cache.insert(sequence, event);
+                                if persistent_cache.insert(sequence, event.clone()).is_none() {
+                                    let new_highest_sequence = u64::from(sequence);
+                                    highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
+                                }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 break;

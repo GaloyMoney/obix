@@ -28,6 +28,7 @@ im = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+serial_test = { version = "3", features = ["file_locks"] }
 
 [workspace]
 resolver = "2"
