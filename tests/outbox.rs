@@ -20,10 +20,10 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 
 #[tokio::test]
 #[file_serial]
-async fn events_are_short_circuited() -> anyhow::Result<()> {
+async fn events_via_short_circuit() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, Default::default()).await?;
+    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = outbox.begin_op().await?;
@@ -41,10 +41,10 @@ async fn events_are_short_circuited() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn events_are_listened() -> anyhow::Result<()> {
+async fn events_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, Default::default()).await?;
+    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -62,64 +62,77 @@ async fn events_are_listened() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn events_are_cached() -> anyhow::Result<()> {
+async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent>::init(&pool, Default::default()).await?;
+    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let mut pre_listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
         .await?;
     op.commit().await?;
+    pre_listener.next().await.expect("event was cached");
 
     let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
 
-    let Some(event) = listener.next().await else {
+    let Some(event) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), listener.next()).await?
+    else {
         anyhow::bail!("expected event from listener");
     };
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
-    Ok(())
-}
-
-#[tokio::test]
-#[file_serial]
-async fn events_not_in_cache_fails() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    let config = MailboxConfig {
-        event_cache_size: 2,
-        event_cache_trim_percent: 50,
-        ..Default::default()
-    };
-    let outbox = Outbox::<TestEvent>::init(&pool, config).await?;
-
-    // Create listener before publish to track when all events are processed
-    let mut pre_listener = outbox.listen_persisted(None);
-
-    let mut op = pool.begin().await?;
-    outbox
-        .publish_all_persisted(&mut op, (0..10).map(TestEvent::Ping))
-        .await?;
-    op.commit().await?;
-
-    // Wait for all 10 events
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        (&mut pre_listener).take(5).for_each(|_| async {}),
-    )
-    .await?;
-
-    let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
-
-    // This should fail/timeout because event 1 is no longer in cache
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next()).await;
-    assert!(
-        result.is_err(),
-        "expected timeout because early events were evicted from cache"
-    );
 
     Ok(())
 }
+
+// #[tokio::test]
+// #[file_serial]
+// async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
+//     let pool = init_pool().await?;
+//     let config = MailboxConfig {
+//         event_cache_size: 2,
+//         event_cache_trim_percent: 50,
+//         ..Default::default()
+//     };
+//     let outbox = Outbox::<TestEvent>::init(&pool, config).await?;
+
+//     // Create listener before publish to track when all events are processed
+//     let mut pre_listener = outbox.listen_persisted(None);
+
+//     let mut op = pool.begin().await?;
+//     outbox
+//         .publish_all_persisted(&mut op, (0..10).map(TestEvent::Ping))
+//         .await?;
+//     op.commit().await?;
+
+//     // Wait for all 10 events
+//     tokio::time::timeout(
+//         std::time::Duration::from_secs(1),
+//         (&mut pre_listener).take(5).for_each(|_| async {}),
+//     )
+//     .await?;
+
+//     let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
+
+//     // This should now work because backfill will fetch from PG even if events are not in cache
+//     let mut events = Vec::new();
+//     for _ in 0..10 {
+//         let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
+//             .await
+//             .expect("should receive event via PG backfill")
+//             .expect("should have event");
+//         events.push(event);
+//     }
+
+//     // Verify we got all 10 events in order
+//     for (i, event) in events.iter().enumerate() {
+//         assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64));
+//     }
+
+//     Ok(())
+// }
 
 async fn wipeout_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")

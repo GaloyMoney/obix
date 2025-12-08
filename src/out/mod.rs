@@ -4,12 +4,8 @@ mod listener;
 mod persist_events_hook;
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::broadcast;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use crate::{config::*, sequence::EventSequence, tables::*};
 use cache::OutboxEventCache;
@@ -23,8 +19,6 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-    highest_known_sequence: Arc<AtomicU64>,
     event_buffer_size: usize,
     cache: Arc<OutboxEventCache<P, Tables>>,
 }
@@ -37,8 +31,6 @@ where
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
-            persistent_event_sender: self.persistent_event_sender.clone(),
-            highest_known_sequence: self.highest_known_sequence.clone(),
             event_buffer_size: self.event_buffer_size,
             cache: self.cache.clone(),
         }
@@ -52,23 +44,11 @@ where
 {
     pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
         let pool = pool.clone();
-        let (sender, _) = broadcast::channel(config.event_buffer_size);
-        let highest_known_sequence = Arc::new(AtomicU64::from(
-            Tables::highest_known_persistent_sequence(&pool).await?,
-        ));
 
-        let cache = OutboxEventCache::init(
-            &pool,
-            config,
-            sender.clone(),
-            highest_known_sequence.clone(),
-        )
-        .await?;
+        let cache = OutboxEventCache::init(&pool, config).await?;
 
         Ok(Self {
             pool,
-            persistent_event_sender: sender,
-            highest_known_sequence,
             event_buffer_size: config.event_buffer_size,
             cache: Arc::new(cache),
         })
@@ -92,7 +72,7 @@ where
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Result<(), sqlx::Error> {
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
-            self.persistent_event_sender.clone(),
+            self.cache.cache_fill_sender(),
             events,
         );
         if let Err(hook) = op.add_commit_hook(hook) {
@@ -106,15 +86,6 @@ where
         &self,
         start_after: impl Into<Option<EventSequence>>,
     ) -> OutboxListener<P> {
-        let sub = self.persistent_event_sender.subscribe();
-        let latest_known = EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed));
-        let start = start_after.into().unwrap_or(latest_known);
-        OutboxListener::new(
-            sub,
-            start,
-            latest_known,
-            self.event_buffer_size,
-            self.cache.handle(),
-        )
+        OutboxListener::new(self.cache.handle(), start_after, self.event_buffer_size)
     }
 }

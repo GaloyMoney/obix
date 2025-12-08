@@ -77,6 +77,41 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        let load_next_page_query = format!(
+            r#"
+            WITH max_sequence AS (
+                SELECT COALESCE(MAX(sequence), 0) AS max FROM {}persistent_outbox_events
+            )
+            SELECT
+              g.seq AS "sequence!: i64",
+              e.id AS "id?",
+              e.payload AS "payload?",
+              e.tracing_context AS "tracing_context?",
+              e.recorded_at AS "recorded_at?"
+            FROM
+                generate_series(LEAST($1 + 1, (SELECT max FROM max_sequence)),
+                  LEAST($1 + $2, (SELECT max FROM max_sequence)))
+                AS g(seq)
+            LEFT JOIN
+                {}persistent_outbox_events e ON g.seq = e.sequence
+            WHERE
+                g.seq > $1
+            ORDER BY
+                g.seq ASC
+            LIMIT $2"#,
+            table_prefix, table_prefix
+        );
+
+        let fill_gaps_query = format!(
+            r#"
+            INSERT INTO {}persistent_outbox_events (sequence)
+            SELECT unnest($1::bigint[]) AS sequence
+            ON CONFLICT (sequence) DO UPDATE
+            SET sequence = EXCLUDED.sequence
+            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at"#,
+            table_prefix
+        );
+
         tokens.append_all(quote! {
             impl #crate_name::MailboxTables for #ident {
                 fn persistent_outbox_events_channel() -> &'static str {
@@ -162,7 +197,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
 
                     #extract_tracing
-                
+
                     async move {
                         let row = executor.fetch_one(sqlx::query!(
                             #persist_ephemeral_events_query,
@@ -171,13 +206,72 @@ FROM {}persistent_outbox_events_sequence_seq",
                             tracing_json,
                             now
                         )).await?;
-                
+
                         Ok(#crate_name::out::EphemeralOutboxEvent {
                             event_type,
                             payload,
                             recorded_at: row.recorded_at,
                             #set_context
                         })
+                    }
+                }
+
+                fn load_next_page<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    from_sequence: #crate_name::EventSequence,
+                    buffer_size: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_next_page_query,
+                            from_sequence as #crate_name::EventSequence,
+                            buffer_size as i64,
+                        ).fetch_all(&pool).await?;
+
+                        let mut events = Vec::new();
+                        let mut empty_ids = Vec::new();
+
+                        for row in rows {
+                            if row.id.is_none() {
+                                empty_ids.push(row.sequence);
+                                continue;
+                            }
+                            events.push(#crate_name::out::PersistentOutboxEvent {
+                                id: #crate_name::out::OutboxEventId::from(row.id.expect("already checked")),
+                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                payload: row
+                                    .payload
+                                    .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
+                                recorded_at: row.recorded_at.unwrap_or_default(),
+                                #set_context
+                            });
+                        }
+
+                        if !empty_ids.is_empty() {
+                            let gap_rows = sqlx::query!(
+                                #fill_gaps_query,
+                                &empty_ids as _
+                            ).fetch_all(&pool).await?;
+
+                            for row in gap_rows {
+                                events.push(#crate_name::out::PersistentOutboxEvent {
+                                    id: #crate_name::out::OutboxEventId::from(row.id),
+                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                    payload: row
+                                        .payload
+                                        .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
+                                    recorded_at: row.recorded_at,
+                                    #set_context
+                                });
+                            }
+                            events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
+                        }
+
+                        Ok(events)
                     }
                 }
             }

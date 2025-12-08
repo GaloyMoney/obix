@@ -31,6 +31,14 @@ pub trait MailboxTables: Send + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    fn load_next_page<P>(
+        pool: &sqlx::PgPool,
+        from_sequence: EventSequence,
+        buffer_size: usize,
+    ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
 }

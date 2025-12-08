@@ -1,8 +1,7 @@
 use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
 use super::event::PersistentOutboxEvent;
@@ -14,11 +13,11 @@ where
 {
     last_returned_sequence: EventSequence,
     latest_known: EventSequence,
-    event_receiver: Pin<Box<BroadcastStream<Arc<PersistentOutboxEvent<P>>>>>,
+    event_receiver: BroadcastStream<Arc<PersistentOutboxEvent<P>>>,
     buffer_size: usize,
     local_cache: BTreeMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
     cache_handle: CacheHandle<P>,
-    backfill_receiver: Option<mpsc::Receiver<Arc<PersistentOutboxEvent<P>>>>,
+    backfill_receiver: Option<ReceiverStream<Arc<PersistentOutboxEvent<P>>>>,
 }
 
 impl<P> OutboxListener<P>
@@ -26,16 +25,16 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pub(super) fn new(
-        event_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
-        start_after: EventSequence,
-        latest_known: EventSequence,
+        mut cache_handle: CacheHandle<P>,
+        start_after: impl Into<Option<EventSequence>>,
         buffer: usize,
-        cache_handle: CacheHandle<P>,
     ) -> Self {
+        let latest_known = cache_handle.latest_known_persisted();
+        let start_after = start_after.into().unwrap_or(latest_known);
         Self {
             last_returned_sequence: start_after,
             latest_known,
-            event_receiver: Box::pin(BroadcastStream::new(event_receiver)),
+            event_receiver: cache_handle.persistent_event_stream(),
             local_cache: BTreeMap::new(),
             buffer_size: buffer,
             cache_handle,
@@ -76,7 +75,7 @@ where
         let this = self.as_mut().get_mut();
 
         loop {
-            match this.event_receiver.as_mut().poll_next(cx) {
+            match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(None) => {
                     return Poll::Ready(None);
                 }
@@ -90,20 +89,19 @@ where
 
         let mut backfill_events = Vec::new();
         let mut backfill_done = false;
-        if let Some(ref mut receiver) = this.backfill_receiver {
-            loop {
-                match Pin::new(&mut *receiver).poll_recv(cx) {
-                    Poll::Ready(Some(event)) => {
-                        backfill_events.push(event);
-                    }
-                    Poll::Ready(None) => {
-                        backfill_done = true;
-                        break;
-                    }
-                    Poll::Pending => break,
+        while let Some(backfill_receiver) = this.backfill_receiver.as_mut() {
+            match Pin::new(backfill_receiver).poll_next(cx) {
+                Poll::Ready(Some(event)) => {
+                    backfill_events.push(event);
                 }
+                Poll::Ready(None) => {
+                    backfill_done = true;
+                    break;
+                }
+                Poll::Pending => break,
             }
         }
+
         if backfill_done {
             this.backfill_receiver = None;
         }
