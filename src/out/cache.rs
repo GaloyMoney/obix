@@ -202,12 +202,11 @@ where
         cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     ) {
         let start_after = EventSequence::from(u64::from(sequence).saturating_sub(1));
-        if let Ok(events) = Tables::load_next_page::<P>(&pool, start_after, 1).await {
-            if let Some(event) = events.into_iter().next() {
-                if event.sequence == sequence {
-                    let _ = cache_fill_sender.send(Arc::new(event));
-                }
-            }
+        if let Ok(events) = Tables::load_next_page::<P>(&pool, start_after, 1).await
+            && let Some(event) = events.into_iter().next()
+            && event.sequence == sequence
+        {
+            let _ = cache_fill_sender.send(Arc::new(event));
         }
     }
 
