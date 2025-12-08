@@ -1,16 +1,17 @@
 mod ephemeral;
 mod event;
-mod persistent;
 mod persist_events_hook;
+mod persistent;
+mod pg_notify;
 
 use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
 
-use crate::{config::*, sequence::EventSequence, tables::*};
+use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 use ephemeral::{EphemeralOutboxEventCache, EphemeralOutboxListener};
-use persistent::{PersistentOutboxEventCache, PersistentOutboxListener};
 pub use event::*;
+use persistent::{PersistentOutboxEventCache, PersistentOutboxListener};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -22,6 +23,7 @@ where
     event_buffer_size: usize,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
+    _pg_listener_handle: Arc<OwnedTaskHandle>,
 }
 
 impl<P, Tables> Clone for Outbox<P, Tables>
@@ -35,6 +37,7 @@ where
             event_buffer_size: self.event_buffer_size,
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
+            _pg_listener_handle: self._pg_listener_handle.clone(),
         }
     }
 }
@@ -47,17 +50,28 @@ where
     pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
         let pool = pool.clone();
 
-        // Create a channel for forwarding ephemeral notifications from persistent cache to ephemeral cache
-        let (ephemeral_notification_tx, ephemeral_notification_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (persistent_notification_tx, persistent_notification_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (ephemeral_notification_tx, ephemeral_notification_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let pg_listener_handle = pg_notify::spawn_pg_listener::<Tables>(
+            &pool,
+            persistent_notification_tx,
+            ephemeral_notification_tx,
+        )
+        .await?;
 
-        let persistent_cache = PersistentOutboxEventCache::init(&pool, config, Some(ephemeral_notification_tx)).await?;
-        let ephemeral_cache = EphemeralOutboxEventCache::init(&pool, config, ephemeral_notification_rx).await?;
+        let persistent_cache =
+            PersistentOutboxEventCache::init(&pool, config, persistent_notification_rx).await?;
+        let ephemeral_cache =
+            EphemeralOutboxEventCache::init(&pool, config, ephemeral_notification_rx).await?;
 
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
+            _pg_listener_handle: Arc::new(pg_listener_handle),
         })
     }
 
@@ -95,7 +109,10 @@ where
         event: impl Into<P>,
     ) -> Result<(), sqlx::Error> {
         let event = Tables::persist_ephemeral_event(&self.pool, event_type, event.into()).await?;
-        let _ = self.ephemeral_cache.cache_fill_sender().send(Arc::new(event));
+        let _ = self
+            .ephemeral_cache
+            .cache_fill_sender()
+            .send(Arc::new(event));
         Ok(())
     }
 
@@ -103,7 +120,11 @@ where
         &self,
         start_after: impl Into<Option<EventSequence>>,
     ) -> PersistentOutboxListener<P> {
-        PersistentOutboxListener::new(self.persistent_cache.handle(), start_after, self.event_buffer_size)
+        PersistentOutboxListener::new(
+            self.persistent_cache.handle(),
+            start_after,
+            self.event_buffer_size,
+        )
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
