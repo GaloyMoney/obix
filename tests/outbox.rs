@@ -5,9 +5,10 @@ use serial_test::file_serial;
 
 use obix::{EventSequence, out::Outbox};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
     Ping(u64),
+    LargePayload(String),
 }
 
 pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
@@ -129,6 +130,67 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
     // Verify we got all 10 events in order
     for (i, event) in events.iter().enumerate() {
         assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = Outbox::<TestEvent>::init(&pool, MailboxConfig::default()).await?;
+    let mut listener = outbox.listen_persisted(None);
+
+    let large_string = "x".repeat(10_000);
+
+    let expected_events = vec![
+        TestEvent::Ping(0),
+        TestEvent::LargePayload(large_string.clone()),
+        TestEvent::Ping(1),
+        TestEvent::Ping(2),
+        TestEvent::LargePayload(format!("y{}", "y".repeat(9_999))),
+        TestEvent::Ping(3),
+        TestEvent::LargePayload(large_string.clone()),
+        TestEvent::Ping(4),
+    ];
+
+    let mut op = pool.begin().await?;
+    for event in &expected_events {
+        outbox
+            .publish_persisted_in_op(&mut op, event.clone())
+            .await?;
+    }
+    op.commit().await?;
+
+    let mut received_events = Vec::new();
+    for i in 0..expected_events.len() {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+            .await
+            .unwrap_or_else(|_| panic!("timeout waiting for event {}", i))
+            .unwrap_or_else(|| panic!("expected event {} but got None", i));
+        received_events.push(event);
+    }
+
+    for (i, (received, expected)) in received_events.iter().zip(&expected_events).enumerate() {
+        let payload = received
+            .payload
+            .as_ref()
+            .unwrap_or_else(|| panic!("event {} payload should not be None", i));
+
+        assert_eq!(
+            payload, expected,
+            "event {} should match expected payload",
+            i
+        );
+        if let TestEvent::LargePayload(s) = payload {
+            assert!(
+                s.len() >= 10_000,
+                "event {} large payload should be complete, got {} bytes",
+                i,
+                s.len()
+            );
+        }
     }
 
     Ok(())

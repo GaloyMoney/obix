@@ -18,6 +18,7 @@ BEGIN
       'id', NEW.id,
       'sequence', NEW.sequence,
       'payload', NULL,
+      'payload_omitted', true,
       'tracing_context', NEW.tracing_context,
       'recorded_at', NEW.recorded_at,
       'seen_at', NEW.seen_at
@@ -46,6 +47,7 @@ BEGIN
     payload := json_build_object(
       'event_type', NEW.event_type,
       'payload', NULL,
+      'payload_omitted', true,
       'tracing_context', NEW.tracing_context,
       'recorded_at', NEW.recorded_at
     )::TEXT;

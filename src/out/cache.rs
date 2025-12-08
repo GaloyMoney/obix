@@ -84,10 +84,12 @@ where
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
         let (persistent_event_sender, _) = broadcast::channel(config.event_buffer_size);
+
         let highest_known_sequence = Arc::new(AtomicU64::from(
             Tables::highest_known_persistent_sequence(pool).await?,
         ));
-        let handle = Self::spawn_cache_loop(
+
+        let cache_loop_handle = Self::spawn_cache_loop(
             pool,
             config,
             persistent_event_sender.clone(),
@@ -97,13 +99,14 @@ where
             cache_fill_send.clone(),
         )
         .await?;
+
         let ret = Self {
             highest_known_sequence,
             backfill_request_send: backfill_send,
             persistent_event_sender,
             backfill_buffer_size: config.event_buffer_size,
             cache_fill_sender: cache_fill_send,
-            _cache_loop_handle: handle,
+            _cache_loop_handle: cache_loop_handle,
             _phantom: std::marker::PhantomData,
         };
         Ok(ret)
@@ -193,6 +196,51 @@ where
         }
     }
 
+    async fn fetch_event_by_sequence(
+        pool: sqlx::PgPool,
+        sequence: EventSequence,
+        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    ) {
+        let start_after = EventSequence::from(u64::from(sequence).saturating_sub(1));
+        if let Ok(events) = Tables::load_next_page::<P>(&pool, start_after, 1).await {
+            if let Some(event) = events.into_iter().next() {
+                if event.sequence == sequence {
+                    let _ = cache_fill_sender.send(Arc::new(event));
+                }
+            }
+        }
+    }
+
+    fn handle_persistent_notification(
+        pool: sqlx::PgPool,
+        payload: &str,
+        cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    ) -> Option<PersistentOutboxEvent<P>> {
+        #[derive(serde::Deserialize)]
+        struct NotificationHeader {
+            sequence: EventSequence,
+            #[serde(default)]
+            payload_omitted: bool,
+        }
+
+        let header: NotificationHeader = serde_json::from_str(payload).ok()?;
+
+        if header.payload_omitted {
+            if cache.contains_key(&header.sequence) {
+                return None;
+            }
+            tokio::spawn(Self::fetch_event_by_sequence(
+                pool,
+                header.sequence,
+                cache_fill_sender,
+            ));
+            None
+        } else {
+            serde_json::from_str(payload).ok()
+        }
+    }
+
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
@@ -255,9 +303,12 @@ where
                         match result {
                             Ok(notification) => {
                                 if notification.channel() == Tables::persistent_outbox_events_channel() {
-                                    if let Ok(event) =
-                                        serde_json::from_str::<PersistentOutboxEvent<P>>(notification.payload())
-                                    {
+                                    if let Some(event) = Self::handle_persistent_notification(
+                                        pool.clone(),
+                                        notification.payload(),
+                                        &persistent_cache,
+                                        cache_fill_sender.clone(),
+                                    ) {
                                         (persistent_cache, last_broadcast_sequence) =
                                             Self::insert_into_cache_and_maybe_broadcast(
                                                 persistent_cache,
