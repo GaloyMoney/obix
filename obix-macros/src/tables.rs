@@ -33,10 +33,12 @@ impl ToTokens for MailboxTables {
             },
             quote! { tracing_context: tracing_context.clone(), },
             quote! {
-                let tracing_context = row.tracing_context.map(|p| {
-                    #crate_name::prelude::serde_json::from_value(p)
-                        .expect("Could not deserialize tracing context")
-                });
+                let tracing_context = row.tracing_context
+                    .filter(|v| !v.is_null())
+                    .map(|p| {
+                        #crate_name::prelude::serde_json::from_value(p)
+                            .expect("Could not deserialize tracing context")
+                    });
             },
         );
         #[cfg(not(feature = "tracing"))]
@@ -109,10 +111,19 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix, table_prefix
         );
 
-        let load_ephemeral_events_query = format!(
+        let load_ephemeral_events_query_all = format!(
             r#"
             SELECT event_type, payload, tracing_context, recorded_at
             FROM {}ephemeral_outbox_events
+            ORDER BY recorded_at"#,
+            table_prefix
+        );
+
+        let load_ephemeral_events_query_filtered = format!(
+            r#"
+            SELECT event_type, payload, tracing_context, recorded_at
+            FROM {}ephemeral_outbox_events
+            WHERE event_type = $1
             ORDER BY recorded_at"#,
             table_prefix
         );
@@ -292,32 +303,63 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn load_ephemeral_events<'a, P>(
-                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                fn load_ephemeral_events<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    event_type_filter: Option<#crate_name::out::EphemeralEventType>,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
-                    let executor = op.into_executor();
+                    let pool = pool.clone();
 
                     async move {
-                        let rows = executor.fetch_all(sqlx::query!(
-                            #load_ephemeral_events_query
-                        )).await?;
+                        type RowData = (String, #crate_name::prelude::serde_json::Value, Option<#crate_name::prelude::serde_json::Value>, chrono::DateTime<chrono::Utc>);
+
+                        let rows: Vec<RowData> = if let Some(event_type) = event_type_filter {
+                            sqlx::query!(
+                                #load_ephemeral_events_query_filtered,
+                                event_type.as_str()
+                            )
+                            .fetch_all(&pool)
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.event_type, row.payload, row.tracing_context, row.recorded_at))
+                            .collect()
+                        } else {
+                            sqlx::query!(
+                                #load_ephemeral_events_query_all
+                            )
+                            .fetch_all(&pool)
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.event_type, row.payload, row.tracing_context, row.recorded_at))
+                            .collect()
+                        };
 
                         let events = rows
                             .into_iter()
-                            .map(|row| {
-                                let payload = #crate_name::prelude::serde_json::from_value(row.payload)
+                            .map(|(event_type_str, payload_json, tracing_context_json, recorded_at)| {
+                                let payload = #crate_name::prelude::serde_json::from_value(payload_json)
                                     .expect("Couldn't deserialize payload");
                                 let event_type = #crate_name::prelude::serde_json::from_value(
-                                    #crate_name::prelude::serde_json::Value::String(row.event_type)
+                                    #crate_name::prelude::serde_json::Value::String(event_type_str)
                                 ).expect("Couldn't deserialize event_type");
+
+                                // Create a row-like struct for the deserialize_context macro
+                                let row = {
+                                    struct TempRow {
+                                        tracing_context: Option<#crate_name::prelude::serde_json::Value>,
+                                    }
+                                    TempRow {
+                                        tracing_context: tracing_context_json,
+                                    }
+                                };
                                 #deserialize_context
+
                                 #crate_name::out::EphemeralOutboxEvent {
                                     event_type,
                                     payload,
                                     #set_context
-                                    recorded_at: row.recorded_at,
+                                    recorded_at,
                                 }
                             })
                             .collect::<Vec<_>>();

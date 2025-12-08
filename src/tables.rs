@@ -39,8 +39,9 @@ pub trait MailboxTables: Send + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    fn load_ephemeral_events<'a, P>(
-        op: impl es_entity::IntoOneTimeExecutor<'a>,
+    fn load_ephemeral_events<P>(
+        pool: &sqlx::PgPool,
+        event_type_filter: Option<EphemeralEventType>,
     ) -> impl Future<Output = Result<Vec<EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;

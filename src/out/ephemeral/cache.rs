@@ -59,11 +59,15 @@ where
         }
     }
 
-    pub fn cache_fill_sender(&self) -> broadcast::Sender<Arc<EphemeralOutboxEvent<P>>> {
-        self.cache_fill_sender.clone()
+    pub fn cache_fill_sender(&self) -> &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>> {
+        &self.cache_fill_sender
     }
 
-    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
+    pub async fn init(
+        pool: &sqlx::PgPool,
+        config: MailboxConfig,
+        ephemeral_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
+    ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
         let (ephemeral_event_sender, _) = broadcast::channel(config.event_buffer_size);
@@ -75,6 +79,7 @@ where
             backfill_recv,
             cache_fill_recv,
             cache_fill_send.clone(),
+            ephemeral_notification_rx,
         )
         .await?;
 
@@ -89,8 +94,7 @@ where
         Ok(ret)
     }
 
-    // @ claude this is not maybe
-    fn insert_into_cache_and_maybe_broadcast(
+    fn insert_into_cache_and_broadcast(
         cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
         event: Arc<EphemeralOutboxEvent<P>>,
         ephemeral_event_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
@@ -112,15 +116,63 @@ where
         }
     }
 
-    fn handle_ephemeral_notification(payload: &str) -> Option<EphemeralOutboxEvent<P>> {
-        serde_json::from_str(payload).ok()
+    async fn fetch_event_by_type(
+        pool: sqlx::PgPool,
+        event_type: EphemeralEventType,
+        cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+    ) {
+        if let Ok(events) = Tables::load_ephemeral_events::<P>(&pool, Some(event_type)).await {
+            for event in events {
+                let _ = cache_fill_sender.send(Arc::new(event));
+            }
+        }
+    }
+
+    fn handle_ephemeral_notification(
+        pool: &sqlx::PgPool,
+        payload: &str,
+        cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
+        cache_fill_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+    ) -> Option<EphemeralOutboxEvent<P>> {
+        #[derive(serde::Deserialize)]
+        struct NotificationHeader {
+            event_type: String,
+            #[serde(default)]
+            payload_omitted: bool,
+        }
+
+        let header: NotificationHeader = serde_json::from_str(payload).ok()?;
+        let event_type = serde_json::from_value(serde_json::Value::String(header.event_type))
+            .expect("Couldn't deserialize event_type");
+
+        if header.payload_omitted {
+            if cache.contains_key(&event_type) {
+                return None;
+            }
+            tokio::spawn(Self::fetch_event_by_type(
+                pool.clone(),
+                event_type,
+                cache_fill_sender.clone(),
+            ));
+            None
+        } else {
+            serde_json::from_str(payload).ok()
+        }
     }
 
     fn process_notification(
-        notification: &sqlx::postgres::PgNotification,
+        notification: sqlx::postgres::PgNotification,
+        pool: &sqlx::PgPool,
+        cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
+        cache_fill_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     ) -> Option<EphemeralOutboxEvent<P>> {
         if notification.channel() == Tables::ephemeral_outbox_events_channel() {
-            Self::handle_ephemeral_notification(notification.payload())
+            Self::handle_ephemeral_notification(
+                pool,
+                notification.payload(),
+                cache,
+                cache_fill_sender,
+            )
         } else {
             None
         }
@@ -132,13 +184,10 @@ where
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut backfill_request: mpsc::UnboundedReceiver<mpsc::Sender<Arc<EphemeralOutboxEvent<P>>>>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
-        _cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+        mut ephemeral_notification_rx: mpsc::UnboundedReceiver<sqlx::postgres::PgNotification>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
-        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
-        listener
-            .listen(Tables::ephemeral_outbox_events_channel())
-            .await?;
 
         let handle = tokio::spawn(async move {
             let mut ephemeral_cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> =
@@ -167,14 +216,14 @@ where
                     result = cache_fill_receiver.recv() => {
                         match result {
                             Ok(event) => {
-                                ephemeral_cache = Self::insert_into_cache_and_maybe_broadcast(
+                                ephemeral_cache = Self::insert_into_cache_and_broadcast(
                                     ephemeral_cache,
                                     event,
                                     &ephemeral_event_sender,
                                 );
 
                                 while let Ok(event) = cache_fill_receiver.try_recv() {
-                                    ephemeral_cache = Self::insert_into_cache_and_maybe_broadcast(
+                                    ephemeral_cache = Self::insert_into_cache_and_broadcast(
                                         ephemeral_cache,
                                         event,
                                         &ephemeral_event_sender,
@@ -190,20 +239,31 @@ where
                         }
                     }
 
-                    result = listener.recv() => {
+                    result = ephemeral_notification_rx.recv() => {
                         match result {
-                            Ok(notification) => {
-                                if let Some(event) = Self::process_notification(&notification) {
-                                    ephemeral_cache = Self::insert_into_cache_and_maybe_broadcast(
+                            Some(notification) => {
+                                if let Some(event) = Self::process_notification(
+                                    notification,
+                                    &pool,
+                                    &ephemeral_cache,
+                                    &cache_fill_sender,
+                                ) {
+                                    ephemeral_cache = Self::insert_into_cache_and_broadcast(
                                         ephemeral_cache,
                                         Arc::new(event),
                                         &ephemeral_event_sender,
                                     );
                                 }
 
-                                while let Some(notification) = listener.next_buffered() {
-                                    if let Some(event) = Self::process_notification(&notification) {
-                                        ephemeral_cache = Self::insert_into_cache_and_maybe_broadcast(
+                                // Process any additional buffered notifications
+                                while let Ok(notification) = ephemeral_notification_rx.try_recv() {
+                                    if let Some(event) = Self::process_notification(
+                                        notification,
+                                        &pool,
+                                        &ephemeral_cache,
+                                        &cache_fill_sender,
+                                    ) {
+                                        ephemeral_cache = Self::insert_into_cache_and_broadcast(
                                             ephemeral_cache,
                                             Arc::new(event),
                                             &ephemeral_event_sender,
@@ -211,7 +271,7 @@ where
                                     }
                                 }
                             }
-                            Err(_) => {
+                            None => {
                                 break;
                             }
                         }

@@ -47,8 +47,11 @@ where
     pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
         let pool = pool.clone();
 
-        let persistent_cache = PersistentOutboxEventCache::init(&pool, config).await?;
-        let ephemeral_cache = EphemeralOutboxEventCache::init(&pool, config).await?;
+        // Create a channel for forwarding ephemeral notifications from persistent cache to ephemeral cache
+        let (ephemeral_notification_tx, ephemeral_notification_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let persistent_cache = PersistentOutboxEventCache::init(&pool, config, Some(ephemeral_notification_tx)).await?;
+        let ephemeral_cache = EphemeralOutboxEventCache::init(&pool, config, ephemeral_notification_rx).await?;
 
         Ok(Self {
             pool,

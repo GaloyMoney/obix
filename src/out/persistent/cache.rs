@@ -80,7 +80,11 @@ where
         self.cache_fill_sender.clone()
     }
 
-    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
+    pub async fn init(
+        pool: &sqlx::PgPool,
+        config: MailboxConfig,
+        ephemeral_notification_tx: Option<mpsc::UnboundedSender<sqlx::postgres::PgNotification>>,
+    ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
         let (persistent_event_sender, _) = broadcast::channel(config.event_buffer_size);
@@ -97,6 +101,7 @@ where
             backfill_recv,
             cache_fill_recv,
             cache_fill_send.clone(),
+            ephemeral_notification_tx,
         )
         .await?;
 
@@ -241,10 +246,11 @@ where
     }
 
     fn process_notification(
-        notification: &sqlx::postgres::PgNotification,
+        notification: sqlx::postgres::PgNotification,
         pool: &sqlx::PgPool,
         cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
         cache_fill_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        ephemeral_notification_tx: &Option<mpsc::UnboundedSender<sqlx::postgres::PgNotification>>,
     ) -> Option<PersistentOutboxEvent<P>> {
         if notification.channel() == Tables::persistent_outbox_events_channel() {
             Self::handle_persistent_notification(
@@ -253,15 +259,18 @@ where
                 cache,
                 cache_fill_sender,
             )
-        } else if let Ok(_event) =
-            serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
-        {
-            unimplemented!();
+        } else if notification.channel() == Tables::ephemeral_outbox_events_channel() {
+            // Forward ephemeral notifications to the ephemeral cache
+            if let Some(tx) = ephemeral_notification_tx {
+                let _ = tx.send(notification);
+            }
+            None
         } else {
             None
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
@@ -273,6 +282,7 @@ where
         )>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        ephemeral_notification_tx: Option<mpsc::UnboundedSender<sqlx::postgres::PgNotification>>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
         let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
@@ -361,10 +371,11 @@ where
                         match result {
                             Ok(notification) => {
                                 if let Some(event) = Self::process_notification(
-                                    &notification,
+                                    notification,
                                     &pool,
                                     &persistent_cache,
                                     &cache_fill_sender,
+                                    &ephemeral_notification_tx,
                                 ) {
                                     (persistent_cache, last_broadcast_sequence) =
                                         Self::insert_into_cache_and_maybe_broadcast(
@@ -379,10 +390,11 @@ where
 
                                 while let Some(notification) = listener.next_buffered() {
                                     if let Some(event) = Self::process_notification(
-                                        &notification,
+                                        notification,
                                         &pool,
                                         &persistent_cache,
                                         &cache_fill_sender,
+                                        &ephemeral_notification_tx,
                                     ) {
                                         (persistent_cache, last_broadcast_sequence) =
                                             Self::insert_into_cache_and_maybe_broadcast(
