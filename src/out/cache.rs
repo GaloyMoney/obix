@@ -94,6 +94,7 @@ where
             highest_known_sequence.clone(),
             backfill_recv,
             cache_fill_recv,
+            cache_fill_send.clone(),
         )
         .await?;
         let ret = Self {
@@ -122,7 +123,7 @@ where
         use std::ops::Bound;
 
         let sequence = event.sequence;
-        let highest_known = highest_known_sequence.fetch_max(u64::from(sequence), Ordering::AcqRel);
+        let highest_known = highest_known_sequence.load(Ordering::Relaxed);
 
         // Skip events that are too old to be useful
         let threshold = highest_known.saturating_sub(cache_size as u64);
@@ -130,6 +131,7 @@ where
             return (cache, last_broadcast_sequence);
         }
 
+        highest_known_sequence.fetch_max(u64::from(sequence), Ordering::AcqRel);
         let cache = cache.alter(|existing| existing.or(Some(event)), sequence);
 
         for (seq, evt) in cache.range((Bound::Excluded(last_broadcast_sequence), Bound::Unbounded))
@@ -146,6 +148,51 @@ where
         (cache, last_broadcast_sequence)
     }
 
+    async fn handle_backfill_request(
+        pool: sqlx::PgPool,
+        start_after: EventSequence,
+        sender: mpsc::Sender<Arc<PersistentOutboxEvent<P>>>,
+        cache_snapshot: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        highest: EventSequence,
+        buffer_size: usize,
+    ) {
+        use std::ops::Bound;
+
+        let mut current_sequence = start_after;
+
+        while current_sequence < highest {
+            let next_needed = current_sequence.next();
+            if cache_snapshot.contains_key(&next_needed) {
+                break;
+            }
+
+            match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
+                Ok(events) if events.is_empty() => break,
+                Ok(events) => {
+                    for event in events {
+                        let seq = event.sequence;
+                        let event = Arc::new(event);
+                        let _ = cache_fill_sender.send(event.clone());
+                        if sender.send(event).await.is_err() {
+                            return;
+                        }
+                        current_sequence = seq;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        for (_, event) in
+            cache_snapshot.range((Bound::Excluded(current_sequence), Bound::Unbounded))
+        {
+            if sender.send(event.clone()).await.is_err() {
+                return;
+            }
+        }
+    }
+
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
@@ -156,6 +203,7 @@ where
             mpsc::Sender<Arc<PersistentOutboxEvent<P>>>,
         )>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
         let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
@@ -236,14 +284,19 @@ where
                         match result {
                             Some((start_after, sender)) => {
                                 let cache_snapshot = persistent_cache.clone();
-                                tokio::spawn(async move {
-                                    use std::ops::Bound;
-                                    for (_, event) in cache_snapshot.range((Bound::Excluded(start_after), Bound::Unbounded)) {
-                                        if sender.send(event.clone()).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
+                                let highest = EventSequence::from(
+                                    highest_known_sequence.load(Ordering::Relaxed)
+                                );
+
+                                tokio::spawn(Self::handle_backfill_request(
+                                    pool.clone(),
+                                    start_after,
+                                    sender,
+                                    cache_snapshot,
+                                    cache_fill_sender.clone(),
+                                    highest,
+                                    cache_size,
+                                ));
                             }
                             None => {
                                 break;

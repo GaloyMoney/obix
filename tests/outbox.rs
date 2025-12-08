@@ -87,52 +87,52 @@ async fn events_via_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-// #[tokio::test]
-// #[file_serial]
-// async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
-//     let pool = init_pool().await?;
-//     let config = MailboxConfig {
-//         event_cache_size: 2,
-//         event_cache_trim_percent: 50,
-//         ..Default::default()
-//     };
-//     let outbox = Outbox::<TestEvent>::init(&pool, config).await?;
+#[tokio::test]
+#[file_serial]
+async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let config = MailboxConfig {
+        event_cache_size: 2,
+        event_cache_trim_percent: 50,
+        ..Default::default()
+    };
+    let outbox = Outbox::<TestEvent>::init(&pool, config).await?;
 
-//     // Create listener before publish to track when all events are processed
-//     let mut pre_listener = outbox.listen_persisted(None);
+    // Create listener before publish to track when all events are processed
+    let mut pre_listener = outbox.listen_persisted(None);
 
-//     let mut op = pool.begin().await?;
-//     outbox
-//         .publish_all_persisted(&mut op, (0..10).map(TestEvent::Ping))
-//         .await?;
-//     op.commit().await?;
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..10).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
 
-//     // Wait for all 10 events
-//     tokio::time::timeout(
-//         std::time::Duration::from_secs(1),
-//         (&mut pre_listener).take(5).for_each(|_| async {}),
-//     )
-//     .await?;
+    // Wait for all 10 events
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        (&mut pre_listener).take(5).for_each(|_| async {}),
+    )
+    .await?;
 
-//     let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
+    let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
 
-//     // This should now work because backfill will fetch from PG even if events are not in cache
-//     let mut events = Vec::new();
-//     for _ in 0..10 {
-//         let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
-//             .await
-//             .expect("should receive event via PG backfill")
-//             .expect("should have event");
-//         events.push(event);
-//     }
+    // This should now work because backfill will fetch from PG even if events are not in cache
+    let mut events = Vec::new();
+    for _ in 0..10 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
+            .await
+            .expect("should receive event via PG backfill")
+            .expect("should have event");
+        events.push(event);
+    }
 
-//     // Verify we got all 10 events in order
-//     for (i, event) in events.iter().enumerate() {
-//         assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64));
-//     }
+    // Verify we got all 10 events in order
+    for (i, event) in events.iter().enumerate() {
+        assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64));
+    }
 
-//     Ok(())
-// }
+    Ok(())
+}
 
 async fn wipeout_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")
