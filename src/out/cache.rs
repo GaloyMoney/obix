@@ -108,6 +108,44 @@ where
         Ok(ret)
     }
 
+    fn insert_into_cache_and_maybe_broadcast(
+        cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        event: Arc<PersistentOutboxEvent<P>>,
+        highest_known_sequence: &AtomicU64,
+        persistent_event_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        mut last_broadcast_sequence: EventSequence,
+        cache_size: usize,
+    ) -> (
+        im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        EventSequence,
+    ) {
+        use std::ops::Bound;
+
+        let sequence = event.sequence;
+        let highest_known = highest_known_sequence.fetch_max(u64::from(sequence), Ordering::AcqRel);
+
+        // Skip events that are too old to be useful
+        let threshold = highest_known.saturating_sub(cache_size as u64);
+        if u64::from(sequence) <= threshold {
+            return (cache, last_broadcast_sequence);
+        }
+
+        let cache = cache.alter(|existing| existing.or(Some(event)), sequence);
+
+        for (seq, evt) in cache.range((Bound::Excluded(last_broadcast_sequence), Bound::Unbounded))
+        {
+            if *seq != last_broadcast_sequence.next() {
+                break;
+            }
+            if persistent_event_sender.send(evt.clone()).is_err() {
+                break;
+            }
+            last_broadcast_sequence = *seq;
+        }
+
+        (cache, last_broadcast_sequence)
+    }
+
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: MailboxConfig,
@@ -127,32 +165,36 @@ where
                 Tables::ephemeral_outbox_events_channel(),
             ])
             .await?;
-        let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
-            im::OrdMap::new();
 
-        let high_water =
-            config.event_cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
-        let low_water =
-            config.event_cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
+        let cache_size = config.event_cache_size;
+        let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
+        let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
+
+        let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
         let handle = tokio::spawn(async move {
+            let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
+                im::OrdMap::new();
+            let mut last_broadcast_sequence = initial_sequence;
+
             loop {
                 tokio::select! {
                     biased;
 
-                    // Highest priority - local publishes (short-circuit pg_notify)
                     result = cache_fill_receiver.recv() => {
                         match result {
                             Ok(event) => {
-                                let sequence = event.sequence;
-                                if persistent_cache.insert(sequence, event.clone()).is_none() {
-                                    let new_highest_sequence = u64::from(sequence);
-                                    highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
-                                    let _ = persistent_event_sender.send(event);
-                                }
+                                (persistent_cache, last_broadcast_sequence) =
+                                    Self::insert_into_cache_and_maybe_broadcast(
+                                        persistent_cache,
+                                        event,
+                                        &highest_known_sequence,
+                                        &persistent_event_sender,
+                                        last_broadcast_sequence,
+                                        cache_size,
+                                    );
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
-                                // Missed messages will arrive via pg_notify
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -161,7 +203,6 @@ where
                         }
                     }
 
-                    // High priority - database notifications (remote publishes)
                     result = listener.recv() => {
                         match result {
                             Ok(notification) => {
@@ -169,13 +210,15 @@ where
                                     if let Ok(event) =
                                         serde_json::from_str::<PersistentOutboxEvent<P>>(notification.payload())
                                     {
-                                        let sequence = event.sequence;
-                                        let event = Arc::new(event);
-                                        if persistent_cache.insert(sequence, event.clone()).is_none() {
-                                            let new_highest_sequence = u64::from(sequence);
-                                            highest_known_sequence.fetch_max(new_highest_sequence, Ordering::AcqRel);
-                                            let _ = persistent_event_sender.send(event);
-                                        }
+                                        (persistent_cache, last_broadcast_sequence) =
+                                            Self::insert_into_cache_and_maybe_broadcast(
+                                                persistent_cache,
+                                                Arc::new(event),
+                                                &highest_known_sequence,
+                                                &persistent_event_sender,
+                                                last_broadcast_sequence,
+                                                cache_size,
+                                            );
                                     }
                                 } else if let Ok(_event) =
                                     serde_json::from_str::<EphemeralOutboxEvent<P>>(notification.payload())
@@ -189,7 +232,6 @@ where
                         }
                     }
 
-                    // Lower priority - backfill requests
                     result = backfill_request.recv() => {
                         match result {
                             Some((start_after, sender)) => {
@@ -201,9 +243,7 @@ where
                                             break;
                                         }
                                     }
-                                }
-
-                                    );
+                                });
                             }
                             None => {
                                 break;
