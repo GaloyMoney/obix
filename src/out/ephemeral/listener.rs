@@ -89,16 +89,13 @@ where
             }
         }
 
-        // Poll the event receiver for new events
-        match Pin::new(&mut this.event_receiver).poll_next(cx) {
-            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(event)),
-            Poll::Ready(Some(Err(_))) => {
-                // On lagged error, just continue to next event
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        loop {
+            match Pin::new(&mut this.event_receiver).poll_next(cx) {
+                Poll::Ready(Some(Ok(event))) => return Poll::Ready(Some(event)),
+                Poll::Ready(Some(Err(_))) => continue, // Skip lagged, try next
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
