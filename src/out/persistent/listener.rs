@@ -76,9 +76,7 @@ where
 
         loop {
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
-                Poll::Ready(None) => {
-                    return Poll::Ready(None);
-                }
+                Poll::Ready(None) => break,
                 Poll::Ready(Some(Ok(event))) => {
                     this.maybe_add_to_cache(event);
                 }
@@ -123,6 +121,8 @@ where
 
         if this.last_returned_sequence < this.latest_known && this.backfill_receiver.is_none() {
             this.request_backfill();
+            // need to register the cx with the backfill_receiver to get woken up
+            return self.poll_next(cx);
         }
 
         Poll::Pending
