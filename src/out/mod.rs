@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
-use ephemeral::{EphemeralOutboxEventCache, EphemeralOutboxListener};
+use ephemeral::EphemeralOutboxEventCache;
+pub use ephemeral::EphemeralOutboxListener;
 pub use event::*;
-use persistent::{PersistentOutboxEventCache, PersistentOutboxListener};
+use persistent::PersistentOutboxEventCache;
+pub use persistent::PersistentOutboxListener;
 
 #[derive(Debug)]
 #[allow(dead_code)]

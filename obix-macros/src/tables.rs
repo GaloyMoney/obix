@@ -170,7 +170,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                 {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
-                    let now = op.now();
+                    let now = op.maybe_now();
 
                     let mut payloads = Vec::new();
                     let serialized_events = events
@@ -217,7 +217,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
                     let executor = op.into_executor();
-                    let now = executor.now();
+                    let now = executor.maybe_now();
 
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
