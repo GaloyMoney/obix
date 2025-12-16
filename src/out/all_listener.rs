@@ -54,7 +54,7 @@ where
     ) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
 
-        let result = if this.poll_count % 2 == 0 {
+        let result = if this.poll_count.is_multiple_of(2) {
             Pin::new(&mut this.persistent_listener)
                 .poll_next(cx)
                 .map(|opt| opt.map(OutboxEvent::Persistent))
