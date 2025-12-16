@@ -5,12 +5,14 @@ edition = "2024"
 
 [features]
 
+default = ["default-tables"]
+
 fail-on-warnings = ["obix-macros/fail-on-warnings"]
 tracing = [
   "es-entity/tracing-context",
   "obix-macros/tracing"
 ]
-custom-tables = []
+default-tables = []
 
 [dependencies]
 obix-macros = { workspace = true }
