@@ -236,8 +236,12 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     let type1 = obix::out::EphemeralEventType::new("type1");
     let type2 = obix::out::EphemeralEventType::new("type2");
 
-    outbox.publish_ephemeral(type1.clone(), TestEvent::Ping(1)).await?;
-    outbox.publish_ephemeral(type2.clone(), TestEvent::Ping(2)).await?;
+    outbox
+        .publish_ephemeral(type1.clone(), TestEvent::Ping(1))
+        .await?;
+    outbox
+        .publish_ephemeral(type2.clone(), TestEvent::Ping(2))
+        .await?;
 
     // Give the cache time to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -273,9 +277,15 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     // Publish events of the same type - later should replace earlier
     let event_type = obix::out::EphemeralEventType::new("replaceable");
 
-    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(1)).await?;
-    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(2)).await?;
-    outbox.publish_ephemeral(event_type.clone(), TestEvent::Ping(3)).await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(1))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(2))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(3))
+        .await?;
 
     // Give the cache time to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -291,12 +301,13 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     assert!(matches!(event.payload, TestEvent::Ping(3)));
 
     // Should not receive any more events from backfill
-    let timeout_result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        listener.next()
-    ).await;
+    let timeout_result =
+        tokio::time::timeout(std::time::Duration::from_millis(200), listener.next()).await;
 
-    assert!(timeout_result.is_err(), "should not have received additional events from backfill");
+    assert!(
+        timeout_result.is_err(),
+        "should not have received additional events from backfill"
+    );
 
     Ok(())
 }

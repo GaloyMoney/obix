@@ -11,7 +11,9 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_receiver: Option<broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>>,
-    backfill_request: mpsc::UnboundedSender<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
+    backfill_request: mpsc::UnboundedSender<
+        oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
+    >,
 }
 
 impl<P> CacheHandle<P>
@@ -24,7 +26,9 @@ where
             .expect("receiver already taken")
     }
 
-    pub fn request_current_ephemeral_events(&self) -> oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>> {
+    pub fn request_current_ephemeral_events(
+        &self,
+    ) -> oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.backfill_request.send(tx);
         rx
@@ -37,7 +41,9 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    backfill_request_send: mpsc::UnboundedSender<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
+    backfill_request_send: mpsc::UnboundedSender<
+        oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
+    >,
     cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     _cache_loop_handle: OwnedTaskHandle,
     _phantom: std::marker::PhantomData<Tables>,
@@ -99,7 +105,6 @@ where
         let _ = ephemeral_event_sender.send(event);
         cache
     }
-
 
     async fn fetch_event_by_type(
         pool: sqlx::PgPool,
@@ -167,7 +172,9 @@ where
         pool: &sqlx::PgPool,
         _config: MailboxConfig,
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut backfill_request: mpsc::UnboundedReceiver<oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>>,
+        mut backfill_request: mpsc::UnboundedReceiver<
+            oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
+        >,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
