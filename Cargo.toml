@@ -3,6 +3,10 @@ name = "obix"
 version = "0.1.0-dev"
 edition = "2024"
 license = "Apache-2.0"
+description = "Implementation of outbox backed by PG / sqlx"
+repository = "https://github.com/GaloyMoney/obix"
+documentation = "https://docs.rs/obix"
+categories = ["database"]
 
 [features]
 
