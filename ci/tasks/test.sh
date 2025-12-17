@@ -15,7 +15,6 @@ cachix use "${CACHIX_CACHE_NAME}"
 # perhaps its a reserved keyword
 echo "--- Setting up Nix development environment ---"
 nix develop --profile dev-profile -c true
-cachix push "${CACHIX_CACHE_NAME}" dev-profile
 
 echo "--- Running integration tests in Nix environment ---"
 nix -L develop --command sh -exc '
