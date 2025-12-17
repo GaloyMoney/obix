@@ -7,8 +7,8 @@ use crate::{
     sequence::*,
 };
 
-#[cfg_attr(not(feature = "custom-tables"), derive(obix_macros::MailboxTables))]
-#[cfg_attr(not(feature = "custom-tables"), obix(crate = "crate"))]
+#[cfg_attr(feature = "default-tables", derive(obix_macros::MailboxTables))]
+#[cfg_attr(feature = "default-tables", obix(crate = "crate"))]
 pub struct DefaultMailboxTables;
 
 pub trait MailboxTables: Send + 'static {
