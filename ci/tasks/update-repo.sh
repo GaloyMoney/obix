@@ -11,7 +11,7 @@ pushd repo
 VERSION="$(cat ../version/version)"
 
 cat <<EOF >new_change_log.md
-# [cala release v${VERSION}](https://github.com/GaloyMoney/obix/releases/tag/${VERSION})
+# [obix release v${VERSION}](https://github.com/GaloyMoney/obix/releases/tag/${VERSION})
 
 $(cat ../artifacts/gh-release-notes.md)
 
