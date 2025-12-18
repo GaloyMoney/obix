@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     ).await?;
     op.commit().await?;
 
-    // Publish an ephemeral event (not persisted to DB)
+    // Publish an ephemeral event (only latest per type is kept)
     let event_type = obix::out::EphemeralEventType::new("user_online_status");
     outbox.publish_ephemeral(
         event_type,
@@ -126,7 +126,7 @@ You can copy the default migration and add your prefix to all table names, seque
 
 **Persistent Events**: Stored in the database with sequential ordering, guaranteed delivery, and replay capability. Use for critical business events that must be processed reliably.
 
-**Ephemeral Events**: Stored only in memory, representing current state. Later events of the same type replace earlier ones. Use for transient state updates like online status or real-time metrics.
+**Ephemeral Events**: Persisted to the database to enable replication across multiple runtime instances, but only the latest event per event type is kept. Later events of the same type replace earlier ones via database UPSERT. Use for current state updates like online status, real-time metrics, or any state that only needs the most recent value.
 
 ### Listening to Events
 
