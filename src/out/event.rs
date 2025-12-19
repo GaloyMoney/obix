@@ -66,7 +66,6 @@ where
 {
     pub event_type: EphemeralEventType,
     pub payload: T,
-    #[cfg(feature = "tracing")]
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
@@ -101,7 +100,6 @@ where
     pub sequence: EventSequence,
     #[serde(bound = "T: DeserializeOwned")]
     pub payload: Option<T>,
-    #[cfg(feature = "tracing")]
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
@@ -115,7 +113,6 @@ where
             id: self.id,
             sequence: self.sequence,
             payload: self.payload.clone(),
-            #[cfg(feature = "tracing")]
             tracing_context: self.tracing_context.clone(),
             recorded_at: self.recorded_at,
         }
