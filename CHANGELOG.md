@@ -1,3 +1,10 @@
+# [obix release v0.1.6](https://github.com/GaloyMoney/obix/releases/tag/0.1.6)
+
+
+### Refactor
+
+- Always include tracing_context in events
+
 # [obix release v0.1.5](https://github.com/GaloyMoney/obix/releases/tag/0.1.5)
 
 
