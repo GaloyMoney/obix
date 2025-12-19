@@ -13,7 +13,7 @@
 #@ )
 
 groups:
-- name: job
+- name: obix
   jobs:
   - check-code
   - tests
