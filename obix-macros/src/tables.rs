@@ -209,29 +209,26 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn persist_ephemeral_event<'a, P>(
-                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                fn persist_ephemeral_event<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
                     event_type: #crate_name::out::EphemeralEventType,
                     payload: P,
                 ) -> impl std::future::Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
-                    let executor = op.into_executor();
-                    let now = executor.maybe_now();
-
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
 
                     #extract_tracing
 
                     async move {
-                        let row = executor.fetch_one(sqlx::query!(
+                        let row = sqlx::query!(
                             #persist_ephemeral_events_query,
                             event_type.as_str(),
                             serialized_payload,
                             tracing_json,
-                            now
-                        )).await?;
+                            None::<chrono::DateTime<chrono::Utc>>
+                        ).fetch_one(pool).await?;
 
                         Ok(#crate_name::out::EphemeralOutboxEvent {
                             event_type,
