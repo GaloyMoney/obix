@@ -46,8 +46,8 @@ impl ToTokens for MailboxTables {
             quote! {
                 let tracing_json = None::<serde_json::Value>;
             },
-            quote! { tracing_context: None::<#crate_name::out::TracingContext>, },
-            quote! { let tracing_context = None::<#crate_name::out::TracingContext>; },
+            quote! {},
+            quote! {},
         );
 
         let table_prefix = self
