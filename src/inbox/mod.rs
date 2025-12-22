@@ -88,23 +88,4 @@ where
     pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent<P>>, InboxError> {
         Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit).await
     }
-
-    /// Retry a failed event
-    pub async fn retry(&self, id: InboxEventId) -> Result<(), InboxError> {
-        let mut op = es_entity::DbOp::init(&self.pool).await?;
-
-        Tables::update_inbox_event_status_in_op(&mut op, id, InboxEventStatus::Pending, None)
-            .await?;
-
-        let config = job::InboxJobData::<Tables> {
-            inbox_event_id: id,
-            _phantom: std::marker::PhantomData,
-        };
-        self.jobs
-            .create_and_spawn_in_op(&mut op, id, config)
-            .await?;
-
-        op.commit().await?;
-        Ok(())
-    }
 }
