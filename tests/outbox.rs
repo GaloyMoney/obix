@@ -1,12 +1,11 @@
+mod helpers;
+
 use futures::stream::StreamExt;
-use obix::MailboxConfig;
+use obix::{EventSequence, MailboxConfig};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
-use obix::{EventSequence, out::Outbox};
-
-#[derive(obix::MailboxTables)]
-pub struct TestTables;
+use helpers::{init_outbox, init_pool};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
@@ -14,20 +13,13 @@ enum TestEvent {
     LargePayload(String),
 }
 
-pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
-    let pg_host = std::env::var("PG_HOST").unwrap_or("localhost".to_string());
-    let pg_con = format!("postgres://user:password@{pg_host}:5432/pg");
-    let pool = sqlx::PgPool::connect(&pg_con).await?;
-    wipeout_table(&pool).await?;
-    Ok(pool)
-}
 
 #[tokio::test]
 #[file_serial]
 async fn events_via_short_circuit() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = outbox.begin_op().await?;
@@ -48,7 +40,7 @@ async fn events_via_short_circuit() -> anyhow::Result<()> {
 async fn events_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -69,7 +61,7 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
 async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
     let mut pre_listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -100,7 +92,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         event_cache_trim_percent: 50,
         ..Default::default()
     };
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, config).await?;
 
     // Create listener before publish to track when all events are processed
     let mut pre_listener = outbox.listen_persisted(None);
@@ -142,7 +134,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
 #[file_serial]
 async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let large_string = "x".repeat(10_000);
@@ -204,7 +196,7 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
     let mut listener = outbox.listen_ephemeral();
 
     // Publish an ephemeral event
@@ -230,7 +222,7 @@ async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
 async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
 
     // Publish events before creating listener
     let type1 = obix::out::EphemeralEventType::new("type1");
@@ -272,7 +264,7 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
 async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
 
     // Publish events of the same type - later should replace earlier
     let event_type = obix::out::EphemeralEventType::new("replaceable");
@@ -312,12 +304,3 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wipeout_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")
-        .execute(pool)
-        .await?;
-    sqlx::query!("TRUNCATE ephemeral_outbox_events")
-        .execute(pool)
-        .await?;
-    Ok(())
-}
