@@ -8,6 +8,7 @@ use crate::{
     sequence::*,
 };
 
+#[derive(Clone)]
 #[cfg_attr(feature = "default-tables", derive(obix_macros::MailboxTables))]
 #[cfg_attr(feature = "default-tables", obix(crate = "crate"))]
 pub struct DefaultMailboxTables;
