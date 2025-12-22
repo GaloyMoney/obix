@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
-use obix::{Inbox, MailboxConfig, inbox::InboxConfig, out::Outbox};
+use obix::{
+    Inbox, InboxEventStatus, MailboxConfig,
+    inbox::{InboxConfig, InboxEventId},
+    out::Outbox,
+};
 
 #[derive(obix::MailboxTables)]
 pub struct TestTables;
@@ -59,4 +63,35 @@ where
     wipeout_outbox_tables(pool).await?;
     let outbox = Outbox::<P, TestTables>::init(pool, config).await?;
     Ok(outbox)
+}
+
+pub async fn wait_for_inbox_status<P>(
+    inbox: &Inbox<P, TestTables>,
+    event_id: InboxEventId,
+    expected_status: InboxEventStatus,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()>
+where
+    P: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+
+    loop {
+        let event = inbox.find_event_by_id(event_id).await?;
+        if event.status == expected_status {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            anyhow::bail!(
+                "Timeout waiting for event {:?} to reach status {:?}, current status: {:?}",
+                event_id,
+                expected_status,
+                event.status
+            );
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
 }

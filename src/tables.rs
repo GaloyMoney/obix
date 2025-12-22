@@ -74,6 +74,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    // Wait for all events to be processed (max 5 seconds)
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
         id: InboxEventId,

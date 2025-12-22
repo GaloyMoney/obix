@@ -97,7 +97,7 @@ where
     }
 
     /// Find an inbox event by ID
-    pub async fn find_by_id(&self, id: InboxEventId) -> Result<InboxEvent<P>, InboxError> {
+    pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent<P>, InboxError> {
         Tables::find_inbox_event_by_id(&self.pool, id).await
     }
 

@@ -10,7 +10,7 @@ use obix::{
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
-use helpers::{init_inbox, init_pool};
+use helpers::{init_inbox, init_pool, wait_for_inbox_status};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestInboxEvent {
@@ -62,13 +62,20 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+    // Wait for the event to be processed (max 5 seconds)
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
 
     let events = received.lock().await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], TestInboxEvent::DoWork(42));
 
-    let event = inbox.find_by_id(event_id).await?;
+    let event = inbox.find_event_by_id(event_id).await?;
     assert_eq!(event.status, InboxEventStatus::Completed);
 
     Ok(())
@@ -104,6 +111,7 @@ async fn inbox_idempotent_push() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
     assert!(first.is_some());
+    let first_id = first.unwrap();
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let second = inbox
@@ -112,7 +120,14 @@ async fn inbox_idempotent_push() -> anyhow::Result<()> {
     op.commit().await?;
     assert!(second.is_none());
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for the first event to be processed (max 5 seconds)
+    wait_for_inbox_status(
+        &inbox,
+        first_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
 
     let events = received.lock().await;
     assert_eq!(events.len(), 1);
@@ -144,15 +159,25 @@ async fn inbox_multiple_events() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
+    let mut event_ids = Vec::new();
     for i in 0..5 {
         let mut op = es_entity::DbOp::init(&pool).await?;
-        inbox
+        let event_id = inbox
             .persist_and_process_in_op(&mut op, TestInboxEvent::DoWork(i))
             .await?;
         op.commit().await?;
+        event_ids.push(event_id);
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    for event_id in event_ids {
+        wait_for_inbox_status(
+            &inbox,
+            event_id,
+            InboxEventStatus::Completed,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+    }
 
     let events = received.lock().await;
     assert_eq!(events.len(), 5);
