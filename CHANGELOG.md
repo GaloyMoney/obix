@@ -1,3 +1,10 @@
+# [obix release v0.2.1](https://github.com/GaloyMoney/obix/releases/tag/0.2.1)
+
+
+### Bug Fixes
+
+- Bump job (#4)
+
 # [obix release v0.2.0](https://github.com/GaloyMoney/obix/releases/tag/0.2.0)
 
 
