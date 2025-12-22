@@ -1,3 +1,10 @@
+# [obix release v0.2.0](https://github.com/GaloyMoney/obix/releases/tag/0.2.0)
+
+
+### Features
+
+- [**breaking**] Implementation of inbox pattern using job crate (#3)
+
 # [obix release v0.1.6](https://github.com/GaloyMoney/obix/releases/tag/0.1.6)
 
 
