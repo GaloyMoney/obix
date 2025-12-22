@@ -6,6 +6,31 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 es_entity::entity_id! { InboxEventId }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InboxIdempotencyKey(String);
+
+impl InboxIdempotencyKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<T: std::fmt::Display> From<T> for InboxIdempotencyKey {
+    fn from(value: T) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl AsRef<str> for InboxIdempotencyKey {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<InboxEventId> for job::JobId {
     fn from(id: InboxEventId) -> Self {
         job::JobId::from(id.0)

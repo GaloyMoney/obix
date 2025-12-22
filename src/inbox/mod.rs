@@ -77,12 +77,13 @@ where
     pub async fn push_idempotent(
         &self,
         op: &mut impl es_entity::AtomicOperation,
-        idempotency_key: &str,
+        idempotency_key: impl Into<InboxIdempotencyKey>,
         event: impl Into<P>,
     ) -> Result<Option<InboxEventId>, InboxError> {
         let event = event.into();
+        let idempotency_key = idempotency_key.into();
 
-        let Some(id) = Tables::insert_inbox_event_idempotent(op, idempotency_key, &event).await?
+        let Some(id) = Tables::insert_inbox_event_idempotent(op, &idempotency_key, &event).await?
         else {
             return Ok(None);
         };

@@ -447,7 +447,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn insert_inbox_event_idempotent<P>(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
-                    idempotency_key: &str,
+                    idempotency_key: &#crate_name::inbox::InboxIdempotencyKey,
                     payload: &P,
                 ) -> impl std::future::Future<Output = Result<Option<#crate_name::inbox::InboxEventId>, #crate_name::prelude::sqlx::Error>> + Send
                 where
@@ -458,7 +458,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let id = #crate_name::inbox::InboxEventId::new();
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(payload).expect("Could not serialize payload");
-                    let idempotency_key = idempotency_key.to_string();
+                    let idempotency_key = idempotency_key.as_str().to_string();
                     let now = op.maybe_now();
 
                     async move {

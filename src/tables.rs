@@ -3,7 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use es_entity::hooks::HookOperation;
 
 use crate::{
-    inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus},
+    inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{EphemeralEventType, EphemeralOutboxEvent, PersistentOutboxEvent},
     sequence::*,
 };
@@ -61,7 +61,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     fn insert_inbox_event_idempotent<P>(
         op: &mut impl es_entity::AtomicOperation,
-        idempotency_key: &str,
+        idempotency_key: &InboxIdempotencyKey,
         payload: &P,
     ) -> impl Future<Output = Result<Option<InboxEventId>, sqlx::Error>> + Send
     where
