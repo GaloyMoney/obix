@@ -93,7 +93,8 @@ where
     pub async fn retry(&self, id: InboxEventId) -> Result<(), InboxError> {
         let mut op = es_entity::DbOp::init(&self.pool).await?;
 
-        Tables::update_inbox_event_status(&self.pool, id, InboxEventStatus::Pending, None).await?;
+        Tables::update_inbox_event_status_in_op(&mut op, id, InboxEventStatus::Pending, None)
+            .await?;
 
         let config = job::InboxJobData::<Tables> {
             inbox_event_id: id,

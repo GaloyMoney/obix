@@ -525,7 +525,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                     error: Option<&str>,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
                 {
-                    let pool = pool.clone();
                     let error = error.map(|s| s.to_string());
 
                     async move {
@@ -535,7 +534,31 @@ FROM {}persistent_outbox_events_sequence_seq",
                             status as #crate_name::inbox::InboxEventStatus,
                             error
                         )
-                        .execute(&pool)
+                        .execute(pool)
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn update_inbox_event_status_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    id: #crate_name::inbox::InboxEventId,
+                    status: #crate_name::inbox::InboxEventStatus,
+                    error: Option<&str>,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let error = error.map(|s| s.to_string());
+
+                    async move {
+                        sqlx::query!(
+                            #update_inbox_event_status_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            status as #crate_name::inbox::InboxEventStatus,
+                            error
+                        )
+                        .execute(op.as_executor())
                         .await?;
                         Ok(())
                     }
