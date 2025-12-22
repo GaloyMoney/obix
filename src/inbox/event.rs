@@ -1,4 +1,3 @@
-// src/inbox/event.rs
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};

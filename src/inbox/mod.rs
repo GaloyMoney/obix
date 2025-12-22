@@ -23,9 +23,6 @@ impl<Tables> Inbox<Tables>
 where
     Tables: MailboxTables,
 {
-    /// Initialize the inbox with a handler
-    ///
-    /// This registers the job initializer automatically.
     pub fn new<H>(
         pool: &sqlx::PgPool,
         jobs: &mut job::Jobs,
@@ -51,8 +48,6 @@ where
         }
     }
 
-    /// Push an event into the inbox with idempotency key and spawn a processing job
-    /// Returns None if an event with this idempotency key already exists
     pub async fn persist_and_process_in_op<P>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -77,12 +72,10 @@ where
         Ok(es_entity::Idempotent::Executed(id))
     }
 
-    /// Find an inbox event by ID
     pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent, InboxError> {
         Tables::find_inbox_event_by_id(&self.pool, id).await
     }
 
-    /// List failed events (dead letters)
     pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, InboxError> {
         Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit).await
     }

@@ -1,4 +1,3 @@
-// src/inbox/error.rs
 use thiserror::Error;
 
 #[derive(Error, Debug)]

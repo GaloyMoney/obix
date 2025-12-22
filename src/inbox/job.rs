@@ -10,17 +10,12 @@ use job::{
 use super::{InboxEvent, InboxEventId, InboxEventStatus};
 use crate::tables::MailboxTables;
 
-/// Result returned by inbox handlers
 pub enum InboxResult {
-    /// Event processed successfully
     Complete,
-    /// Reprocess immediately (e.g., partial progress made)
     ReprocessNow,
-    /// Reprocess after a delay
     ReprocessIn(std::time::Duration),
 }
 
-/// Trait for handling inbox events
 pub trait InboxHandler: Send + Sync + 'static {
     fn handle(
         &self,
@@ -30,7 +25,6 @@ pub trait InboxHandler: Send + Sync + 'static {
     > + Send;
 }
 
-/// Job data stored in the job table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InboxJobData<Tables> {
     pub inbox_event_id: InboxEventId,
@@ -42,7 +36,6 @@ impl<Tables: MailboxTables> JobConfig for InboxJobData<Tables> {
     type Initializer = InboxJobInitializer<DummyHandler, Tables>;
 }
 
-/// Placeholder handler for JobConfig bound
 pub(super) struct DummyHandler;
 impl InboxHandler for DummyHandler {
     async fn handle(
@@ -53,7 +46,6 @@ impl InboxHandler for DummyHandler {
     }
 }
 
-/// The job initializer registered with the Jobs service
 pub(super) struct InboxJobInitializer<H, Tables>
 where
     H: InboxHandler,
@@ -120,7 +112,6 @@ where
     }
 }
 
-/// The job runner that wraps the user's handler
 struct InboxJobRunner<H, Tables>
 where
     H: InboxHandler,
