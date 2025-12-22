@@ -43,14 +43,13 @@ impl ToTokens for MailboxTables {
                     });
             },
         );
-
         #[cfg(not(feature = "tracing"))]
         let (extract_tracing, set_context, deserialize_context) = (
             quote! {
                 let tracing_json = None::<serde_json::Value>;
             },
-            quote! {},
-            quote! {},
+            quote! { tracing_context: None::<es_entity::context::TracingContext>, },
+            quote! { let tracing_context = None::<es_entity::context::TracingContext>; },
         );
 
         let table_prefix = self

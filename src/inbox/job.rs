@@ -150,12 +150,10 @@ where
         &self,
         mut current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        // Check for shutdown before doing any work
         if current_job.is_shutdown_requested() {
             return Ok(JobCompletion::RescheduleNow);
         }
 
-        // Mark as processing
         Tables::update_inbox_event_status(
             &self.pool,
             self.inbox_event_id,
@@ -165,12 +163,10 @@ where
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-        // Load the event
         let event: InboxEvent<P> = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-        // Call the user's handler
         let result = self.handler.handle(&event).await;
 
         match result {
@@ -208,7 +204,6 @@ where
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
-                // Record the error - job crate handles retry/dead-letter
                 Tables::update_inbox_event_status(
                     &self.pool,
                     self.inbox_event_id,

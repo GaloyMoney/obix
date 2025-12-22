@@ -20,7 +20,7 @@ impl From<job::JobId> for InboxEventId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "inbox_event_status", rename_all = "snake_case")]
+#[sqlx(type_name = "InboxEventStatus", rename_all = "snake_case")]
 pub enum InboxEventStatus {
     Pending,
     Processing,

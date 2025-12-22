@@ -30,7 +30,7 @@ where
     /// Initialize the inbox with a handler
     ///
     /// This registers the job initializer automatically.
-    pub fn init<H>(
+    pub fn new<H>(
         pool: &sqlx::PgPool,
         jobs: &mut job::Jobs,
         config: InboxConfig,
@@ -56,7 +56,7 @@ where
     }
 
     /// Push an event into the inbox and spawn a processing job
-    pub async fn push(
+    pub async fn persist_and_process_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         event: impl Into<P>,
