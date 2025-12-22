@@ -11,6 +11,7 @@ pub struct MailboxTables {
     #[darling(default = "default_crate_name", rename = "crate")]
     crate_name: syn::LitStr,
 }
+
 fn default_crate_name() -> syn::LitStr {
     syn::LitStr::new("obix", proc_macro2::Span::call_site())
 }
@@ -24,6 +25,7 @@ impl ToTokens for MailboxTables {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let ident = &self.ident;
         let crate_name: syn::Path = self.crate_name.parse().expect("invalid crate path");
+
         #[cfg(feature = "tracing")]
         let (extract_tracing, set_context, deserialize_context) = (
             quote! {
@@ -41,13 +43,14 @@ impl ToTokens for MailboxTables {
                     });
             },
         );
+
         #[cfg(not(feature = "tracing"))]
         let (extract_tracing, set_context, deserialize_context) = (
             quote! {
                 let tracing_json = None::<serde_json::Value>;
             },
-            quote! { tracing_context: None::<es_entity::context::TracingContext>, },
-            quote! { let tracing_context = None::<es_entity::context::TracingContext>; },
+            quote! {},
+            quote! {},
         );
 
         let table_prefix = self
@@ -56,8 +59,10 @@ impl ToTokens for MailboxTables {
             .map(|p| format!("{}_", p.value()))
             .unwrap_or_default();
 
+        // === Outbox queries ===
         let persistent_outbox_events_channel = format!("{}persistent_outbox_events", table_prefix);
         let ephemeral_outbox_events_channel = format!("{}ephemeral_outbox_events", table_prefix);
+
         let highest_known_query = format!(
             "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
 FROM {}persistent_outbox_events_sequence_seq",
@@ -138,14 +143,60 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // === Inbox queries ===
+        let insert_inbox_event_query = format!(
+            r#"INSERT INTO {tbl}inbox_events (id, payload, recorded_at)
+            VALUES ($1, $2, COALESCE($3::timestamptz, NOW()))
+            RETURNING id"#,
+            tbl = table_prefix
+        );
+
+        let insert_inbox_event_idempotent_query = format!(
+            r#"INSERT INTO {tbl}inbox_events (id, idempotency_key, payload, recorded_at)
+            VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id"#,
+            tbl = table_prefix
+        );
+
+        let find_inbox_event_by_id_query = format!(
+            r#"SELECT id, idempotency_key, payload, status::text AS "status!", error, recorded_at, processed_at
+            FROM {tbl}inbox_events
+            WHERE id = $1"#,
+            tbl = table_prefix
+        );
+
+        let update_inbox_event_status_query = format!(
+            r#"UPDATE {tbl}inbox_events
+            SET status = $2,
+                error = $3,
+                processed_at = CASE WHEN $2 = 'completed'::InboxEventStatus THEN NOW() ELSE processed_at END
+            WHERE id = $1"#,
+            tbl = table_prefix
+        );
+
+        let list_inbox_events_by_status_query = format!(
+            r#"SELECT id, idempotency_key, payload, status::text AS "status!", error, recorded_at, processed_at
+            FROM {tbl}inbox_events
+            WHERE status = $1
+            ORDER BY recorded_at ASC
+            LIMIT $2"#,
+            tbl = table_prefix
+        );
+
         tokens.append_all(quote! {
             impl #crate_name::MailboxTables for #ident {
+                // === Outbox channel names ===
+
                 fn persistent_outbox_events_channel() -> &'static str {
                     #persistent_outbox_events_channel
                 }
+
                 fn ephemeral_outbox_events_channel() -> &'static str {
                     #ephemeral_outbox_events_channel
                 }
+
+                // === Outbox methods ===
 
                 fn highest_known_persistent_sequence<'a>(
                     op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
@@ -153,9 +204,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let executor = op.into_executor();
                     async {
                         let row = executor
-                            .fetch_one(sqlx::query!(
-                                    #highest_known_query
-                            ))
+                            .fetch_one(sqlx::query!(#highest_known_query))
                             .await?;
                         Ok(#crate_name::EventSequence::from(row.last_returned as u64))
                     }
@@ -180,7 +229,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             payloads.push(e);
                             serialized_event
                         })
-                    .collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
 
                     #extract_tracing
 
@@ -194,6 +243,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             tracing_json,
                             now
                         ).fetch_all(op.as_executor()).await?;
+
                         let events = rows
                             .into_iter()
                             .zip(payloads.into_iter())
@@ -204,7 +254,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 payload: Some(payload),
                                 #set_context
                             })
-                        .collect::<Vec<_>>();
+                            .collect::<Vec<_>>();
                         Ok(events)
                     }
                 }
@@ -215,7 +265,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                     payload: P,
                 ) -> impl std::future::Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
                 where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
                     let serialized_payload =
                         #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
 
@@ -245,7 +296,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                     buffer_size: usize,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
                 where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
                     let pool = pool.clone();
 
                     async move {
@@ -305,7 +357,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                     event_type_filter: Option<#crate_name::out::EphemeralEventType>,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::EphemeralOutboxEvent<P>>, sqlx::Error>> + Send
                 where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send {
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
                     let pool = pool.clone();
 
                     async move {
@@ -341,7 +394,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     #crate_name::prelude::serde_json::Value::String(event_type_str)
                                 ).expect("Couldn't deserialize event_type");
 
-                                // Create a row-like struct for the deserialize_context macro
                                 let row = {
                                     struct TempRow {
                                         tracing_context: Option<#crate_name::prelude::serde_json::Value>,
@@ -361,6 +413,167 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect::<Vec<_>>();
                         Ok(events)
+                    }
+                }
+
+                // === Inbox methods ===
+
+                fn insert_inbox_event<P>(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    payload: &P,
+                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEventId, #crate_name::prelude::sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + Send + Sync
+                {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let id = #crate_name::inbox::InboxEventId::new();
+                    let serialized_payload =
+                        #crate_name::prelude::serde_json::to_value(payload).expect("Could not serialize payload");
+                    let now = op.maybe_now();
+
+                    async move {
+                        sqlx::query!(
+                            #insert_inbox_event_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            serialized_payload,
+                            now
+                        )
+                        .fetch_one(op.as_executor())
+                        .await?;
+
+                        Ok(id)
+                    }
+                }
+
+                fn insert_inbox_event_idempotent<P>(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    idempotency_key: &str,
+                    payload: &P,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::inbox::InboxEventId>, #crate_name::prelude::sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + Send + Sync
+                {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let id = #crate_name::inbox::InboxEventId::new();
+                    let serialized_payload =
+                        #crate_name::prelude::serde_json::to_value(payload).expect("Could not serialize payload");
+                    let idempotency_key = idempotency_key.to_string();
+                    let now = op.maybe_now();
+
+                    async move {
+                        let result = sqlx::query!(
+                            #insert_inbox_event_idempotent_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            idempotency_key,
+                            serialized_payload,
+                            now
+                        )
+                        .fetch_optional(op.as_executor())
+                        .await?;
+
+                        Ok(result.map(|row| #crate_name::inbox::InboxEventId::from(row.id)))
+                    }
+                }
+
+                fn find_inbox_event_by_id<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    id: #crate_name::inbox::InboxEventId,
+                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEvent<P>, #crate_name::inbox::InboxError>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(
+                            #find_inbox_event_by_id_query,
+                            id as #crate_name::inbox::InboxEventId
+                        )
+                        .fetch_optional(&pool)
+                        .await?
+                        .ok_or(#crate_name::inbox::InboxError::NotFound(id))?;
+
+                        let payload = #crate_name::prelude::serde_json::from_value(row.payload)?;
+                        let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
+                            .expect("Invalid inbox event status in database");
+
+                        Ok(#crate_name::inbox::InboxEvent {
+                            id: #crate_name::inbox::InboxEventId::from(row.id),
+                            idempotency_key: row.idempotency_key,
+                            payload,
+                            status,
+                            error: row.error,
+                            recorded_at: row.recorded_at,
+                            processed_at: row.processed_at,
+                        })
+                    }
+                }
+
+                fn list_inbox_events_by_status<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    status: #crate_name::inbox::InboxEventStatus,
+                    limit: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent<P>>, #crate_name::inbox::InboxError>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #list_inbox_events_by_status_query,
+                            status as #crate_name::inbox::InboxEventStatus,
+                            limit as i64
+                        )
+                        .fetch_all(&pool)
+                        .await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                let payload = #crate_name::prelude::serde_json::from_value(row.payload)
+                                    .expect("Could not deserialize payload");
+                                let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
+                                    .expect("Invalid inbox event status in database");
+
+                                #crate_name::inbox::InboxEvent {
+                                    id: #crate_name::inbox::InboxEventId::from(row.id),
+                                    idempotency_key: row.idempotency_key,
+                                    payload,
+                                    status,
+                                    error: row.error,
+                                    recorded_at: row.recorded_at,
+                                    processed_at: row.processed_at,
+                                }
+                            })
+                            .collect();
+
+                        Ok(events)
+                    }
+                }                
+
+                fn update_inbox_event_status(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    id: #crate_name::inbox::InboxEventId,
+                    status: #crate_name::inbox::InboxEventStatus,
+                    error: Option<&str>,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+                    let error = error.map(|s| s.to_string());
+
+                    async move {
+                        sqlx::query!(
+                            #update_inbox_event_status_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            status as #crate_name::inbox::InboxEventStatus,
+                            error
+                        )
+                        .execute(&pool)
+                        .await?;
+                        Ok(())
                     }
                 }
             }

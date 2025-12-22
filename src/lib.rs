@@ -11,11 +11,16 @@ pub mod prelude {
 
 mod config;
 mod handle;
+pub mod inbox;
 pub mod out;
 mod sequence;
 mod tables;
 
 pub use config::MailboxConfig;
+pub use inbox::{
+    Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
+    InboxResult,
+};
 pub use obix_macros::MailboxTables;
 pub use out::Outbox;
 pub use sequence::EventSequence;
