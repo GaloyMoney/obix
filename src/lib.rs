@@ -18,8 +18,8 @@ mod tables;
 
 pub use config::MailboxConfig;
 pub use inbox::{
-    Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus,
-    InboxIdempotencyKey, InboxHandler, InboxResult,
+    Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
+    InboxIdempotencyKey, InboxResult,
 };
 pub use obix_macros::MailboxTables;
 pub use out::Outbox;

@@ -13,7 +13,6 @@ enum TestEvent {
     LargePayload(String),
 }
 
-
 #[tokio::test]
 #[file_serial]
 async fn events_via_short_circuit() -> anyhow::Result<()> {
@@ -303,4 +302,3 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
 
     Ok(())
 }
-

@@ -516,7 +516,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                         Ok(events)
                     }
-                }                
+                }
 
                 fn update_inbox_event_status(
                     pool: &#crate_name::prelude::sqlx::PgPool,
