@@ -3,7 +3,7 @@ mod error;
 mod event;
 mod job;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 
 pub use config::*;
 pub use error::*;
@@ -13,18 +13,14 @@ pub use job::{InboxHandler, InboxResult};
 use crate::tables::MailboxTables;
 
 #[derive(Clone)]
-pub struct Inbox<P, Tables = crate::tables::DefaultMailboxTables>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
+pub struct Inbox<Tables = crate::tables::DefaultMailboxTables> {
     pool: sqlx::PgPool,
     jobs: job::Jobs,
-    _phantom: std::marker::PhantomData<(P, Tables)>,
+    _phantom: std::marker::PhantomData<Tables>,
 }
 
-impl<P, Tables> Inbox<P, Tables>
+impl<Tables> Inbox<Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
     /// Initialize the inbox with a handler
@@ -37,9 +33,9 @@ where
         handler: H,
     ) -> Self
     where
-        H: InboxHandler<P>,
+        H: InboxHandler,
     {
-        let initializer = job::InboxJobInitializer::<P, H, Tables>::new(
+        let initializer = job::InboxJobInitializer::<H, Tables>::new(
             pool,
             handler,
             config.job_type.clone(),
@@ -57,13 +53,15 @@ where
 
     /// Push an event into the inbox with idempotency key and spawn a processing job
     /// Returns None if an event with this idempotency key already exists
-    pub async fn persist_and_process_in_op(
+    pub async fn persist_and_process_in_op<P>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,
-        event: impl Into<P>,
-    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError> {
-        let event = event.into();
+        event: P,
+    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    where
+        P: Serialize + Send + Sync,
+    {
         let idempotency_key = idempotency_key.into();
 
         let Some(id) = Tables::insert_inbox_event(op, &idempotency_key, &event).await? else {
@@ -80,12 +78,12 @@ where
     }
 
     /// Find an inbox event by ID
-    pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent<P>, InboxError> {
+    pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent, InboxError> {
         Tables::find_inbox_event_by_id(&self.pool, id).await
     }
 
     /// List failed events (dead letters)
-    pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent<P>>, InboxError> {
+    pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, InboxError> {
         Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit).await
     }
 }

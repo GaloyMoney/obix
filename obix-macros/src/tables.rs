@@ -441,12 +441,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn find_inbox_event_by_id<P>(
+                fn find_inbox_event_by_id(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     id: #crate_name::inbox::InboxEventId,
-                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEvent<P>, #crate_name::inbox::InboxError>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEvent, #crate_name::inbox::InboxError>> + Send
                 {
                     let pool = pool.clone();
 
@@ -459,14 +457,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .await?
                         .ok_or(#crate_name::inbox::InboxError::NotFound(id))?;
 
-                        let payload = #crate_name::prelude::serde_json::from_value(row.payload)?;
                         let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
                             .expect("Invalid inbox event status in database");
 
                         Ok(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
                             idempotency_key: row.idempotency_key,
-                            payload,
+                            payload: row.payload,
                             status,
                             error: row.error,
                             recorded_at: row.recorded_at,
@@ -475,13 +472,11 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn list_inbox_events_by_status<P>(
+                fn list_inbox_events_by_status(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     status: #crate_name::inbox::InboxEventStatus,
                     limit: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent<P>>, #crate_name::inbox::InboxError>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent>, #crate_name::inbox::InboxError>> + Send
                 {
                     let pool = pool.clone();
 
@@ -497,15 +492,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                         let events = rows
                             .into_iter()
                             .map(|row| {
-                                let payload = #crate_name::prelude::serde_json::from_value(row.payload)
-                                    .expect("Could not deserialize payload");
                                 let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
                                     .expect("Invalid inbox event status in database");
 
                                 #crate_name::inbox::InboxEvent {
                                     id: #crate_name::inbox::InboxEventId::from(row.id),
                                     idempotency_key: row.idempotency_key,
-                                    payload,
+                                    payload: row.payload,
                                     status,
                                     error: row.error,
                                     recorded_at: row.recorded_at,

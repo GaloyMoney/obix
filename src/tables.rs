@@ -60,12 +60,10 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + Send + Sync;
 
-    fn find_inbox_event_by_id<P>(
+    fn find_inbox_event_by_id(
         pool: &sqlx::PgPool,
         id: InboxEventId,
-    ) -> impl Future<Output = Result<InboxEvent<P>, InboxError>> + Send
-    where
-        P: Serialize + DeserializeOwned + Send;
+    ) -> impl Future<Output = Result<InboxEvent, InboxError>> + Send;
 
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
@@ -81,11 +79,9 @@ pub trait MailboxTables: Send + Sync + 'static {
         error: Option<&str>,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    fn list_inbox_events_by_status<P>(
+    fn list_inbox_events_by_status(
         pool: &sqlx::PgPool,
         status: InboxEventStatus,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<InboxEvent<P>>, InboxError>> + Send
-    where
-        P: Serialize + DeserializeOwned + Send;
+    ) -> impl Future<Output = Result<Vec<InboxEvent>, InboxError>> + Send;
 }

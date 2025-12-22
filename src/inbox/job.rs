@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use job::Jobs;
@@ -21,13 +21,10 @@ pub enum InboxResult {
 }
 
 /// Trait for handling inbox events
-pub trait InboxHandler<P>: Send + Sync + 'static
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
+pub trait InboxHandler: Send + Sync + 'static {
     fn handle(
         &self,
-        event: &InboxEvent<P>,
+        event: &InboxEvent,
     ) -> impl std::future::Future<
         Output = Result<InboxResult, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
@@ -42,25 +39,24 @@ pub(super) struct InboxJobData<Tables> {
 }
 
 impl<Tables: MailboxTables> JobConfig for InboxJobData<Tables> {
-    type Initializer = InboxJobInitializer<serde_json::Value, DummyHandler, Tables>;
+    type Initializer = InboxJobInitializer<DummyHandler, Tables>;
 }
 
 /// Placeholder handler for JobConfig bound
 pub(super) struct DummyHandler;
-impl InboxHandler<serde_json::Value> for DummyHandler {
+impl InboxHandler for DummyHandler {
     async fn handle(
         &self,
-        _: &InboxEvent<serde_json::Value>,
+        _: &InboxEvent,
     ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
         unreachable!()
     }
 }
 
 /// The job initializer registered with the Jobs service
-pub(super) struct InboxJobInitializer<P, H, Tables>
+pub(super) struct InboxJobInitializer<H, Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    H: InboxHandler<P>,
+    H: InboxHandler,
     Tables: MailboxTables,
 {
     pool: sqlx::PgPool,
@@ -69,13 +65,12 @@ where
     job_type: JobType,
     #[allow(dead_code)]
     retry_settings: RetrySettings,
-    _phantom: std::marker::PhantomData<(P, Tables)>,
+    _phantom: std::marker::PhantomData<Tables>,
 }
 
-impl<P, H, Tables> InboxJobInitializer<P, H, Tables>
+impl<H, Tables> InboxJobInitializer<H, Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    H: InboxHandler<P>,
+    H: InboxHandler,
     Tables: MailboxTables,
 {
     pub fn new(
@@ -94,10 +89,9 @@ where
     }
 }
 
-impl<P, H, Tables> JobInitializer for InboxJobInitializer<P, H, Tables>
+impl<H, Tables> JobInitializer for InboxJobInitializer<H, Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    H: InboxHandler<P>,
+    H: InboxHandler,
     Tables: MailboxTables,
 {
     fn job_type() -> JobType
@@ -117,7 +111,7 @@ where
     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: InboxJobData<Tables> = job.config()?;
 
-        Ok(Box::new(InboxJobRunner::<P, H, Tables> {
+        Ok(Box::new(InboxJobRunner::<H, Tables> {
             pool: self.pool.clone(),
             handler: self.handler.clone(),
             inbox_event_id: config.inbox_event_id,
@@ -127,23 +121,21 @@ where
 }
 
 /// The job runner that wraps the user's handler
-struct InboxJobRunner<P, H, Tables>
+struct InboxJobRunner<H, Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    H: InboxHandler<P>,
+    H: InboxHandler,
     Tables: MailboxTables,
 {
     pool: sqlx::PgPool,
     handler: Arc<H>,
     inbox_event_id: InboxEventId,
-    _phantom: std::marker::PhantomData<(P, Tables)>,
+    _phantom: std::marker::PhantomData<Tables>,
 }
 
 #[async_trait]
-impl<P, H, Tables> JobRunner for InboxJobRunner<P, H, Tables>
+impl<H, Tables> JobRunner for InboxJobRunner<H, Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    H: InboxHandler<P>,
+    H: InboxHandler,
     Tables: MailboxTables,
 {
     async fn run(
@@ -163,7 +155,7 @@ where
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-        let event: InboxEvent<P> = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
+        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 

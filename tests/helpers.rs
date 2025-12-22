@@ -34,17 +34,16 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn init_inbox<P, H>(
+pub async fn init_inbox<H>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<Inbox<P, TestTables>>
+) -> anyhow::Result<Inbox<TestTables>>
 where
-    P: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
-    H: obix::inbox::InboxHandler<P>,
+    H: obix::inbox::InboxHandler,
 {
     wipeout_inbox_tables(pool).await?;
-    let inbox = Inbox::<P, TestTables>::new(
+    let inbox = Inbox::<TestTables>::new(
         pool,
         jobs,
         InboxConfig::new(job::JobType::new("test-inbox")),
@@ -65,15 +64,12 @@ where
     Ok(outbox)
 }
 
-pub async fn wait_for_inbox_status<P>(
-    inbox: &Inbox<P, TestTables>,
+pub async fn wait_for_inbox_status(
+    inbox: &Inbox<TestTables>,
     event_id: InboxEventId,
     expected_status: InboxEventStatus,
     timeout: std::time::Duration,
-) -> anyhow::Result<()>
-where
-    P: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
-{
+) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let poll_interval = std::time::Duration::from_millis(50);
 

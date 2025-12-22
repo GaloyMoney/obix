@@ -22,12 +22,13 @@ struct TestHandler {
     received: Arc<Mutex<Vec<TestInboxEvent>>>,
 }
 
-impl InboxHandler<TestInboxEvent> for TestHandler {
+impl InboxHandler for TestHandler {
     async fn handle(
         &self,
-        event: &InboxEvent<TestInboxEvent>,
+        event: &InboxEvent,
     ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.received.lock().await.push(event.payload.clone());
+        let payload: TestInboxEvent = event.payload()?;
+        self.received.lock().await.push(payload);
         Ok(InboxResult::Complete)
     }
 }

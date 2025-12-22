@@ -79,16 +79,21 @@ impl FromStr for InboxEventStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InboxEvent<T>
-where
-    T: Serialize + DeserializeOwned + Send,
-{
+pub struct InboxEvent {
     pub id: InboxEventId,
     pub idempotency_key: Option<String>,
-    #[serde(bound = "T: DeserializeOwned")]
-    pub payload: T,
+    pub payload: serde_json::Value,
     pub status: InboxEventStatus,
     pub error: Option<String>,
     pub recorded_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
+}
+
+impl InboxEvent {
+    pub fn payload<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_value(self.payload.clone())
+    }
 }
