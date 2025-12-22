@@ -144,13 +144,6 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         // === Inbox queries ===
         let insert_inbox_event_query = format!(
-            r#"INSERT INTO {tbl}inbox_events (id, payload, recorded_at)
-            VALUES ($1, $2, COALESCE($3::timestamptz, NOW()))
-            RETURNING id"#,
-            tbl = table_prefix
-        );
-
-        let insert_inbox_event_idempotent_query = format!(
             r#"INSERT INTO {tbl}inbox_events (id, idempotency_key, payload, recorded_at)
             VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
             ON CONFLICT (idempotency_key) DO NOTHING
@@ -419,34 +412,6 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn insert_inbox_event<P>(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
-                    payload: &P,
-                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEventId, #crate_name::prelude::sqlx::Error>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + Send + Sync
-                {
-                    use #crate_name::prelude::es_entity::AtomicOperation;
-
-                    let id = #crate_name::inbox::InboxEventId::new();
-                    let serialized_payload =
-                        #crate_name::prelude::serde_json::to_value(payload).expect("Could not serialize payload");
-                    let now = op.maybe_now();
-
-                    async move {
-                        sqlx::query!(
-                            #insert_inbox_event_query,
-                            id as #crate_name::inbox::InboxEventId,
-                            serialized_payload,
-                            now
-                        )
-                        .fetch_one(op.as_executor())
-                        .await?;
-
-                        Ok(id)
-                    }
-                }
-
-                fn insert_inbox_event_idempotent<P>(
-                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     idempotency_key: &#crate_name::inbox::InboxIdempotencyKey,
                     payload: &P,
                 ) -> impl std::future::Future<Output = Result<Option<#crate_name::inbox::InboxEventId>, #crate_name::prelude::sqlx::Error>> + Send
@@ -463,7 +428,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                     async move {
                         let result = sqlx::query!(
-                            #insert_inbox_event_idempotent_query,
+                            #insert_inbox_event_query,
                             id as #crate_name::inbox::InboxEventId,
                             idempotency_key,
                             serialized_payload,

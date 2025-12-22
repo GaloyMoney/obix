@@ -54,13 +54,6 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     fn insert_inbox_event<P>(
         op: &mut impl es_entity::AtomicOperation,
-        payload: &P,
-    ) -> impl Future<Output = Result<InboxEventId, sqlx::Error>> + Send
-    where
-        P: Serialize + Send + Sync;
-
-    fn insert_inbox_event_idempotent<P>(
-        op: &mut impl es_entity::AtomicOperation,
         idempotency_key: &InboxIdempotencyKey,
         payload: &P,
     ) -> impl Future<Output = Result<Option<InboxEventId>, sqlx::Error>> + Send

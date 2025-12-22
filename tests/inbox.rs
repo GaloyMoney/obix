@@ -58,8 +58,9 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let event_id = inbox
-        .persist_and_process_in_op(&mut op, TestInboxEvent::DoWork(42))
-        .await?;
+        .persist_and_process_in_op(&mut op, "test-event-1", TestInboxEvent::DoWork(42))
+        .await?
+        .expect("Event should be created");
     op.commit().await?;
 
     // Wait for the event to be processed (max 5 seconds)
@@ -83,7 +84,7 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn inbox_idempotent_push() -> anyhow::Result<()> {
+async fn inbox_duplicate_idempotency_key() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     let job_config = job::JobSvcConfig::builder()
@@ -107,7 +108,7 @@ async fn inbox_idempotent_push() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let first = inbox
-        .push_idempotent(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
+        .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
     assert!(first.is_some());
@@ -115,7 +116,7 @@ async fn inbox_idempotent_push() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let second = inbox
-        .push_idempotent(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
+        .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
     assert!(second.is_none());
@@ -163,8 +164,9 @@ async fn inbox_multiple_events() -> anyhow::Result<()> {
     for i in 0..5 {
         let mut op = es_entity::DbOp::init(&pool).await?;
         let event_id = inbox
-            .persist_and_process_in_op(&mut op, TestInboxEvent::DoWork(i))
-            .await?;
+            .persist_and_process_in_op(&mut op, format!("event-{}", i), TestInboxEvent::DoWork(i))
+            .await?
+            .expect("Event should be created");
         op.commit().await?;
         event_ids.push(event_id);
     }

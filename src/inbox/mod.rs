@@ -55,26 +55,9 @@ where
         }
     }
 
-    /// Push an event into the inbox and spawn a processing job
+    /// Push an event into the inbox with idempotency key and spawn a processing job
+    /// Returns None if an event with this idempotency key already exists
     pub async fn persist_and_process_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        event: impl Into<P>,
-    ) -> Result<InboxEventId, InboxError> {
-        let event = event.into();
-        let id = Tables::insert_inbox_event(op, &event).await?;
-
-        let config = job::InboxJobData::<Tables> {
-            inbox_event_id: id,
-            _phantom: std::marker::PhantomData,
-        };
-        self.jobs.create_and_spawn_in_op(op, id, config).await?;
-
-        Ok(id)
-    }
-
-    /// Push with idempotency key - returns None if already exists
-    pub async fn push_idempotent(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,
@@ -83,8 +66,7 @@ where
         let event = event.into();
         let idempotency_key = idempotency_key.into();
 
-        let Some(id) = Tables::insert_inbox_event_idempotent(op, &idempotency_key, &event).await?
-        else {
+        let Some(id) = Tables::insert_inbox_event(op, &idempotency_key, &event).await? else {
             return Ok(None);
         };
 
