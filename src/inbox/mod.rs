@@ -62,12 +62,12 @@ where
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: impl Into<P>,
-    ) -> Result<Option<InboxEventId>, InboxError> {
+    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError> {
         let event = event.into();
         let idempotency_key = idempotency_key.into();
 
         let Some(id) = Tables::insert_inbox_event(op, &idempotency_key, &event).await? else {
-            return Ok(None);
+            return Ok(es_entity::Idempotent::AlreadyApplied);
         };
 
         let config = job::InboxJobData::<Tables> {
@@ -76,7 +76,7 @@ where
         };
         self.jobs.create_and_spawn_in_op(op, id, config).await?;
 
-        Ok(Some(id))
+        Ok(es_entity::Idempotent::Executed(id))
     }
 
     /// Find an inbox event by ID

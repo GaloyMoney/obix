@@ -111,7 +111,7 @@ async fn inbox_duplicate_idempotency_key() -> anyhow::Result<()> {
         .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
-    assert!(first.is_some());
+    assert!(first.did_execute());
     let first_id = first.unwrap();
 
     let mut op = es_entity::DbOp::init(&pool).await?;
@@ -119,7 +119,7 @@ async fn inbox_duplicate_idempotency_key() -> anyhow::Result<()> {
         .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
-    assert!(second.is_none());
+    assert!(second.was_already_applied());
 
     // Wait for the first event to be processed (max 5 seconds)
     wait_for_inbox_status(
