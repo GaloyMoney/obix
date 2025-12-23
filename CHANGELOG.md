@@ -1,3 +1,10 @@
+# [obix release v0.2.2](https://github.com/GaloyMoney/obix/releases/tag/0.2.2)
+
+
+### Bug Fixes
+
+- Make inbox status type creation idempotent (#5)
+
 # [obix release v0.2.1](https://github.com/GaloyMoney/obix/releases/tag/0.2.1)
 
 
