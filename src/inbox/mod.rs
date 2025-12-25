@@ -48,6 +48,22 @@ where
         }
     }
 
+    pub async fn persist_and_process<P>(
+        &self,
+        idempotency_key: impl Into<InboxIdempotencyKey>,
+        event: P,
+    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        let mut op = self.pool.begin().await?;
+        let res = self
+            .persist_and_process_in_op(&mut op, idempotency_key, event)
+            .await?;
+        op.commit().await?;
+        Ok(res)
+    }
+
     pub async fn persist_and_process_in_op<P>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
