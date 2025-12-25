@@ -1,3 +1,10 @@
+# [obix release v0.2.3](https://github.com/GaloyMoney/obix/releases/tag/0.2.3)
+
+
+### Features
+
+- Persist_and_process inbox fn (#7)
+
 # [obix release v0.2.2](https://github.com/GaloyMoney/obix/releases/tag/0.2.2)
 
 
