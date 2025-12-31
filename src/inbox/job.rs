@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 pub use job::Jobs;
 use job::{
-    CurrentJob, Job, JobCompletion, JobConfig, JobInitializer, JobRunner, JobType, RetrySettings,
+    CurrentJob, Job, JobCompletion, JobInitializer, JobRunner, JobSpawner, JobType, RetrySettings,
 };
 
 use super::{InboxEvent, InboxEventId, InboxEventStatus};
@@ -26,24 +26,10 @@ pub trait InboxHandler: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct InboxJobData<Tables> {
+pub struct InboxJobData<Tables> {
     pub inbox_event_id: InboxEventId,
     #[serde(skip)]
     pub(super) _phantom: std::marker::PhantomData<Tables>,
-}
-
-impl<Tables: MailboxTables> JobConfig for InboxJobData<Tables> {
-    type Initializer = InboxJobInitializer<DummyHandler, Tables>;
-}
-
-pub(super) struct DummyHandler;
-impl InboxHandler for DummyHandler {
-    async fn handle(
-        &self,
-        _: &InboxEvent,
-    ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
-        unreachable!()
-    }
 }
 
 pub(super) struct InboxJobInitializer<H, Tables>
@@ -53,9 +39,7 @@ where
 {
     pool: sqlx::PgPool,
     handler: Arc<H>,
-    #[allow(dead_code)]
     job_type: JobType,
-    #[allow(dead_code)]
     retry_settings: RetrySettings,
     _phantom: std::marker::PhantomData<Tables>,
 }
@@ -86,18 +70,14 @@ where
     H: InboxHandler,
     Tables: MailboxTables,
 {
-    fn job_type() -> JobType
-    where
-        Self: Sized,
-    {
-        JobType::new("inbox")
+    type Config = InboxJobData<Tables>;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
     }
 
-    fn retry_on_error_settings() -> RetrySettings
-    where
-        Self: Sized,
-    {
-        RetrySettings::default()
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        self.retry_settings.clone()
     }
 
     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
@@ -200,3 +180,6 @@ where
         }
     }
 }
+
+// Re-export JobSpawner for use in mod.rs
+pub(super) type InboxJobSpawner<Tables> = JobSpawner<InboxJobData<Tables>>;

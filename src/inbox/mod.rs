@@ -15,7 +15,7 @@ use crate::tables::MailboxTables;
 #[derive(Clone)]
 pub struct Inbox<Tables = crate::tables::DefaultMailboxTables> {
     pool: sqlx::PgPool,
-    jobs: job::Jobs,
+    spawner: job::InboxJobSpawner<Tables>,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -39,11 +39,11 @@ where
             config.retry_settings.clone(),
         );
 
-        jobs.add_initializer(initializer);
+        let spawner = jobs.add_initializer(initializer);
 
         Self {
             pool: pool.clone(),
-            jobs: jobs.clone(),
+            spawner,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -83,7 +83,8 @@ where
             inbox_event_id: id,
             _phantom: std::marker::PhantomData,
         };
-        self.jobs.create_and_spawn_in_op(op, id, config).await?;
+
+        self.spawner.spawn_in_op(op, id, config).await?;
 
         Ok(es_entity::Idempotent::Executed(id))
     }
