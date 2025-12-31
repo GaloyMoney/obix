@@ -1,3 +1,11 @@
+# [obix release v0.2.4](https://github.com/GaloyMoney/obix/releases/tag/0.2.4)
+
+
+### Miscellaneous Tasks
+
+- Bump job crate (#8)
+- Bump flake and uncomment check-code (#6)
+
 # [obix release v0.2.3](https://github.com/GaloyMoney/obix/releases/tag/0.2.3)
 
 
