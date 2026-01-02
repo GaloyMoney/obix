@@ -80,7 +80,11 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: InboxJobData<Tables> = job.config()?;
 
         Ok(Box::new(InboxJobRunner::<H, Tables> {
