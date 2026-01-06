@@ -1,3 +1,10 @@
+# [obix release v0.2.6](https://github.com/GaloyMoney/obix/releases/tag/0.2.6)
+
+
+### Miscellaneous Tasks
+
+- Update job requirement from 0.5 to 0.6 (#9)
+
 # [obix release v0.2.5](https://github.com/GaloyMoney/obix/releases/tag/0.2.5)
 
 
