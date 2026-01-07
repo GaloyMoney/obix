@@ -3,6 +3,7 @@ mod error;
 mod event;
 mod job;
 
+use es_entity::clock::ClockHandle;
 use serde::Serialize;
 
 pub use config::*;
@@ -16,6 +17,7 @@ use crate::tables::MailboxTables;
 pub struct Inbox<Tables = crate::tables::DefaultMailboxTables> {
     pool: sqlx::PgPool,
     spawner: job::InboxJobSpawner<Tables>,
+    clock: ClockHandle,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -45,7 +47,12 @@ where
             pool: pool.clone(),
             spawner,
             _phantom: std::marker::PhantomData,
+            clock: config.clock.clone(),
         }
+    }
+
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
+        es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
     }
 
     pub async fn persist_and_process<P>(
@@ -56,7 +63,8 @@ where
     where
         P: Serialize + Send + Sync,
     {
-        let mut op = self.pool.begin().await?;
+        let mut op = self.begin_op().await?;
+        // TODO: need to revisit
         let res = self
             .persist_and_process_in_op(&mut op, idempotency_key, event)
             .await?;

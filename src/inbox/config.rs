@@ -1,3 +1,5 @@
+use es_entity::clock::{Clock, ClockHandle};
+
 use std::time::Duration;
 
 use job::{JobType, RetrySettings};
@@ -6,6 +8,7 @@ use job::{JobType, RetrySettings};
 pub struct InboxConfig {
     pub job_type: JobType,
     pub retry_settings: RetrySettings,
+    pub clock: ClockHandle,
 }
 
 impl InboxConfig {
@@ -13,6 +16,7 @@ impl InboxConfig {
         Self {
             job_type,
             retry_settings: RetrySettings::default(),
+            clock: Clock::handle().clone(),
         }
     }
 
@@ -37,6 +41,11 @@ impl InboxConfig {
     /// Set jitter percentage (0-100)
     pub fn with_jitter(mut self, pct: u8) -> Self {
         self.retry_settings.backoff_jitter_pct = pct;
+        self
+    }
+
+    pub fn with_clock(mut self, clock: ClockHandle) -> Self {
+        self.clock = clock;
         self
     }
 }

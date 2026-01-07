@@ -82,7 +82,7 @@ where
 
     pub async fn init(
         pool: &sqlx::PgPool,
-        config: MailboxConfig,
+        config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
@@ -95,7 +95,7 @@ where
 
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
-            config,
+            config.clone(),
             persistent_event_sender.clone(),
             highest_known_sequence.clone(),
             backfill_recv,
