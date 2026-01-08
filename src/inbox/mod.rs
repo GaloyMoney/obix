@@ -64,7 +64,6 @@ where
         P: Serialize + Send + Sync,
     {
         let mut op = self.begin_op().await?;
-        // TODO: need to revisit
         let res = self
             .persist_and_process_in_op(&mut op, idempotency_key, event)
             .await?;

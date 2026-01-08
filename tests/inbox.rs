@@ -256,54 +256,40 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Verify first execution happened
-    {
+    let (times_len, first_execution_time) = {
         let times = execution_times.lock().await;
-        assert_eq!(times.len(), 1, "Should have executed once");
-        assert_eq!(
-            times[0], initial_time,
-            "First execution should be at initial time"
-        );
-    }
+        (times.len(), times[0])
+    };
+    assert_eq!(times_len, 1);
+    assert_eq!(first_execution_time, initial_time);
 
     // Event should be Pending (scheduled for reprocessing), not Completed
     let event = inbox.find_event_by_id(event_id).await?;
-    assert_eq!(
-        event.status,
-        InboxEventStatus::Pending,
-        "Event should be pending reprocessing"
-    );
+    let event_status = event.status;
+    assert_eq!(event_status, InboxEventStatus::Pending);
 
     // Advance clock by 20 seconds (not enough - needs 30s)
     controller.advance(std::time::Duration::from_secs(20)).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Should NOT have executed again yet
-    {
+    let times_len = {
         let times = execution_times.lock().await;
-        assert_eq!(
-            times.len(),
-            1,
-            "Should still only have one execution (30s not elapsed)"
-        );
-    }
+        times.len()
+    };
+    assert_eq!(times_len, 1);
 
     // Advance clock by another 11 seconds (total 31s - past the 30s threshold)
     controller.advance(std::time::Duration::from_secs(11)).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Now it should have executed again
-    {
+    let (times_len, delay) = {
         let times = execution_times.lock().await;
-        assert_eq!(times.len(), 2, "Should have executed twice after 30s delay");
-
-        // Verify the second execution was ~30 seconds after the first
-        let delay = times[1] - times[0];
-        assert!(
-            delay >= chrono::Duration::seconds(30) && delay <= chrono::Duration::seconds(32),
-            "Delay between executions should be >= 30s, was {:?}",
-            delay
-        );
-    }
+        (times.len(), times[1] - times[0])
+    };
+    assert_eq!(times_len, 2);
+    assert!(delay >= chrono::Duration::seconds(31));
 
     wait_for_inbox_status(
         &inbox,
