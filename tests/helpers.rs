@@ -74,6 +74,21 @@ where
     Ok(inbox)
 }
 
+pub async fn init_inbox_with_clock<H>(
+    pool: &sqlx::PgPool,
+    jobs: &mut job::Jobs,
+    handler: H,
+    clock: es_entity::clock::ClockHandle,
+) -> anyhow::Result<Inbox<TestTables>>
+where
+    H: obix::inbox::InboxHandler,
+{
+    wipeout_inbox_tables(pool).await?;
+    let inbox_config = InboxConfig::new(job::JobType::new("test-inbox")).with_clock(clock);
+    let inbox = Inbox::<TestTables>::new(pool, jobs, inbox_config, handler);
+    Ok(inbox)
+}
+
 pub async fn init_outbox<P>(
     pool: &sqlx::PgPool,
     config: MailboxConfig,

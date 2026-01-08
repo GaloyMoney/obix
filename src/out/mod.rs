@@ -5,6 +5,7 @@ mod persist_events_hook;
 mod persistent;
 mod pg_notify;
 
+use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ where
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
+    clock: ClockHandle,
 }
 
 impl<P, Tables> Clone for Outbox<P, Tables>
@@ -42,6 +44,7 @@ where
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -66,9 +69,9 @@ where
         .await?;
 
         let persistent_cache =
-            PersistentOutboxEventCache::init(&pool, config, persistent_notification_rx).await?;
+            PersistentOutboxEventCache::init(&pool, &config, persistent_notification_rx).await?;
         let ephemeral_cache =
-            EphemeralOutboxEventCache::init(&pool, config, ephemeral_notification_rx).await?;
+            EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
         Ok(Self {
             pool,
@@ -76,11 +79,12 @@ where
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
+            clock: config.clock.clone(),
         })
     }
 
     pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
-        es_entity::DbOp::init(&self.pool).await
+        es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
     }
 
     pub async fn publish_persisted_in_op(

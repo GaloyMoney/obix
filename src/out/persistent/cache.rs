@@ -82,7 +82,7 @@ where
 
     pub async fn init(
         pool: &sqlx::PgPool,
-        config: MailboxConfig,
+        config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
@@ -248,7 +248,7 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
-        config: MailboxConfig,
+        config: &MailboxConfig,
         persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         highest_known_sequence: Arc<AtomicU64>,
         mut backfill_request: mpsc::UnboundedReceiver<(
