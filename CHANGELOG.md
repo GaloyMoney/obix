@@ -1,3 +1,10 @@
+# [obix release v0.2.7](https://github.com/GaloyMoney/obix/releases/tag/0.2.7)
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity (#10)
+
 # [obix release v0.2.6](https://github.com/GaloyMoney/obix/releases/tag/0.2.6)
 
 
