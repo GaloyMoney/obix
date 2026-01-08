@@ -18,7 +18,14 @@ enum TestEvent {
 async fn events_via_short_circuit() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = outbox.begin_op().await?;
@@ -39,7 +46,14 @@ async fn events_via_short_circuit() -> anyhow::Result<()> {
 async fn events_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
     let mut listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -60,7 +74,14 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
 async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
     let mut pre_listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -195,7 +216,14 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
     let mut listener = outbox.listen_ephemeral();
 
     // Publish an ephemeral event
@@ -221,7 +249,13 @@ async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
 async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
 
     // Publish events before creating listener
     let type1 = obix::out::EphemeralEventType::new("type1");
@@ -263,7 +297,13 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
 async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
 
     // Publish events of the same type - later should replace earlier
     let event_type = obix::out::EphemeralEventType::new("replaceable");
