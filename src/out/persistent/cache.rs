@@ -95,7 +95,7 @@ where
 
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
-            config.clone(),
+            config,
             persistent_event_sender.clone(),
             highest_known_sequence.clone(),
             backfill_recv,
@@ -248,7 +248,7 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
-        config: MailboxConfig,
+        config: &MailboxConfig,
         persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         highest_known_sequence: Arc<AtomicU64>,
         mut backfill_request: mpsc::UnboundedReceiver<(

@@ -76,7 +76,7 @@ where
 
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
-            config.clone(),
+            config,
             ephemeral_event_sender.clone(),
             backfill_recv,
             cache_fill_recv,
@@ -170,7 +170,7 @@ where
 
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
-        _config: MailboxConfig,
+        _config: &MailboxConfig,
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut backfill_request: mpsc::UnboundedReceiver<
             oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,

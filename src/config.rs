@@ -18,14 +18,3 @@ impl MailboxConfig {
         MailboxConfigBuilder::default()
     }
 }
-
-impl Default for MailboxConfig {
-    fn default() -> Self {
-        Self {
-            event_buffer_size: 100,
-            event_cache_size: 1000,
-            event_cache_trim_percent: 10,
-            clock: Clock::handle().clone(),
-        }
-    }
-}

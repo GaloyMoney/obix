@@ -107,11 +107,11 @@ async fn events_via_cache() -> anyhow::Result<()> {
 #[file_serial]
 async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let config = MailboxConfig {
-        event_cache_size: 2,
-        event_cache_trim_percent: 50,
-        ..Default::default()
-    };
+    let config = MailboxConfig::builder()
+        .event_cache_trim_percent(50)
+        .event_cache_size(2)
+        .build()
+        .expect("Couldn't build MailboxConfig");
     let outbox = init_outbox::<TestEvent>(&pool, config).await?;
 
     // Create listener before publish to track when all events are processed
@@ -154,7 +154,13 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
 #[file_serial]
 async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::default()).await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
     let mut listener = outbox.listen_persisted(None);
 
     let large_string = "x".repeat(10_000);
