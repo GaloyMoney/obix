@@ -1,8 +1,7 @@
 use es_entity::clock::{Clock, ClockHandle};
+use job::{JobType, RetrySettings};
 
 use std::time::Duration;
-
-use job::{JobType, RetrySettings};
 
 #[derive(Clone)]
 pub struct InboxConfig {
