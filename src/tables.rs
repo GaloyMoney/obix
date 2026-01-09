@@ -35,6 +35,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     fn persist_ephemeral_event<P>(
         pool: &sqlx::PgPool,
+        now: Option<chrono::DateTime<chrono::Utc>>,
         event_type: EphemeralEventType,
         payload: P,
     ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
@@ -68,6 +69,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
+        now: Option<chrono::DateTime<chrono::Utc>>,
         id: InboxEventId,
         status: InboxEventStatus,
         error: Option<&str>,

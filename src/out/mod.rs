@@ -116,7 +116,13 @@ where
         event_type: EphemeralEventType,
         event: impl Into<P>,
     ) -> Result<(), sqlx::Error> {
-        let event = Tables::persist_ephemeral_event(&self.pool, event_type, event.into()).await?;
+        let now = if self.clock.is_artificial() {
+            Some(self.clock.now())
+        } else {
+            None
+        };
+        let event =
+            Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
         let _ = self
             .ephemeral_cache
             .cache_fill_sender()

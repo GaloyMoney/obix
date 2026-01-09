@@ -162,7 +162,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             r#"UPDATE {tbl}inbox_events
             SET status = $2,
                 error = $3,
-                processed_at = CASE WHEN $2 = 'completed'::InboxEventStatus THEN NOW() ELSE processed_at END
+                processed_at = CASE WHEN $2 = 'completed'::InboxEventStatus THEN COALESCE($4::timestamptz, NOW()) ELSE processed_at END
             WHERE id = $1"#,
             tbl = table_prefix
         );
@@ -253,6 +253,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn persist_ephemeral_event<P>(
                     pool: &#crate_name::prelude::sqlx::PgPool,
+                    now: Option<chrono::DateTime<chrono::Utc>>,
                     event_type: #crate_name::out::EphemeralEventType,
                     payload: P,
                 ) -> impl std::future::Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
@@ -270,7 +271,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             event_type.as_str(),
                             serialized_payload,
                             tracing_json,
-                            None::<chrono::DateTime<chrono::Utc>>
+                            now
                         ).fetch_one(pool).await?;
 
                         Ok(#crate_name::out::EphemeralOutboxEvent {
@@ -513,6 +514,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn update_inbox_event_status(
                     pool: &#crate_name::prelude::sqlx::PgPool,
+                    now: Option<chrono::DateTime<chrono::Utc>>,
                     id: #crate_name::inbox::InboxEventId,
                     status: #crate_name::inbox::InboxEventStatus,
                     error: Option<&str>,
@@ -525,7 +527,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                             #update_inbox_event_status_query,
                             id as #crate_name::inbox::InboxEventId,
                             status as #crate_name::inbox::InboxEventStatus,
-                            error
+                            error,
+                            now
                         )
                         .execute(pool)
                         .await?;
@@ -543,13 +546,15 @@ FROM {}persistent_outbox_events_sequence_seq",
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
                     let error = error.map(|s| s.to_string());
+                    let now = op.maybe_now();
 
                     async move {
                         sqlx::query!(
                             #update_inbox_event_status_query,
                             id as #crate_name::inbox::InboxEventId,
                             status as #crate_name::inbox::InboxEventStatus,
-                            error
+                            error,
+                            now
                         )
                         .execute(op.as_executor())
                         .await?;
