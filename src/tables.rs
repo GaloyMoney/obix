@@ -34,7 +34,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         P: Serialize + DeserializeOwned + Send;
 
     fn persist_ephemeral_event<P>(
-        pool: &sqlx::PgPool,
+        op: &mut impl es_entity::AtomicOperation,
         event_type: EphemeralEventType,
         payload: P,
     ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
@@ -65,13 +65,6 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         id: InboxEventId,
     ) -> impl Future<Output = Result<InboxEvent, InboxError>> + Send;
-
-    fn update_inbox_event_status(
-        pool: &sqlx::PgPool,
-        id: InboxEventId,
-        status: InboxEventStatus,
-        error: Option<&str>,
-    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
     fn update_inbox_event_status_in_op(
         op: &mut impl es_entity::AtomicOperation,

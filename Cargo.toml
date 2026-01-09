@@ -62,7 +62,7 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
-job = "0.6"
+job = { version = "0.6", features = ["es-entity"] }
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"

@@ -120,15 +120,16 @@ where
         if current_job.is_shutdown_requested() {
             return Ok(JobCompletion::RescheduleNow);
         }
-
-        Tables::update_inbox_event_status(
-            &self.pool,
+        let mut op = current_job.begin_op().await?;
+        Tables::update_inbox_event_status_in_op(
+            &mut op,
             self.inbox_event_id,
             InboxEventStatus::Processing,
             None,
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        op.commit().await?;
 
         let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
             .await
@@ -138,47 +139,55 @@ where
 
         match result {
             Ok(InboxResult::Complete) => {
-                Tables::update_inbox_event_status(
-                    &self.pool,
+                let mut op = current_job.begin_op().await?;
+                Tables::update_inbox_event_status_in_op(
+                    &mut op,
                     self.inbox_event_id,
                     InboxEventStatus::Completed,
                     None,
                 )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                op.commit().await?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
-                Tables::update_inbox_event_status(
-                    &self.pool,
+                let mut op = current_job.begin_op().await?;
+                Tables::update_inbox_event_status_in_op(
+                    &mut op,
                     self.inbox_event_id,
                     InboxEventStatus::Pending,
                     None,
                 )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                op.commit().await?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
-                Tables::update_inbox_event_status(
-                    &self.pool,
+                let mut op = current_job.begin_op().await?;
+                Tables::update_inbox_event_status_in_op(
+                    &mut op,
                     self.inbox_event_id,
                     InboxEventStatus::Pending,
                     None,
                 )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                op.commit().await?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
-                Tables::update_inbox_event_status(
-                    &self.pool,
+                let mut op = current_job.begin_op().await?;
+                Tables::update_inbox_event_status_in_op(
+                    &mut op,
                     self.inbox_event_id,
                     InboxEventStatus::Failed,
                     Some(&e.to_string()),
                 )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                op.commit().await?;
                 Err(e)
             }
         }
