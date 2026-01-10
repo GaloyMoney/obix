@@ -39,6 +39,7 @@ where
             handler,
             config.job_type.clone(),
             config.retry_settings.clone(),
+            config.clock.clone(),
         );
 
         let spawner = jobs.add_initializer(initializer);

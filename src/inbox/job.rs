@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use es_entity::clock::ClockHandle;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ where
     handler: Arc<H>,
     job_type: JobType,
     retry_settings: RetrySettings,
+    clock: ClockHandle,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -54,12 +56,14 @@ where
         handler: H,
         job_type: JobType,
         retry_settings: RetrySettings,
+        clock: ClockHandle,
     ) -> Self {
         Self {
             pool: pool.clone(),
             handler: Arc::new(handler),
             job_type,
             retry_settings,
+            clock,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -91,6 +95,7 @@ where
             pool: self.pool.clone(),
             handler: self.handler.clone(),
             inbox_event_id: config.inbox_event_id,
+            clock: self.clock.clone(),
             _phantom: std::marker::PhantomData,
         }))
     }
@@ -104,6 +109,7 @@ where
     pool: sqlx::PgPool,
     handler: Arc<H>,
     inbox_event_id: InboxEventId,
+    clock: ClockHandle,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -121,8 +127,15 @@ where
             return Ok(JobCompletion::RescheduleNow);
         }
 
+        let now = if self.clock.is_artificial() {
+            Some(self.clock.now())
+        } else {
+            None
+        };
+
         Tables::update_inbox_event_status(
             &self.pool,
+            now,
             self.inbox_event_id,
             InboxEventStatus::Processing,
             None,
@@ -140,6 +153,7 @@ where
             Ok(InboxResult::Complete) => {
                 Tables::update_inbox_event_status(
                     &self.pool,
+                    now,
                     self.inbox_event_id,
                     InboxEventStatus::Completed,
                     None,
@@ -151,6 +165,7 @@ where
             Ok(InboxResult::ReprocessNow) => {
                 Tables::update_inbox_event_status(
                     &self.pool,
+                    now,
                     self.inbox_event_id,
                     InboxEventStatus::Pending,
                     None,
@@ -162,6 +177,7 @@ where
             Ok(InboxResult::ReprocessIn(duration)) => {
                 Tables::update_inbox_event_status(
                     &self.pool,
+                    now,
                     self.inbox_event_id,
                     InboxEventStatus::Pending,
                     None,
@@ -173,6 +189,7 @@ where
             Err(e) => {
                 Tables::update_inbox_event_status(
                     &self.pool,
+                    now,
                     self.inbox_event_id,
                     InboxEventStatus::Failed,
                     Some(&e.to_string()),
