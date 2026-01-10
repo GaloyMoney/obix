@@ -127,11 +127,7 @@ where
             return Ok(JobCompletion::RescheduleNow);
         }
 
-        let now = if self.clock.is_artificial() {
-            Some(self.clock.now())
-        } else {
-            None
-        };
+        let now = self.clock.artificial_now();
 
         Tables::update_inbox_event_status(
             &self.pool,
