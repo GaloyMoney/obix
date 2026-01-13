@@ -1,3 +1,10 @@
+# [obix release v0.2.9](https://github.com/GaloyMoney/obix/releases/tag/0.2.9)
+
+
+### Miscellaneous Tasks
+
+- Refactor use artificial_now (#13)
+
 # [obix release v0.2.8](https://github.com/GaloyMoney/obix/releases/tag/0.2.8)
 
 
