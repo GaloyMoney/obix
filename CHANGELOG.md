@@ -1,3 +1,10 @@
+# [obix release v0.2.10](https://github.com/GaloyMoney/obix/releases/tag/0.2.10)
+
+
+### Refactor
+
+- Rename process -> queue_job (#14)
+
 # [obix release v0.2.9](https://github.com/GaloyMoney/obix/releases/tag/0.2.9)
 
 
