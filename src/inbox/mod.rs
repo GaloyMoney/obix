@@ -56,7 +56,7 @@ where
         es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
     }
 
-    pub async fn persist_and_process<P>(
+    pub async fn persist_and_queue_job<P>(
         &self,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: P,
@@ -66,13 +66,13 @@ where
     {
         let mut op = self.begin_op().await?;
         let res = self
-            .persist_and_process_in_op(&mut op, idempotency_key, event)
+            .persist_and_queue_job_in_op(&mut op, idempotency_key, event)
             .await?;
         op.commit().await?;
         Ok(res)
     }
 
-    pub async fn persist_and_process_in_op<P>(
+    pub async fn persist_and_queue_job_in_op<P>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,

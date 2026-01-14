@@ -85,7 +85,7 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let event_id = inbox
-        .persist_and_process_in_op(&mut op, "test-event-1", TestInboxEvent::DoWork(42))
+        .persist_and_queue_job_in_op(&mut op, "test-event-1", TestInboxEvent::DoWork(42))
         .await?
         .expect("Event should be created");
     op.commit().await?;
@@ -135,7 +135,7 @@ async fn inbox_duplicate_idempotency_key() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let first = inbox
-        .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
+        .persist_and_queue_job_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
     assert!(first.did_execute());
@@ -143,7 +143,7 @@ async fn inbox_duplicate_idempotency_key() -> anyhow::Result<()> {
 
     let mut op = es_entity::DbOp::init(&pool).await?;
     let second = inbox
-        .persist_and_process_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
+        .persist_and_queue_job_in_op(&mut op, "unique-key-1", TestInboxEvent::DoWork(1))
         .await?;
     op.commit().await?;
     assert!(second.was_already_applied());
@@ -191,7 +191,7 @@ async fn inbox_multiple_events() -> anyhow::Result<()> {
     for i in 0..5 {
         let mut op = es_entity::DbOp::init(&pool).await?;
         let event_id = inbox
-            .persist_and_process_in_op(&mut op, format!("event-{}", i), TestInboxEvent::DoWork(i))
+            .persist_and_queue_job_in_op(&mut op, format!("event-{}", i), TestInboxEvent::DoWork(i))
             .await?
             .expect("Event should be created");
         op.commit().await?;
@@ -247,7 +247,7 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
 
     let mut op = inbox.begin_op().await?;
     let event_id = inbox
-        .persist_and_process_in_op(&mut op, "reprocess-test", TestInboxEvent::DoWork(42))
+        .persist_and_queue_job_in_op(&mut op, "reprocess-test", TestInboxEvent::DoWork(42))
         .await?
         .expect("Event should be created");
     op.commit().await?;
