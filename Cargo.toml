@@ -18,6 +18,7 @@ tracing = [
   "obix-macros/tracing"
 ]
 default-tables = []
+test-utils = ["tokio/time"]
 
 [dependencies]
 obix-macros = { workspace = true }
