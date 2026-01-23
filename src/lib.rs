@@ -16,6 +16,9 @@ pub mod out;
 mod sequence;
 mod tables;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 pub use config::MailboxConfig;
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
