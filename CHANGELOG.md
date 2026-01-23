@@ -1,3 +1,11 @@
+# [obix release v0.2.11](https://github.com/GaloyMoney/obix/releases/tag/0.2.11)
+
+
+### Miscellaneous Tasks
+
+- Test-utils (#18)
+- Bump-flake (#15)
+
 # [obix release v0.2.10](https://github.com/GaloyMoney/obix/releases/tag/0.2.10)
 
 
