@@ -1,3 +1,11 @@
+# [obix release v0.2.12](https://github.com/GaloyMoney/obix/releases/tag/0.2.12)
+
+
+
+### Miscellaneous Tasks
+
+- Increase test timeout to 20s
+
 # [obix release v0.2.11](https://github.com/GaloyMoney/obix/releases/tag/0.2.11)
 
 
