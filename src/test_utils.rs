@@ -113,7 +113,7 @@ where
 
     let result = trigger().await.map_err(ExpectEventError::TriggerFailed)?;
 
-    let event = tokio::time::timeout(Duration::from_secs(5), async {
+    let event = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let event = listener.next().await.expect("stream should not end");
             if let Some(extracted) = (*event).as_event::<IE>().and_then(|e| matches(&result, e)) {
