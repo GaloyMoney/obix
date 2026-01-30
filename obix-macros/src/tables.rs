@@ -283,6 +283,40 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
+                fn persist_ephemeral_event_in_op<'a, P>(
+                    op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
+                    event_type: #crate_name::out::EphemeralEventType,
+                    payload: P,
+                ) -> impl std::future::Future<Output = Result<#crate_name::out::EphemeralOutboxEvent<P>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let now = op.maybe_now();
+                    let serialized_payload =
+                        #crate_name::prelude::serde_json::to_value(&payload).expect("Could not serialize payload");
+
+                    #extract_tracing
+
+                    async move {
+                        let row = sqlx::query!(
+                            #persist_ephemeral_events_query,
+                            event_type.as_str(),
+                            serialized_payload,
+                            tracing_json,
+                            now
+                        ).fetch_one(op.as_executor()).await?;
+
+                        Ok(#crate_name::out::EphemeralOutboxEvent {
+                            event_type,
+                            payload,
+                            recorded_at: row.recorded_at,
+                            #set_context
+                        })
+                    }
+                }
+
                 fn load_next_page<P>(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     from_sequence: #crate_name::EventSequence,
