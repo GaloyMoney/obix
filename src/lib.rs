@@ -24,7 +24,7 @@ pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,
 };
-pub use obix_macros::MailboxTables;
+pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::Outbox;
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

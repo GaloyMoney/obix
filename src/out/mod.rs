@@ -1,5 +1,6 @@
 mod all_listener;
 mod ephemeral;
+mod ephemeral_events_hook;
 mod event;
 mod persist_events_hook;
 mod persistent;
@@ -123,6 +124,24 @@ where
             .ephemeral_cache
             .cache_fill_sender()
             .send(Arc::new(event));
+        Ok(())
+    }
+
+    pub async fn publish_ephemeral_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        event_type: EphemeralEventType,
+        event: impl Into<P>,
+    ) -> Result<(), sqlx::Error> {
+        let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
+            self.ephemeral_cache.cache_fill_sender().clone(),
+            event_type,
+            event,
+        );
+        if let Err(hook) = op.add_commit_hook(hook) {
+            use es_entity::hooks::CommitHook;
+            hook.force_execute_pre_commit(op).await?;
+        }
         Ok(())
     }
 
