@@ -1,3 +1,11 @@
+# [obix release v0.2.13](https://github.com/GaloyMoney/obix/releases/tag/0.2.13)
+
+
+
+### Miscellaneous Tasks
+
+- OutboxEvent macro and better test helper (#19)
+
 # [obix release v0.2.12](https://github.com/GaloyMoney/obix/releases/tag/0.2.12)
 
 
