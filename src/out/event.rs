@@ -39,6 +39,21 @@ where
     }
 }
 
+impl<P> OutboxEvent<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub fn as_event<E>(&self) -> Option<&E>
+    where
+        P: OutboxEventMarker<E>,
+    {
+        match self {
+            Self::Persistent(e) => (**e).as_event::<E>(),
+            Self::Ephemeral(e) => (**e).as_event::<E>(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct EphemeralEventType(Cow<'static, str>);
@@ -74,6 +89,13 @@ impl<T> EphemeralOutboxEvent<T>
 where
     T: Serialize + DeserializeOwned + Send,
 {
+    pub fn as_event<E>(&self) -> Option<&E>
+    where
+        T: OutboxEventMarker<E>,
+    {
+        self.payload.as_event()
+    }
+
     #[cfg(feature = "tracing")]
     pub fn inject_trace_parent(&self) {
         if let Some(context) = &self.tracing_context {

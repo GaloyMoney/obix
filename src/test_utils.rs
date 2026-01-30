@@ -7,10 +7,7 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_stream::StreamExt;
 
-use crate::{
-    out::{Outbox, OutboxEventMarker},
-    tables::MailboxTables,
-};
+use crate::{Outbox, out::OutboxEventMarker, tables::MailboxTables};
 
 /// Error type for [`expect_event`].
 #[derive(Debug, thiserror::Error)]
@@ -109,14 +106,14 @@ where
     Fut: std::future::Future<Output = Result<R, E>>,
     M: Fn(&R, &IE) -> Option<T>,
 {
-    let mut listener = outbox.listen_persisted(None);
+    let mut listener = outbox.listen_all(None);
 
     let result = trigger().await.map_err(ExpectEventError::TriggerFailed)?;
 
     let event = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let event = listener.next().await.expect("stream should not end");
-            if let Some(extracted) = (*event).as_event::<IE>().and_then(|e| matches(&result, e)) {
+            if let Some(extracted) = event.as_event::<IE>().and_then(|e| matches(&result, e)) {
                 return extracted;
             }
         }
