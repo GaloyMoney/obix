@@ -1,7 +1,7 @@
 mod helpers;
 
 use futures::stream::StreamExt;
-use obix::{EventSequence, MailboxConfig};
+use obix::{EventSequence, MailboxConfig, OutboxEvent, out::OutboxEventMarker};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
@@ -11,6 +11,66 @@ use helpers::{init_outbox, init_pool};
 enum TestEvent {
     Ping(u64),
     LargePayload(String),
+}
+
+// Test the OutboxEvent derive macro
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PingEvent(u64);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PongEvent(String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, OutboxEvent)]
+#[serde(tag = "type")]
+enum DerivedEvent {
+    Ping(PingEvent),
+    Pong(PongEvent),
+    #[serde(other)]
+    Unknown,
+}
+
+#[test]
+fn outbox_event_derive_generates_marker_impls() {
+    // Test From impls
+    let ping = PingEvent(42);
+    let event: DerivedEvent = ping.clone().into();
+    assert_eq!(event, DerivedEvent::Ping(PingEvent(42)));
+
+    let pong = PongEvent("hello".to_string());
+    let event: DerivedEvent = pong.clone().into();
+    assert_eq!(event, DerivedEvent::Pong(PongEvent("hello".to_string())));
+
+    // Test OutboxEventMarker::as_event
+    let event = DerivedEvent::Ping(PingEvent(42));
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PingEvent>>::as_event(&event),
+        Some(&PingEvent(42))
+    );
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PongEvent>>::as_event(&event),
+        None
+    );
+
+    let event = DerivedEvent::Pong(PongEvent("test".to_string()));
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PongEvent>>::as_event(&event),
+        Some(&PongEvent("test".to_string()))
+    );
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PingEvent>>::as_event(&event),
+        None
+    );
+
+    // Unknown variant returns None for all
+    let event = DerivedEvent::Unknown;
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PingEvent>>::as_event(&event),
+        None
+    );
+    assert_eq!(
+        <DerivedEvent as OutboxEventMarker<PongEvent>>::as_event(&event),
+        None
+    );
 }
 
 #[tokio::test]
