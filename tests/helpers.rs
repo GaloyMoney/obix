@@ -89,6 +89,26 @@ where
     Ok(inbox)
 }
 
+pub async fn wipeout_outbox_job_tables(pool: &sqlx::PgPool, job_type: &str) -> anyhow::Result<()> {
+    sqlx::query(&format!(
+        "DELETE FROM job_events WHERE id IN (SELECT id FROM jobs WHERE job_type = '{job_type}')"
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "DELETE FROM job_executions WHERE id IN (SELECT id FROM jobs WHERE job_type = '{job_type}')"
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!("DELETE FROM jobs WHERE job_type = '{job_type}'"))
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 pub async fn init_outbox<P>(
     pool: &sqlx::PgPool,
     config: MailboxConfig,
