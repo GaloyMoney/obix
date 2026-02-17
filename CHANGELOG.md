@@ -1,3 +1,19 @@
+# [obix release v0.2.14](https://github.com/GaloyMoney/obix/releases/tag/0.2.14)
+
+
+
+### Bug Fixes
+
+- Sqlx-prepare
+
+### Features
+
+- Outbox event job (#20)
+
+### Miscellaneous Tasks
+
+- Bump job migration
+
 # [obix release v0.2.13](https://github.com/GaloyMoney/obix/releases/tag/0.2.13)
 
 

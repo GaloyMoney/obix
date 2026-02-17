@@ -1,6 +1,6 @@
 [package]
 name = "obix-macros"
-version = "0.2.14-dev"
+version = "0.2.14"
 edition = "2024"
 license = "Apache-2.0"
 description = "macros for obix crate"
