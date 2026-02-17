@@ -13,6 +13,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::job::{OutboxEventHandler, OutboxEventJobConfig};
+pub use event::OutboxEventMeta;
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
@@ -174,17 +175,19 @@ where
         )
     }
 
-    pub async fn register_event_handler<H>(
+    pub async fn register_handler<H, E>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        H: OutboxEventHandler<P>,
+        H: OutboxEventHandler<E>,
+        E: Send + Sync + 'static,
+        P: OutboxEventMarker<E>,
     {
         let initializer =
-            job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
+            job::OutboxEventJobInitializer::<H, E, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);
         spawner
             .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())

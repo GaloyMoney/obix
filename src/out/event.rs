@@ -6,6 +6,63 @@ use crate::sequence::*;
 
 es_entity::entity_id! { OutboxEventId }
 
+pub enum OutboxEventMeta {
+    Persistent {
+        id: OutboxEventId,
+        sequence: EventSequence,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+        tracing_context: Option<es_entity::context::TracingContext>,
+    },
+    Ephemeral {
+        event_type: EphemeralEventType,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+        tracing_context: Option<es_entity::context::TracingContext>,
+    },
+}
+
+impl OutboxEventMeta {
+    pub fn recorded_at(&self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::Persistent { recorded_at, .. } => *recorded_at,
+            Self::Ephemeral { recorded_at, .. } => *recorded_at,
+        }
+    }
+
+    pub fn tracing_context(&self) -> Option<&es_entity::context::TracingContext> {
+        match self {
+            Self::Persistent {
+                tracing_context, ..
+            } => tracing_context.as_ref(),
+            Self::Ephemeral {
+                tracing_context, ..
+            } => tracing_context.as_ref(),
+        }
+    }
+
+    pub(crate) fn from_persistent<P>(event: &PersistentOutboxEvent<P>) -> Self
+    where
+        P: Serialize + DeserializeOwned + Send,
+    {
+        Self::Persistent {
+            id: event.id,
+            sequence: event.sequence,
+            recorded_at: event.recorded_at,
+            tracing_context: event.tracing_context.clone(),
+        }
+    }
+
+    pub(crate) fn from_ephemeral<P>(event: &EphemeralOutboxEvent<P>) -> Self
+    where
+        P: Serialize + DeserializeOwned + Send,
+    {
+        Self::Ephemeral {
+            event_type: event.event_type.clone(),
+            recorded_at: event.recorded_at,
+            tracing_context: event.tracing_context.clone(),
+        }
+    }
+}
+
 pub trait OutboxEventMarker<E>:
     serde::de::DeserializeOwned + serde::Serialize + Send + Sync + 'static + Unpin + From<E>
 {

@@ -10,28 +10,13 @@ use job::{
 use super::{Outbox, event::*};
 use crate::{sequence::EventSequence, tables::MailboxTables};
 
-pub trait OutboxEventHandler<P>: Send + Sync + 'static
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
-    fn handle_persistent(
+pub trait OutboxEventHandler<E>: Send + Sync + 'static {
+    fn handle(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        event: &PersistentOutboxEvent<P>,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
-    {
-        let _ = (op, event);
-        async { Ok(()) }
-    }
-
-    fn handle_ephemeral(
-        &self,
-        event: &EphemeralOutboxEvent<P>,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
-    {
-        let _ = event;
-        async { Ok(()) }
-    }
+        event: &E,
+        meta: OutboxEventMeta,
+    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
 }
 
 #[derive(Clone)]
@@ -62,22 +47,23 @@ struct OutboxEventJobState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct OutboxEventJobData {}
 
-pub(super) struct OutboxEventJobInitializer<H, P, Tables>
+pub(super) struct OutboxEventJobInitializer<H, E, P, Tables>
 where
-    H: OutboxEventHandler<P>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: OutboxEventHandler<E>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
     Tables: MailboxTables,
 {
     outbox: Outbox<P, Tables>,
     handler: Arc<H>,
     job_type: JobType,
     retry_settings: RetrySettings,
+    _phantom: std::marker::PhantomData<E>,
 }
 
-impl<H, P, Tables> OutboxEventJobInitializer<H, P, Tables>
+impl<H, E, P, Tables> OutboxEventJobInitializer<H, E, P, Tables>
 where
-    H: OutboxEventHandler<P>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: OutboxEventHandler<E>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
     Tables: MailboxTables,
 {
     pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
@@ -86,14 +72,16 @@ where
             handler: Arc::new(handler),
             job_type: config.job_type.clone(),
             retry_settings: config.retry_settings.clone(),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<H, P, Tables> JobInitializer for OutboxEventJobInitializer<H, P, Tables>
+impl<H, E, P, Tables> JobInitializer for OutboxEventJobInitializer<H, E, P, Tables>
 where
-    H: OutboxEventHandler<P>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: OutboxEventHandler<E>,
+    E: Send + Sync + 'static,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
     Tables: MailboxTables,
 {
     type Config = OutboxEventJobData;
@@ -111,28 +99,31 @@ where
         _job: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(OutboxEventJobRunner::<H, P, Tables> {
+        Ok(Box::new(OutboxEventJobRunner::<H, E, P, Tables> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
+            _phantom: std::marker::PhantomData,
         }))
     }
 }
 
-struct OutboxEventJobRunner<H, P, Tables>
+struct OutboxEventJobRunner<H, E, P, Tables>
 where
-    H: OutboxEventHandler<P>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: OutboxEventHandler<E>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
     Tables: MailboxTables,
 {
     outbox: Outbox<P, Tables>,
     handler: Arc<H>,
+    _phantom: std::marker::PhantomData<E>,
 }
 
 #[async_trait]
-impl<H, P, Tables> JobRunner for OutboxEventJobRunner<H, P, Tables>
+impl<H, E, P, Tables> JobRunner for OutboxEventJobRunner<H, E, P, Tables>
 where
-    H: OutboxEventHandler<P>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: OutboxEventHandler<E>,
+    E: Send + Sync + 'static,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
     Tables: MailboxTables,
 {
     async fn run(
@@ -153,20 +144,39 @@ where
                 }
                 event = stream.next() => {
                     match event {
-                        Some(OutboxEvent::Persistent(e)) => {
-                            let mut op = es_entity::DbOp::init_with_clock(
-                                current_job.pool(),
-                                current_job.clock(),
-                            ).await?;
-                            self.handler.handle_persistent(&mut op, &e).await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
-                            state.sequence = e.sequence;
-                            current_job.update_execution_state_in_op(&mut op, &state).await?;
-                            op.commit().await?;
+                        Some(OutboxEvent::Persistent(ref e)) => {
+                            if let Some(inner) = e.payload.as_ref().and_then(|p| p.as_event()) {
+                                let meta = OutboxEventMeta::from_persistent(e);
+                                let mut op = es_entity::DbOp::init_with_clock(
+                                    current_job.pool(),
+                                    current_job.clock(),
+                                ).await?;
+                                self.handler.handle(&mut op, inner, meta).await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                state.sequence = e.sequence;
+                                current_job.update_execution_state_in_op(&mut op, &state).await?;
+                                op.commit().await?;
+                            } else {
+                                let mut op = es_entity::DbOp::init_with_clock(
+                                    current_job.pool(),
+                                    current_job.clock(),
+                                ).await?;
+                                state.sequence = e.sequence;
+                                current_job.update_execution_state_in_op(&mut op, &state).await?;
+                                op.commit().await?;
+                            }
                         }
-                        Some(OutboxEvent::Ephemeral(e)) => {
-                            self.handler.handle_ephemeral(&e).await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        Some(OutboxEvent::Ephemeral(ref e)) => {
+                            if let Some(inner) = e.payload.as_event() {
+                                let meta = OutboxEventMeta::from_ephemeral(e);
+                                let mut op = es_entity::DbOp::init_with_clock(
+                                    current_job.pool(),
+                                    current_job.clock(),
+                                ).await?;
+                                self.handler.handle(&mut op, inner, meta).await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                op.commit().await?;
+                            }
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
                     }
