@@ -2,9 +2,7 @@ mod helpers;
 
 use std::sync::Arc;
 
-use obix::{
-    MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, OutboxMultiEventHandler, out::Outbox,
-};
+use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
@@ -68,6 +66,8 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
                 received: received.clone(),
             },
         )
+        .with_event::<Ping>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -153,6 +153,8 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
                 received: received.clone(),
             },
         )
+        .with_event::<EphemeralPing>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -216,6 +218,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
                     received: received_first.clone(),
                 },
             )
+            .with_event::<Ping>()
+            .register()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -268,6 +272,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
                     received: received_second.clone(),
                 },
             )
+            .with_event::<Ping>()
+            .register()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -380,6 +386,8 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
                 received: persist_received.clone(),
             },
         )
+        .with_event::<MixedPersist>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -392,6 +400,8 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
                 received: ephemeral_received.clone(),
             },
         )
+        .with_event::<MixedEphemeral>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -514,6 +524,8 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
                 received: ping_received.clone(),
             },
         )
+        .with_event::<PingEvent>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -526,6 +538,8 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
                 received: pong_received.clone(),
             },
         )
+        .with_event::<PongEvent>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -635,16 +649,15 @@ async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()
         pongs: pongs.clone(),
     };
 
-    let multi = OutboxMultiEventHandler::new(handler)
-        .with_event::<PingEvent>()
-        .with_event::<PongEvent>();
-
     outbox
-        .register_multi_event_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(MULTI_HANDLER_JOB_TYPE)),
-            multi,
+            handler,
         )
+        .with_event::<PingEvent>()
+        .with_event::<PongEvent>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -719,16 +732,15 @@ async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
         pongs: pongs.clone(),
     };
 
-    let multi = OutboxMultiEventHandler::new(handler)
-        .with_event::<PingEvent>()
-        .with_event::<PongEvent>();
-
     outbox
-        .register_multi_event_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(MULTI_HANDLER_EPHEMERAL_JOB_TYPE)),
-            multi,
+            handler,
         )
+        .with_event::<PingEvent>()
+        .with_event::<PongEvent>()
+        .register()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

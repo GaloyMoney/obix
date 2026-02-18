@@ -49,143 +49,7 @@ struct OutboxEventJobState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct OutboxEventJobData {}
 
-pub(super) struct OutboxEventJobInitializer<H, E, P, Tables>
-where
-    H: OutboxEventHandler<E>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
-    Tables: MailboxTables,
-{
-    outbox: Outbox<P, Tables>,
-    handler: Arc<H>,
-    job_type: JobType,
-    retry_settings: RetrySettings,
-    _phantom: std::marker::PhantomData<E>,
-}
-
-impl<H, E, P, Tables> OutboxEventJobInitializer<H, E, P, Tables>
-where
-    H: OutboxEventHandler<E>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
-    Tables: MailboxTables,
-{
-    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
-        Self {
-            outbox,
-            handler: Arc::new(handler),
-            job_type: config.job_type.clone(),
-            retry_settings: config.retry_settings.clone(),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<H, E, P, Tables> JobInitializer for OutboxEventJobInitializer<H, E, P, Tables>
-where
-    H: OutboxEventHandler<E>,
-    E: Send + Sync + 'static,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
-    Tables: MailboxTables,
-{
-    type Config = OutboxEventJobData;
-
-    fn job_type(&self) -> JobType {
-        self.job_type.clone()
-    }
-
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        self.retry_settings.clone()
-    }
-
-    fn init(
-        &self,
-        _job: &Job,
-        _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(OutboxEventJobRunner::<H, E, P, Tables> {
-            outbox: self.outbox.clone(),
-            handler: self.handler.clone(),
-            _phantom: std::marker::PhantomData,
-        }))
-    }
-}
-
-struct OutboxEventJobRunner<H, E, P, Tables>
-where
-    H: OutboxEventHandler<E>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
-    Tables: MailboxTables,
-{
-    outbox: Outbox<P, Tables>,
-    handler: Arc<H>,
-    _phantom: std::marker::PhantomData<E>,
-}
-
-#[async_trait]
-impl<H, E, P, Tables> JobRunner for OutboxEventJobRunner<H, E, P, Tables>
-where
-    H: OutboxEventHandler<E>,
-    E: Send + Sync + 'static,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin + OutboxEventMarker<E>,
-    Tables: MailboxTables,
-{
-    async fn run(
-        &self,
-        mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        let mut state = current_job
-            .execution_state::<OutboxEventJobState>()?
-            .unwrap_or_default();
-
-        let mut stream = self.outbox.listen_all(Some(state.sequence));
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = current_job.shutdown_requested() => {
-                    return Ok(JobCompletion::RescheduleNow);
-                }
-                event = stream.next() => {
-                    match event {
-                        Some(OutboxEvent::Persistent(ref e)) => {
-                            if let Some(inner) = e.payload.as_ref().and_then(|p| p.as_event()) {
-                                let meta = OutboxEventMeta::from_persistent(e);
-                                let mut op = es_entity::DbOp::init_with_clock(
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                ).await?;
-                                self.handler.handle(&mut op, inner, meta).await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
-                                op.commit().await?;
-                            }
-                            state.sequence = e.sequence;
-                            let mut op = es_entity::DbOp::init_with_clock(
-                                current_job.pool(),
-                                current_job.clock(),
-                            ).await?;
-                            current_job.update_execution_state_in_op(&mut op, &state).await?;
-                            op.commit().await?;
-                        }
-                        Some(OutboxEvent::Ephemeral(ref e)) => {
-                            if let Some(inner) = e.payload.as_event() {
-                                let meta = OutboxEventMeta::from_ephemeral(e);
-                                let mut op = es_entity::DbOp::init_with_clock(
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                ).await?;
-                                self.handler.handle(&mut op, inner, meta).await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
-                                op.commit().await?;
-                            }
-                        }
-                        None => return Ok(JobCompletion::RescheduleNow),
-                    }
-                }
-            }
-        }
-    }
-}
-
-// --- Multi-event handler support ---
+// --- Type-erased event dispatch machinery ---
 
 /// Object-safe trait for dispatching a full outbox event enum `P` to a typed handler.
 ///
@@ -238,39 +102,69 @@ where
     }
 }
 
-/// Builder for registering a single handler struct that handles multiple event types.
+// --- Event handler registration builder ---
+
+/// Builder for registering an event handler for one or more event types.
 ///
-/// Collects type-erased dispatchers for each event type, then produces a single background
-/// job that processes the full event stream and routes to the appropriate `handle` method.
+/// Created by [`Outbox::register_event_handler`]. Use `.with_event::<E>()` to specify
+/// which event types the handler should receive, then `.register().await` to finalize.
 ///
-/// # Example
+/// # Examples
 ///
+/// Single event type:
 /// ```ignore
-/// OutboxMultiEventHandler::new(my_handler)
+/// outbox.register_event_handler(&mut jobs, config, handler)
+///     .with_event::<PingEvent>()
+///     .register()
+///     .await?;
+/// ```
+///
+/// Multiple event types:
+/// ```ignore
+/// outbox.register_event_handler(&mut jobs, config, handler)
 ///     .with_event::<PingEvent>()
 ///     .with_event::<PongEvent>()
+///     .register()
+///     .await?;
 /// ```
-pub struct OutboxMultiEventHandler<H, P> {
+pub struct EventHandlerRegistration<'a, H, P, Tables>
+where
+    H: Send + Sync + 'static,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    outbox: Outbox<P, Tables>,
+    jobs: &'a mut ::job::Jobs,
+    config: OutboxEventJobConfig,
     handler: Arc<H>,
     dispatchers: Vec<Box<dyn DispatchEventHandler<P>>>,
 }
 
-impl<H, P> OutboxMultiEventHandler<H, P>
+impl<'a, H, P, Tables> EventHandlerRegistration<'a, H, P, Tables>
 where
     H: Send + Sync + 'static,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
 {
-    pub fn new(handler: H) -> Self {
+    pub(super) fn new(
+        outbox: Outbox<P, Tables>,
+        jobs: &'a mut ::job::Jobs,
+        config: OutboxEventJobConfig,
+        handler: H,
+    ) -> Self {
         Self {
+            outbox,
+            jobs,
+            config,
             handler: Arc::new(handler),
             dispatchers: Vec::new(),
         }
     }
 
-    /// Register the handler for an additional event type `E`.
+    /// Register the handler for event type `E`.
     ///
-    /// The handler must implement `OutboxEventHandler<E>` and `P` must implement
-    /// `OutboxEventMarker<E>` (generated by the `OutboxEvent` derive macro).
+    /// The handler must implement `OutboxEventHandler<E>` and the outbox event enum `P`
+    /// must implement `OutboxEventMarker<E>` (generated by the `OutboxEvent` derive macro).
     pub fn with_event<E>(mut self) -> Self
     where
         H: OutboxEventHandler<E>,
@@ -283,9 +177,30 @@ where
         }));
         self
     }
+
+    /// Finalize registration, spawning a background job to process events.
+    pub async fn register(self) -> Result<(), BoxError> {
+        assert!(
+            !self.dispatchers.is_empty(),
+            "register_event_handler requires at least one .with_event::<E>() call"
+        );
+        let initializer = EventHandlerJobInitializer::<P, Tables> {
+            outbox: self.outbox,
+            dispatchers: Arc::new(self.dispatchers),
+            job_type: self.config.job_type.clone(),
+            retry_settings: self.config.retry_settings.clone(),
+        };
+        let spawner = self.jobs.add_initializer(initializer);
+        spawner
+            .spawn_unique(::job::JobId::new(), OutboxEventJobData::default())
+            .await?;
+        Ok(())
+    }
 }
 
-pub(super) struct MultiEventJobInitializer<P, Tables>
+// --- Job initializer and runner (dispatcher-based, handles any number of event types) ---
+
+struct EventHandlerJobInitializer<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -296,29 +211,7 @@ where
     retry_settings: RetrySettings,
 }
 
-impl<P, Tables> MultiEventJobInitializer<P, Tables>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
-{
-    pub fn new<H>(
-        outbox: Outbox<P, Tables>,
-        multi_handler: OutboxMultiEventHandler<H, P>,
-        config: &OutboxEventJobConfig,
-    ) -> Self
-    where
-        H: Send + Sync + 'static,
-    {
-        Self {
-            outbox,
-            dispatchers: Arc::new(multi_handler.dispatchers),
-            job_type: config.job_type.clone(),
-            retry_settings: config.retry_settings.clone(),
-        }
-    }
-}
-
-impl<P, Tables> JobInitializer for MultiEventJobInitializer<P, Tables>
+impl<P, Tables> JobInitializer for EventHandlerJobInitializer<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -338,14 +231,14 @@ where
         _job: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(MultiEventJobRunner::<P, Tables> {
+        Ok(Box::new(EventHandlerJobRunner::<P, Tables> {
             outbox: self.outbox.clone(),
             dispatchers: self.dispatchers.clone(),
         }))
     }
 }
 
-struct MultiEventJobRunner<P, Tables>
+struct EventHandlerJobRunner<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -355,7 +248,7 @@ where
 }
 
 #[async_trait]
-impl<P, Tables> JobRunner for MultiEventJobRunner<P, Tables>
+impl<P, Tables> JobRunner for EventHandlerJobRunner<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,

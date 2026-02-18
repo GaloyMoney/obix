@@ -12,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
 
-pub use self::job::{OutboxEventHandler, OutboxEventJobConfig, OutboxMultiEventHandler};
+pub use self::job::{EventHandlerRegistration, OutboxEventHandler, OutboxEventJobConfig};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
@@ -174,41 +174,38 @@ where
         )
     }
 
-    pub async fn register_event_handler<H, E>(
+    /// Register an event handler for one or more event types.
+    ///
+    /// Returns a builder — use `.with_event::<E>()` to specify which event types
+    /// the handler should receive, then call `.register().await` to finalize.
+    ///
+    /// # Examples
+    ///
+    /// Single event type:
+    /// ```ignore
+    /// outbox.register_event_handler(&mut jobs, config, handler)
+    ///     .with_event::<PingEvent>()
+    ///     .register()
+    ///     .await?;
+    /// ```
+    ///
+    /// Multiple event types:
+    /// ```ignore
+    /// outbox.register_event_handler(&mut jobs, config, handler)
+    ///     .with_event::<PingEvent>()
+    ///     .with_event::<PongEvent>()
+    ///     .register()
+    ///     .await?;
+    /// ```
+    pub fn register_event_handler<'a, H>(
         &self,
-        jobs: &mut ::job::Jobs,
+        jobs: &'a mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        H: OutboxEventHandler<E>,
-        E: Send + Sync + 'static,
-        P: OutboxEventMarker<E>,
-    {
-        let initializer =
-            job::OutboxEventJobInitializer::<H, E, P, Tables>::new(self.clone(), handler, &config);
-        let spawner = jobs.add_initializer(initializer);
-        spawner
-            .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())
-            .await?;
-        Ok(())
-    }
-
-    pub async fn register_multi_event_handler<H>(
-        &self,
-        jobs: &mut ::job::Jobs,
-        config: OutboxEventJobConfig,
-        multi_handler: OutboxMultiEventHandler<H, P>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    ) -> EventHandlerRegistration<'a, H, P, Tables>
     where
         H: Send + Sync + 'static,
     {
-        let initializer =
-            job::MultiEventJobInitializer::<P, Tables>::new(self.clone(), multi_handler, &config);
-        let spawner = jobs.add_initializer(initializer);
-        spawner
-            .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())
-            .await?;
-        Ok(())
+        EventHandlerRegistration::new(self.clone(), jobs, config, handler)
     }
 }
