@@ -343,12 +343,23 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 continue;
                             }
                             #deserialize_context
+                            let payload = row.payload.and_then(|p| {
+                                match #crate_name::prelude::serde_json::from_value(p) {
+                                    Ok(v) => Some(v),
+                                    Err(err) => {
+                                        #crate_name::prelude::tracing::debug!(
+                                            sequence = row.sequence,
+                                            %err,
+                                            "skipping persistent outbox event: payload deserialization failed"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
                             events.push(#crate_name::out::PersistentOutboxEvent {
                                 id: #crate_name::out::OutboxEventId::from(row.id.expect("already checked")),
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                payload: row
-                                    .payload
-                                    .and_then(|p| #crate_name::prelude::serde_json::from_value(p).ok()),
+                                payload,
                                 recorded_at: row.recorded_at.unwrap_or_default(),
                                 #set_context
                             });
@@ -362,12 +373,23 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                             for row in gap_rows {
                                 #deserialize_context
+                                let payload = row.payload.and_then(|p| {
+                                    match #crate_name::prelude::serde_json::from_value(p) {
+                                        Ok(v) => Some(v),
+                                        Err(err) => {
+                                            #crate_name::prelude::tracing::debug!(
+                                                sequence = row.sequence,
+                                                %err,
+                                                "skipping persistent outbox event: payload deserialization failed"
+                                            );
+                                            None
+                                        }
+                                    }
+                                });
                                 events.push(#crate_name::out::PersistentOutboxEvent {
                                     id: #crate_name::out::OutboxEventId::from(row.id),
                                     sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    payload: row
-                                        .payload
-                                        .and_then(|p| #crate_name::prelude::serde_json::from_value(p).ok()),
+                                    payload,
                                     recorded_at: row.recorded_at,
                                     #set_context
                                 });
