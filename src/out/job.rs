@@ -147,16 +147,21 @@ where
                 event = stream.next() => {
                     match event {
                         Some(OutboxEvent::Persistent(ref e)) => {
+                            if let Some(inner) = e.payload.as_ref().and_then(|p| p.as_event()) {
+                                let meta = OutboxEventMeta::from_persistent(e);
+                                let mut op = es_entity::DbOp::init_with_clock(
+                                    current_job.pool(),
+                                    current_job.clock(),
+                                ).await?;
+                                self.handler.handle(&mut op, inner, meta).await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                op.commit().await?;
+                            }
+                            state.sequence = e.sequence;
                             let mut op = es_entity::DbOp::init_with_clock(
                                 current_job.pool(),
                                 current_job.clock(),
                             ).await?;
-                            if let Some(inner) = e.payload.as_ref().and_then(|p| p.as_event()) {
-                                let meta = OutboxEventMeta::from_persistent(e);
-                                self.handler.handle(&mut op, inner, meta).await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
-                            }
-                            state.sequence = e.sequence;
                             current_job.update_execution_state_in_op(&mut op, &state).await?;
                             op.commit().await?;
                         }
@@ -192,9 +197,11 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     /// Try to dispatch the event. Returns `true` if the event matched and was handled.
+    /// Each dispatch creates and commits its own `DbOp` for transaction isolation.
     async fn dispatch(
         &self,
-        op: &mut es_entity::DbOp<'_>,
+        pool: &sqlx::PgPool,
+        clock: &es_entity::clock::ClockHandle,
         event: &P,
         meta: OutboxEventMeta,
     ) -> Result<bool, BoxError>;
@@ -215,12 +222,15 @@ where
 {
     async fn dispatch(
         &self,
-        op: &mut es_entity::DbOp<'_>,
+        pool: &sqlx::PgPool,
+        clock: &es_entity::clock::ClockHandle,
         event: &P,
         meta: OutboxEventMeta,
     ) -> Result<bool, BoxError> {
         if let Some(inner) = event.as_event() {
-            self.handler.handle(op, inner, meta).await?;
+            let mut op = es_entity::DbOp::init_with_clock(pool, clock).await?;
+            self.handler.handle(&mut op, inner, meta).await?;
+            op.commit().await?;
             Ok(true)
         } else {
             Ok(false)
@@ -369,40 +379,44 @@ where
                 event = stream.next() => {
                     match event {
                         Some(OutboxEvent::Persistent(ref e)) => {
-                            let mut op = es_entity::DbOp::init_with_clock(
-                                current_job.pool(),
-                                current_job.clock(),
-                            ).await?;
                             if let Some(payload) = e.payload.as_ref() {
                                 let meta = OutboxEventMeta::from_persistent(e);
                                 for dispatcher in self.dispatchers.iter() {
-                                    if dispatcher.dispatch(&mut op, payload, meta.clone()).await
+                                    if dispatcher.dispatch(
+                                        current_job.pool(),
+                                        current_job.clock(),
+                                        payload,
+                                        meta.clone(),
+                                    ).await
                                         .map_err(|e| e as Box<dyn std::error::Error>)? {
                                         break;
                                     }
                                 }
                             }
                             state.sequence = e.sequence;
+                            let mut op = es_entity::DbOp::init_with_clock(
+                                current_job.pool(),
+                                current_job.clock(),
+                            ).await?;
                             current_job.update_execution_state_in_op(&mut op, &state).await?;
                             op.commit().await?;
                         }
                         Some(OutboxEvent::Ephemeral(ref e)) => {
                             let meta = OutboxEventMeta::from_ephemeral(e);
-                            let mut op = es_entity::DbOp::init_with_clock(
-                                current_job.pool(),
-                                current_job.clock(),
-                            )
-                            .await?;
                             for dispatcher in self.dispatchers.iter() {
                                 if dispatcher
-                                    .dispatch(&mut op, &e.payload, meta.clone())
+                                    .dispatch(
+                                        current_job.pool(),
+                                        current_job.clock(),
+                                        &e.payload,
+                                        meta.clone(),
+                                    )
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?
                                 {
                                     break;
                                 }
                             }
-                            op.commit().await?;
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
                     }
