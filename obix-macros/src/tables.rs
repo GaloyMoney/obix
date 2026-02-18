@@ -348,7 +348,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
                                 payload: row
                                     .payload
-                                    .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
+                                    .and_then(|p| #crate_name::prelude::serde_json::from_value(p).ok()),
                                 recorded_at: row.recorded_at.unwrap_or_default(),
                                 #set_context
                             });
@@ -367,7 +367,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     sequence: #crate_name::EventSequence::from(row.sequence as u64),
                                     payload: row
                                         .payload
-                                        .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
+                                        .and_then(|p| #crate_name::prelude::serde_json::from_value(p).ok()),
                                     recorded_at: row.recorded_at,
                                     #set_context
                                 });
