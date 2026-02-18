@@ -700,6 +700,179 @@ async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()
     Ok(())
 }
 
+// --- Cross-domain handler test: single handler, two unrelated event types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct UserCreated {
+    user_id: u64,
+    email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct InvoicePaid {
+    invoice_id: u64,
+    amount_cents: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, obix::OutboxEvent)]
+enum CrossDomainEvent {
+    UserCreated(UserCreated),
+    InvoicePaid(InvoicePaid),
+}
+
+const CROSS_DOMAIN_JOB_TYPE: &str = "test-cross-domain-handler";
+
+/// A single handler that handles two conceptually unrelated events from different
+/// domains (user management and billing). This demonstrates that handlers have no
+/// coupling between the event types they handle — the `with_event` registration
+/// compiles only because the handler implements `OutboxEventHandler<E>` for each
+/// event type and the enum implements `OutboxEventMarker<E>` for each variant.
+struct CrossDomainHandler {
+    users: Arc<Mutex<Vec<(u64, String)>>>,
+    invoices: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl OutboxEventHandler<UserCreated> for CrossDomainHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &UserCreated,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.users
+            .lock()
+            .await
+            .push((event.user_id, event.email.clone()));
+        Ok(())
+    }
+}
+
+impl OutboxEventHandler<InvoicePaid> for CrossDomainHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &InvoicePaid,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.invoices
+            .lock()
+            .await
+            .push((event.invoice_id, event.amount_cents));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn cross_domain_handler_receives_unrelated_events() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, CROSS_DOMAIN_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let outbox = Outbox::<CrossDomainEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let users = Arc::new(Mutex::new(Vec::new()));
+    let invoices = Arc::new(Mutex::new(Vec::new()));
+
+    let handler = CrossDomainHandler {
+        users: users.clone(),
+        invoices: invoices.clone(),
+    };
+
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(CROSS_DOMAIN_JOB_TYPE)),
+            handler,
+        )
+        .with_event::<UserCreated>()
+        .with_event::<InvoicePaid>()
+        .register()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            UserCreated {
+                user_id: 42,
+                email: "alice@example.com".into(),
+            },
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            InvoicePaid {
+                invoice_id: 1001,
+                amount_cents: 9999,
+            },
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            UserCreated {
+                user_id: 43,
+                email: "bob@example.com".into(),
+            },
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            InvoicePaid {
+                invoice_id: 1002,
+                amount_cents: 4500,
+            },
+        )
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let u = users.lock().await;
+        let i = invoices.lock().await;
+        if u.len() >= 2 && i.len() >= 2 {
+            assert_eq!(
+                *u,
+                vec![
+                    (42, "alice@example.com".to_string()),
+                    (43, "bob@example.com".to_string()),
+                ]
+            );
+            assert_eq!(*i, vec![(1001, 9999), (1002, 4500)]);
+            break;
+        }
+        drop(u);
+        drop(i);
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let u = users.lock().await;
+            let i = invoices.lock().await;
+            anyhow::bail!("Timeout: users={:?}, invoices={:?}", *u, *i);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
 const MULTI_HANDLER_EPHEMERAL_JOB_TYPE: &str = "test-multi-handler-ephemeral";
 
 #[tokio::test]
