@@ -215,7 +215,11 @@ where
     where
         T: OutboxEventMarker<E>,
     {
-        self.payload.as_ref().and_then(|p| p.as_event())
+        if let Some(payload) = &self.payload {
+            payload.as_event()
+        } else {
+            None
+        }
     }
 
     #[cfg(feature = "tracing")]

@@ -59,7 +59,7 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
 
     let received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             TestHandler {
@@ -144,7 +144,7 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
 
     let received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(EPHEMERAL_JOB_TYPE)),
             EphemeralTestHandler {
@@ -207,7 +207,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         .await?;
 
         outbox
-            .register_handler(
+            .register_event_handler(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 TestHandler {
@@ -259,7 +259,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         .await?;
 
         outbox
-            .register_handler(
+            .register_event_handler(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 TestHandler {
@@ -371,7 +371,7 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
 
     let persist_received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(MIXED_PERSIST_JOB)),
             MixedPersistHandler {
@@ -383,7 +383,7 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
 
     let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(MIXED_EPHEMERAL_JOB)),
             MixedEphemeralHandler {
@@ -505,7 +505,7 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
 
     let ping_received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(PING_JOB_TYPE)),
             PingHandler {
@@ -517,7 +517,7 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
 
     let pong_received = Arc::new(Mutex::new(Vec::new()));
     outbox
-        .register_handler(
+        .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(PONG_JOB_TYPE)),
             PongHandler {
