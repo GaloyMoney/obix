@@ -290,15 +290,26 @@ where
                     match event {
                         Some(OutboxEvent::Persistent(ref e)) => {
                             if let Some(payload) = e.payload.as_ref() {
-                                let meta = OutboxEventMeta::from_persistent(e);
-                                for dispatcher in self.dispatchers.iter() {
-                                    dispatcher.dispatch(
+                                let mut meta = Some(OutboxEventMeta::from_persistent(e));
+                                let mut errors: Vec<BoxError> = Vec::new();
+                                let last = self.dispatchers.len().saturating_sub(1);
+                                for (i, dispatcher) in self.dispatchers.iter().enumerate() {
+                                    let m = if i == last {
+                                        meta.take().expect("meta consumed")
+                                    } else {
+                                        meta.as_ref().expect("meta consumed").clone()
+                                    };
+                                    if let Err(e) = dispatcher.dispatch(
                                         current_job.pool(),
                                         current_job.clock(),
                                         payload,
-                                        meta.clone(),
-                                    ).await
-                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                        m,
+                                    ).await {
+                                        errors.push(e);
+                                    }
+                                }
+                                if let Some(first) = errors.into_iter().next() {
+                                    return Err(first as Box<dyn std::error::Error>);
                                 }
                             }
                             state.sequence = e.sequence;
@@ -310,17 +321,29 @@ where
                             op.commit().await?;
                         }
                         Some(OutboxEvent::Ephemeral(ref e)) => {
-                            let meta = OutboxEventMeta::from_ephemeral(e);
-                            for dispatcher in self.dispatchers.iter() {
-                                dispatcher
+                            let mut meta = Some(OutboxEventMeta::from_ephemeral(e));
+                            let mut errors: Vec<BoxError> = Vec::new();
+                            let last = self.dispatchers.len().saturating_sub(1);
+                            for (i, dispatcher) in self.dispatchers.iter().enumerate() {
+                                let m = if i == last {
+                                    meta.take().expect("meta consumed")
+                                } else {
+                                    meta.as_ref().expect("meta consumed").clone()
+                                };
+                                if let Err(e) = dispatcher
                                     .dispatch(
                                         current_job.pool(),
                                         current_job.clock(),
                                         &e.payload,
-                                        meta.clone(),
+                                        m,
                                     )
                                     .await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                {
+                                    errors.push(e);
+                                }
+                            }
+                            if let Some(first) = errors.into_iter().next() {
+                                return Err(first as Box<dyn std::error::Error>);
                             }
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
