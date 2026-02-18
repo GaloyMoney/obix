@@ -1,15 +1,19 @@
 mod helpers;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
 
-use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
+use helpers::{
+    TestTables, init_jobs, init_outbox, init_pool, poll_until, wipeout_outbox_job_tables,
+};
 
 const JOB_TYPE: &str = "test-outbox-handler";
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Ping(u64);
@@ -39,23 +43,10 @@ impl OutboxEventHandler<Ping> for TestHandler {
 #[file_serial]
 async fn handler_receives_persistent_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<TestEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<TestEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let received = Arc::new(Mutex::new(Vec::new()));
     outbox
@@ -79,19 +70,19 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
     outbox.publish_persisted_in_op(&mut op, Ping(3)).await?;
     op.commit().await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let events = received.lock().await;
-        if events.len() >= 3 {
-            assert_eq!(*events, vec![1, 2, 3]);
-            break;
+    poll_until(TIMEOUT, || {
+        let received = received.clone();
+        async move {
+            let events = received.lock().await;
+            if events.len() >= 3 {
+                assert_eq!(*events, vec![1, 2, 3]);
+                Some(())
+            } else {
+                None
+            }
         }
-        drop(events);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for persistent events");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -126,23 +117,10 @@ impl OutboxEventHandler<EphemeralPing> for EphemeralTestHandler {
 #[file_serial]
 async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, EPHEMERAL_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<EphemeralTestEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<EphemeralTestEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let received = Arc::new(Mutex::new(Vec::new()));
     outbox
@@ -161,26 +139,26 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     // Give the job time to start and begin listening
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let event_type = obix::out::EphemeralEventType::new("test_type");
     outbox
         .publish_ephemeral(event_type.clone(), EphemeralPing(42))
         .await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let events = received.lock().await;
-        if !events.is_empty() {
-            assert!(events.iter().all(|&v| v == 42));
-            break;
+    poll_until(TIMEOUT, || {
+        let received = received.clone();
+        async move {
+            let events = received.lock().await;
+            if !events.is_empty() {
+                assert!(events.iter().all(|&v| v == 42));
+                Some(())
+            } else {
+                None
+            }
         }
-        drop(events);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for ephemeral events");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -189,26 +167,14 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
 #[file_serial]
 async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, JOB_TYPE).await?;
 
     // First run: process some events
     let received_first = Arc::new(Mutex::new(Vec::new()));
     {
-        let job_config = job::JobSvcConfig::builder()
-            .pool(pool.clone())
-            .build()
-            .unwrap();
-        let mut jobs = job::Jobs::init(job_config).await?;
-
-        let outbox = Outbox::<TestEvent, TestTables>::init(
-            &pool,
-            MailboxConfig::builder()
-                .build()
-                .expect("Couldn't build MailboxConfig"),
-        )
-        .await?;
+        let mut jobs = init_jobs(&pool).await?;
+        let outbox: Outbox<TestEvent, TestTables> =
+            init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
         outbox
             .register_event_handler(
@@ -230,18 +196,14 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox.publish_persisted_in_op(&mut op, Ping(20)).await?;
         op.commit().await?;
 
-        let start = std::time::Instant::now();
-        loop {
-            let events = received_first.lock().await;
-            if events.len() >= 2 {
-                break;
+        poll_until(TIMEOUT, || {
+            let received_first = received_first.clone();
+            async move {
+                let events = received_first.lock().await;
+                if events.len() >= 2 { Some(()) } else { None }
             }
-            drop(events);
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                anyhow::bail!("Timeout waiting for first-run events");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        })
+        .await?;
 
         jobs.shutdown().await?;
     }
@@ -249,11 +211,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
     // Second run: publish more events, handler should NOT receive events 10,20 again
     let received_second = Arc::new(Mutex::new(Vec::new()));
     {
-        let job_config = job::JobSvcConfig::builder()
-            .pool(pool.clone())
-            .build()
-            .unwrap();
-        let mut jobs = job::Jobs::init(job_config).await?;
+        let mut jobs = init_jobs(&pool).await?;
 
         // Re-init outbox (don't wipe tables — we want to keep the sequence state)
         let outbox = Outbox::<TestEvent, TestTables>::init(
@@ -283,23 +241,23 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox.publish_persisted_in_op(&mut op, Ping(30)).await?;
         op.commit().await?;
 
-        let start = std::time::Instant::now();
-        loop {
-            let events = received_second.lock().await;
-            if !events.is_empty() {
-                // Should only have 30, not 10 or 20
-                assert_eq!(*events, vec![30]);
-                break;
+        poll_until(TIMEOUT, || {
+            let received_second = received_second.clone();
+            async move {
+                let events = received_second.lock().await;
+                if !events.is_empty() {
+                    // Should only have 30, not 10 or 20
+                    assert_eq!(*events, vec![30]);
+                    Some(())
+                } else {
+                    None
+                }
             }
-            drop(events);
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                anyhow::bail!("Timeout waiting for second-run events");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        })
+        .await?;
 
         // Wait a bit to make sure no stale events arrive
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let events = received_second.lock().await;
         assert_eq!(*events, vec![30]);
     }
@@ -358,24 +316,11 @@ impl OutboxEventHandler<MixedEphemeral> for MixedEphemeralHandler {
 #[file_serial]
 async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, MIXED_PERSIST_JOB).await?;
     wipeout_outbox_job_tables(&pool, MIXED_EPHEMERAL_JOB).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<MixedEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<MixedEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let persist_received = Arc::new(Mutex::new(Vec::new()));
     outbox
@@ -408,7 +353,7 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
     jobs.start_poll().await?;
 
     // Give the job time to start
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Publish persistent event
     let mut op = outbox.begin_op().await?;
@@ -423,22 +368,22 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
         .publish_ephemeral(event_type, MixedEphemeral(200))
         .await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let persists = persist_received.lock().await;
-        let ephemerals = ephemeral_received.lock().await;
-        if !persists.is_empty() && !ephemerals.is_empty() {
-            assert_eq!(*persists, vec![100]);
-            assert!(ephemerals.iter().all(|&v| v == 200));
-            break;
+    poll_until(TIMEOUT, || {
+        let persist_received = persist_received.clone();
+        let ephemeral_received = ephemeral_received.clone();
+        async move {
+            let persists = persist_received.lock().await;
+            let ephemerals = ephemeral_received.lock().await;
+            if !persists.is_empty() && !ephemerals.is_empty() {
+                assert_eq!(*persists, vec![100]);
+                assert!(ephemerals.iter().all(|&v| v == 200));
+                Some(())
+            } else {
+                None
+            }
         }
-        drop(persists);
-        drop(ephemerals);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for both event types");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -496,24 +441,11 @@ impl OutboxEventHandler<PongEvent> for PongHandler {
 #[file_serial]
 async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, PING_JOB_TYPE).await?;
     wipeout_outbox_job_tables(&pool, PONG_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<MultiEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<MultiEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let ping_received = Arc::new(Mutex::new(Vec::new()));
     outbox
@@ -560,28 +492,22 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let pings = ping_received.lock().await;
-        let pongs = pong_received.lock().await;
-        if pings.len() >= 2 && pongs.len() >= 2 {
-            assert_eq!(*pings, vec![1, 2]);
-            assert_eq!(*pongs, vec!["hello", "world"]);
-            break;
-        }
-        drop(pings);
-        drop(pongs);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let ping_received = ping_received.clone();
+        let pong_received = pong_received.clone();
+        async move {
             let pings = ping_received.lock().await;
             let pongs = pong_received.lock().await;
-            anyhow::bail!(
-                "Timeout: ping_received={:?}, pong_received={:?}",
-                *pings,
-                *pongs
-            );
+            if pings.len() >= 2 && pongs.len() >= 2 {
+                assert_eq!(*pings, vec![1, 2]);
+                assert_eq!(*pongs, vec!["hello", "world"]);
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -623,23 +549,10 @@ impl OutboxEventHandler<PongEvent> for MultiHandler {
 #[file_serial]
 async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, MULTI_HANDLER_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<MultiEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<MultiEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let pings = Arc::new(Mutex::new(Vec::new()));
     let pongs = Arc::new(Mutex::new(Vec::new()));
@@ -678,24 +591,22 @@ async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()
         .await?;
     op.commit().await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let p = pings.lock().await;
-        let q = pongs.lock().await;
-        if p.len() >= 2 && q.len() >= 2 {
-            assert_eq!(*p, vec![1, 2]);
-            assert_eq!(*q, vec!["hello", "world"]);
-            break;
-        }
-        drop(p);
-        drop(q);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let pings = pings.clone();
+        let pongs = pongs.clone();
+        async move {
             let p = pings.lock().await;
             let q = pongs.lock().await;
-            anyhow::bail!("Timeout: pings={:?}, pongs={:?}", *p, *q);
+            if p.len() >= 2 && q.len() >= 2 {
+                assert_eq!(*p, vec![1, 2]);
+                assert_eq!(*q, vec!["hello", "world"]);
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -766,23 +677,10 @@ impl OutboxEventHandler<InvoicePaid> for CrossDomainHandler {
 #[file_serial]
 async fn cross_domain_handler_receives_unrelated_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, CROSS_DOMAIN_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<CrossDomainEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<CrossDomainEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let users = Arc::new(Mutex::new(Vec::new()));
     let invoices = Arc::new(Mutex::new(Vec::new()));
@@ -845,30 +743,28 @@ async fn cross_domain_handler_receives_unrelated_events() -> anyhow::Result<()> 
         .await?;
     op.commit().await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let u = users.lock().await;
-        let i = invoices.lock().await;
-        if u.len() >= 2 && i.len() >= 2 {
-            assert_eq!(
-                *u,
-                vec![
-                    (42, "alice@example.com".to_string()),
-                    (43, "bob@example.com".to_string()),
-                ]
-            );
-            assert_eq!(*i, vec![(1001, 9999), (1002, 4500)]);
-            break;
-        }
-        drop(u);
-        drop(i);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let users = users.clone();
+        let invoices = invoices.clone();
+        async move {
             let u = users.lock().await;
             let i = invoices.lock().await;
-            anyhow::bail!("Timeout: users={:?}, invoices={:?}", *u, *i);
+            if u.len() >= 2 && i.len() >= 2 {
+                assert_eq!(
+                    *u,
+                    vec![
+                        (42, "alice@example.com".to_string()),
+                        (43, "bob@example.com".to_string()),
+                    ]
+                );
+                assert_eq!(*i, vec![(1001, 9999), (1002, 4500)]);
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -879,23 +775,10 @@ const MULTI_HANDLER_EPHEMERAL_JOB_TYPE: &str = "test-multi-handler-ephemeral";
 #[file_serial]
 async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, MULTI_HANDLER_EPHEMERAL_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<MultiEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<MultiEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let pings = Arc::new(Mutex::new(Vec::new()));
     let pongs = Arc::new(Mutex::new(Vec::new()));
@@ -920,7 +803,7 @@ async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     // Give the job time to start and begin listening for ephemeral events
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let event_type = obix::out::EphemeralEventType::new("multi_ephemeral_test");
     outbox
@@ -936,38 +819,32 @@ async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
         .publish_ephemeral(event_type.clone(), PongEvent("ephemeral_world".into()))
         .await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let p = pings.lock().await;
-        let q = pongs.lock().await;
-        // Ephemeral events may be delivered more than once (PG NOTIFY + cache_fill
-        // paths can both fire), so check that all expected values are present
-        // rather than asserting exact counts.
-        if p.contains(&10)
-            && p.contains(&20)
-            && q.iter().any(|s| s == "ephemeral_hello")
-            && q.iter().any(|s| s == "ephemeral_world")
-        {
-            assert!(p.iter().all(|v| *v == 10 || *v == 20));
-            assert!(
-                q.iter()
-                    .all(|s| s == "ephemeral_hello" || s == "ephemeral_world")
-            );
-            break;
-        }
-        drop(p);
-        drop(q);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let pings = pings.clone();
+        let pongs = pongs.clone();
+        async move {
             let p = pings.lock().await;
             let q = pongs.lock().await;
-            anyhow::bail!(
-                "Timeout waiting for ephemeral multi-events: pings={:?}, pongs={:?}",
-                *p,
-                *q
-            );
+            // Ephemeral events may be delivered more than once (PG NOTIFY + cache_fill
+            // paths can both fire), so check that all expected values are present
+            // rather than asserting exact counts.
+            if p.contains(&10)
+                && p.contains(&20)
+                && q.iter().any(|s| s == "ephemeral_hello")
+                && q.iter().any(|s| s == "ephemeral_world")
+            {
+                assert!(p.iter().all(|v| *v == 10 || *v == 20));
+                assert!(
+                    q.iter()
+                        .all(|s| s == "ephemeral_hello" || s == "ephemeral_world")
+                );
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -1042,25 +919,15 @@ impl OutboxEventHandler<PaymentReceived> for TrueCrossDomainHandler {
 #[file_serial]
 async fn handler_spans_two_separate_outbox_enums() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, USER_DOMAIN_JOB_TYPE).await?;
     wipeout_outbox_job_tables(&pool, BILLING_DOMAIN_JOB_TYPE).await?;
+    let mut jobs = init_jobs(&pool).await?;
 
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let user_outbox = Outbox::<UserDomainEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
-
+    // This test needs two separate outboxes with different enum types.
+    // init_outbox wipes shared outbox tables, so call it once for the first,
+    // then init the second directly (tables are already clean).
+    let user_outbox: Outbox<UserDomainEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
     let billing_outbox = Outbox::<BillingDomainEvent, TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -1150,24 +1017,22 @@ async fn handler_spans_two_separate_outbox_enums() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    let start = std::time::Instant::now();
-    loop {
-        let a = accounts.lock().await;
-        let p = payments.lock().await;
-        if a.len() >= 2 && p.len() >= 2 {
-            assert_eq!(*a, vec![(1, "alice".to_string()), (2, "bob".to_string())]);
-            assert_eq!(*p, vec![(100, 5000), (101, 7500)]);
-            break;
-        }
-        drop(a);
-        drop(p);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let accounts = accounts.clone();
+        let payments = payments.clone();
+        async move {
             let a = accounts.lock().await;
             let p = payments.lock().await;
-            anyhow::bail!("Timeout: accounts={:?}, payments={:?}", *a, *p);
+            if a.len() >= 2 && p.len() >= 2 {
+                assert_eq!(*a, vec![(1, "alice".to_string()), (2, "bob".to_string())]);
+                assert_eq!(*p, vec![(100, 5000), (101, 7500)]);
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     Ok(())
 }
@@ -1235,23 +1100,10 @@ impl OutboxEventHandler<Deactivated> for SubsetHandler {
 #[file_serial]
 async fn handler_subscribes_to_subset_of_enum_variants() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-
-    wipeout_outbox_tables(&pool).await?;
     wipeout_outbox_job_tables(&pool, SUBSET_JOB_TYPE).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let outbox = Outbox::<UserLifecycleEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<UserLifecycleEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
 
     let registered = Arc::new(Mutex::new(Vec::new()));
     let deactivated = Arc::new(Mutex::new(Vec::new()));
@@ -1308,27 +1160,25 @@ async fn handler_subscribes_to_subset_of_enum_variants() -> anyhow::Result<()> {
     op.commit().await?;
 
     // Wait for the handler to receive the Registered and Deactivated events
-    let start = std::time::Instant::now();
-    loop {
-        let r = registered.lock().await;
-        let d = deactivated.lock().await;
-        if r.len() >= 2 && !d.is_empty() {
-            assert_eq!(*r, vec![1, 3]);
-            assert_eq!(*d, vec![2]);
-            break;
-        }
-        drop(r);
-        drop(d);
-        if start.elapsed() > std::time::Duration::from_secs(5) {
+    poll_until(TIMEOUT, || {
+        let registered = registered.clone();
+        let deactivated = deactivated.clone();
+        async move {
             let r = registered.lock().await;
             let d = deactivated.lock().await;
-            anyhow::bail!("Timeout: registered={:?}, deactivated={:?}", *r, *d);
+            if r.len() >= 2 && !d.is_empty() {
+                assert_eq!(*r, vec![1, 3]);
+                assert_eq!(*d, vec![2]);
+                Some(())
+            } else {
+                None
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await?;
 
     // Extra wait to ensure ProfileUpdated events are NOT delivered
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let r = registered.lock().await;
     let d = deactivated.lock().await;
     assert_eq!(*r, vec![1, 3], "Should only contain Registered events");
@@ -1344,26 +1194,14 @@ async fn handler_subscribes_to_subset_of_enum_variants() -> anyhow::Result<()> {
 #[should_panic(expected = "duplicate with_event")]
 async fn duplicate_with_event_panics() {
     let pool = init_pool().await.unwrap();
-
-    wipeout_outbox_tables(&pool).await.unwrap();
     wipeout_outbox_job_tables(&pool, "test-dup-detection")
         .await
         .unwrap();
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await.unwrap();
-
-    let outbox = Outbox::<MultiEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await
-    .unwrap();
+    let mut jobs = init_jobs(&pool).await.unwrap();
+    let outbox: Outbox<MultiEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap())
+            .await
+            .unwrap();
 
     let handler = MultiHandler {
         pings: Arc::new(Mutex::new(Vec::new())),

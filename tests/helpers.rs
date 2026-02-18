@@ -121,6 +121,32 @@ where
     Ok(outbox)
 }
 
+pub async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    Ok(job::Jobs::init(job_config).await?)
+}
+
+/// Poll `check` every 50ms until it returns `Some(T)` or `timeout` elapses.
+pub async fn poll_until<T, F, Fut>(timeout: std::time::Duration, check: F) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(val) = check().await {
+            return Ok(val);
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!("poll_until timed out after {timeout:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn wait_for_inbox_status(
     inbox: &Inbox<TestTables>,
     event_id: InboxEventId,
