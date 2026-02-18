@@ -971,3 +971,368 @@ async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// --- True cross-domain test: one handler struct, two separate outbox enums, two outboxes ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AccountCreated {
+    account_id: u64,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PaymentReceived {
+    payment_id: u64,
+    amount_cents: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, obix::OutboxEvent)]
+enum UserDomainEvent {
+    AccountCreated(AccountCreated),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, obix::OutboxEvent)]
+enum BillingDomainEvent {
+    PaymentReceived(PaymentReceived),
+}
+
+const USER_DOMAIN_JOB_TYPE: &str = "test-user-domain-handler";
+const BILLING_DOMAIN_JOB_TYPE: &str = "test-billing-domain-handler";
+
+/// A single handler struct that spans two completely separate outbox enums.
+/// It implements `OutboxEventHandler<AccountCreated>` and `OutboxEventHandler<PaymentReceived>`,
+/// and is registered on two different outboxes — proving that handler structs are not
+/// coupled to a single enum and can span domain boundaries via multiple registrations.
+struct TrueCrossDomainHandler {
+    accounts: Arc<Mutex<Vec<(u64, String)>>>,
+    payments: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl OutboxEventHandler<AccountCreated> for TrueCrossDomainHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &AccountCreated,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.accounts
+            .lock()
+            .await
+            .push((event.account_id, event.name.clone()));
+        Ok(())
+    }
+}
+
+impl OutboxEventHandler<PaymentReceived> for TrueCrossDomainHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &PaymentReceived,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.payments
+            .lock()
+            .await
+            .push((event.payment_id, event.amount_cents));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handler_spans_two_separate_outbox_enums() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, USER_DOMAIN_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, BILLING_DOMAIN_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let user_outbox = Outbox::<UserDomainEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let billing_outbox = Outbox::<BillingDomainEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let accounts = Arc::new(Mutex::new(Vec::new()));
+    let payments = Arc::new(Mutex::new(Vec::new()));
+
+    // Two handler instances sharing the same state — the same struct type is
+    // registered on two different outboxes with different enum parameters.
+    // Register on the user-domain outbox
+    user_outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(USER_DOMAIN_JOB_TYPE)),
+            TrueCrossDomainHandler {
+                accounts: accounts.clone(),
+                payments: payments.clone(),
+            },
+        )
+        .with_event::<AccountCreated>()
+        .register()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Register on the billing-domain outbox
+    billing_outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(BILLING_DOMAIN_JOB_TYPE)),
+            TrueCrossDomainHandler {
+                accounts: accounts.clone(),
+                payments: payments.clone(),
+            },
+        )
+        .with_event::<PaymentReceived>()
+        .register()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    // Publish on the user-domain outbox
+    let mut op = user_outbox.begin_op().await?;
+    user_outbox
+        .publish_persisted_in_op(
+            &mut op,
+            AccountCreated {
+                account_id: 1,
+                name: "alice".into(),
+            },
+        )
+        .await?;
+    user_outbox
+        .publish_persisted_in_op(
+            &mut op,
+            AccountCreated {
+                account_id: 2,
+                name: "bob".into(),
+            },
+        )
+        .await?;
+    op.commit().await?;
+
+    // Publish on the billing-domain outbox
+    let mut op = billing_outbox.begin_op().await?;
+    billing_outbox
+        .publish_persisted_in_op(
+            &mut op,
+            PaymentReceived {
+                payment_id: 100,
+                amount_cents: 5000,
+            },
+        )
+        .await?;
+    billing_outbox
+        .publish_persisted_in_op(
+            &mut op,
+            PaymentReceived {
+                payment_id: 101,
+                amount_cents: 7500,
+            },
+        )
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let a = accounts.lock().await;
+        let p = payments.lock().await;
+        if a.len() >= 2 && p.len() >= 2 {
+            assert_eq!(*a, vec![(1, "alice".to_string()), (2, "bob".to_string())]);
+            assert_eq!(*p, vec![(100, 5000), (101, 7500)]);
+            break;
+        }
+        drop(a);
+        drop(p);
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let a = accounts.lock().await;
+            let p = payments.lock().await;
+            anyhow::bail!("Timeout: accounts={:?}, payments={:?}", *a, *p);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+// --- Subset-of-variants test: handler does NOT need to handle all enum variants ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Registered {
+    user_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ProfileUpdated {
+    user_id: u64,
+    field: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Deactivated {
+    user_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, obix::OutboxEvent)]
+enum UserLifecycleEvent {
+    Registered(Registered),
+    ProfileUpdated(ProfileUpdated),
+    Deactivated(Deactivated),
+}
+
+const SUBSET_JOB_TYPE: &str = "test-subset-handler";
+
+/// A handler that only handles `Registered` and `Deactivated` events,
+/// deliberately ignoring `ProfileUpdated`. This proves that handlers do NOT
+/// need to handle all variants of an enum — only the subset they register for.
+struct SubsetHandler {
+    registered: Arc<Mutex<Vec<u64>>>,
+    deactivated: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<Registered> for SubsetHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &Registered,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.registered.lock().await.push(event.user_id);
+        Ok(())
+    }
+}
+
+impl OutboxEventHandler<Deactivated> for SubsetHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &Deactivated,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.deactivated.lock().await.push(event.user_id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handler_subscribes_to_subset_of_enum_variants() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, SUBSET_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let outbox = Outbox::<UserLifecycleEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    let deactivated = Arc::new(Mutex::new(Vec::new()));
+
+    let handler = SubsetHandler {
+        registered: registered.clone(),
+        deactivated: deactivated.clone(),
+    };
+
+    // Only register for Registered and Deactivated — NOT ProfileUpdated
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(SUBSET_JOB_TYPE)),
+            handler,
+        )
+        .with_event::<Registered>()
+        .with_event::<Deactivated>()
+        .register()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    // Publish all three variant types — the handler should only receive two
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, Registered { user_id: 1 })
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            ProfileUpdated {
+                user_id: 1,
+                field: "email".into(),
+            },
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, Deactivated { user_id: 2 })
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            ProfileUpdated {
+                user_id: 2,
+                field: "name".into(),
+            },
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, Registered { user_id: 3 })
+        .await?;
+    op.commit().await?;
+
+    // Wait for the handler to receive the Registered and Deactivated events
+    let start = std::time::Instant::now();
+    loop {
+        let r = registered.lock().await;
+        let d = deactivated.lock().await;
+        if r.len() >= 2 && !d.is_empty() {
+            assert_eq!(*r, vec![1, 3]);
+            assert_eq!(*d, vec![2]);
+            break;
+        }
+        drop(r);
+        drop(d);
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let r = registered.lock().await;
+            let d = deactivated.lock().await;
+            anyhow::bail!("Timeout: registered={:?}, deactivated={:?}", *r, *d);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Extra wait to ensure ProfileUpdated events are NOT delivered
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let r = registered.lock().await;
+    let d = deactivated.lock().await;
+    assert_eq!(*r, vec![1, 3], "Should only contain Registered events");
+    assert_eq!(*d, vec![2], "Should only contain Deactivated events");
+
+    Ok(())
+}
