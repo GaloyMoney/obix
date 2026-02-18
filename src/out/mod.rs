@@ -13,7 +13,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::job::{OutboxEventHandler, OutboxEventJobConfig};
-pub use event::OutboxEventMeta;
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;

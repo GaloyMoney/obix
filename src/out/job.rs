@@ -145,26 +145,18 @@ where
                 event = stream.next() => {
                     match event {
                         Some(OutboxEvent::Persistent(ref e)) => {
+                            let mut op = es_entity::DbOp::init_with_clock(
+                                current_job.pool(),
+                                current_job.clock(),
+                            ).await?;
                             if let Some(inner) = e.payload.as_ref().and_then(|p| p.as_event()) {
                                 let meta = OutboxEventMeta::from_persistent(e);
-                                let mut op = es_entity::DbOp::init_with_clock(
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                ).await?;
                                 self.handler.handle(&mut op, inner, meta).await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;
-                                state.sequence = e.sequence;
-                                current_job.update_execution_state_in_op(&mut op, &state).await?;
-                                op.commit().await?;
-                            } else {
-                                let mut op = es_entity::DbOp::init_with_clock(
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                ).await?;
-                                state.sequence = e.sequence;
-                                current_job.update_execution_state_in_op(&mut op, &state).await?;
-                                op.commit().await?;
                             }
+                            state.sequence = e.sequence;
+                            current_job.update_execution_state_in_op(&mut op, &state).await?;
+                            op.commit().await?;
                         }
                         Some(OutboxEvent::Ephemeral(ref e)) => {
                             if let Some(inner) = e.payload.as_event() {
