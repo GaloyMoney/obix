@@ -1336,3 +1336,47 @@ async fn handler_subscribes_to_subset_of_enum_variants() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// --- Duplicate with_event detection test ---
+
+#[tokio::test]
+#[file_serial]
+#[should_panic(expected = "duplicate with_event")]
+async fn duplicate_with_event_panics() {
+    let pool = init_pool().await.unwrap();
+
+    wipeout_outbox_tables(&pool).await.unwrap();
+    wipeout_outbox_job_tables(&pool, "test-dup-detection")
+        .await
+        .unwrap();
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await.unwrap();
+
+    let outbox = Outbox::<MultiEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await
+    .unwrap();
+
+    let handler = MultiHandler {
+        pings: Arc::new(Mutex::new(Vec::new())),
+        pongs: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    // This should panic — PingEvent is registered twice
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new("test-dup-detection")),
+            handler,
+        )
+        .with_event::<PingEvent>()
+        .with_event::<PingEvent>(); // duplicate!
+}
