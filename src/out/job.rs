@@ -388,17 +388,21 @@ where
                         }
                         Some(OutboxEvent::Ephemeral(ref e)) => {
                             let meta = OutboxEventMeta::from_ephemeral(e);
+                            let mut op = es_entity::DbOp::init_with_clock(
+                                current_job.pool(),
+                                current_job.clock(),
+                            )
+                            .await?;
                             for dispatcher in self.dispatchers.iter() {
-                                let mut op = es_entity::DbOp::init_with_clock(
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                ).await?;
-                                if dispatcher.dispatch(&mut op, &e.payload, meta.clone()).await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)? {
-                                    op.commit().await?;
+                                if dispatcher
+                                    .dispatch(&mut op, &e.payload, meta.clone())
+                                    .await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?
+                                {
                                     break;
                                 }
                             }
+                            op.commit().await?;
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
                     }
