@@ -275,15 +275,13 @@ where
                             if let Some(payload) = e.payload.as_ref() {
                                 let meta = OutboxEventMeta::from_persistent(e);
                                 for dispatcher in self.dispatchers.iter() {
-                                    if dispatcher.dispatch(
+                                    dispatcher.dispatch(
                                         current_job.pool(),
                                         current_job.clock(),
                                         payload,
                                         meta.clone(),
                                     ).await
-                                        .map_err(|e| e as Box<dyn std::error::Error>)? {
-                                        break;
-                                    }
+                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
                                 }
                             }
                             state.sequence = e.sequence;
@@ -297,7 +295,7 @@ where
                         Some(OutboxEvent::Ephemeral(ref e)) => {
                             let meta = OutboxEventMeta::from_ephemeral(e);
                             for dispatcher in self.dispatchers.iter() {
-                                if dispatcher
+                                dispatcher
                                     .dispatch(
                                         current_job.pool(),
                                         current_job.clock(),
@@ -305,10 +303,7 @@ where
                                         meta.clone(),
                                     )
                                     .await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?
-                                {
-                                    break;
-                                }
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
                             }
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
