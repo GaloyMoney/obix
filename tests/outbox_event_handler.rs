@@ -686,3 +686,93 @@ async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()
 
     Ok(())
 }
+
+const MULTI_HANDLER_EPHEMERAL_JOB_TYPE: &str = "test-multi-handler-ephemeral";
+
+#[tokio::test]
+#[file_serial]
+async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, MULTI_HANDLER_EPHEMERAL_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let outbox = Outbox::<MultiEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let pings = Arc::new(Mutex::new(Vec::new()));
+    let pongs = Arc::new(Mutex::new(Vec::new()));
+
+    let handler = MultiHandler {
+        pings: pings.clone(),
+        pongs: pongs.clone(),
+    };
+
+    let multi = OutboxMultiEventHandler::new(handler)
+        .with_event::<PingEvent>()
+        .with_event::<PongEvent>();
+
+    outbox
+        .register_multi_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(MULTI_HANDLER_EPHEMERAL_JOB_TYPE)),
+            multi,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    // Give the job time to start and begin listening for ephemeral events
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let event_type = obix::out::EphemeralEventType::new("multi_ephemeral_test");
+    outbox
+        .publish_ephemeral(event_type.clone(), PingEvent(10))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), PongEvent("ephemeral_hello".into()))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), PingEvent(20))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), PongEvent("ephemeral_world".into()))
+        .await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let p = pings.lock().await;
+        let q = pongs.lock().await;
+        if p.len() >= 2 && q.len() >= 2 {
+            assert_eq!(*p, vec![10, 20]);
+            assert_eq!(*q, vec!["ephemeral_hello", "ephemeral_world"]);
+            break;
+        }
+        drop(p);
+        drop(q);
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let p = pings.lock().await;
+            let q = pongs.lock().await;
+            anyhow::bail!(
+                "Timeout waiting for ephemeral multi-events: pings={:?}, pongs={:?}",
+                *p,
+                *q
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
