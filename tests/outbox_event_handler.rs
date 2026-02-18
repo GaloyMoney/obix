@@ -758,9 +758,16 @@ async fn multi_event_handler_receives_ephemeral_events() -> anyhow::Result<()> {
         // Ephemeral events may be delivered more than once (PG NOTIFY + cache_fill
         // paths can both fire), so check that all expected values are present
         // rather than asserting exact counts.
-        if p.contains(&10) && p.contains(&20) && q.iter().any(|s| s == "ephemeral_hello") && q.iter().any(|s| s == "ephemeral_world") {
+        if p.contains(&10)
+            && p.contains(&20)
+            && q.iter().any(|s| s == "ephemeral_hello")
+            && q.iter().any(|s| s == "ephemeral_world")
+        {
             assert!(p.iter().all(|v| *v == 10 || *v == 20));
-            assert!(q.iter().all(|s| s == "ephemeral_hello" || s == "ephemeral_world"));
+            assert!(
+                q.iter()
+                    .all(|s| s == "ephemeral_hello" || s == "ephemeral_world")
+            );
             break;
         }
         drop(p);
