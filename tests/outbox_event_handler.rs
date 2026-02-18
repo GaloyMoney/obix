@@ -2,7 +2,9 @@ mod helpers;
 
 use std::sync::Arc;
 
-use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
+use obix::{
+    MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, OutboxMultiEventHandler, out::Outbox,
+};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
@@ -563,6 +565,121 @@ async fn handler_only_receives_matching_event_variant() -> anyhow::Result<()> {
                 *pings,
                 *pongs
             );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+// --- Multi-event handler test (single handler struct, multiple event types, one job) ---
+
+const MULTI_HANDLER_JOB_TYPE: &str = "test-multi-handler";
+
+struct MultiHandler {
+    pings: Arc<Mutex<Vec<u64>>>,
+    pongs: Arc<Mutex<Vec<String>>>,
+}
+
+impl OutboxEventHandler<PingEvent> for MultiHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &PingEvent,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.pings.lock().await.push(event.0);
+        Ok(())
+    }
+}
+
+impl OutboxEventHandler<PongEvent> for MultiHandler {
+    async fn handle(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &PongEvent,
+        _meta: obix::out::OutboxEventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.pongs.lock().await.push(event.0.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn multi_event_handler_receives_all_matching_events() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, MULTI_HANDLER_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let outbox = Outbox::<MultiEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let pings = Arc::new(Mutex::new(Vec::new()));
+    let pongs = Arc::new(Mutex::new(Vec::new()));
+
+    let handler = MultiHandler {
+        pings: pings.clone(),
+        pongs: pongs.clone(),
+    };
+
+    let multi = OutboxMultiEventHandler::new(handler)
+        .with_event::<PingEvent>()
+        .with_event::<PongEvent>();
+
+    outbox
+        .register_multi_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(MULTI_HANDLER_JOB_TYPE)),
+            multi,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, PingEvent(1))
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, PongEvent("hello".into()))
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, PingEvent(2))
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, PongEvent("world".into()))
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let p = pings.lock().await;
+        let q = pongs.lock().await;
+        if p.len() >= 2 && q.len() >= 2 {
+            assert_eq!(*p, vec![1, 2]);
+            assert_eq!(*q, vec!["hello", "world"]);
+            break;
+        }
+        drop(p);
+        drop(q);
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let p = pings.lock().await;
+            let q = pongs.lock().await;
+            anyhow::bail!("Timeout: pings={:?}, pongs={:?}", *p, *q);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

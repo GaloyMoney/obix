@@ -6,6 +6,7 @@ use crate::sequence::*;
 
 es_entity::entity_id! { OutboxEventId }
 
+#[derive(Clone)]
 pub enum OutboxEventMeta {
     Persistent {
         id: OutboxEventId,
