@@ -72,15 +72,9 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     let mut op = outbox.begin_op().await?;
-    outbox
-        .publish_persisted_in_op(&mut op, Ping(1))
-        .await?;
-    outbox
-        .publish_persisted_in_op(&mut op, Ping(2))
-        .await?;
-    outbox
-        .publish_persisted_in_op(&mut op, Ping(3))
-        .await?;
+    outbox.publish_persisted_in_op(&mut op, Ping(1)).await?;
+    outbox.publish_persisted_in_op(&mut op, Ping(2)).await?;
+    outbox.publish_persisted_in_op(&mut op, Ping(3)).await?;
     op.commit().await?;
 
     let start = std::time::Instant::now();
@@ -226,12 +220,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         jobs.start_poll().await?;
 
         let mut op = outbox.begin_op().await?;
-        outbox
-            .publish_persisted_in_op(&mut op, Ping(10))
-            .await?;
-        outbox
-            .publish_persisted_in_op(&mut op, Ping(20))
-            .await?;
+        outbox.publish_persisted_in_op(&mut op, Ping(10)).await?;
+        outbox.publish_persisted_in_op(&mut op, Ping(20)).await?;
         op.commit().await?;
 
         let start = std::time::Instant::now();
@@ -282,9 +272,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         jobs.start_poll().await?;
 
         let mut op = outbox.begin_op().await?;
-        outbox
-            .publish_persisted_in_op(&mut op, Ping(30))
-            .await?;
+        outbox.publish_persisted_in_op(&mut op, Ping(30)).await?;
         op.commit().await?;
 
         let start = std::time::Instant::now();
