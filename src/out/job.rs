@@ -134,6 +134,194 @@ impl<'a> EventHandlerContext<'a> {
     {
         self.jobs.add_initializer(initializer)
     }
+
+    /// Register a [`CommandJob`] and return a [`CommandJobSpawner`] for it.
+    ///
+    /// This is the ergonomic way to wire up command jobs. The returned spawner
+    /// provides [`spawn_for_event`](CommandJobSpawner::spawn_for_event) which
+    /// derives deterministic job IDs from event IDs.
+    pub fn add_command_job<C, P, Tables>(
+        &mut self,
+        outbox: &Outbox<P, Tables>,
+        command: C,
+    ) -> CommandJobSpawner<C::Config>
+    where
+        C: CommandJob<P, Tables>,
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables,
+    {
+        let initializer = CommandJobInitializer::new(outbox.clone(), command);
+        let spawner = self.add_initializer(initializer);
+        CommandJobSpawner::new(spawner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command Job abstraction
+// ---------------------------------------------------------------------------
+
+/// A one-time command job spawned by event handlers.
+///
+/// Command jobs do atomic work within a database transaction and can
+/// publish outbox events as part of that transaction. The framework
+/// handles transaction lifecycle — it begins a `DbOp`, passes it to
+/// `run`, and commits on success via `JobCompletion::CompleteWithOp`.
+#[async_trait]
+pub trait CommandJob<P, Tables>: Send + Sync + 'static
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    /// The configuration/payload type for this command job.
+    type Config: Serialize + DeserializeOwned + Send + Sync + 'static;
+
+    /// The job type identifier for this command.
+    fn job_type() -> JobType;
+
+    /// Execute the command within a database transaction.
+    ///
+    /// The `op` is committed by the framework after `run` returns `Ok(())`.
+    /// Use `outbox.publish_persisted_in_op(op, event)` to publish events
+    /// atomically with the command's work.
+    async fn run(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        outbox: &Outbox<P, Tables>,
+        config: &Self::Config,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Auto-generated [`JobInitializer`] wrapper for a [`CommandJob`].
+///
+/// Created automatically by [`EventHandlerContext::add_command_job`].
+/// You can also construct one manually and pass it to
+/// [`EventHandlerContext::add_initializer`].
+pub struct CommandJobInitializer<C, P, Tables>
+where
+    C: CommandJob<P, Tables>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    outbox: Outbox<P, Tables>,
+    command: Arc<C>,
+}
+
+impl<C, P, Tables> CommandJobInitializer<C, P, Tables>
+where
+    C: CommandJob<P, Tables>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    pub fn new(outbox: Outbox<P, Tables>, command: C) -> Self {
+        Self {
+            outbox,
+            command: Arc::new(command),
+        }
+    }
+}
+
+impl<C, P, Tables> JobInitializer for CommandJobInitializer<C, P, Tables>
+where
+    C: CommandJob<P, Tables>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    type Config = C::Config;
+
+    fn job_type(&self) -> JobType {
+        C::job_type()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: C::Config = job.config()?;
+        Ok(Box::new(CommandJobRunnerInner {
+            outbox: self.outbox.clone(),
+            command: self.command.clone(),
+            config,
+        }))
+    }
+}
+
+struct CommandJobRunnerInner<C, P, Tables>
+where
+    C: CommandJob<P, Tables>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    outbox: Outbox<P, Tables>,
+    command: Arc<C>,
+    config: C::Config,
+}
+
+#[async_trait]
+impl<C, P, Tables> JobRunner for CommandJobRunnerInner<C, P, Tables>
+where
+    C: CommandJob<P, Tables>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let mut op = es_entity::DbOp::init_with_clock(
+            current_job.pool(),
+            current_job.clock(),
+        )
+        .await?;
+        self.command
+            .run(&mut op, &self.outbox, &self.config)
+            .await
+            .map_err(|e| e as Box<dyn std::error::Error>)?;
+        op.commit().await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// A spawner for command jobs that derives deterministic job IDs from events.
+///
+/// Wraps a [`JobSpawner`] and provides [`spawn_for_event`](Self::spawn_for_event)
+/// which derives the job ID from the event ID, ensuring replay-safe spawning.
+#[derive(Clone)]
+pub struct CommandJobSpawner<Config> {
+    inner: JobSpawner<Config>,
+}
+
+impl<Config> CommandJobSpawner<Config>
+where
+    Config: Serialize + Send + Sync + 'static,
+{
+    pub fn new(inner: JobSpawner<Config>) -> Self {
+        Self { inner }
+    }
+
+    /// Spawn a command job for the given event.
+    ///
+    /// The job ID is deterministically derived from the event ID, ensuring
+    /// that replaying the same event does not create duplicate jobs.
+    ///
+    /// This method is idempotent: if a job with the derived ID already exists,
+    /// it returns `Ok(())`.
+    pub async fn spawn_for_event<P>(
+        &self,
+        event: &PersistentOutboxEvent<P>,
+        config: Config,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        let job_id =
+            job::JobId::from(es_entity::prelude::uuid::Uuid::from(event.id));
+        match self.inner.spawn(job_id, config).await {
+            Ok(_) => Ok(()),
+            Err(job::error::JobError::DuplicateId) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 struct OutboxEventJobRunner<H, P, Tables>

@@ -12,7 +12,10 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
 
-pub use self::job::{EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig};
+pub use self::job::{
+    CommandJob, CommandJobInitializer, CommandJobSpawner, EventHandlerContext, OutboxEventHandler,
+    OutboxEventJobConfig,
+};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
