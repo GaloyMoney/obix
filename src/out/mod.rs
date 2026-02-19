@@ -13,7 +13,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::job::{
-    CommandJobSpawner, EventHandlerRegistration, OutboxEventHandler, OutboxEventJobConfig,
+    EventHandlerContext, EventHandlerRegistration, OutboxEventHandler, OutboxEventJobConfig,
 };
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -208,6 +208,44 @@ where
     where
         H: Send + Sync + 'static,
     {
+        EventHandlerRegistration::new(self.clone(), jobs, config, handler)
+    }
+
+    /// Register an event handler constructed via a closure that receives an
+    /// [`EventHandlerContext`] for registering downstream job initializers.
+    ///
+    /// This is the recommended way to register handlers that spawn downstream
+    /// jobs. The closure registers initializers via the context (which returns
+    /// concrete [`job::JobSpawner<T>`] values), then returns the handler struct
+    /// with those spawners stored as fields.
+    ///
+    /// For simple handlers that don't spawn jobs, use
+    /// [`register_event_handler`](Self::register_event_handler) instead.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// outbox.register_event_handler_with(&mut jobs, config, |ctx| {
+    ///     let spawner = ctx.add_initializer(MyJobInitializer { ... });
+    ///     MyHandler { spawner }
+    /// })
+    /// .with_event::<MyEvent>()
+    /// .register()
+    /// .await?;
+    /// ```
+    pub fn register_event_handler_with<'a, H, F>(
+        &self,
+        jobs: &'a mut ::job::Jobs,
+        config: OutboxEventJobConfig,
+        build: F,
+    ) -> EventHandlerRegistration<'a, H, P, Tables>
+    where
+        H: Send + Sync + 'static,
+        F: FnOnce(&mut EventHandlerContext<'_>) -> H,
+    {
+        let mut ctx = EventHandlerContext::new(jobs);
+        let handler = build(&mut ctx);
+        let jobs = ctx.into_jobs();
         EventHandlerRegistration::new(self.clone(), jobs, config, handler)
     }
 }

@@ -34,7 +34,6 @@ impl OutboxEventHandler<Ping> for TestHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Ping,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -109,7 +108,6 @@ impl OutboxEventHandler<EphemeralPing> for EphemeralTestHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &EphemeralPing,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -293,7 +291,6 @@ impl OutboxEventHandler<MixedPersist> for MixedPersistHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &MixedPersist,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -310,7 +307,6 @@ impl OutboxEventHandler<MixedEphemeral> for MixedEphemeralHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &MixedEphemeral,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -420,7 +416,6 @@ impl OutboxEventHandler<PingEvent> for PingHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PingEvent,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -437,7 +432,6 @@ impl OutboxEventHandler<PongEvent> for PongHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PongEvent,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0.clone());
         Ok(())
@@ -534,7 +528,6 @@ impl OutboxEventHandler<PingEvent> for MultiHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PingEvent,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.pings.lock().await.push(event.0);
         Ok(())
@@ -547,7 +540,6 @@ impl OutboxEventHandler<PongEvent> for MultiHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PongEvent,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.pongs.lock().await.push(event.0.clone());
         Ok(())
@@ -658,7 +650,6 @@ impl OutboxEventHandler<UserCreated> for CrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &UserCreated,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.users
             .lock()
@@ -674,7 +665,6 @@ impl OutboxEventHandler<InvoicePaid> for CrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &InvoicePaid,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.invoices
             .lock()
@@ -902,7 +892,6 @@ impl OutboxEventHandler<AccountCreated> for TrueCrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &AccountCreated,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.accounts
             .lock()
@@ -918,7 +907,6 @@ impl OutboxEventHandler<PaymentReceived> for TrueCrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PaymentReceived,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.payments
             .lock()
@@ -1091,7 +1079,6 @@ impl OutboxEventHandler<Registered> for SubsetHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Registered,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.registered.lock().await.push(event.user_id);
         Ok(())
@@ -1104,7 +1091,6 @@ impl OutboxEventHandler<Deactivated> for SubsetHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Deactivated,
         _meta: obix::out::OutboxEventMeta,
-        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.deactivated.lock().await.push(event.user_id);
         Ok(())
@@ -1224,7 +1210,7 @@ async fn duplicate_with_event_panics() {
     };
 
     // This should panic — PingEvent is registered twice
-    outbox
+    let _ = outbox
         .register_event_handler(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new("test-dup-detection")),
@@ -1234,7 +1220,7 @@ async fn duplicate_with_event_panics() {
         .with_event::<PingEvent>(); // duplicate!
 }
 
-// --- Handler spawns downstream job via CommandJobSpawner ---
+// --- Handler spawns downstream job via constructor-injected JobSpawner ---
 
 const SPAWNING_HANDLER_JOB_TYPE: &str = "test-spawning-handler";
 const DOWNSTREAM_JOB_TYPE: &str = "test-downstream-command";
@@ -1288,7 +1274,11 @@ impl job::JobRunner for SendNotificationRunner {
     }
 }
 
-struct SpawningHandler;
+/// Handler with a `JobSpawner<SendNotificationConfig>` field, injected at
+/// registration time via the closure pattern.
+struct SpawningHandler {
+    notify: job::JobSpawner<SendNotificationConfig>,
+}
 
 impl OutboxEventHandler<Ping> for SpawningHandler {
     async fn handle(
@@ -1296,9 +1286,8 @@ impl OutboxEventHandler<Ping> for SpawningHandler {
         op: &mut es_entity::DbOp<'_>,
         event: &Ping,
         _meta: obix::out::OutboxEventMeta,
-        spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        spawner
+        self.notify
             .spawn_in_op(
                 op,
                 job::JobId::new(),
@@ -1325,12 +1314,15 @@ async fn handler_spawns_downstream_job_via_spawner() -> anyhow::Result<()> {
     let sent = Arc::new(Mutex::new(Vec::new()));
 
     outbox
-        .register_event_handler(
+        .register_event_handler_with(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(SPAWNING_HANDLER_JOB_TYPE)),
-            SpawningHandler,
+            |ctx| {
+                let notify =
+                    ctx.add_initializer(SendNotificationInitializer { sent: sent.clone() });
+                SpawningHandler { notify }
+            },
         )
-        .with_job_initializer(SendNotificationInitializer { sent: sent.clone() })
         .with_event::<Ping>()
         .register()
         .await
