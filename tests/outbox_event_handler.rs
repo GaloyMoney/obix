@@ -386,23 +386,25 @@ enum OrderEvent {
     OrderShipped { order_id: u64 },
 }
 
-const FULFILLMENT_HANDLER_JOB_TYPE: &str = "fulfillment-handler";
-const FULFILL_ORDER_JOB_TYPE: &str = "fulfill-order";
+// -- Order placed handler: spawns a downstream job from an event --
+
+const ORDER_PLACED_HANDLER_JOB_TYPE: &str = "order-placed-handler";
+const SEND_INVOICE_JOB_TYPE: &str = "send-invoice";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FulfillOrderConfig {
+struct SendInvoiceConfig {
     order_id: u64,
 }
 
-struct FulfillOrderInitializer {
-    fulfilled: Arc<Mutex<Vec<u64>>>,
+struct SendInvoiceInitializer {
+    results: Arc<Mutex<Vec<u64>>>,
 }
 
-impl job::JobInitializer for FulfillOrderInitializer {
-    type Config = FulfillOrderConfig;
+impl job::JobInitializer for SendInvoiceInitializer {
+    type Config = SendInvoiceConfig;
 
     fn job_type(&self) -> job::JobType {
-        job::JobType::new(FULFILL_ORDER_JOB_TYPE)
+        job::JobType::new(SEND_INVOICE_JOB_TYPE)
     }
 
     fn init(
@@ -410,35 +412,35 @@ impl job::JobInitializer for FulfillOrderInitializer {
         job: &job::Job,
         _: job::JobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
-        let config: FulfillOrderConfig = job.config()?;
-        Ok(Box::new(FulfillOrderRunner {
+        let config: SendInvoiceConfig = job.config()?;
+        Ok(Box::new(SendInvoiceRunner {
             order_id: config.order_id,
-            fulfilled: self.fulfilled.clone(),
+            results: self.results.clone(),
         }))
     }
 }
 
-struct FulfillOrderRunner {
+struct SendInvoiceRunner {
     order_id: u64,
-    fulfilled: Arc<Mutex<Vec<u64>>>,
+    results: Arc<Mutex<Vec<u64>>>,
 }
 
 #[async_trait]
-impl job::JobRunner for FulfillOrderRunner {
+impl job::JobRunner for SendInvoiceRunner {
     async fn run(
         &self,
         _current_job: job::CurrentJob,
     ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
-        self.fulfilled.lock().await.push(self.order_id);
+        self.results.lock().await.push(self.order_id);
         Ok(job::JobCompletion::Complete)
     }
 }
 
-struct OrderFulfillmentHandler {
-    spawner: job::JobSpawner<FulfillOrderConfig>,
+struct OrderPlacedEventHandler {
+    spawner: job::JobSpawner<SendInvoiceConfig>,
 }
 
-impl OutboxEventHandler<OrderEvent> for OrderFulfillmentHandler {
+impl OutboxEventHandler<OrderEvent> for OrderPlacedEventHandler {
     async fn handle_persistent(
         &self,
         op: &mut es_entity::DbOp<'_>,
@@ -449,7 +451,7 @@ impl OutboxEventHandler<OrderEvent> for OrderFulfillmentHandler {
                 .spawn_in_op(
                     op,
                     job::JobId::new(),
-                    FulfillOrderConfig {
+                    SendInvoiceConfig {
                         order_id: *order_id,
                     },
                 )
@@ -461,12 +463,12 @@ impl OutboxEventHandler<OrderEvent> for OrderFulfillmentHandler {
 
 #[tokio::test]
 #[file_serial]
-async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
+async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     wipeout_outbox_tables(&pool).await?;
-    wipeout_outbox_job_tables(&pool, FULFILLMENT_HANDLER_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, FULFILL_ORDER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, ORDER_PLACED_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, SEND_INVOICE_JOB_TYPE).await?;
 
     let job_config = job::JobSvcConfig::builder()
         .pool(pool.clone())
@@ -474,7 +476,7 @@ async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let fulfilled = Arc::new(Mutex::new(Vec::new()));
+    let results = Arc::new(Mutex::new(Vec::new()));
 
     let outbox = Outbox::<OrderEvent, TestTables>::init(
         &pool,
@@ -484,16 +486,16 @@ async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
     )
     .await?;
 
-    let fulfilled_clone = fulfilled.clone();
+    let results_clone = results.clone();
     outbox
         .register_event_handler_with_context(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(FULFILLMENT_HANDLER_JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(ORDER_PLACED_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_initializer(FulfillOrderInitializer {
-                    fulfilled: fulfilled_clone,
+                let spawner = ctx.add_initializer(SendInvoiceInitializer {
+                    results: results_clone,
                 });
-                OrderFulfillmentHandler { spawner }
+                OrderPlacedEventHandler { spawner }
             },
         )
         .await
@@ -509,7 +511,7 @@ async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
 
     let start = std::time::Instant::now();
     loop {
-        let values = fulfilled.lock().await;
+        let values = results.lock().await;
         if !values.is_empty() {
             assert_eq!(*values, vec![99]);
             break;
@@ -716,31 +718,31 @@ async fn event_chain_handler_to_job_to_handler() -> anyhow::Result<()> {
 // Command Job round-trip test
 // ---------------------------------------------------------------------------
 
-const CMD_HANDLER_JOB_TYPE: &str = "test-cmd-handler";
-const PROCESS_CMD_JOB_TYPE: &str = "process-command";
-const CMD_OBSERVER_JOB_TYPE: &str = "test-cmd-observer";
+const CUSTOMER_CREATED_HANDLER_JOB_TYPE: &str = "customer-created-handler";
+const SEND_WELCOME_EMAIL_JOB_TYPE: &str = "send-welcome-email";
+const WELCOME_EMAIL_OBSERVER_JOB_TYPE: &str = "welcome-email-observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProcessCommandConfig {
+struct SendWelcomeEmailConfig {
     value: u64,
 }
 
-struct ProcessCommand {
+struct SendWelcomeEmailCommandJob {
     outbox: Outbox<TestEvent, TestTables>,
 }
 
 #[async_trait]
-impl CommandJob for ProcessCommand {
-    type Config = ProcessCommandConfig;
+impl CommandJob for SendWelcomeEmailCommandJob {
+    type Config = SendWelcomeEmailConfig;
 
     fn job_type() -> job::JobType {
-        job::JobType::new(PROCESS_CMD_JOB_TYPE)
+        job::JobType::new(SEND_WELCOME_EMAIL_JOB_TYPE)
     }
 
     async fn run(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        config: &ProcessCommandConfig,
+        config: &SendWelcomeEmailConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.outbox
             .publish_persisted_in_op(op, TestEvent::Ping(config.value * 10))
@@ -749,11 +751,11 @@ impl CommandJob for ProcessCommand {
     }
 }
 
-struct CommandSpawnerHandler {
-    spawner: CommandJobSpawner<ProcessCommandConfig>,
+struct CustomerCreatedOutboxEventHandler {
+    spawner: CommandJobSpawner<SendWelcomeEmailConfig>,
 }
 
-impl OutboxEventHandler<TestEvent> for CommandSpawnerHandler {
+impl OutboxEventHandler<TestEvent> for CustomerCreatedOutboxEventHandler {
     async fn handle_persistent(
         &self,
         _op: &mut es_entity::DbOp<'_>,
@@ -763,11 +765,11 @@ impl OutboxEventHandler<TestEvent> for CommandSpawnerHandler {
             // Only spawn command jobs for "trigger" events (< 100) to avoid infinite chain
             if *n < 100 {
                 self.spawner
-                    .spawn_for_event(event, ProcessCommandConfig { value: *n })
+                    .spawn_for_event(event, SendWelcomeEmailConfig { value: *n })
                     .await?;
                 // Call again to verify idempotency — should be a no-op (DuplicateId)
                 self.spawner
-                    .spawn_for_event(event, ProcessCommandConfig { value: *n })
+                    .spawn_for_event(event, SendWelcomeEmailConfig { value: *n })
                     .await?;
             }
         }
@@ -781,9 +783,9 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     wipeout_outbox_tables(&pool).await?;
-    wipeout_outbox_job_tables(&pool, CMD_HANDLER_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, PROCESS_CMD_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, CMD_OBSERVER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, CUSTOMER_CREATED_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, SEND_WELCOME_EMAIL_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, WELCOME_EMAIL_OBSERVER_JOB_TYPE).await?;
 
     let job_config = job::JobSvcConfig::builder()
         .pool(pool.clone())
@@ -801,12 +803,12 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
 
     // Register the command-spawning handler
     outbox
-        .register_event_handler_with::<CommandSpawnerHandler>(
+        .register_event_handler_with(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(CMD_HANDLER_JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_command_job_from(|outbox| ProcessCommand { outbox });
-                CommandSpawnerHandler { spawner }
+                let spawner = ctx.add_command_job_from(|outbox| SendWelcomeEmailCommandJob { outbox });
+                CustomerCreatedOutboxEventHandler { spawner }
             },
         )
         .await
@@ -817,7 +819,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(CMD_OBSERVER_JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(WELCOME_EMAIL_OBSERVER_JOB_TYPE)),
             TestPersistentHandler {
                 received: observed.clone(),
             },
