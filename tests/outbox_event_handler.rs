@@ -3,7 +3,10 @@ mod helpers;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
+use obix::{
+    CommandJob, CommandJobSpawner, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    out::Outbox,
+};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
@@ -705,6 +708,166 @@ async fn event_chain_handler_to_job_to_handler() -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Command Job round-trip test
+// ---------------------------------------------------------------------------
+
+const CMD_HANDLER_JOB_TYPE: &str = "test-cmd-handler";
+const PROCESS_CMD_JOB_TYPE: &str = "process-command";
+const CMD_OBSERVER_JOB_TYPE: &str = "test-cmd-observer";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcessCommandConfig {
+    value: u64,
+}
+
+struct ProcessCommand;
+
+#[async_trait]
+impl CommandJob<TestEvent, TestTables> for ProcessCommand {
+    type Config = ProcessCommandConfig;
+
+    fn job_type() -> job::JobType {
+        job::JobType::new(PROCESS_CMD_JOB_TYPE)
+    }
+
+    async fn run(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        outbox: &Outbox<TestEvent, TestTables>,
+        config: &ProcessCommandConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        outbox
+            .publish_persisted_in_op(op, TestEvent::Ping(config.value * 10))
+            .await?;
+        Ok(())
+    }
+}
+
+struct CommandSpawnerHandler {
+    spawner: CommandJobSpawner<ProcessCommandConfig>,
+}
+
+impl OutboxEventHandler<TestEvent> for CommandSpawnerHandler {
+    async fn handle_persistent(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            // Only spawn command jobs for "trigger" events (< 100) to avoid infinite chain
+            if *n < 100 {
+                self.spawner
+                    .spawn_for_event(event, ProcessCommandConfig { value: *n })
+                    .await?;
+                // Call again to verify idempotency — should be a no-op (DuplicateId)
+                self.spawner
+                    .spawn_for_event(event, ProcessCommandConfig { value: *n })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn command_job_round_trip() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, CMD_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, PROCESS_CMD_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, CMD_OBSERVER_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    // Register the command-spawning handler
+    let outbox_for_cmd = outbox.clone();
+    outbox
+        .register_event_handler_with::<CommandSpawnerHandler, _>(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(CMD_HANDLER_JOB_TYPE)),
+            |ctx| {
+                let spawner = ctx.add_command_job(&outbox_for_cmd, ProcessCommand);
+                CommandSpawnerHandler { spawner }
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Register an observer handler to capture all persistent events
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(CMD_OBSERVER_JOB_TYPE)),
+            TestPersistentHandler {
+                received: observed.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    // Publish trigger event: Ping(42)
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(42))
+        .await?;
+    op.commit().await?;
+
+    // Wait for the downstream event (420 = 42 * 10) published by the command job
+    let start = std::time::Instant::now();
+    loop {
+        let values = observed.lock().await;
+        if values.contains(&420) {
+            break;
+        }
+        drop(values);
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            let values = observed.lock().await;
+            anyhow::bail!(
+                "Timeout waiting for command job downstream event. Observed: {:?}",
+                *values
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Verify: observer should have seen both the trigger (42) and downstream (420)
+    let values = observed.lock().await;
+    assert!(
+        values.contains(&42),
+        "Should have observed trigger event"
+    );
+    assert!(
+        values.contains(&420),
+        "Should have observed downstream event from command job"
+    );
+    // Verify no duplicate downstream events (dedup via deterministic job ID)
+    assert_eq!(
+        values.iter().filter(|&&v| v == 420).count(),
+        1,
+        "Downstream event should appear exactly once (dedup test)"
+    );
 
     Ok(())
 }

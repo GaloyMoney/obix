@@ -165,7 +165,7 @@ impl<'a> EventHandlerContext<'a> {
 /// Command jobs do atomic work within a database transaction and can
 /// publish outbox events as part of that transaction. The framework
 /// handles transaction lifecycle — it begins a `DbOp`, passes it to
-/// `run`, and commits on success via `JobCompletion::CompleteWithOp`.
+/// `run`, commits the `DbOp`, and returns `JobCompletion::Complete`.
 #[async_trait]
 pub trait CommandJob<P, Tables>: Send + Sync + 'static
 where
