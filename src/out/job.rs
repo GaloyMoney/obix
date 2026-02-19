@@ -140,17 +140,14 @@ impl<'a> EventHandlerContext<'a> {
     /// This is the ergonomic way to wire up command jobs. The returned spawner
     /// provides [`spawn_for_event`](CommandJobSpawner::spawn_for_event) which
     /// derives deterministic job IDs from event IDs.
-    pub fn add_command_job<C, P, Tables>(
+    ///
+    /// The command struct itself holds whatever outboxes or other dependencies
+    /// it needs — construct it before calling this method.
+    pub fn add_command_job<C: CommandJob>(
         &mut self,
-        outbox: &Outbox<P, Tables>,
         command: C,
-    ) -> CommandJobSpawner<C::Config>
-    where
-        C: CommandJob<P, Tables>,
-        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-        Tables: MailboxTables,
-    {
-        let initializer = CommandJobInitializer::new(outbox.clone(), command);
+    ) -> CommandJobSpawner<C::Config> {
+        let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
         CommandJobSpawner::new(spawner)
     }
@@ -166,12 +163,12 @@ impl<'a> EventHandlerContext<'a> {
 /// publish outbox events as part of that transaction. The framework
 /// handles transaction lifecycle — it begins a `DbOp`, passes it to
 /// `run`, commits the `DbOp`, and returns `JobCompletion::Complete`.
+///
+/// The command struct itself holds whatever outboxes (or other deps) it
+/// needs, injected at construction time. This makes command jobs
+/// outbox-agnostic — a single command can publish to multiple outboxes.
 #[async_trait]
-pub trait CommandJob<P, Tables>: Send + Sync + 'static
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
-{
+pub trait CommandJob: Send + Sync + 'static {
     /// The configuration/payload type for this command job.
     type Config: Serialize + DeserializeOwned + Send + Sync + 'static;
 
@@ -186,7 +183,6 @@ where
     async fn run(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        outbox: &Outbox<P, Tables>,
         config: &Self::Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -196,35 +192,27 @@ where
 /// Created automatically by [`EventHandlerContext::add_command_job`].
 /// You can also construct one manually and pass it to
 /// [`EventHandlerContext::add_initializer`].
-pub struct CommandJobInitializer<C, P, Tables>
+pub struct CommandJobInitializer<C>
 where
-    C: CommandJob<P, Tables>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
+    C: CommandJob,
 {
-    outbox: Outbox<P, Tables>,
     command: Arc<C>,
 }
 
-impl<C, P, Tables> CommandJobInitializer<C, P, Tables>
+impl<C> CommandJobInitializer<C>
 where
-    C: CommandJob<P, Tables>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
+    C: CommandJob,
 {
-    pub fn new(outbox: Outbox<P, Tables>, command: C) -> Self {
+    pub fn new(command: C) -> Self {
         Self {
-            outbox,
             command: Arc::new(command),
         }
     }
 }
 
-impl<C, P, Tables> JobInitializer for CommandJobInitializer<C, P, Tables>
+impl<C> JobInitializer for CommandJobInitializer<C>
 where
-    C: CommandJob<P, Tables>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
+    C: CommandJob,
 {
     type Config = C::Config;
 
@@ -239,30 +227,24 @@ where
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: C::Config = job.config()?;
         Ok(Box::new(CommandJobRunnerInner {
-            outbox: self.outbox.clone(),
             command: self.command.clone(),
             config,
         }))
     }
 }
 
-struct CommandJobRunnerInner<C, P, Tables>
+struct CommandJobRunnerInner<C>
 where
-    C: CommandJob<P, Tables>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
+    C: CommandJob,
 {
-    outbox: Outbox<P, Tables>,
     command: Arc<C>,
     config: C::Config,
 }
 
 #[async_trait]
-impl<C, P, Tables> JobRunner for CommandJobRunnerInner<C, P, Tables>
+impl<C> JobRunner for CommandJobRunnerInner<C>
 where
-    C: CommandJob<P, Tables>,
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
+    C: CommandJob,
 {
     async fn run(
         &self,
@@ -274,7 +256,7 @@ where
         )
         .await?;
         self.command
-            .run(&mut op, &self.outbox, &self.config)
+            .run(&mut op, &self.config)
             .await
             .map_err(|e| e as Box<dyn std::error::Error>)?;
         op.commit().await?;

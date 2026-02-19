@@ -725,10 +725,12 @@ struct ProcessCommandConfig {
     value: u64,
 }
 
-struct ProcessCommand;
+struct ProcessCommand {
+    outbox: Outbox<TestEvent, TestTables>,
+}
 
 #[async_trait]
-impl CommandJob<TestEvent, TestTables> for ProcessCommand {
+impl CommandJob for ProcessCommand {
     type Config = ProcessCommandConfig;
 
     fn job_type() -> job::JobType {
@@ -738,10 +740,9 @@ impl CommandJob<TestEvent, TestTables> for ProcessCommand {
     async fn run(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        outbox: &Outbox<TestEvent, TestTables>,
         config: &ProcessCommandConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        outbox
+        self.outbox
             .publish_persisted_in_op(op, TestEvent::Ping(config.value * 10))
             .await?;
         Ok(())
@@ -805,7 +806,9 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(CMD_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_command_job(&outbox_for_cmd, ProcessCommand);
+                let spawner = ctx.add_command_job(ProcessCommand {
+                    outbox: outbox_for_cmd,
+                });
                 CommandSpawnerHandler { spawner }
             },
         )
