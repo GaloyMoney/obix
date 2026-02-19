@@ -118,6 +118,28 @@ where
     }
 }
 
+pub struct EventHandlerContext<'a> {
+    jobs: &'a mut ::job::Jobs,
+}
+
+impl<'a> EventHandlerContext<'a> {
+    pub(super) fn new(jobs: &'a mut ::job::Jobs) -> Self {
+        Self { jobs }
+    }
+
+    pub fn add_initializer<I>(&mut self, initializer: I) -> JobSpawner<I::Config>
+    where
+        I: JobInitializer,
+        I::Config: Send + Sync + 'static,
+    {
+        self.jobs.add_initializer(initializer)
+    }
+
+    pub(super) fn into_jobs(self) -> &'a mut ::job::Jobs {
+        self.jobs
+    }
+}
+
 struct OutboxEventJobRunner<H, P, Tables>
 where
     H: OutboxEventHandler<P>,

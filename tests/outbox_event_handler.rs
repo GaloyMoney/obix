@@ -2,6 +2,7 @@ mod helpers;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -369,6 +370,138 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
         drop(e);
         if start.elapsed() > std::time::Duration::from_secs(5) {
             anyhow::bail!("Timeout waiting for both event types");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+const SPAWNER_HANDLER_JOB_TYPE: &str = "test-spawner-handler";
+const NOTIFICATION_JOB_TYPE: &str = "send-notification";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SendNotificationConfig {
+    value: u64,
+}
+
+struct SendNotificationInitializer {
+    results: Arc<Mutex<Vec<u64>>>,
+}
+
+impl job::JobInitializer for SendNotificationInitializer {
+    type Config = SendNotificationConfig;
+
+    fn job_type(&self) -> job::JobType {
+        job::JobType::new(NOTIFICATION_JOB_TYPE)
+    }
+
+    fn init(
+        &self,
+        job: &job::Job,
+        _: job::JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
+        let config: SendNotificationConfig = job.config()?;
+        Ok(Box::new(SendNotificationRunner {
+            value: config.value,
+            results: self.results.clone(),
+        }))
+    }
+}
+
+struct SendNotificationRunner {
+    value: u64,
+    results: Arc<Mutex<Vec<u64>>>,
+}
+
+#[async_trait]
+impl job::JobRunner for SendNotificationRunner {
+    async fn run(
+        &self,
+        _current_job: job::CurrentJob,
+    ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
+        self.results.lock().await.push(self.value);
+        Ok(job::JobCompletion::Complete)
+    }
+}
+
+struct SpawnerHandler {
+    spawner: job::JobSpawner<SendNotificationConfig>,
+}
+
+impl OutboxEventHandler<TestEvent> for SpawnerHandler {
+    async fn handle_persistent(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.spawner
+                .spawn_in_op(op, job::JobId::new(), SendNotificationConfig { value: *n })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, SPAWNER_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, NOTIFICATION_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let results_clone = results.clone();
+    outbox
+        .register_event_handler_with::<SpawnerHandler, _>(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(SPAWNER_HANDLER_JOB_TYPE)),
+            |ctx| {
+                let spawner = ctx.add_initializer(SendNotificationInitializer {
+                    results: results_clone,
+                });
+                SpawnerHandler { spawner }
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(99))
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let values = results.lock().await;
+        if !values.is_empty() {
+            assert_eq!(*values, vec![99]);
+            break;
+        }
+        drop(values);
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            anyhow::bail!("Timeout waiting for downstream job to execute");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
