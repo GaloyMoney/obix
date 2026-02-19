@@ -192,15 +192,14 @@ where
         Ok(())
     }
 
-    pub async fn register_event_handler_with<H, F>(
+    pub async fn register_event_handler_with<H>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
-        build: F,
+        build: impl FnOnce(&mut EventHandlerContext<'_>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
-        F: FnOnce(&mut EventHandlerContext<'_>) -> H,
     {
         let mut ctx = EventHandlerContext::new(jobs);
         let handler = build(&mut ctx);
