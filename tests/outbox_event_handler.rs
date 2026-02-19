@@ -3,6 +3,7 @@ mod helpers;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use obix::{MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -1231,4 +1232,131 @@ async fn duplicate_with_event_panics() {
         )
         .with_event::<PingEvent>()
         .with_event::<PingEvent>(); // duplicate!
+}
+
+// --- Handler spawns downstream job via CommandJobSpawner ---
+
+const SPAWNING_HANDLER_JOB_TYPE: &str = "test-spawning-handler";
+const DOWNSTREAM_JOB_TYPE: &str = "test-downstream-command";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SendNotificationConfig {
+    user_id: u64,
+    message: String,
+}
+
+struct SendNotificationInitializer {
+    sent: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl job::JobInitializer for SendNotificationInitializer {
+    type Config = SendNotificationConfig;
+
+    fn job_type(&self) -> job::JobType {
+        job::JobType::new(DOWNSTREAM_JOB_TYPE)
+    }
+
+    fn init(
+        &self,
+        job: &job::Job,
+        _spawner: job::JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
+        let config: SendNotificationConfig = job.config()?;
+        Ok(Box::new(SendNotificationRunner {
+            config,
+            sent: self.sent.clone(),
+        }))
+    }
+}
+
+struct SendNotificationRunner {
+    config: SendNotificationConfig,
+    sent: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+#[async_trait]
+impl job::JobRunner for SendNotificationRunner {
+    async fn run(
+        &self,
+        _current_job: job::CurrentJob,
+    ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
+        self.sent
+            .lock()
+            .await
+            .push((self.config.user_id, self.config.message.clone()));
+        Ok(job::JobCompletion::Complete)
+    }
+}
+
+struct SpawningHandler;
+
+impl OutboxEventHandler<Ping> for SpawningHandler {
+    async fn handle(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        event: &Ping,
+        _meta: obix::out::OutboxEventMeta,
+        spawner: &obix::CommandJobSpawner,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        spawner
+            .spawn_in_op(
+                op,
+                job::JobId::new(),
+                SendNotificationConfig {
+                    user_id: event.0,
+                    message: format!("ping received: {}", event.0),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handler_spawns_downstream_job_via_spawner() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipeout_outbox_job_tables(&pool, SPAWNING_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, DOWNSTREAM_JOB_TYPE).await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox: Outbox<TestEvent, TestTables> =
+        init_outbox(&pool, MailboxConfig::builder().build().unwrap()).await?;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(SPAWNING_HANDLER_JOB_TYPE)),
+            SpawningHandler,
+        )
+        .with_job_initializer(SendNotificationInitializer { sent: sent.clone() })
+        .with_event::<Ping>()
+        .register()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox.publish_persisted_in_op(&mut op, Ping(42)).await?;
+    op.commit().await?;
+
+    poll_until(TIMEOUT, || {
+        let sent = sent.clone();
+        async move {
+            let notifications = sent.lock().await;
+            if !notifications.is_empty() {
+                assert_eq!(notifications.len(), 1);
+                assert_eq!(notifications[0].0, 42);
+                assert_eq!(notifications[0].1, "ping received: 42");
+                Some(())
+            } else {
+                None
+            }
+        }
+    })
+    .await?;
+
+    Ok(())
 }
