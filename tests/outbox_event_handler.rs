@@ -33,6 +33,7 @@ impl OutboxEventHandler<Ping> for TestHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Ping,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -107,6 +108,7 @@ impl OutboxEventHandler<EphemeralPing> for EphemeralTestHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &EphemeralPing,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -290,6 +292,7 @@ impl OutboxEventHandler<MixedPersist> for MixedPersistHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &MixedPersist,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -306,6 +309,7 @@ impl OutboxEventHandler<MixedEphemeral> for MixedEphemeralHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &MixedEphemeral,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -415,6 +419,7 @@ impl OutboxEventHandler<PingEvent> for PingHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PingEvent,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0);
         Ok(())
@@ -431,6 +436,7 @@ impl OutboxEventHandler<PongEvent> for PongHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PongEvent,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.received.lock().await.push(event.0.clone());
         Ok(())
@@ -527,6 +533,7 @@ impl OutboxEventHandler<PingEvent> for MultiHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PingEvent,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.pings.lock().await.push(event.0);
         Ok(())
@@ -539,6 +546,7 @@ impl OutboxEventHandler<PongEvent> for MultiHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PongEvent,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.pongs.lock().await.push(event.0.clone());
         Ok(())
@@ -649,6 +657,7 @@ impl OutboxEventHandler<UserCreated> for CrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &UserCreated,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.users
             .lock()
@@ -664,6 +673,7 @@ impl OutboxEventHandler<InvoicePaid> for CrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &InvoicePaid,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.invoices
             .lock()
@@ -891,6 +901,7 @@ impl OutboxEventHandler<AccountCreated> for TrueCrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &AccountCreated,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.accounts
             .lock()
@@ -906,6 +917,7 @@ impl OutboxEventHandler<PaymentReceived> for TrueCrossDomainHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &PaymentReceived,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.payments
             .lock()
@@ -1078,6 +1090,7 @@ impl OutboxEventHandler<Registered> for SubsetHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Registered,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.registered.lock().await.push(event.user_id);
         Ok(())
@@ -1090,6 +1103,7 @@ impl OutboxEventHandler<Deactivated> for SubsetHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &Deactivated,
         _meta: obix::out::OutboxEventMeta,
+        _spawner: &obix::CommandJobSpawner,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.deactivated.lock().await.push(event.user_id);
         Ok(())

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::any::TypeId;
-use std::collections::HashSet;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use job::{
@@ -20,7 +20,86 @@ pub trait OutboxEventHandler<E>: Send + Sync + 'static {
         op: &mut es_entity::DbOp<'_>,
         event: &E,
         meta: OutboxEventMeta,
+        spawner: &CommandJobSpawner,
     ) -> impl std::future::Future<Output = Result<(), BoxError>> + Send;
+}
+
+/// A type-erased container of [`JobSpawner<T>`] instances, keyed by config type.
+///
+/// Passed to every [`OutboxEventHandler::handle`] invocation so handlers can spawn
+/// downstream command jobs without carrying spawner fields on their struct.
+///
+/// # Panics
+///
+/// [`spawn`](Self::spawn) and [`spawn_in_op`](Self::spawn_in_op) panic if the
+/// config type `T` was not registered via [`add_initializer`](Self::add_initializer).
+/// This is always a programming error.
+#[derive(Clone, Default)]
+pub struct CommandJobSpawner {
+    spawners: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl CommandJobSpawner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a [`JobInitializer`] and store its [`JobSpawner`] for later use.
+    pub fn add_initializer<I>(&mut self, jobs: &mut ::job::Jobs, initializer: I)
+    where
+        I: JobInitializer,
+        I::Config: Send + Sync + 'static,
+    {
+        let spawner = jobs.add_initializer(initializer);
+        self.spawners
+            .insert(TypeId::of::<I::Config>(), Arc::new(spawner));
+    }
+
+    /// Spawn a downstream job in its own transaction.
+    ///
+    /// `T` must match the `Config` type of a previously-registered initializer.
+    pub async fn spawn<T>(
+        &self,
+        id: impl Into<::job::JobId> + std::fmt::Debug + Send,
+        config: T,
+    ) -> Result<Job, ::job::error::JobError>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        self.get_spawner::<T>().spawn(id, config).await
+    }
+
+    /// Spawn a downstream job within an existing atomic operation.
+    ///
+    /// `T` must match the `Config` type of a previously-registered initializer.
+    pub async fn spawn_in_op<T>(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: impl Into<::job::JobId> + std::fmt::Debug + Send,
+        config: T,
+    ) -> Result<Job, ::job::error::JobError>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        self.get_spawner::<T>().spawn_in_op(op, id, config).await
+    }
+
+    fn get_spawner<T: 'static>(&self) -> &JobSpawner<T> {
+        let type_id = TypeId::of::<T>();
+        let erased = self.spawners.get(&type_id).unwrap_or_else(|| {
+            panic!(
+                "CommandJobSpawner: no initializer registered for config type `{}`. \
+                 Did you forget to call `add_initializer` or `with_job_initializer`?",
+                std::any::type_name::<T>(),
+            )
+        });
+        erased.downcast_ref::<JobSpawner<T>>().unwrap_or_else(|| {
+            unreachable!(
+                "TypeId matched but downcast failed for `{}` — this is a bug",
+                std::any::type_name::<T>(),
+            )
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +149,7 @@ where
         clock: &es_entity::clock::ClockHandle,
         event: &P,
         meta: OutboxEventMeta,
+        spawner: &CommandJobSpawner,
     ) -> Result<bool, BoxError>;
 }
 
@@ -92,10 +172,11 @@ where
         clock: &es_entity::clock::ClockHandle,
         event: &P,
         meta: OutboxEventMeta,
+        spawner: &CommandJobSpawner,
     ) -> Result<bool, BoxError> {
         if let Some(inner) = event.as_event() {
             let mut op = es_entity::DbOp::init_with_clock(pool, clock).await?;
-            self.handler.handle(&mut op, inner, meta).await?;
+            self.handler.handle(&mut op, inner, meta, spawner).await?;
             op.commit().await?;
             Ok(true)
         } else {
@@ -141,6 +222,7 @@ where
     handler: Arc<H>,
     dispatchers: Vec<Box<dyn DispatchEventHandler<P>>>,
     registered_events: HashSet<TypeId>,
+    cmd_spawner: CommandJobSpawner,
 }
 
 impl<'a, H, P, Tables> EventHandlerRegistration<'a, H, P, Tables>
@@ -162,7 +244,19 @@ where
             handler: Arc::new(handler),
             dispatchers: Vec::new(),
             registered_events: HashSet::new(),
+            cmd_spawner: CommandJobSpawner::new(),
         }
+    }
+
+    /// Register a [`JobInitializer`] whose [`JobSpawner`] will be available
+    /// to the handler via the [`CommandJobSpawner`] parameter.
+    pub fn with_job_initializer<I>(mut self, initializer: I) -> Self
+    where
+        I: JobInitializer,
+        I::Config: Send + Sync + 'static,
+    {
+        self.cmd_spawner.add_initializer(self.jobs, initializer);
+        self
     }
 
     /// Register the handler for event type `E`.
@@ -204,6 +298,7 @@ where
         let initializer = EventHandlerJobInitializer::<P, Tables> {
             outbox: self.outbox,
             dispatchers: Arc::new(self.dispatchers),
+            cmd_spawner: self.cmd_spawner,
             job_type: self.config.job_type.clone(),
             retry_settings: self.config.retry_settings.clone(),
         };
@@ -224,6 +319,7 @@ where
 {
     outbox: Outbox<P, Tables>,
     dispatchers: Arc<Vec<Box<dyn DispatchEventHandler<P>>>>,
+    cmd_spawner: CommandJobSpawner,
     job_type: JobType,
     retry_settings: RetrySettings,
 }
@@ -251,6 +347,7 @@ where
         Ok(Box::new(EventHandlerJobRunner::<P, Tables> {
             outbox: self.outbox.clone(),
             dispatchers: self.dispatchers.clone(),
+            cmd_spawner: self.cmd_spawner.clone(),
         }))
     }
 }
@@ -262,6 +359,7 @@ where
 {
     outbox: Outbox<P, Tables>,
     dispatchers: Arc<Vec<Box<dyn DispatchEventHandler<P>>>>,
+    cmd_spawner: CommandJobSpawner,
 }
 
 #[async_trait]
@@ -297,6 +395,7 @@ where
                                         current_job.clock(),
                                         payload,
                                         meta.clone(),
+                                        &self.cmd_spawner,
                                     ).await
                                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                                 }
@@ -321,6 +420,7 @@ where
                                         current_job.clock(),
                                         &e.payload,
                                         meta.clone(),
+                                        &self.cmd_spawner,
                                     )
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;

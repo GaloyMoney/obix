@@ -28,7 +28,8 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    EventHandlerRegistration, Outbox, OutboxEventHandler, OutboxEventJobConfig, OutboxEventMeta,
+    CommandJobSpawner, EventHandlerRegistration, Outbox, OutboxEventHandler, OutboxEventJobConfig,
+    OutboxEventMeta,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
