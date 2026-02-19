@@ -10,81 +10,84 @@ use tokio::sync::Mutex;
 
 use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
 
-const JOB_TYPE: &str = "test-outbox-handler";
+const ORDER_HANDLER_JOB_TYPE: &str = "order-event-handler";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-enum TestEvent {
-    Ping(u64),
+enum OrderEvent {
+    OrderPlaced { order_id: u64 },
+    OrderShipped { order_id: u64 },
 }
 
-struct TestPersistentHandler {
-    received: Arc<Mutex<Vec<u64>>>,
+struct OrderLedgerHandler {
+    recorded: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestPersistentHandler {
+impl OutboxEventHandler<OrderEvent> for OrderLedgerHandler {
     async fn handle_persistent(
         &self,
         _op: &mut es_entity::DbOp<'_>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &obix::out::PersistentOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
-            self.received.lock().await.push(*n);
+        if let Some(OrderEvent::OrderPlaced { order_id }) = &event.payload {
+            self.recorded.lock().await.push(*order_id);
         }
         Ok(())
     }
 }
 
-struct TestEphemeralHandler {
-    received: Arc<Mutex<Vec<u64>>>,
+struct OrderDashboardHandler {
+    displayed: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestEphemeralHandler {
+impl OutboxEventHandler<OrderEvent> for OrderDashboardHandler {
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &obix::out::EphemeralOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
-        self.received.lock().await.push(*n);
+        if let OrderEvent::OrderPlaced { order_id } = &event.payload {
+            self.displayed.lock().await.push(*order_id);
+        }
         Ok(())
     }
 }
 
-struct TestBothHandler {
-    persistent_received: Arc<Mutex<Vec<u64>>>,
-    ephemeral_received: Arc<Mutex<Vec<u64>>>,
+struct OrderActivityHandler {
+    persistent_recorded: Arc<Mutex<Vec<u64>>>,
+    ephemeral_displayed: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestBothHandler {
+impl OutboxEventHandler<OrderEvent> for OrderActivityHandler {
     async fn handle_persistent(
         &self,
         _op: &mut es_entity::DbOp<'_>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &obix::out::PersistentOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
-            self.persistent_received.lock().await.push(*n);
+        if let Some(OrderEvent::OrderPlaced { order_id }) = &event.payload {
+            self.persistent_recorded.lock().await.push(*order_id);
         }
         Ok(())
     }
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &obix::out::EphemeralOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
-        self.ephemeral_received.lock().await.push(*n);
+        if let OrderEvent::OrderPlaced { order_id } = &event.payload {
+            self.ephemeral_displayed.lock().await.push(*order_id);
+        }
         Ok(())
     }
 }
 
-async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
+async fn init_outbox_with_handler<H: OutboxEventHandler<OrderEvent>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+) -> anyhow::Result<Outbox<OrderEvent, TestTables>> {
     wipeout_outbox_tables(pool).await?;
-    wipeout_outbox_job_tables(pool, JOB_TYPE).await?;
+    wipeout_outbox_job_tables(pool, ORDER_HANDLER_JOB_TYPE).await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(
+    let outbox = Outbox::<OrderEvent, TestTables>::init(
         pool,
         MailboxConfig::builder()
             .build()
@@ -95,7 +98,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     outbox
         .register_event_handler(
             jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(ORDER_HANDLER_JOB_TYPE)),
             handler,
         )
         .await
@@ -106,7 +109,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
 
 #[tokio::test]
 #[file_serial]
-async fn handler_receives_persistent_events() -> anyhow::Result<()> {
+async fn order_ledger_receives_persistent_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     let job_config = job::JobSvcConfig::builder()
@@ -115,12 +118,12 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let received = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
-        TestPersistentHandler {
-            received: received.clone(),
+        OrderLedgerHandler {
+            recorded: recorded.clone(),
         },
     )
     .await?;
@@ -129,26 +132,20 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
 
     let mut op = outbox.begin_op().await?;
     outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
-        .await?;
-    outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(2))
-        .await?;
-    outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(3))
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 1 })
         .await?;
     op.commit().await?;
 
     let start = std::time::Instant::now();
     loop {
-        let events = received.lock().await;
-        if events.len() >= 3 {
-            assert_eq!(*events, vec![1, 2, 3]);
+        let events = recorded.lock().await;
+        if !events.is_empty() {
+            assert_eq!(*events, vec![1]);
             break;
         }
         drop(events);
         if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for persistent events");
+            anyhow::bail!("Timeout waiting for persistent event");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -158,7 +155,7 @@ async fn handler_receives_persistent_events() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
+async fn order_dashboard_receives_ephemeral_events() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     let job_config = job::JobSvcConfig::builder()
@@ -167,12 +164,12 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let received = Arc::new(Mutex::new(Vec::new()));
+    let displayed = Arc::new(Mutex::new(Vec::new()));
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
-        TestEphemeralHandler {
-            received: received.clone(),
+        OrderDashboardHandler {
+            displayed: displayed.clone(),
         },
     )
     .await?;
@@ -182,21 +179,21 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
     // Give the job time to start and begin listening
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let event_type = obix::out::EphemeralEventType::new("test_type");
+    let event_type = obix::out::EphemeralEventType::new("order_update");
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(42))
+        .publish_ephemeral(event_type, OrderEvent::OrderPlaced { order_id: 42 })
         .await?;
 
     let start = std::time::Instant::now();
     loop {
-        let events = received.lock().await;
+        let events = displayed.lock().await;
         if !events.is_empty() {
             assert!(events.iter().all(|&v| v == 42));
             break;
         }
         drop(events);
         if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for ephemeral events");
+            anyhow::bail!("Timeout waiting for ephemeral event");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -206,11 +203,11 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
+async fn order_ledger_resumes_after_restart() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // First run: process some events
-    let received_first = Arc::new(Mutex::new(Vec::new()));
+    // First run: process one event
+    let recorded_first = Arc::new(Mutex::new(Vec::new()));
     {
         let job_config = job::JobSvcConfig::builder()
             .pool(pool.clone())
@@ -221,8 +218,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         let outbox = init_outbox_with_handler(
             &pool,
             &mut jobs,
-            TestPersistentHandler {
-                received: received_first.clone(),
+            OrderLedgerHandler {
+                recorded: recorded_first.clone(),
             },
         )
         .await?;
@@ -231,22 +228,19 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
 
         let mut op = outbox.begin_op().await?;
         outbox
-            .publish_persisted_in_op(&mut op, TestEvent::Ping(10))
-            .await?;
-        outbox
-            .publish_persisted_in_op(&mut op, TestEvent::Ping(20))
+            .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 10 })
             .await?;
         op.commit().await?;
 
         let start = std::time::Instant::now();
         loop {
-            let events = received_first.lock().await;
-            if events.len() >= 2 {
+            let events = recorded_first.lock().await;
+            if !events.is_empty() {
                 break;
             }
             drop(events);
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                anyhow::bail!("Timeout waiting for first-run events");
+                anyhow::bail!("Timeout waiting for first-run event");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -254,8 +248,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         jobs.shutdown().await?;
     }
 
-    // Second run: publish more events, handler should NOT receive events 10,20 again
-    let received_second = Arc::new(Mutex::new(Vec::new()));
+    // Second run: handler should NOT receive event with order_id 10 again
+    let recorded_second = Arc::new(Mutex::new(Vec::new()));
     {
         let job_config = job::JobSvcConfig::builder()
             .pool(pool.clone())
@@ -264,7 +258,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         let mut jobs = job::Jobs::init(job_config).await?;
 
         // Re-init outbox (don't wipe tables — we want to keep the sequence state)
-        let outbox = Outbox::<TestEvent, TestTables>::init(
+        let outbox = Outbox::<OrderEvent, TestTables>::init(
             &pool,
             MailboxConfig::builder()
                 .build()
@@ -275,9 +269,9 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox
             .register_event_handler(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
-                TestPersistentHandler {
-                    received: received_second.clone(),
+                OutboxEventJobConfig::new(job::JobType::new(ORDER_HANDLER_JOB_TYPE)),
+                OrderLedgerHandler {
+                    recorded: recorded_second.clone(),
                 },
             )
             .await
@@ -287,29 +281,29 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
 
         let mut op = outbox.begin_op().await?;
         outbox
-            .publish_persisted_in_op(&mut op, TestEvent::Ping(30))
+            .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 20 })
             .await?;
         op.commit().await?;
 
         let start = std::time::Instant::now();
         loop {
-            let events = received_second.lock().await;
+            let events = recorded_second.lock().await;
             if !events.is_empty() {
-                // Should only have 30, not 10 or 20
-                assert_eq!(*events, vec![30]);
+                // Should only have 20, not 10
+                assert_eq!(*events, vec![20]);
                 break;
             }
             drop(events);
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                anyhow::bail!("Timeout waiting for second-run events");
+                anyhow::bail!("Timeout waiting for second-run event");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         // Wait a bit to make sure no stale events arrive
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let events = received_second.lock().await;
-        assert_eq!(*events, vec![30]);
+        let events = recorded_second.lock().await;
+        assert_eq!(*events, vec![20]);
     }
 
     Ok(())
@@ -317,7 +311,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> {
+async fn order_activity_handler_receives_both_event_types() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     let job_config = job::JobSvcConfig::builder()
@@ -326,15 +320,15 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let persistent_received = Arc::new(Mutex::new(Vec::new()));
-    let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
+    let persistent_recorded = Arc::new(Mutex::new(Vec::new()));
+    let ephemeral_displayed = Arc::new(Mutex::new(Vec::new()));
 
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
-        TestBothHandler {
-            persistent_received: persistent_received.clone(),
-            ephemeral_received: ephemeral_received.clone(),
+        OrderActivityHandler {
+            persistent_recorded: persistent_recorded.clone(),
+            ephemeral_displayed: ephemeral_displayed.clone(),
         },
     )
     .await?;
@@ -347,20 +341,20 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
     // Publish persistent event
     let mut op = outbox.begin_op().await?;
     outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(100))
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 100 })
         .await?;
     op.commit().await?;
 
     // Publish ephemeral event
-    let event_type = obix::out::EphemeralEventType::new("both_test");
+    let event_type = obix::out::EphemeralEventType::new("order_update");
     outbox
-        .publish_ephemeral(event_type, TestEvent::Ping(200))
+        .publish_ephemeral(event_type, OrderEvent::OrderPlaced { order_id: 200 })
         .await?;
 
     let start = std::time::Instant::now();
     loop {
-        let p = persistent_received.lock().await;
-        let e = ephemeral_received.lock().await;
+        let p = persistent_recorded.lock().await;
+        let e = ephemeral_displayed.lock().await;
         if !p.is_empty() && !e.is_empty() {
             assert_eq!(*p, vec![100]);
             assert!(e.iter().all(|&v| v == 200));
@@ -377,25 +371,25 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
     Ok(())
 }
 
-const SPAWNER_HANDLER_JOB_TYPE: &str = "test-spawner-handler";
-const NOTIFICATION_JOB_TYPE: &str = "send-notification";
-const AUDIT_LOG_JOB_TYPE: &str = "send-audit-log";
-const MULTI_SPAWNER_HANDLER_JOB_TYPE: &str = "test-multi-spawner-handler";
+// -- Fulfillment handler: spawns a downstream job from an event --
+
+const FULFILLMENT_HANDLER_JOB_TYPE: &str = "fulfillment-handler";
+const FULFILL_ORDER_JOB_TYPE: &str = "fulfill-order";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SendNotificationConfig {
-    value: u64,
+struct FulfillOrderConfig {
+    order_id: u64,
 }
 
-struct SendNotificationInitializer {
-    results: Arc<Mutex<Vec<u64>>>,
+struct FulfillOrderInitializer {
+    fulfilled: Arc<Mutex<Vec<u64>>>,
 }
 
-impl job::JobInitializer for SendNotificationInitializer {
-    type Config = SendNotificationConfig;
+impl job::JobInitializer for FulfillOrderInitializer {
+    type Config = FulfillOrderConfig;
 
     fn job_type(&self) -> job::JobType {
-        job::JobType::new(NOTIFICATION_JOB_TYPE)
+        job::JobType::new(FULFILL_ORDER_JOB_TYPE)
     }
 
     fn init(
@@ -403,43 +397,49 @@ impl job::JobInitializer for SendNotificationInitializer {
         job: &job::Job,
         _: job::JobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
-        let config: SendNotificationConfig = job.config()?;
-        Ok(Box::new(SendNotificationRunner {
-            value: config.value,
-            results: self.results.clone(),
+        let config: FulfillOrderConfig = job.config()?;
+        Ok(Box::new(FulfillOrderRunner {
+            order_id: config.order_id,
+            fulfilled: self.fulfilled.clone(),
         }))
     }
 }
 
-struct SendNotificationRunner {
-    value: u64,
-    results: Arc<Mutex<Vec<u64>>>,
+struct FulfillOrderRunner {
+    order_id: u64,
+    fulfilled: Arc<Mutex<Vec<u64>>>,
 }
 
 #[async_trait]
-impl job::JobRunner for SendNotificationRunner {
+impl job::JobRunner for FulfillOrderRunner {
     async fn run(
         &self,
         _current_job: job::CurrentJob,
     ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
-        self.results.lock().await.push(self.value);
+        self.fulfilled.lock().await.push(self.order_id);
         Ok(job::JobCompletion::Complete)
     }
 }
 
-struct SpawnerHandler {
-    spawner: job::JobSpawner<SendNotificationConfig>,
+struct OrderFulfillmentHandler {
+    spawner: job::JobSpawner<FulfillOrderConfig>,
 }
 
-impl OutboxEventHandler<TestEvent> for SpawnerHandler {
+impl OutboxEventHandler<OrderEvent> for OrderFulfillmentHandler {
     async fn handle_persistent(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &obix::out::PersistentOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
+        if let Some(OrderEvent::OrderPlaced { order_id }) = &event.payload {
             self.spawner
-                .spawn_in_op(op, job::JobId::new(), SendNotificationConfig { value: *n })
+                .spawn_in_op(
+                    op,
+                    job::JobId::new(),
+                    FulfillOrderConfig {
+                        order_id: *order_id,
+                    },
+                )
                 .await?;
         }
         Ok(())
@@ -448,12 +448,12 @@ impl OutboxEventHandler<TestEvent> for SpawnerHandler {
 
 #[tokio::test]
 #[file_serial]
-async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
+async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     wipeout_outbox_tables(&pool).await?;
-    wipeout_outbox_job_tables(&pool, SPAWNER_HANDLER_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, NOTIFICATION_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, FULFILLMENT_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, FULFILL_ORDER_JOB_TYPE).await?;
 
     let job_config = job::JobSvcConfig::builder()
         .pool(pool.clone())
@@ -461,9 +461,9 @@ async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let results = Arc::new(Mutex::new(Vec::new()));
+    let fulfilled = Arc::new(Mutex::new(Vec::new()));
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(
+    let outbox = Outbox::<OrderEvent, TestTables>::init(
         &pool,
         MailboxConfig::builder()
             .build()
@@ -471,16 +471,16 @@ async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
     )
     .await?;
 
-    let results_clone = results.clone();
+    let fulfilled_clone = fulfilled.clone();
     outbox
-        .register_event_handler_with::<SpawnerHandler, _>(
+        .register_event_handler_with::<OrderFulfillmentHandler, _>(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(SPAWNER_HANDLER_JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(FULFILLMENT_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_initializer(SendNotificationInitializer {
-                    results: results_clone,
+                let spawner = ctx.add_initializer(FulfillOrderInitializer {
+                    fulfilled: fulfilled_clone,
                 });
-                SpawnerHandler { spawner }
+                OrderFulfillmentHandler { spawner }
             },
         )
         .await
@@ -490,13 +490,13 @@ async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
 
     let mut op = outbox.begin_op().await?;
     outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(99))
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 99 })
         .await?;
     op.commit().await?;
 
     let start = std::time::Instant::now();
     loop {
-        let values = results.lock().await;
+        let values = fulfilled.lock().await;
         if !values.is_empty() {
             assert_eq!(*values, vec![99]);
             break;
@@ -511,22 +511,30 @@ async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
     Ok(())
 }
 
-// -- Second downstream job type for multi-spawner test --
+// -- Chain test: EventHandler1 → CommandJob → EventHandler2 --
+//
+// OrderPlaced → ShippingHandler spawns ShipOrder job
+//            → ShipOrderRunner publishes OrderShipped
+//            → DeliveryConfirmationHandler records the shipment
+
+const SHIPPING_HANDLER_JOB_TYPE: &str = "shipping-handler";
+const SHIP_ORDER_JOB_TYPE: &str = "ship-order";
+const DELIVERY_HANDLER_JOB_TYPE: &str = "delivery-confirmation-handler";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SendAuditLogConfig {
-    value: u64,
+struct ShipOrderConfig {
+    order_id: u64,
 }
 
-struct SendAuditLogInitializer {
-    results: Arc<Mutex<Vec<u64>>>,
+struct ShipOrderInitializer {
+    outbox: Outbox<OrderEvent, TestTables>,
 }
 
-impl job::JobInitializer for SendAuditLogInitializer {
-    type Config = SendAuditLogConfig;
+impl job::JobInitializer for ShipOrderInitializer {
+    type Config = ShipOrderConfig;
 
     fn job_type(&self) -> job::JobType {
-        job::JobType::new(AUDIT_LOG_JOB_TYPE)
+        job::JobType::new(SHIP_ORDER_JOB_TYPE)
     }
 
     fn init(
@@ -534,48 +542,76 @@ impl job::JobInitializer for SendAuditLogInitializer {
         job: &job::Job,
         _: job::JobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
-        let config: SendAuditLogConfig = job.config()?;
-        Ok(Box::new(SendAuditLogRunner {
-            value: config.value,
-            results: self.results.clone(),
+        let config: ShipOrderConfig = job.config()?;
+        Ok(Box::new(ShipOrderRunner {
+            order_id: config.order_id,
+            outbox: self.outbox.clone(),
         }))
     }
 }
 
-struct SendAuditLogRunner {
-    value: u64,
-    results: Arc<Mutex<Vec<u64>>>,
+struct ShipOrderRunner {
+    order_id: u64,
+    outbox: Outbox<OrderEvent, TestTables>,
 }
 
 #[async_trait]
-impl job::JobRunner for SendAuditLogRunner {
+impl job::JobRunner for ShipOrderRunner {
     async fn run(
         &self,
         _current_job: job::CurrentJob,
     ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
-        self.results.lock().await.push(self.value);
+        let mut op = self.outbox.begin_op().await?;
+        self.outbox
+            .publish_persisted_in_op(
+                &mut op,
+                OrderEvent::OrderShipped {
+                    order_id: self.order_id,
+                },
+            )
+            .await?;
+        op.commit().await?;
         Ok(job::JobCompletion::Complete)
     }
 }
 
-struct MultiSpawnerHandler {
-    notification_spawner: job::JobSpawner<SendNotificationConfig>,
-    audit_log_spawner: job::JobSpawner<SendAuditLogConfig>,
+struct ShippingHandler {
+    spawner: job::JobSpawner<ShipOrderConfig>,
 }
 
-impl OutboxEventHandler<TestEvent> for MultiSpawnerHandler {
+impl OutboxEventHandler<OrderEvent> for ShippingHandler {
     async fn handle_persistent(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &obix::out::PersistentOutboxEvent<OrderEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
-            self.notification_spawner
-                .spawn_in_op(op, job::JobId::new(), SendNotificationConfig { value: *n })
+        if let Some(OrderEvent::OrderPlaced { order_id }) = &event.payload {
+            self.spawner
+                .spawn_in_op(
+                    op,
+                    job::JobId::new(),
+                    ShipOrderConfig {
+                        order_id: *order_id,
+                    },
+                )
                 .await?;
-            self.audit_log_spawner
-                .spawn_in_op(op, job::JobId::new(), SendAuditLogConfig { value: *n * 10 })
-                .await?;
+        }
+        Ok(())
+    }
+}
+
+struct DeliveryConfirmationHandler {
+    confirmed: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<OrderEvent> for DeliveryConfirmationHandler {
+    async fn handle_persistent(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<OrderEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(OrderEvent::OrderShipped { order_id }) = &event.payload {
+            self.confirmed.lock().await.push(*order_id);
         }
         Ok(())
     }
@@ -583,13 +619,13 @@ impl OutboxEventHandler<TestEvent> for MultiSpawnerHandler {
 
 #[tokio::test]
 #[file_serial]
-async fn handler_spawns_multiple_downstream_jobs() -> anyhow::Result<()> {
+async fn event_chain_handler_to_job_to_handler() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     wipeout_outbox_tables(&pool).await?;
-    wipeout_outbox_job_tables(&pool, MULTI_SPAWNER_HANDLER_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, NOTIFICATION_JOB_TYPE).await?;
-    wipeout_outbox_job_tables(&pool, AUDIT_LOG_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, SHIPPING_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, SHIP_ORDER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, DELIVERY_HANDLER_JOB_TYPE).await?;
 
     let job_config = job::JobSvcConfig::builder()
         .pool(pool.clone())
@@ -597,10 +633,7 @@ async fn handler_spawns_multiple_downstream_jobs() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let notification_results = Arc::new(Mutex::new(Vec::new()));
-    let audit_log_results = Arc::new(Mutex::new(Vec::new()));
-
-    let outbox = Outbox::<TestEvent, TestTables>::init(
+    let outbox = Outbox::<OrderEvent, TestTables>::init(
         &pool,
         MailboxConfig::builder()
             .build()
@@ -608,23 +641,30 @@ async fn handler_spawns_multiple_downstream_jobs() -> anyhow::Result<()> {
     )
     .await?;
 
-    let notif_results = notification_results.clone();
-    let audit_results = audit_log_results.clone();
+    // Handler1: ShippingHandler spawns ShipOrder job on OrderPlaced
+    let outbox_for_job = outbox.clone();
     outbox
-        .register_event_handler_with::<MultiSpawnerHandler, _>(
+        .register_event_handler_with::<ShippingHandler, _>(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(MULTI_SPAWNER_HANDLER_JOB_TYPE)),
+            OutboxEventJobConfig::new(job::JobType::new(SHIPPING_HANDLER_JOB_TYPE)),
             |ctx| {
-                let notification_spawner = ctx.add_initializer(SendNotificationInitializer {
-                    results: notif_results,
+                let spawner = ctx.add_initializer(ShipOrderInitializer {
+                    outbox: outbox_for_job,
                 });
-                let audit_log_spawner = ctx.add_initializer(SendAuditLogInitializer {
-                    results: audit_results,
-                });
-                MultiSpawnerHandler {
-                    notification_spawner,
-                    audit_log_spawner,
-                }
+                ShippingHandler { spawner }
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Handler2: DeliveryConfirmationHandler records OrderShipped
+    let confirmed = Arc::new(Mutex::new(Vec::new()));
+    outbox
+        .register_event_handler(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(DELIVERY_HANDLER_JOB_TYPE)),
+            DeliveryConfirmationHandler {
+                confirmed: confirmed.clone(),
             },
         )
         .await
@@ -632,25 +672,26 @@ async fn handler_spawns_multiple_downstream_jobs() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
+    // Publish OrderPlaced — triggers the chain:
+    // ShippingHandler → ShipOrder job → publishes OrderShipped → DeliveryConfirmationHandler
     let mut op = outbox.begin_op().await?;
     outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(7))
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 42 })
         .await?;
     op.commit().await?;
 
     let start = std::time::Instant::now();
     loop {
-        let notifs = notification_results.lock().await;
-        let audits = audit_log_results.lock().await;
-        if !notifs.is_empty() && !audits.is_empty() {
-            assert_eq!(*notifs, vec![7]);
-            assert_eq!(*audits, vec![70]);
+        let values = confirmed.lock().await;
+        if !values.is_empty() {
+            assert_eq!(*values, vec![42]);
             break;
         }
-        drop(notifs);
-        drop(audits);
-        if start.elapsed() > std::time::Duration::from_secs(10) {
-            anyhow::bail!("Timeout waiting for both downstream jobs to execute");
+        drop(values);
+        if start.elapsed() > std::time::Duration::from_secs(15) {
+            anyhow::bail!(
+                "Timeout waiting for chain: OrderPlaced → ShipOrder → OrderShipped confirmation"
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
