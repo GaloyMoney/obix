@@ -37,6 +37,7 @@ im = { workspace = true }
 job = { workspace = true }
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -67,3 +68,4 @@ job = "0.6"
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
+uuid = { version = "1", features = ["v5"] }

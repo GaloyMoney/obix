@@ -160,9 +160,10 @@ where
         &mut self,
         command: C,
     ) -> CommandJobSpawner<C::Config> {
+        let job_type = C::job_type();
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
-        CommandJobSpawner::new(spawner)
+        CommandJobSpawner::new(spawner, job_type)
     }
 
     /// Register a [`CommandJob`] built from the handler's outbox.
@@ -197,6 +198,11 @@ where
 /// The command struct itself holds whatever outboxes (or other deps) it
 /// needs, injected at construction time. This makes command jobs
 /// outbox-agnostic — a single command can publish to multiple outboxes.
+///
+/// Each command job is scoped to one entity (identified by
+/// [`entity_id`](Self::entity_id)). The entity ID is used as a queue ID
+/// to ensure at most one job per entity runs at a time, and as part of the
+/// deterministic job ID derivation for dedup protection.
 #[async_trait]
 pub trait CommandJob: Send + Sync + 'static {
     /// The configuration/payload type for this command job.
@@ -204,6 +210,12 @@ pub trait CommandJob: Send + Sync + 'static {
 
     /// The job type identifier for this command.
     fn job_type() -> JobType;
+
+    /// Return the entity ID that this command targets.
+    ///
+    /// Used as the queue ID (ensuring at most one job per entity runs at a
+    /// time) and as part of the deterministic job ID derivation.
+    fn entity_id(config: &Self::Config) -> &str;
 
     /// Execute the command within a database transaction.
     ///
@@ -297,38 +309,54 @@ where
 /// A spawner for command jobs that derives deterministic job IDs from events.
 ///
 /// Wraps a [`JobSpawner`] and provides [`spawn_for_event`](Self::spawn_for_event)
-/// which derives the job ID from the event ID, ensuring replay-safe spawning.
+/// which derives the job ID from (event ID, job type, entity ID), ensuring
+/// replay-safe spawning while allowing multiple commands per event.
 #[derive(Clone)]
 pub struct CommandJobSpawner<Config> {
     inner: JobSpawner<Config>,
+    job_type: JobType,
 }
 
 impl<Config> CommandJobSpawner<Config>
 where
     Config: Serialize + Send + Sync + 'static,
 {
-    pub fn new(inner: JobSpawner<Config>) -> Self {
-        Self { inner }
+    pub fn new(inner: JobSpawner<Config>, job_type: JobType) -> Self {
+        Self { inner, job_type }
     }
 
     /// Spawn a command job for the given event.
     ///
-    /// The job ID is deterministically derived from the event ID, ensuring
-    /// that replaying the same event does not create duplicate jobs.
+    /// The job ID is deterministically derived from (event ID, job type,
+    /// entity ID) using UUID v5, ensuring that replaying the same event
+    /// does not create duplicate jobs while allowing one event to spawn
+    /// multiple commands of different types or targeting different entities.
+    ///
+    /// The entity ID (extracted from the config via [`CommandJob::entity_id`])
+    /// is used as the queue ID, so at most one job per entity runs at a time.
     ///
     /// This method is idempotent: if a job with the derived ID already exists,
     /// it returns `Ok(())`.
-    pub async fn spawn_for_event<P>(
+    pub async fn spawn_for_event<C, P>(
         &self,
         event: &PersistentOutboxEvent<P>,
         config: Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
+        C: CommandJob<Config = Config>,
         P: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        let job_id =
-            job::JobId::from(es_entity::prelude::uuid::Uuid::from(event.id));
-        match self.inner.spawn(job_id, config).await {
+        let entity_id = C::entity_id(&config);
+        let event_uuid: uuid::Uuid = event.id.into();
+        let name = format!(
+            "{}:{}:{}",
+            event_uuid,
+            self.job_type,
+            entity_id
+        );
+        let job_id = job::JobId::from(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()));
+        let queue_id = entity_id.to_string();
+        match self.inner.spawn_with_queue_id(job_id, config, queue_id).await {
             Ok(_) => Ok(()),
             Err(job::error::JobError::DuplicateId) => Ok(()),
             Err(e) => Err(e.into()),

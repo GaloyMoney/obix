@@ -724,6 +724,7 @@ const WELCOME_EMAIL_OBSERVER_JOB_TYPE: &str = "welcome-email-observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SendWelcomeEmailConfig {
+    customer_id: String,
     value: u64,
 }
 
@@ -737,6 +738,10 @@ impl CommandJob for SendWelcomeEmailCommandJob {
 
     fn job_type() -> job::JobType {
         job::JobType::new(SEND_WELCOME_EMAIL_JOB_TYPE)
+    }
+
+    fn entity_id(config: &Self::Config) -> &str {
+        &config.customer_id
     }
 
     async fn run(
@@ -764,12 +769,16 @@ impl OutboxEventHandler<TestEvent> for CustomerCreatedOutboxEventHandler {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             // Only spawn command jobs for "trigger" events (< 100) to avoid infinite chain
             if *n < 100 {
+                let config = SendWelcomeEmailConfig {
+                    customer_id: format!("customer-{n}"),
+                    value: *n,
+                };
                 self.spawner
-                    .spawn_for_event(event, SendWelcomeEmailConfig { value: *n })
+                    .spawn_for_event::<SendWelcomeEmailCommandJob, _>(event, config.clone())
                     .await?;
                 // Call again to verify idempotency — should be a no-op (DuplicateId)
                 self.spawner
-                    .spawn_for_event(event, SendWelcomeEmailConfig { value: *n })
+                    .spawn_for_event::<SendWelcomeEmailCommandJob, _>(event, config)
                     .await?;
             }
         }
