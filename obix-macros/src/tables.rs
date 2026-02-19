@@ -52,23 +52,6 @@ impl ToTokens for MailboxTables {
             quote! { let tracing_context = None::<es_entity::context::TracingContext>; },
         );
 
-        #[cfg(feature = "tracing")]
-        let deserialize_payload = quote! {
-            row.payload.and_then(|p| {
-                match #crate_name::prelude::serde_json::from_value(p) {
-                    Ok(v) => Some(v),
-                    Err(err) => {
-                        #crate_name::prelude::tracing::debug!(
-                            sequence = row.sequence,
-                            %err,
-                            "skipping persistent outbox event: payload deserialization failed"
-                        );
-                        None
-                    }
-                }
-            })
-        };
-        #[cfg(not(feature = "tracing"))]
         let deserialize_payload = quote! {
             row.payload.and_then(|p| #crate_name::prelude::serde_json::from_value(p).ok())
         };
