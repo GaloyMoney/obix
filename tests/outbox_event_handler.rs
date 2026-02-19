@@ -379,6 +379,8 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
 
 const SPAWNER_HANDLER_JOB_TYPE: &str = "test-spawner-handler";
 const NOTIFICATION_JOB_TYPE: &str = "send-notification";
+const AUDIT_LOG_JOB_TYPE: &str = "send-audit-log";
+const MULTI_SPAWNER_HANDLER_JOB_TYPE: &str = "test-multi-spawner-handler";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SendNotificationConfig {
@@ -502,6 +504,153 @@ async fn handler_spawns_downstream_job() -> anyhow::Result<()> {
         drop(values);
         if start.elapsed() > std::time::Duration::from_secs(10) {
             anyhow::bail!("Timeout waiting for downstream job to execute");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+// -- Second downstream job type for multi-spawner test --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SendAuditLogConfig {
+    value: u64,
+}
+
+struct SendAuditLogInitializer {
+    results: Arc<Mutex<Vec<u64>>>,
+}
+
+impl job::JobInitializer for SendAuditLogInitializer {
+    type Config = SendAuditLogConfig;
+
+    fn job_type(&self) -> job::JobType {
+        job::JobType::new(AUDIT_LOG_JOB_TYPE)
+    }
+
+    fn init(
+        &self,
+        job: &job::Job,
+        _: job::JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
+        let config: SendAuditLogConfig = job.config()?;
+        Ok(Box::new(SendAuditLogRunner {
+            value: config.value,
+            results: self.results.clone(),
+        }))
+    }
+}
+
+struct SendAuditLogRunner {
+    value: u64,
+    results: Arc<Mutex<Vec<u64>>>,
+}
+
+#[async_trait]
+impl job::JobRunner for SendAuditLogRunner {
+    async fn run(
+        &self,
+        _current_job: job::CurrentJob,
+    ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
+        self.results.lock().await.push(self.value);
+        Ok(job::JobCompletion::Complete)
+    }
+}
+
+struct MultiSpawnerHandler {
+    notification_spawner: job::JobSpawner<SendNotificationConfig>,
+    audit_log_spawner: job::JobSpawner<SendAuditLogConfig>,
+}
+
+impl OutboxEventHandler<TestEvent> for MultiSpawnerHandler {
+    async fn handle_persistent(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.notification_spawner
+                .spawn_in_op(op, job::JobId::new(), SendNotificationConfig { value: *n })
+                .await?;
+            self.audit_log_spawner
+                .spawn_in_op(op, job::JobId::new(), SendAuditLogConfig { value: *n * 10 })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handler_spawns_multiple_downstream_jobs() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    wipeout_outbox_tables(&pool).await?;
+    wipeout_outbox_job_tables(&pool, MULTI_SPAWNER_HANDLER_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, NOTIFICATION_JOB_TYPE).await?;
+    wipeout_outbox_job_tables(&pool, AUDIT_LOG_JOB_TYPE).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let notification_results = Arc::new(Mutex::new(Vec::new()));
+    let audit_log_results = Arc::new(Mutex::new(Vec::new()));
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let notif_results = notification_results.clone();
+    let audit_results = audit_log_results.clone();
+    outbox
+        .register_event_handler_with::<MultiSpawnerHandler, _>(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(MULTI_SPAWNER_HANDLER_JOB_TYPE)),
+            |ctx| {
+                let notification_spawner = ctx.add_initializer(SendNotificationInitializer {
+                    results: notif_results,
+                });
+                let audit_log_spawner = ctx.add_initializer(SendAuditLogInitializer {
+                    results: audit_results,
+                });
+                MultiSpawnerHandler {
+                    notification_spawner,
+                    audit_log_spawner,
+                }
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(7))
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        let notifs = notification_results.lock().await;
+        let audits = audit_log_results.lock().await;
+        if !notifs.is_empty() && !audits.is_empty() {
+            assert_eq!(*notifs, vec![7]);
+            assert_eq!(*audits, vec![70]);
+            break;
+        }
+        drop(notifs);
+        drop(audits);
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            anyhow::bail!("Timeout waiting for both downstream jobs to execute");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
