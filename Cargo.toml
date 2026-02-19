@@ -14,6 +14,7 @@ default = ["default-tables"]
 
 fail-on-warnings = ["obix-macros/fail-on-warnings"]
 tracing = [
+  "dep:tracing",
   "es-entity/tracing-context",
   "obix-macros/tracing"
 ]
@@ -37,7 +38,7 @@ im = { workspace = true }
 job = { workspace = true }
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
-tracing = { workspace = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

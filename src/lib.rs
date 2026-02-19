@@ -7,6 +7,7 @@ pub mod prelude {
     pub use serde;
     pub use serde_json;
     pub use sqlx;
+    #[cfg(feature = "tracing")]
     pub use tracing;
 }
 

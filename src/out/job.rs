@@ -264,32 +264,6 @@ where
     dispatchers: Arc<Vec<Box<dyn DispatchEventHandler<P>>>>,
 }
 
-async fn dispatch_to_all<P>(
-    dispatchers: &[Box<dyn DispatchEventHandler<P>>],
-    pool: &sqlx::PgPool,
-    clock: &es_entity::clock::ClockHandle,
-    payload: &P,
-    meta: OutboxEventMeta,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    let mut first_error: Option<BoxError> = None;
-    for dispatcher in dispatchers.iter() {
-        if let Err(e) = dispatcher
-            .dispatch(pool, clock, payload, meta.clone())
-            .await
-            && first_error.is_none()
-        {
-            first_error = Some(e);
-        }
-    }
-    match first_error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
 #[async_trait]
 impl<P, Tables> JobRunner for EventHandlerJobRunner<P, Tables>
 where
@@ -317,14 +291,15 @@ where
                         Some(OutboxEvent::Persistent(ref e)) => {
                             if let Some(payload) = e.payload.as_ref() {
                                 let meta = OutboxEventMeta::from_persistent(e);
-                                dispatch_to_all(
-                                    &self.dispatchers,
-                                    current_job.pool(),
-                                    current_job.clock(),
-                                    payload,
-                                    meta,
-                                )
-                                .await?;
+                                for dispatcher in self.dispatchers.iter() {
+                                    dispatcher.dispatch(
+                                        current_job.pool(),
+                                        current_job.clock(),
+                                        payload,
+                                        meta.clone(),
+                                    ).await
+                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                }
                             }
                             state.sequence = e.sequence;
                             let mut op = es_entity::DbOp::init_with_clock(
@@ -339,14 +314,17 @@ where
                         }
                         Some(OutboxEvent::Ephemeral(ref e)) => {
                             let meta = OutboxEventMeta::from_ephemeral(e);
-                            dispatch_to_all(
-                                &self.dispatchers,
-                                current_job.pool(),
-                                current_job.clock(),
-                                &e.payload,
-                                meta,
-                            )
-                            .await?;
+                            for dispatcher in self.dispatchers.iter() {
+                                dispatcher
+                                    .dispatch(
+                                        current_job.pool(),
+                                        current_job.clock(),
+                                        &e.payload,
+                                        meta.clone(),
+                                    )
+                                    .await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            }
                         }
                         None => return Ok(JobCompletion::RescheduleNow),
                     }
