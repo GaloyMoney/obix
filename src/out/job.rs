@@ -118,13 +118,26 @@ where
     }
 }
 
-pub struct EventHandlerContext<'a> {
+pub struct EventHandlerContext<'a, P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
     jobs: &'a mut ::job::Jobs,
+    outbox: Outbox<P, Tables>,
 }
 
-impl<'a> EventHandlerContext<'a> {
-    pub(super) fn new(jobs: &'a mut ::job::Jobs) -> Self {
-        Self { jobs }
+impl<'a, P, Tables> EventHandlerContext<'a, P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    pub(super) fn new(jobs: &'a mut ::job::Jobs, outbox: Outbox<P, Tables>) -> Self {
+        Self { jobs, outbox }
+    }
+
+    pub fn outbox(&self) -> &Outbox<P, Tables> {
+        &self.outbox
     }
 
     pub fn add_initializer<I>(&mut self, initializer: I) -> JobSpawner<I::Config>
@@ -150,6 +163,23 @@ impl<'a> EventHandlerContext<'a> {
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
         CommandJobSpawner::new(spawner)
+    }
+
+    /// Register a [`CommandJob`] built from the handler's outbox.
+    ///
+    /// This is the convenience method for the common case where a command job
+    /// needs the same outbox the event handler is reading from. The closure
+    /// receives a clone of the outbox and returns the command.
+    ///
+    /// For commands that need multiple outboxes, use [`add_command_job`](Self::add_command_job)
+    /// and access additional outboxes via [`outbox()`](Self::outbox).
+    pub fn add_command_job_from<C, F>(&mut self, build: F) -> CommandJobSpawner<C::Config>
+    where
+        C: CommandJob,
+        F: FnOnce(Outbox<P, Tables>) -> C,
+    {
+        let command = build(self.outbox.clone());
+        self.add_command_job(command)
     }
 }
 

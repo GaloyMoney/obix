@@ -199,13 +199,13 @@ where
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
-        build: impl FnOnce(&mut EventHandlerContext<'_>) -> H,
+        build: impl FnOnce(&mut EventHandlerContext<'_, P, Tables>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
         let handler = {
-            let mut ctx = EventHandlerContext::new(jobs);
+            let mut ctx = EventHandlerContext::new(jobs, self.clone());
             build(&mut ctx)
         };
         let initializer =

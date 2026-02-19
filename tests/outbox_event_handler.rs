@@ -800,15 +800,12 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     .await?;
 
     // Register the command-spawning handler
-    let outbox_for_cmd = outbox.clone();
     outbox
-        .register_event_handler_with::<CommandSpawnerHandler, _>(
+        .register_event_handler_with::<CommandSpawnerHandler>(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(CMD_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_command_job(ProcessCommand {
-                    outbox: outbox_for_cmd,
-                });
+                let spawner = ctx.add_command_job_from(|outbox| ProcessCommand { outbox });
                 CommandSpawnerHandler { spawner }
             },
         )
