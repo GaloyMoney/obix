@@ -141,14 +141,6 @@ where
         &self.outbox
     }
 
-    pub fn add_initializer<I>(&mut self, initializer: I) -> JobSpawner<I::Config>
-    where
-        I: JobInitializer,
-        I::Config: Send + Sync + 'static,
-    {
-        self.jobs.add_initializer(initializer)
-    }
-
     /// Register a [`CommandJob`] and return a [`CommandJobSpawner`] for it.
     ///
     /// This is the ergonomic way to wire up command jobs. The returned spawner
@@ -159,7 +151,7 @@ where
     /// it needs — construct it before calling this method.
     pub fn add_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C> {
         let initializer = CommandJobInitializer::new(command);
-        let spawner = self.add_initializer(initializer);
+        let spawner = self.jobs.add_initializer(initializer);
         CommandJobSpawner::new(spawner)
     }
 }
