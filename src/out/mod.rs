@@ -12,7 +12,10 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
 
-pub use self::job::{EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig};
+pub use self::job::{
+    CommandJob, CommandJobSpawner, EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig,
+};
+pub use ::job::{CurrentJob, RetrySettings};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
@@ -196,13 +199,13 @@ where
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
-        build: impl FnOnce(&mut EventHandlerContext<'_>) -> H,
+        build: impl FnOnce(&mut EventHandlerContext<'_, P, Tables>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
         let handler = {
-            let mut ctx = EventHandlerContext::new(jobs);
+            let mut ctx = EventHandlerContext::new(jobs, self.clone());
             build(&mut ctx)
         };
         let initializer =
