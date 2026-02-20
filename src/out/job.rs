@@ -156,10 +156,7 @@ where
     ///
     /// The command struct itself holds whatever outboxes or other dependencies
     /// it needs — construct it before calling this method.
-    pub fn add_command_job<C: CommandJob>(
-        &mut self,
-        command: C,
-    ) -> CommandJobSpawner<C::Command> {
+    pub fn add_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C::Command> {
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
         CommandJobSpawner::new(spawner, C::entity_id)
@@ -271,11 +268,8 @@ where
         &self,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        let mut op = es_entity::DbOp::init_with_clock(
-            current_job.pool(),
-            current_job.clock(),
-        )
-        .await?;
+        let mut op =
+            es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
         self.command_job
             .run(&mut op, &self.command)
             .await
