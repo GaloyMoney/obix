@@ -152,7 +152,7 @@ where
     ///
     /// This is the ergonomic way to wire up command jobs. The returned spawner
     /// provides [`spawn_for_event`](CommandJobSpawner::spawn_for_event) which
-    /// derives deterministic job IDs from event IDs.
+    /// uses the entity ID as a queue ID for per-entity concurrency control.
     ///
     /// The command struct itself holds whatever outboxes or other dependencies
     /// it needs — construct it before calling this method.
@@ -160,10 +160,9 @@ where
         &mut self,
         command: C,
     ) -> CommandJobSpawner<C::Config> {
-        let job_type = C::job_type();
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
-        CommandJobSpawner::new(spawner, job_type)
+        CommandJobSpawner::new(spawner, C::entity_id)
     }
 
     /// Register a [`CommandJob`] built from the handler's outbox.
@@ -201,8 +200,7 @@ where
 ///
 /// Each command job is scoped to one entity (identified by
 /// [`entity_id`](Self::entity_id)). The entity ID is used as a queue ID
-/// to ensure at most one job per entity runs at a time, and as part of the
-/// deterministic job ID derivation for dedup protection.
+/// to ensure at most one job per entity runs at a time.
 #[async_trait]
 pub trait CommandJob: Send + Sync + 'static {
     /// The configuration/payload type for this command job.
@@ -213,8 +211,8 @@ pub trait CommandJob: Send + Sync + 'static {
 
     /// Return the entity ID that this command targets.
     ///
-    /// Used as the queue ID (ensuring at most one job per entity runs at a
-    /// time) and as part of the deterministic job ID derivation.
+    /// Used as the queue ID, ensuring at most one job per entity runs at a
+    /// time.
     fn entity_id(config: &Self::Config) -> &str;
 
     /// Execute the command within a database transaction.
@@ -306,61 +304,46 @@ where
     }
 }
 
-/// A spawner for command jobs that derives deterministic job IDs from events.
+/// A spawner for command jobs tied to a specific entity.
 ///
 /// Wraps a [`JobSpawner`] and provides [`spawn_for_event`](Self::spawn_for_event)
-/// which derives the job ID from (event ID, job type, entity ID), ensuring
-/// replay-safe spawning while allowing multiple commands per event.
+/// which spawns a job with the entity ID as the queue ID, ensuring at most one
+/// job per entity runs at a time.
 #[derive(Clone)]
 pub struct CommandJobSpawner<Config> {
     inner: JobSpawner<Config>,
-    job_type: JobType,
+    entity_id_fn: fn(&Config) -> &str,
 }
 
 impl<Config> CommandJobSpawner<Config>
 where
     Config: Serialize + Send + Sync + 'static,
 {
-    pub fn new(inner: JobSpawner<Config>, job_type: JobType) -> Self {
-        Self { inner, job_type }
+    pub fn new(inner: JobSpawner<Config>, entity_id_fn: fn(&Config) -> &str) -> Self {
+        Self {
+            inner,
+            entity_id_fn,
+        }
     }
 
     /// Spawn a command job for the given event.
     ///
-    /// The job ID is deterministically derived from (event ID, job type,
-    /// entity ID) using UUID v5, ensuring that replaying the same event
-    /// does not create duplicate jobs while allowing one event to spawn
-    /// multiple commands of different types or targeting different entities.
-    ///
-    /// The entity ID (extracted from the config via [`CommandJob::entity_id`])
-    /// is used as the queue ID, so at most one job per entity runs at a time.
-    ///
-    /// This method is idempotent: if a job with the derived ID already exists,
-    /// it returns `Ok(())`.
-    pub async fn spawn_for_event<C, P>(
+    /// The entity ID (extracted from the config) is used as the queue ID,
+    /// so at most one job per entity runs at a time.
+    pub async fn spawn_for_event<P>(
         &self,
-        event: &PersistentOutboxEvent<P>,
+        _event: &PersistentOutboxEvent<P>,
         config: Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        C: CommandJob<Config = Config>,
         P: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        let entity_id = C::entity_id(&config);
-        let event_uuid: uuid::Uuid = event.id.into();
-        let name = format!(
-            "{}:{}:{}",
-            event_uuid,
-            self.job_type,
-            entity_id
-        );
-        let job_id = job::JobId::from(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()));
+        let entity_id = (self.entity_id_fn)(&config);
         let queue_id = entity_id.to_string();
-        match self.inner.spawn_with_queue_id(job_id, config, queue_id).await {
-            Ok(_) => Ok(()),
-            Err(job::error::JobError::DuplicateId) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        self.inner
+            .spawn_with_queue_id(job::JobId::new(), config, queue_id)
+            .await?;
+        Ok(())
     }
 }
 
