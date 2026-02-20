@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use job::{
@@ -156,10 +157,10 @@ where
     ///
     /// The command struct itself holds whatever outboxes or other dependencies
     /// it needs — construct it before calling this method.
-    pub fn add_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C::Command> {
+    pub fn add_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C> {
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
-        CommandJobSpawner::new(spawner, C::entity_id)
+        CommandJobSpawner::new(spawner)
     }
 }
 
@@ -282,19 +283,16 @@ where
 /// job within the caller's transaction, using the entity ID as the queue ID to
 /// ensure at most one job per entity runs at a time.
 #[derive(Clone)]
-pub struct CommandJobSpawner<Command> {
-    inner: JobSpawner<Command>,
-    entity_id_fn: fn(&Command) -> &str,
+pub struct CommandJobSpawner<C: CommandJob> {
+    inner: JobSpawner<C::Command>,
+    _phantom: PhantomData<fn() -> C>,
 }
 
-impl<Command> CommandJobSpawner<Command>
-where
-    Command: Serialize + Send + Sync + 'static,
-{
-    pub fn new(inner: JobSpawner<Command>, entity_id_fn: fn(&Command) -> &str) -> Self {
+impl<C: CommandJob> CommandJobSpawner<C> {
+    pub(crate) fn new(inner: JobSpawner<C::Command>) -> Self {
         Self {
             inner,
-            entity_id_fn,
+            _phantom: PhantomData,
         }
     }
 
@@ -306,9 +304,9 @@ where
     pub async fn spawn(
         &self,
         op: &mut impl es_entity::AtomicOperation,
-        command: Command,
+        command: C::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let entity_id = (self.entity_id_fn)(&command);
+        let entity_id = C::entity_id(&command);
         let queue_id = entity_id.to_string();
         self.inner
             .spawn_with_queue_id_in_op(op, job::JobId::new(), command, queue_id)

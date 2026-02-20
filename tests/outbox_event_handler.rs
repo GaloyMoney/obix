@@ -431,7 +431,7 @@ impl CommandJob for SendWelcomeEmailCommandJob {
 }
 
 struct CustomerCreatedEventHandler {
-    send_welcome_email_command_spawner: CommandJobSpawner<SendWelcomeEmailCommand>,
+    send_welcome_email_command_spawner: CommandJobSpawner<SendWelcomeEmailCommandJob>,
 }
 
 impl OutboxEventHandler<TestEvent> for CustomerCreatedEventHandler {
