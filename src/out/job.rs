@@ -234,14 +234,14 @@ where
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let command: C::Command = job.config()?;
-        Ok(Box::new(CommandJobRunnerInner {
+        Ok(Box::new(CommandJobRunner {
             command_job: self.command.clone(),
             command,
         }))
     }
 }
 
-struct CommandJobRunnerInner<C>
+struct CommandJobRunner<C>
 where
     C: CommandJob,
 {
@@ -250,7 +250,7 @@ where
 }
 
 #[async_trait]
-impl<C> JobRunner for CommandJobRunnerInner<C>
+impl<C> JobRunner for CommandJobRunner<C>
 where
     C: CommandJob,
 {
