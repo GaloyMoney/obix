@@ -123,7 +123,7 @@ pub struct EventHandlerContext<'a> {
 }
 
 impl<'a> EventHandlerContext<'a> {
-    pub fn new(jobs: &'a mut ::job::Jobs) -> Self {
+    pub(super) fn new(jobs: &'a mut ::job::Jobs) -> Self {
         Self { jobs }
     }
 
