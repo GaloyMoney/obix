@@ -123,7 +123,7 @@ pub struct EventHandlerContext<'a> {
 }
 
 impl<'a> EventHandlerContext<'a> {
-    pub(super) fn new(jobs: &'a mut ::job::Jobs) -> Self {
+    pub fn new(jobs: &'a mut ::job::Jobs) -> Self {
         Self { jobs }
     }
 
@@ -135,9 +135,6 @@ impl<'a> EventHandlerContext<'a> {
         self.jobs.add_initializer(initializer)
     }
 
-    pub(super) fn into_jobs(self) -> &'a mut ::job::Jobs {
-        self.jobs
-    }
 }
 
 struct OutboxEventJobRunner<H, P, Tables>

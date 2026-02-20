@@ -201,9 +201,10 @@ where
     where
         H: OutboxEventHandler<P>,
     {
-        let mut ctx = EventHandlerContext::new(jobs);
-        let handler = build(&mut ctx);
-        let jobs = ctx.into_jobs();
+        let handler = {
+            let mut ctx = EventHandlerContext::new(jobs);
+            build(&mut ctx)
+        };
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);
