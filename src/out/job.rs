@@ -134,7 +134,6 @@ impl<'a> EventHandlerContext<'a> {
     {
         self.jobs.add_initializer(initializer)
     }
-
 }
 
 struct OutboxEventJobRunner<H, P, Tables>
