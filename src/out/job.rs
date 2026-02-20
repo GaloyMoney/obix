@@ -149,7 +149,7 @@ where
     ///
     /// The command struct itself holds whatever outboxes or other dependencies
     /// it needs — construct it before calling this method.
-    pub fn add_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C> {
+    pub fn build_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C> {
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.jobs.add_initializer(initializer);
         CommandJobSpawner::new(spawner)

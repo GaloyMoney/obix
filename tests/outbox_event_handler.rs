@@ -487,7 +487,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE)),
             |ctx| {
                 let send_welcome_email_command_spawner =
-                    ctx.add_command_job(SendWelcomeEmailCommandJob {
+                    ctx.build_command_job(SendWelcomeEmailCommandJob {
                         outbox: ctx.outbox().clone(),
                     });
                 CustomerCreatedEventHandler {
