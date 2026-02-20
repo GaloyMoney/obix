@@ -191,6 +191,14 @@ pub trait CommandJob: Send + Sync + 'static {
     /// time.
     fn entity_id(command: &Self::Command) -> &str;
 
+    /// Retry settings for this command job.
+    ///
+    /// Override this to customize retry behavior. The default uses
+    /// [`RetrySettings::default()`].
+    fn retry_settings() -> RetrySettings {
+        RetrySettings::default()
+    }
+
     /// Execute the command.
     ///
     /// The framework passes the [`CurrentJob`] context and the deserialized
@@ -231,6 +239,10 @@ where
         C::job_type()
     }
 
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        C::retry_settings()
+    }
+
     fn init(
         &self,
         job: &Job,
@@ -259,8 +271,11 @@ where
 {
     async fn run(
         &self,
-        current_job: CurrentJob,
+        mut current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        if current_job.is_shutdown_requested() {
+            return Ok(JobCompletion::RescheduleNow);
+        }
         self.command_job
             .run(current_job, &self.command)
             .await
