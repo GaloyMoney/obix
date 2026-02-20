@@ -35,12 +35,12 @@ where
 }
 
 #[derive(Clone)]
-pub struct OutboxEventJobConfig {
+pub struct EventHandlerJobConfig {
     pub job_type: JobType,
     pub retry_settings: RetrySettings,
 }
 
-impl OutboxEventJobConfig {
+impl EventHandlerJobConfig {
     pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
@@ -80,7 +80,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
+    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &EventHandlerJobConfig) -> Self {
         Self {
             outbox,
             handler: Arc::new(handler),
@@ -151,8 +151,8 @@ where
     /// Register a [`CommandJob`] and return a [`CommandJobSpawner`] for it.
     ///
     /// This is the ergonomic way to wire up command jobs. The returned spawner
-    /// provides [`spawn_for_event`](CommandJobSpawner::spawn_for_event) which
-    /// uses the entity ID as a queue ID for per-entity concurrency control.
+    /// provides [`spawn`](CommandJobSpawner::spawn) which uses the entity ID
+    /// as a queue ID for per-entity concurrency control.
     ///
     /// The command struct itself holds whatever outboxes or other dependencies
     /// it needs — construct it before calling this method.
@@ -163,23 +163,6 @@ where
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
         CommandJobSpawner::new(spawner, C::entity_id)
-    }
-
-    /// Register a [`CommandJob`] built from the handler's outbox.
-    ///
-    /// This is the convenience method for the common case where a command job
-    /// needs the same outbox the event handler is reading from. The closure
-    /// receives a clone of the outbox and returns the command.
-    ///
-    /// For commands that need multiple outboxes, use [`add_command_job`](Self::add_command_job)
-    /// and access additional outboxes via [`outbox()`](Self::outbox).
-    pub fn add_command_job_from<C, F>(&mut self, build: F) -> CommandJobSpawner<C::Config>
-    where
-        C: CommandJob,
-        F: FnOnce(Outbox<P, Tables>) -> C,
-    {
-        let command = build(self.outbox.clone());
-        self.add_command_job(command)
     }
 }
 
@@ -230,9 +213,7 @@ pub trait CommandJob: Send + Sync + 'static {
 /// Auto-generated [`JobInitializer`] wrapper for a [`CommandJob`].
 ///
 /// Created automatically by [`EventHandlerContext::add_command_job`].
-/// You can also construct one manually and pass it to
-/// [`EventHandlerContext::add_initializer`].
-pub struct CommandJobInitializer<C>
+pub(crate) struct CommandJobInitializer<C>
 where
     C: CommandJob,
 {
@@ -243,7 +224,7 @@ impl<C> CommandJobInitializer<C>
 where
     C: CommandJob,
 {
-    pub fn new(command: C) -> Self {
+    pub(crate) fn new(command: C) -> Self {
         Self {
             command: Arc::new(command),
         }
@@ -306,9 +287,9 @@ where
 
 /// A spawner for command jobs tied to a specific entity.
 ///
-/// Wraps a [`JobSpawner`] and provides [`spawn_for_event`](Self::spawn_for_event)
-/// which spawns a job with the entity ID as the queue ID, ensuring at most one
-/// job per entity runs at a time.
+/// Wraps a [`JobSpawner`] and provides [`spawn`](Self::spawn) which spawns a
+/// job within the caller's transaction, using the entity ID as the queue ID to
+/// ensure at most one job per entity runs at a time.
 #[derive(Clone)]
 pub struct CommandJobSpawner<Config> {
     inner: JobSpawner<Config>,
@@ -326,22 +307,20 @@ where
         }
     }
 
-    /// Spawn a command job for the given event.
+    /// Spawn a command job within the given transaction.
     ///
     /// The entity ID (extracted from the config) is used as the queue ID,
-    /// so at most one job per entity runs at a time.
-    pub async fn spawn_for_event<P>(
+    /// so at most one job per entity runs at a time. The spawn is part of
+    /// the caller's `op` — if the op is rolled back, the job is not created.
+    pub async fn spawn(
         &self,
-        _event: &PersistentOutboxEvent<P>,
+        op: &mut impl es_entity::AtomicOperation,
         config: Config,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let entity_id = (self.entity_id_fn)(&config);
         let queue_id = entity_id.to_string();
         self.inner
-            .spawn_with_queue_id(job::JobId::new(), config, queue_id)
+            .spawn_with_queue_id_in_op(op, job::JobId::new(), config, queue_id)
             .await?;
         Ok(())
     }
