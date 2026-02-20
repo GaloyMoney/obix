@@ -397,7 +397,7 @@ const SEND_WELCOME_EMAIL_JOB_TYPE: &str = "send-welcome-email";
 const WELCOME_EMAIL_OBSERVER_JOB_TYPE: &str = "welcome-email-observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SendWelcomeEmailConfig {
+struct SendWelcomeEmailCommand {
     customer_id: String,
     value: u64,
 }
@@ -408,30 +408,30 @@ struct SendWelcomeEmailCommandJob {
 
 #[async_trait]
 impl CommandJob for SendWelcomeEmailCommandJob {
-    type Config = SendWelcomeEmailConfig;
+    type Command = SendWelcomeEmailCommand;
 
     fn job_type() -> job::JobType {
         job::JobType::new(SEND_WELCOME_EMAIL_JOB_TYPE)
     }
 
-    fn entity_id(config: &Self::Config) -> &str {
-        &config.customer_id
+    fn entity_id(command: &Self::Command) -> &str {
+        &command.customer_id
     }
 
     async fn run(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        config: &SendWelcomeEmailConfig,
+        command: &SendWelcomeEmailCommand,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.outbox
-            .publish_persisted_in_op(op, TestEvent::WelcomeEmailSent(config.value * 10))
+            .publish_persisted_in_op(op, TestEvent::WelcomeEmailSent(command.value * 10))
             .await?;
         Ok(())
     }
 }
 
 struct CustomerCreatedEventHandler {
-    spawner: CommandJobSpawner<SendWelcomeEmailConfig>,
+    spawner: CommandJobSpawner<SendWelcomeEmailCommand>,
 }
 
 impl OutboxEventHandler<TestEvent> for CustomerCreatedEventHandler {
@@ -441,11 +441,11 @@ impl OutboxEventHandler<TestEvent> for CustomerCreatedEventHandler {
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::CustomerCreated(n)) = &event.payload {
-            let config = SendWelcomeEmailConfig {
+            let command = SendWelcomeEmailCommand {
                 customer_id: format!("customer-{n}"),
                 value: *n,
             };
-            self.spawner.spawn(op, config).await?;
+            self.spawner.spawn(op, command).await?;
         }
         Ok(())
     }

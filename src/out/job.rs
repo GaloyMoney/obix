@@ -159,7 +159,7 @@ where
     pub fn add_command_job<C: CommandJob>(
         &mut self,
         command: C,
-    ) -> CommandJobSpawner<C::Config> {
+    ) -> CommandJobSpawner<C::Command> {
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.add_initializer(initializer);
         CommandJobSpawner::new(spawner, C::entity_id)
@@ -186,8 +186,8 @@ where
 /// to ensure at most one job per entity runs at a time.
 #[async_trait]
 pub trait CommandJob: Send + Sync + 'static {
-    /// The configuration/payload type for this command job.
-    type Config: Serialize + DeserializeOwned + Send + Sync + 'static;
+    /// The command payload type for this command job.
+    type Command: Serialize + DeserializeOwned + Send + Sync + 'static;
 
     /// The job type identifier for this command.
     fn job_type() -> JobType;
@@ -196,7 +196,7 @@ pub trait CommandJob: Send + Sync + 'static {
     ///
     /// Used as the queue ID, ensuring at most one job per entity runs at a
     /// time.
-    fn entity_id(config: &Self::Config) -> &str;
+    fn entity_id(command: &Self::Command) -> &str;
 
     /// Execute the command within a database transaction.
     ///
@@ -206,7 +206,7 @@ pub trait CommandJob: Send + Sync + 'static {
     async fn run(
         &self,
         op: &mut es_entity::DbOp<'_>,
-        config: &Self::Config,
+        command: &Self::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -235,7 +235,7 @@ impl<C> JobInitializer for CommandJobInitializer<C>
 where
     C: CommandJob,
 {
-    type Config = C::Config;
+    type Config = C::Command;
 
     fn job_type(&self) -> JobType {
         C::job_type()
@@ -246,10 +246,10 @@ where
         job: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let config: C::Config = job.config()?;
+        let command: C::Command = job.config()?;
         Ok(Box::new(CommandJobRunnerInner {
-            command: self.command.clone(),
-            config,
+            command_job: self.command.clone(),
+            command,
         }))
     }
 }
@@ -258,8 +258,8 @@ struct CommandJobRunnerInner<C>
 where
     C: CommandJob,
 {
-    command: Arc<C>,
-    config: C::Config,
+    command_job: Arc<C>,
+    command: C::Command,
 }
 
 #[async_trait]
@@ -276,8 +276,8 @@ where
             current_job.clock(),
         )
         .await?;
-        self.command
-            .run(&mut op, &self.config)
+        self.command_job
+            .run(&mut op, &self.command)
             .await
             .map_err(|e| e as Box<dyn std::error::Error>)?;
         op.commit().await?;
@@ -291,16 +291,16 @@ where
 /// job within the caller's transaction, using the entity ID as the queue ID to
 /// ensure at most one job per entity runs at a time.
 #[derive(Clone)]
-pub struct CommandJobSpawner<Config> {
-    inner: JobSpawner<Config>,
-    entity_id_fn: fn(&Config) -> &str,
+pub struct CommandJobSpawner<Command> {
+    inner: JobSpawner<Command>,
+    entity_id_fn: fn(&Command) -> &str,
 }
 
-impl<Config> CommandJobSpawner<Config>
+impl<Command> CommandJobSpawner<Command>
 where
-    Config: Serialize + Send + Sync + 'static,
+    Command: Serialize + Send + Sync + 'static,
 {
-    pub fn new(inner: JobSpawner<Config>, entity_id_fn: fn(&Config) -> &str) -> Self {
+    pub fn new(inner: JobSpawner<Command>, entity_id_fn: fn(&Command) -> &str) -> Self {
         Self {
             inner,
             entity_id_fn,
@@ -309,18 +309,18 @@ where
 
     /// Spawn a command job within the given transaction.
     ///
-    /// The entity ID (extracted from the config) is used as the queue ID,
+    /// The entity ID (extracted from the command) is used as the queue ID,
     /// so at most one job per entity runs at a time. The spawn is part of
     /// the caller's `op` — if the op is rolled back, the job is not created.
     pub async fn spawn(
         &self,
         op: &mut impl es_entity::AtomicOperation,
-        config: Config,
+        command: Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let entity_id = (self.entity_id_fn)(&config);
+        let entity_id = (self.entity_id_fn)(&command);
         let queue_id = entity_id.to_string();
         self.inner
-            .spawn_with_queue_id_in_op(op, job::JobId::new(), config, queue_id)
+            .spawn_with_queue_id_in_op(op, job::JobId::new(), command, queue_id)
             .await?;
         Ok(())
     }
