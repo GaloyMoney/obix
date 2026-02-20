@@ -377,15 +377,11 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
     Ok(())
 }
 
-// -- New tests: order-management domain --
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum OrderEvent {
     OrderPlaced { order_id: u64 },
     OrderShipped { order_id: u64 },
 }
-
-// -- Fulfillment handler: spawns a downstream job from an event --
 
 const FULFILLMENT_HANDLER_JOB_TYPE: &str = "fulfillment-handler";
 const FULFILL_ORDER_JOB_TYPE: &str = "fulfill-order";
