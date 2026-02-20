@@ -431,7 +431,7 @@ impl CommandJob for SendWelcomeEmailCommandJob {
 }
 
 struct CustomerCreatedEventHandler {
-    spawner: CommandJobSpawner<SendWelcomeEmailCommand>,
+    send_welcome_email_command_spawner: CommandJobSpawner<SendWelcomeEmailCommand>,
 }
 
 impl OutboxEventHandler<TestEvent> for CustomerCreatedEventHandler {
@@ -445,7 +445,9 @@ impl OutboxEventHandler<TestEvent> for CustomerCreatedEventHandler {
                 customer_id: format!("customer-{n}"),
                 value: *n,
             };
-            self.spawner.spawn(op, command).await?;
+            self.send_welcome_email_command_spawner
+                .spawn(op, command)
+                .await?;
         }
         Ok(())
     }
@@ -481,10 +483,13 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
             &mut jobs,
             EventHandlerJobConfig::new(job::JobType::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE)),
             |ctx| {
-                let spawner = ctx.add_command_job(SendWelcomeEmailCommandJob {
-                    outbox: ctx.outbox().clone(),
-                });
-                CustomerCreatedEventHandler { spawner }
+                let send_welcome_email_command_spawner =
+                    ctx.add_command_job(SendWelcomeEmailCommandJob {
+                        outbox: ctx.outbox().clone(),
+                    });
+                CustomerCreatedEventHandler {
+                    send_welcome_email_command_spawner,
+                }
             },
         )
         .await
