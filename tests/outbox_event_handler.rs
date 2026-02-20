@@ -18,6 +18,8 @@ const JOB_TYPE: &str = "test-outbox-handler";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
     Ping(u64),
+    CustomerCreated(u64),
+    WelcomeEmailSent(u64),
 }
 
 struct TestPersistentHandler {
@@ -30,9 +32,13 @@ impl OutboxEventHandler<TestEvent> for TestPersistentHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
-            self.received.lock().await.push(*n);
-        }
+        let n = match &event.payload {
+            Some(TestEvent::Ping(n))
+            | Some(TestEvent::CustomerCreated(n))
+            | Some(TestEvent::WelcomeEmailSent(n)) => *n,
+            None => return Ok(()),
+        };
+        self.received.lock().await.push(n);
         Ok(())
     }
 }
@@ -46,8 +52,9 @@ impl OutboxEventHandler<TestEvent> for TestEphemeralHandler {
         &self,
         event: &obix::out::EphemeralOutboxEvent<TestEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
-        self.received.lock().await.push(*n);
+        if let TestEvent::Ping(n) = &event.payload {
+            self.received.lock().await.push(*n);
+        }
         Ok(())
     }
 }
@@ -73,8 +80,9 @@ impl OutboxEventHandler<TestEvent> for TestBothHandler {
         &self,
         event: &obix::out::EphemeralOutboxEvent<TestEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
-        self.ephemeral_received.lock().await.push(*n);
+        if let TestEvent::Ping(n) = &event.payload {
+            self.ephemeral_received.lock().await.push(*n);
+        }
         Ok(())
     }
 }
@@ -750,7 +758,7 @@ impl CommandJob for SendWelcomeEmailCommandJob {
         config: &SendWelcomeEmailConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.outbox
-            .publish_persisted_in_op(op, TestEvent::Ping(config.value * 10))
+            .publish_persisted_in_op(op, TestEvent::WelcomeEmailSent(config.value * 10))
             .await?;
         Ok(())
     }
@@ -766,15 +774,12 @@ impl OutboxEventHandler<TestEvent> for CustomerCreatedOutboxEventHandler {
         _op: &mut es_entity::DbOp<'_>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(TestEvent::Ping(n)) = &event.payload {
-            // Only spawn command jobs for "trigger" events (< 100) to avoid infinite chain
-            if *n < 100 {
-                let config = SendWelcomeEmailConfig {
-                    customer_id: format!("customer-{n}"),
-                    value: *n,
-                };
-                self.spawner.spawn_for_event(event, config).await?;
-            }
+        if let Some(TestEvent::CustomerCreated(n)) = &event.payload {
+            let config = SendWelcomeEmailConfig {
+                customer_id: format!("customer-{n}"),
+                value: *n,
+            };
+            self.spawner.spawn_for_event(event, config).await?;
         }
         Ok(())
     }
@@ -832,14 +837,14 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
-    // Publish trigger event: Ping(42)
+    // Publish trigger event: CustomerCreated(42)
     let mut op = outbox.begin_op().await?;
     outbox
-        .publish_persisted_in_op(&mut op, TestEvent::Ping(42))
+        .publish_persisted_in_op(&mut op, TestEvent::CustomerCreated(42))
         .await?;
     op.commit().await?;
 
-    // Wait for the downstream event (420 = 42 * 10) published by the command job
+    // Wait for the downstream event WelcomeEmailSent(420) published by the command job
     let start = std::time::Instant::now();
     loop {
         let values = observed.lock().await;
@@ -857,15 +862,15 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // Verify: observer should have seen both the trigger (42) and downstream (420)
+    // Verify: observer should have seen both CustomerCreated(42) and WelcomeEmailSent(420)
     let values = observed.lock().await;
     assert!(
         values.contains(&42),
-        "Should have observed trigger event"
+        "Should have observed trigger event (CustomerCreated)"
     );
     assert!(
         values.contains(&420),
-        "Should have observed downstream event from command job"
+        "Should have observed downstream event from command job (WelcomeEmailSent)"
     );
 
     Ok(())
