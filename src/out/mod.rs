@@ -192,7 +192,7 @@ where
         Ok(())
     }
 
-    pub async fn register_event_handler_with<H>(
+    pub async fn register_event_handler_with_context<H>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,

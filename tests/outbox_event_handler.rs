@@ -483,7 +483,7 @@ async fn fulfillment_handler_spawns_downstream_job() -> anyhow::Result<()> {
 
     let fulfilled_clone = fulfilled.clone();
     outbox
-        .register_event_handler_with(
+        .register_event_handler_with_context(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(FULFILLMENT_HANDLER_JOB_TYPE)),
             |ctx| {
@@ -654,7 +654,7 @@ async fn event_chain_handler_to_job_to_handler() -> anyhow::Result<()> {
     // Handler1: ShippingHandler spawns ShipOrder job on OrderPlaced
     let outbox_for_job = outbox.clone();
     outbox
-        .register_event_handler_with(
+        .register_event_handler_with_context(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(SHIPPING_HANDLER_JOB_TYPE)),
             |ctx| {
