@@ -207,9 +207,6 @@ pub trait CommandJob: Send + Sync + 'static {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Auto-generated [`JobInitializer`] wrapper for a [`CommandJob`].
-///
-/// Created automatically by [`EventHandlerContext::add_command_job`].
 pub(crate) struct CommandJobInitializer<C>
 where
     C: CommandJob,
