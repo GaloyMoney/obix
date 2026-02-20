@@ -162,10 +162,13 @@ where
 
 /// A one-time command job spawned by event handlers.
 ///
-/// Command jobs do atomic work within a database transaction and can
-/// publish outbox events as part of that transaction. The framework
-/// handles transaction lifecycle — it begins a `DbOp`, passes it to
-/// `run`, commits the `DbOp`, and returns `JobCompletion::Complete`.
+/// Command jobs are scoped to one entity and do one atomic piece of work.
+/// The framework deserializes the command, invokes `run`, and marks the
+/// job complete on success.
+///
+/// Transaction management is the command job's responsibility — use
+/// `current_job.pool()` and `current_job.clock()` to begin a database
+/// operation when needed.
 ///
 /// The command struct itself holds whatever outboxes (or other deps) it
 /// needs, injected at construction time. This makes command jobs
@@ -188,15 +191,15 @@ pub trait CommandJob: Send + Sync + 'static {
     /// time.
     fn entity_id(command: &Self::Command) -> &str;
 
-    /// Execute the command within a database transaction.
+    /// Execute the command.
     ///
-    /// The `op` is committed by the framework after `run` returns `Ok(())`.
-    /// Use `outbox.publish_persisted_in_op(op, event)` to publish events
-    /// atomically with the command's work.
+    /// The framework passes the [`CurrentJob`] context and the deserialized
+    /// command payload. If the command needs a database transaction, open one
+    /// via `es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock())`.
     async fn run(
         &self,
-        op: &mut es_entity::DbOp<'_>,
-        command: &Self::Command,
+        current_job: CurrentJob,
+        command: Self::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -236,7 +239,7 @@ where
         let command: C::Command = job.config()?;
         Ok(Box::new(CommandJobRunner {
             command_job: self.command.clone(),
-            command,
+            command: std::sync::Mutex::new(Some(command)),
         }))
     }
 }
@@ -246,7 +249,7 @@ where
     C: CommandJob,
 {
     command_job: Arc<C>,
-    command: C::Command,
+    command: std::sync::Mutex<Option<C::Command>>,
 }
 
 #[async_trait]
@@ -258,13 +261,16 @@ where
         &self,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        let mut op =
-            es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+        let command = self
+            .command
+            .lock()
+            .expect("lock poisoned")
+            .take()
+            .expect("command already consumed");
         self.command_job
-            .run(&mut op, &self.command)
+            .run(current_job, command)
             .await
             .map_err(|e| e as Box<dyn std::error::Error>)?;
-        op.commit().await?;
         Ok(JobCompletion::Complete)
     }
 }

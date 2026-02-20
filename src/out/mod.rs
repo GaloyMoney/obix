@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub use self::job::{
     CommandJob, CommandJobSpawner, EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig,
 };
+pub use ::job::CurrentJob;
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;

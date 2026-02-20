@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use obix::{
-    CommandJob, CommandJobSpawner, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
-    out::Outbox,
+    CommandJob, CommandJobSpawner, CurrentJob, MailboxConfig, OutboxEventHandler,
+    OutboxEventJobConfig, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -420,12 +420,15 @@ impl CommandJob for SendWelcomeEmailCommandJob {
 
     async fn run(
         &self,
-        op: &mut es_entity::DbOp<'_>,
-        command: &SendWelcomeEmailCommand,
+        current_job: CurrentJob,
+        command: SendWelcomeEmailCommand,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut op =
+            es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
         self.outbox
-            .publish_persisted_in_op(op, TestEvent::WelcomeEmailSent(command.value * 10))
+            .publish_persisted_in_op(&mut op, TestEvent::WelcomeEmailSent(command.value * 10))
             .await?;
+        op.commit().await?;
         Ok(())
     }
 }
