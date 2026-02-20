@@ -134,18 +134,24 @@ async fn order_ledger_receives_persistent_events() -> anyhow::Result<()> {
     outbox
         .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 1 })
         .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 2 })
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 3 })
+        .await?;
     op.commit().await?;
 
     let start = std::time::Instant::now();
     loop {
         let events = recorded.lock().await;
-        if !events.is_empty() {
-            assert_eq!(*events, vec![1]);
+        if events.len() >= 3 {
+            assert_eq!(*events, vec![1, 2, 3]);
             break;
         }
         drop(events);
         if start.elapsed() > std::time::Duration::from_secs(5) {
-            anyhow::bail!("Timeout waiting for persistent event");
+            anyhow::bail!("Timeout waiting for persistent events");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -206,7 +212,7 @@ async fn order_dashboard_receives_ephemeral_events() -> anyhow::Result<()> {
 async fn order_ledger_resumes_after_restart() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // First run: process one event
+    // First run: process two events
     let recorded_first = Arc::new(Mutex::new(Vec::new()));
     {
         let job_config = job::JobSvcConfig::builder()
@@ -230,17 +236,20 @@ async fn order_ledger_resumes_after_restart() -> anyhow::Result<()> {
         outbox
             .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 10 })
             .await?;
+        outbox
+            .publish_persisted_in_op(&mut op, OrderEvent::OrderPlaced { order_id: 11 })
+            .await?;
         op.commit().await?;
 
         let start = std::time::Instant::now();
         loop {
             let events = recorded_first.lock().await;
-            if !events.is_empty() {
+            if events.len() >= 2 {
                 break;
             }
             drop(events);
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                anyhow::bail!("Timeout waiting for first-run event");
+                anyhow::bail!("Timeout waiting for first-run events");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
