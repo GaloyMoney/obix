@@ -42,9 +42,9 @@ pub struct OutboxEventJobConfig {
 }
 
 impl OutboxEventJobConfig {
-    pub fn new(job_type: JobType) -> Self {
+    pub fn new(job_type: &'static str) -> Self {
         Self {
-            job_type,
+            job_type: JobType::new(job_type),
             retry_settings: RetrySettings::repeat_indefinitely(),
         }
     }
@@ -52,6 +52,12 @@ impl OutboxEventJobConfig {
     pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
         self.retry_settings = settings;
         self
+    }
+}
+
+impl From<&'static str> for OutboxEventJobConfig {
+    fn from(job_type: &'static str) -> Self {
+        Self::new(job_type)
     }
 }
 
