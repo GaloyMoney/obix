@@ -35,12 +35,12 @@ where
 }
 
 #[derive(Clone)]
-pub struct EventHandlerJobConfig {
+pub struct OutboxEventJobConfig {
     pub job_type: JobType,
     pub retry_settings: RetrySettings,
 }
 
-impl EventHandlerJobConfig {
+impl OutboxEventJobConfig {
     pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
@@ -80,7 +80,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &EventHandlerJobConfig) -> Self {
+    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
         Self {
             outbox,
             handler: Arc::new(handler),

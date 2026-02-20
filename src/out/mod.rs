@@ -13,7 +13,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::job::{
-    CommandJob, CommandJobSpawner, EventHandlerContext, EventHandlerJobConfig, OutboxEventHandler,
+    CommandJob, CommandJobSpawner, EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig,
 };
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -179,7 +179,7 @@ where
     pub async fn register_event_handler<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        config: EventHandlerJobConfig,
+        config: OutboxEventJobConfig,
         handler: H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
@@ -197,7 +197,7 @@ where
     pub async fn register_event_handler_with_context<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        config: EventHandlerJobConfig,
+        config: OutboxEventJobConfig,
         build: impl FnOnce(&mut EventHandlerContext<'_, P, Tables>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
