@@ -199,7 +199,7 @@ pub trait CommandJob: Send + Sync + 'static {
     async fn run(
         &self,
         current_job: CurrentJob,
-        command: Self::Command,
+        command: &Self::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -239,7 +239,7 @@ where
         let command: C::Command = job.config()?;
         Ok(Box::new(CommandJobRunner {
             command_job: self.command.clone(),
-            command: std::sync::Mutex::new(Some(command)),
+            command,
         }))
     }
 }
@@ -249,7 +249,7 @@ where
     C: CommandJob,
 {
     command_job: Arc<C>,
-    command: std::sync::Mutex<Option<C::Command>>,
+    command: C::Command,
 }
 
 #[async_trait]
@@ -261,14 +261,8 @@ where
         &self,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        let command = self
-            .command
-            .lock()
-            .expect("lock poisoned")
-            .take()
-            .expect("command already consumed");
         self.command_job
-            .run(current_job, command)
+            .run(current_job, &self.command)
             .await
             .map_err(|e| e as Box<dyn std::error::Error>)?;
         Ok(JobCompletion::Complete)

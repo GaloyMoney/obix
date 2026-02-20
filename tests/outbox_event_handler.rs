@@ -421,7 +421,7 @@ impl CommandJob for SendWelcomeEmailCommandJob {
     async fn run(
         &self,
         current_job: CurrentJob,
-        command: SendWelcomeEmailCommand,
+        command: &SendWelcomeEmailCommand,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut op =
             es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
