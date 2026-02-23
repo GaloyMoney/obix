@@ -149,13 +149,16 @@ where
 
     /// Register a [`CommandJob`] and return a [`CommandJobSpawner`] for it.
     ///
-    /// This is the ergonomic way to wire up command jobs. The returned spawner
-    /// provides [`spawn`](CommandJobSpawner::spawn) which uses the entity ID
-    /// as a queue ID for per-entity concurrency control.
-    ///
-    /// The command struct itself holds whatever outboxes or other dependencies
-    /// it needs — construct it before calling this method.
-    pub fn build_command_job<C: CommandJob>(&mut self, command: C) -> CommandJobSpawner<C> {
+    /// The closure receives a clone of the event handler's [`Outbox`], which
+    /// covers the common case where a command job publishes back to the same
+    /// outbox.  The returned spawner provides
+    /// [`spawn`](CommandJobSpawner::spawn) which uses the entity ID as a
+    /// queue ID for per-entity concurrency control.
+    pub fn build_command_job<C: CommandJob>(
+        &mut self,
+        f: impl FnOnce(Outbox<P, Tables>) -> C,
+    ) -> CommandJobSpawner<C> {
+        let command = f(self.outbox.clone());
         let initializer = CommandJobInitializer::new(command);
         let spawner = self.jobs.add_initializer(initializer);
         CommandJobSpawner::new(spawner)

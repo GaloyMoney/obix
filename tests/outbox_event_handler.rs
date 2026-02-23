@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use obix::{
-    CommandJob, CommandJobSpawner, CurrentJob, MailboxConfig, OutboxEventHandler,
-    OutboxEventJobConfig, out::Outbox,
+    CommandJob, CommandJobSpawner, CurrentJob, MailboxConfig, OutboxEventHandler, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -104,11 +103,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     .await?;
 
     outbox
-        .register_event_handler(
-            jobs,
-            OutboxEventJobConfig::new(JOB_TYPE),
-            handler,
-        )
+        .register_event_handler(jobs, JOB_TYPE, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -286,7 +281,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox
             .register_event_handler(
                 &mut jobs,
-                OutboxEventJobConfig::new(JOB_TYPE),
+                JOB_TYPE,
                 TestPersistentHandler {
                     received: received_second.clone(),
                 },
@@ -484,12 +479,10 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler_with_context(
             &mut jobs,
-            OutboxEventJobConfig::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE),
+            CUSTOMER_CREATED_HANDLER_JOB_TYPE,
             |ctx| {
                 let send_welcome_email_command_spawner =
-                    ctx.build_command_job(SendWelcomeEmailCommandJob {
-                        outbox: ctx.outbox().clone(),
-                    });
+                    ctx.build_command_job(|outbox| SendWelcomeEmailCommandJob { outbox });
                 CustomerCreatedEventHandler {
                     send_welcome_email_command_spawner,
                 }
@@ -503,7 +496,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler(
             &mut jobs,
-            OutboxEventJobConfig::new(WELCOME_EMAIL_OBSERVER_JOB_TYPE),
+            WELCOME_EMAIL_OBSERVER_JOB_TYPE,
             TestPersistentHandler {
                 received: observed.clone(),
             },
