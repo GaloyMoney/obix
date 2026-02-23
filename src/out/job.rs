@@ -36,17 +36,28 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) struct OutboxEventJobConfig {
+pub struct OutboxEventJobConfig {
     pub(crate) job_type: JobType,
     pub(crate) retry_settings: RetrySettings,
 }
 
 impl OutboxEventJobConfig {
-    pub(crate) fn new(job_type: JobType) -> Self {
+    pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
             retry_settings: RetrySettings::repeat_indefinitely(),
         }
+    }
+
+    pub fn with_retry_settings(mut self, retry_settings: RetrySettings) -> Self {
+        self.retry_settings = retry_settings;
+        self
+    }
+}
+
+impl From<JobType> for OutboxEventJobConfig {
+    fn from(job_type: JobType) -> Self {
+        Self::new(job_type)
     }
 }
 

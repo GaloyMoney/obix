@@ -12,8 +12,9 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use std::sync::Arc;
 
-pub use self::job::{CommandJob, CommandJobSpawner, EventHandlerContext, OutboxEventHandler};
-use self::job::OutboxEventJobConfig;
+pub use self::job::{
+    CommandJob, CommandJobSpawner, EventHandlerContext, OutboxEventHandler, OutboxEventJobConfig,
+};
 pub use ::job::{CurrentJob, RetrySettings};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -179,13 +180,13 @@ where
     pub async fn register_event_handler<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        job_type: ::job::JobType,
+        config: impl Into<OutboxEventJobConfig>,
         handler: H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
-        let config = OutboxEventJobConfig::new(job_type);
+        let config = config.into();
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);
@@ -198,7 +199,7 @@ where
     pub async fn register_event_handler_with_context<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        job_type: ::job::JobType,
+        config: impl Into<OutboxEventJobConfig>,
         build: impl FnOnce(&mut EventHandlerContext<'_, P, Tables>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
@@ -208,7 +209,7 @@ where
             let mut ctx = EventHandlerContext::new(jobs, self.clone());
             build(&mut ctx)
         };
-        let config = OutboxEventJobConfig::new(job_type);
+        let config = config.into();
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);

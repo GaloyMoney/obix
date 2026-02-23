@@ -27,7 +27,7 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CommandJob, CommandJobSpawner, CurrentJob, EventHandlerContext, Outbox, OutboxEventHandler,
-    RetrySettings,
+    OutboxEventJobConfig, RetrySettings,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
