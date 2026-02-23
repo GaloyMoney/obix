@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use obix::{
-    CommandJob, CommandJobSpawner, CurrentJob, MailboxConfig, OutboxEventHandler, out::Outbox,
+    CommandJob, CommandJobSpawner, CurrentJob, MailboxConfig, OutboxEventHandler,
+    OutboxEventJobConfig, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -103,7 +104,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     .await?;
 
     outbox
-        .register_event_handler(jobs, JOB_TYPE, handler)
+        .register_event_handler(jobs, OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)), handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -281,7 +282,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox
             .register_event_handler(
                 &mut jobs,
-                JOB_TYPE,
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 TestPersistentHandler {
                     received: received_second.clone(),
                 },
@@ -479,7 +480,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler_with_context(
             &mut jobs,
-            CUSTOMER_CREATED_HANDLER_JOB_TYPE,
+            OutboxEventJobConfig::new(job::JobType::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE)),
             |ctx| {
                 let send_welcome_email_command_spawner =
                     ctx.build_command_job(|outbox| SendWelcomeEmailCommandJob { outbox });
@@ -496,7 +497,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler(
             &mut jobs,
-            WELCOME_EMAIL_OBSERVER_JOB_TYPE,
+            OutboxEventJobConfig::new(job::JobType::new(WELCOME_EMAIL_OBSERVER_JOB_TYPE)),
             TestPersistentHandler {
                 received: observed.clone(),
             },

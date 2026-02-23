@@ -180,13 +180,12 @@ where
     pub async fn register_event_handler<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        config: impl Into<OutboxEventJobConfig>,
+        config: OutboxEventJobConfig,
         handler: H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
-        let config = config.into();
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);
@@ -199,13 +198,12 @@ where
     pub async fn register_event_handler_with_context<H>(
         &self,
         jobs: &mut ::job::Jobs,
-        config: impl Into<OutboxEventJobConfig>,
+        config: OutboxEventJobConfig,
         build: impl FnOnce(&mut EventHandlerContext<'_, P, Tables>) -> H,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
-        let config = config.into();
         let handler = {
             let mut ctx = EventHandlerContext::new(jobs, self.clone());
             build(&mut ctx)
