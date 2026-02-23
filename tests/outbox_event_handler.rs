@@ -106,7 +106,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     outbox
         .register_event_handler(
             jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+            OutboxEventJobConfig::new(JOB_TYPE),
             handler,
         )
         .await
@@ -286,7 +286,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         outbox
             .register_event_handler(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+                OutboxEventJobConfig::new(JOB_TYPE),
                 TestPersistentHandler {
                     received: received_second.clone(),
                 },
@@ -484,7 +484,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler_with_context(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE)),
+            OutboxEventJobConfig::new(CUSTOMER_CREATED_HANDLER_JOB_TYPE),
             |ctx| {
                 let send_welcome_email_command_spawner =
                     ctx.build_command_job(SendWelcomeEmailCommandJob {
@@ -503,7 +503,7 @@ async fn command_job_round_trip() -> anyhow::Result<()> {
     outbox
         .register_event_handler(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(WELCOME_EMAIL_OBSERVER_JOB_TYPE)),
+            OutboxEventJobConfig::new(WELCOME_EMAIL_OBSERVER_JOB_TYPE),
             TestPersistentHandler {
                 received: observed.clone(),
             },
