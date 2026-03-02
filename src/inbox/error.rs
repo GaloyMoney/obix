@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum InboxError {
     #[error("InboxError - Sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("InboxError - EsEntity: {0}")]
-    EsEntity(#[from] es_entity::EsEntityError),
     #[error("InboxError - Job: {0}")]
     Job(#[from] job::error::JobError),
     #[error("InboxError - NotFound: {0}")]
