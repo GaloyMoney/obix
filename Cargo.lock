@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "obix"
-version = "0.2.15-dev"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "obix-macros"
-version = "0.2.15-dev"
+version = "0.2.15"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",

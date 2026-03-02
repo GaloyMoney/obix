@@ -1,3 +1,11 @@
+# [obix release v0.2.15](https://github.com/GaloyMoney/obix/releases/tag/0.2.15)
+
+
+
+### Features
+
+- Adopt es-entity per-operation error types (#26)
+
 # [obix release v0.2.14](https://github.com/GaloyMoney/obix/releases/tag/0.2.14)
 
 
