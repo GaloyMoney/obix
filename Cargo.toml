@@ -7,6 +7,7 @@ description = "Implementation of outbox backed by PG / sqlx"
 repository = "https://github.com/GaloyMoney/obix"
 documentation = "https://docs.rs/obix"
 categories = ["database"]
+include = ["src/**/*", "migrations/**/*", ".sqlx/**/*", "Cargo.toml", "LICENSE", "README.md"]
 
 [features]
 
