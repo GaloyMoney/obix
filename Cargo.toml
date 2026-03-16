@@ -1,6 +1,6 @@
 [package]
 name = "obix"
-version = "0.2.16-dev"
+version = "0.2.17"
 edition = "2024"
 license = "Apache-2.0"
 description = "Implementation of outbox backed by PG / sqlx"
@@ -50,11 +50,11 @@ members = [
 
 [workspace.dependencies]
 
-obix-macros = { path = "obix-macros", version = "0.2.16-dev" }
+obix-macros = { path = "obix-macros", version = "0.2.17" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-es-entity = "0.10.22"
+es-entity = "0.10.28"
 anyhow = "1.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -63,7 +63,12 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
-job = "0.6.8"
+job = "0.6.9"
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
+
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "635fe3daffcfddbc1e62aace816c01e3e3b00967" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "635fe3daffcfddbc1e62aace816c01e3e3b00967" }
+job = { git = "https://github.com/GaloyMoney/job", rev = "643a9ae0a3811572333352db36c6ac6eff53ba5c" }
