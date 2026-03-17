@@ -1,6 +1,6 @@
 mod helpers;
 
-use es_entity::clock::{ArtificialClockConfig, ClockHandle};
+use es_entity::clock::ClockHandle;
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
@@ -219,7 +219,7 @@ async fn inbox_multiple_events() -> anyhow::Result<()> {
 async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+    let (clock, controller) = ClockHandle::manual();
     let initial_time = clock.now();
 
     let job_config = job::JobSvcConfig::builder()
