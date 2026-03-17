@@ -127,7 +127,7 @@ where
             return Ok(JobCompletion::RescheduleNow);
         }
 
-        let now = self.clock.artificial_now();
+        let now = self.clock.manual_now();
 
         Tables::update_inbox_event_status(
             &self.pool,
