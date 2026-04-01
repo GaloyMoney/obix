@@ -71,6 +71,7 @@
         process-compose
         ytt
         curl
+        fly
       ];
 
       pgPort = 5432;
