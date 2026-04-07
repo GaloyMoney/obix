@@ -166,6 +166,19 @@ where
         (cache, last_broadcast_sequence)
     }
 
+    async fn fill_gap(
+        pool: sqlx::PgPool,
+        from_sequence: EventSequence,
+        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        buffer_size: usize,
+    ) {
+        if let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await {
+            for event in events {
+                let _ = cache_fill_sender.send(Arc::new(event));
+            }
+        }
+    }
+
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
         start_after: EventSequence,
@@ -284,6 +297,7 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
+            let mut gap_fill_in_progress_for: Option<(EventSequence, std::time::Instant)> = None;
 
             loop {
                 tokio::select! {
@@ -400,6 +414,33 @@ where
                             }
                         }
                     }
+                }
+
+                // Proactive gap fill: if broadcasting is stuck waiting for a missing
+                // sequence, trigger load_next_page which will fill the gap via
+                // fill_gaps_query.
+                let next_needed = last_broadcast_sequence.next();
+                let highest = highest_known_sequence.load(Ordering::Relaxed);
+                if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
+                {
+                    let should_fill = match gap_fill_in_progress_for {
+                        Some((seq, started)) if seq == last_broadcast_sequence => {
+                            started.elapsed() > std::time::Duration::from_secs(1)
+                        }
+                        _ => true,
+                    };
+                    if should_fill {
+                        gap_fill_in_progress_for =
+                            Some((last_broadcast_sequence, std::time::Instant::now()));
+                        tokio::spawn(Self::fill_gap(
+                            pool.clone(),
+                            last_broadcast_sequence,
+                            cache_fill_sender.clone(),
+                            cache_size,
+                        ));
+                    }
+                } else {
+                    gap_fill_in_progress_for = None;
                 }
 
                 if persistent_cache.len() > high_water {
