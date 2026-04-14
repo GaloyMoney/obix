@@ -1,3 +1,17 @@
+# [obix release v0.2.21](https://github.com/GaloyMoney/obix/releases/tag/0.2.21)
+
+
+
+### Bug Fixes
+
+- Replace cachix with magic-nix-cache-action (#46)
+
+### Miscellaneous Tasks
+
+- Bump job to 0.6.18 (#47)
+- Bump job to 0.6.16 (#38)
+- Bump quote from 1.0.44 to 1.0.45 (#28)
+
 # [obix release v0.2.20](https://github.com/GaloyMoney/obix/releases/tag/0.2.20)
 
 
