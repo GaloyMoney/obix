@@ -8,7 +8,11 @@ use std::sync::{
 };
 
 use crate::out::event::*;
-use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence};
+use crate::{
+    config::*,
+    handle::{OwnedTaskHandle, spawn_supervised},
+    sequence::EventSequence,
+};
 
 pub struct CacheHandle<P>
 where
@@ -145,9 +149,21 @@ where
         for (seq, evt) in cache.range((Bound::Excluded(last_broadcast_sequence), Bound::Unbounded))
         {
             if *seq != last_broadcast_sequence.next() {
+                tracing::warn!(
+                    target: "obix::persistent_cache",
+                    last_broadcast_sequence = u64::from(last_broadcast_sequence),
+                    next_in_cache = u64::from(*seq),
+                    highest_known = highest_known_sequence.load(Ordering::Relaxed),
+                    "persistent cache has sequence gap; broadcast halted until gap is filled"
+                );
                 break;
             }
             if persistent_event_sender.send(evt.clone()).is_err() {
+                tracing::warn!(
+                    target: "obix::persistent_cache",
+                    sequence = u64::from(*seq),
+                    "persistent_event_sender has no active receivers; broadcast halted"
+                );
                 break;
             }
             last_broadcast_sequence = *seq;
@@ -188,7 +204,15 @@ where
                         current_sequence = seq;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "obix::persistent_cache",
+                        error = %e,
+                        current_sequence = u64::from(current_sequence),
+                        "backfill load_next_page failed; aborting backfill for this listener"
+                    );
+                    break;
+                }
             }
         }
 
@@ -267,7 +291,7 @@ where
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn_supervised("obix::persistent_cache_loop", async move {
             let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
@@ -295,6 +319,10 @@ where
                                 ));
                             }
                             None => {
+                                tracing::error!(
+                                    target: "obix::persistent_cache",
+                                    "backfill_request channel closed; cache loop shutting down"
+                                );
                                 break;
                             }
                         }
@@ -326,10 +354,21 @@ where
                                         );
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::error!(
+                                    target: "obix::persistent_cache",
+                                    dropped = n,
+                                    last_broadcast_sequence = u64::from(last_broadcast_sequence),
+                                    highest_known = highest_known_sequence.load(Ordering::Relaxed),
+                                    "cache_fill_receiver lagged — events silently dropped"
+                                );
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
+                                tracing::error!(
+                                    target: "obix::persistent_cache",
+                                    "cache_fill broadcast channel closed; cache loop shutting down"
+                                );
                                 break;
                             }
                         }
@@ -375,6 +414,10 @@ where
                                 }
                             }
                             None => {
+                                tracing::error!(
+                                    target: "obix::persistent_cache",
+                                    "notification_receiver channel closed; cache loop shutting down"
+                                );
                                 break;
                             }
                         }

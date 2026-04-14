@@ -37,6 +37,7 @@ im = { workspace = true }
 job = { workspace = true }
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

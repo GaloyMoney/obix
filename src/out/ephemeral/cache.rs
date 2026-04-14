@@ -4,7 +4,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 
 use crate::out::event::*;
-use crate::{config::*, handle::OwnedTaskHandle};
+use crate::{
+    config::*,
+    handle::{OwnedTaskHandle, spawn_supervised},
+};
 
 pub struct CacheHandle<P>
 where
@@ -181,7 +184,7 @@ where
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn_supervised("obix::ephemeral_cache_loop", async move {
             let mut ephemeral_cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> =
                 im::HashMap::new();
 
@@ -195,6 +198,10 @@ where
                                 let _ = sender.send(ephemeral_cache.clone());
                             }
                             None => {
+                                tracing::error!(
+                                    target: "obix::ephemeral_cache",
+                                    "backfill_request channel closed; ephemeral cache loop shutting down"
+                                );
                                 break;
                             }
                         }
@@ -218,10 +225,19 @@ where
                                     );
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::error!(
+                                    target: "obix::ephemeral_cache",
+                                    dropped = n,
+                                    "ephemeral cache_fill_receiver lagged — events silently dropped"
+                                );
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
+                                tracing::error!(
+                                    target: "obix::ephemeral_cache",
+                                    "ephemeral cache_fill broadcast closed; cache loop shutting down"
+                                );
                                 break;
                             }
                         }
@@ -260,6 +276,10 @@ where
                                 }
                             }
                             None => {
+                                tracing::error!(
+                                    target: "obix::ephemeral_cache",
+                                    "ephemeral notification_receiver channel closed; cache loop shutting down"
+                                );
                                 break;
                             }
                         }
