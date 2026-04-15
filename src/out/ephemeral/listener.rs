@@ -2,7 +2,7 @@ use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{pin::Pin, sync::Arc, task::Poll};
 use tokio::sync::oneshot;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
 use crate::out::event::{EphemeralEventType, EphemeralOutboxEvent};
@@ -92,10 +92,16 @@ where
         loop {
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => return Poll::Ready(Some(event)),
-                Poll::Ready(Some(Err(_))) => continue, // Skip lagged, try next
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    record_lagged(n);
+                    continue;
+                }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
     }
 }
+
+#[tracing::instrument(name = "obix.ephemeral_listener.lagged", level = "warn")]
+fn record_lagged(dropped: u64) {}

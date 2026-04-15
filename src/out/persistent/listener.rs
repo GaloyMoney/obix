@@ -80,7 +80,13 @@ where
                 Poll::Ready(Some(Ok(event))) => {
                     this.maybe_add_to_cache(event);
                 }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => (),
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    record_lagged(
+                        n,
+                        u64::from(this.last_returned_sequence),
+                        u64::from(this.latest_known),
+                    );
+                }
                 Poll::Pending => break,
             }
         }
@@ -128,3 +134,6 @@ where
         Poll::Pending
     }
 }
+
+#[tracing::instrument(name = "obix.persistent_listener.lagged", level = "warn")]
+fn record_lagged(dropped: u64, last_returned_sequence: u64, latest_known: u64) {}

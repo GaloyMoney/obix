@@ -4,7 +4,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 
 use crate::out::event::*;
-use crate::{config::*, handle::OwnedTaskHandle};
+use crate::{
+    config::*,
+    handle::{OwnedTaskHandle, spawn_supervised},
+};
 
 pub struct CacheHandle<P>
 where
@@ -181,7 +184,7 @@ where
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn_supervised("obix::ephemeral_cache_loop", async move {
             let mut ephemeral_cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> =
                 im::HashMap::new();
 
@@ -195,6 +198,7 @@ where
                                 let _ = sender.send(ephemeral_cache.clone());
                             }
                             None => {
+                                record_backfill_channel_closed();
                                 break;
                             }
                         }
@@ -218,10 +222,12 @@ where
                                     );
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                record_cache_fill_lagged(n);
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
+                                record_cache_fill_closed();
                                 break;
                             }
                         }
@@ -260,6 +266,7 @@ where
                                 }
                             }
                             None => {
+                                record_notification_channel_closed();
                                 break;
                             }
                         }
@@ -270,3 +277,31 @@ where
         Ok(OwnedTaskHandle::new(handle))
     }
 }
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.backfill_channel_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_backfill_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.cache_fill_lagged",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_cache_fill_lagged(dropped: u64) {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.cache_fill_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_cache_fill_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.notification_channel_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_notification_channel_closed() {}
