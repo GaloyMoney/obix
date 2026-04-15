@@ -21,11 +21,12 @@ impl Drop for OwnedTaskHandle {
     }
 }
 
-/// Spawn a background task whose exit and panics are loud.
+/// Spawn a background task whose exit and panics surface as OTEL spans.
 ///
 /// All long-lived obix tasks (cache loop, pg-listener forwarder) must go
-/// through here so that any silent death — normal exit or panic — surfaces
-/// in the logs instead of leaving the outbox half-alive.
+/// through here so that any silent death — normal exit or panic — emits a
+/// short-lived error span (queryable in Honeycomb) instead of leaving the
+/// outbox half-alive with no signal.
 pub(crate) fn spawn_supervised<F>(task_name: &'static str, fut: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -33,11 +34,12 @@ where
     tokio::spawn(async move {
         match AssertUnwindSafe(fut).catch_unwind().await {
             Ok(()) => {
-                tracing::error!(
-                    target: "obix::supervisor",
+                tracing::error_span!(
+                    "obix.supervisor.task_exited",
+                    otel.status_code = "ERROR",
                     task = task_name,
-                    "obix background task exited — downstream outbox delivery will stall"
-                );
+                )
+                .in_scope(|| ());
             }
             Err(panic) => {
                 let msg = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -47,12 +49,13 @@ where
                 } else {
                     "<unknown panic payload>".to_string()
                 };
-                tracing::error!(
-                    target: "obix::supervisor",
+                tracing::error_span!(
+                    "obix.supervisor.task_panicked",
+                    otel.status_code = "ERROR",
                     task = task_name,
                     panic = %msg,
-                    "obix background task PANICKED — downstream outbox delivery will stall"
-                );
+                )
+                .in_scope(|| ());
             }
         }
     })

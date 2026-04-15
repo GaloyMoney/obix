@@ -27,11 +27,12 @@ where
             let notification = match listener.recv().await {
                 Ok(notification) => notification,
                 Err(e) => {
-                    tracing::error!(
-                        target: "obix::pg_listener",
+                    tracing::error_span!(
+                        "obix.pg_listener.recv_error",
+                        otel.status_code = "ERROR",
                         error = %e,
-                        "PgListener.recv() returned error; pg-listener forwarder halting"
-                    );
+                    )
+                    .in_scope(|| ());
                     break;
                 }
             };
@@ -48,11 +49,12 @@ where
 
             // If send fails, receiver is dropped, so break
             if let Err(e) = result {
-                tracing::error!(
-                    target: "obix::pg_listener",
+                tracing::error_span!(
+                    "obix.pg_listener.forward_failed",
+                    otel.status_code = "ERROR",
                     error = %e,
-                    "notification forward failed — cache loop receiver dropped; pg-listener forwarder halting"
-                );
+                )
+                .in_scope(|| ());
                 break;
             }
         }

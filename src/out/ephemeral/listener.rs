@@ -93,11 +93,8 @@ where
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => return Poll::Ready(Some(event)),
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    tracing::warn!(
-                        target: "obix::ephemeral_listener",
-                        dropped = n,
-                        "ephemeral broadcast receiver lagged — listener dropped events"
-                    );
+                    tracing::warn_span!("obix.ephemeral_listener.lagged", dropped = n,)
+                        .in_scope(|| ());
                     continue;
                 }
                 Poll::Ready(None) => return Poll::Ready(None),

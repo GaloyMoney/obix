@@ -149,21 +149,21 @@ where
         for (seq, evt) in cache.range((Bound::Excluded(last_broadcast_sequence), Bound::Unbounded))
         {
             if *seq != last_broadcast_sequence.next() {
-                tracing::warn!(
-                    target: "obix::persistent_cache",
+                tracing::warn_span!(
+                    "obix.persistent_cache.sequence_gap",
                     last_broadcast_sequence = u64::from(last_broadcast_sequence),
                     next_in_cache = u64::from(*seq),
                     highest_known = highest_known_sequence.load(Ordering::Relaxed),
-                    "persistent cache has sequence gap; broadcast halted until gap is filled"
-                );
+                )
+                .in_scope(|| ());
                 break;
             }
             if persistent_event_sender.send(evt.clone()).is_err() {
-                tracing::warn!(
-                    target: "obix::persistent_cache",
+                tracing::warn_span!(
+                    "obix.persistent_cache.no_receivers",
                     sequence = u64::from(*seq),
-                    "persistent_event_sender has no active receivers; broadcast halted"
-                );
+                )
+                .in_scope(|| ());
                 break;
             }
             last_broadcast_sequence = *seq;
@@ -205,12 +205,12 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        target: "obix::persistent_cache",
+                    tracing::warn_span!(
+                        "obix.persistent_cache.backfill_failed",
                         error = %e,
                         current_sequence = u64::from(current_sequence),
-                        "backfill load_next_page failed; aborting backfill for this listener"
-                    );
+                    )
+                    .in_scope(|| ());
                     break;
                 }
             }
@@ -319,10 +319,11 @@ where
                                 ));
                             }
                             None => {
-                                tracing::error!(
-                                    target: "obix::persistent_cache",
-                                    "backfill_request channel closed; cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.persistent_cache.backfill_channel_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }
@@ -355,20 +356,22 @@ where
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::error!(
-                                    target: "obix::persistent_cache",
+                                tracing::error_span!(
+                                    "obix.persistent_cache.cache_fill_lagged",
+                                    otel.status_code = "ERROR",
                                     dropped = n,
                                     last_broadcast_sequence = u64::from(last_broadcast_sequence),
                                     highest_known = highest_known_sequence.load(Ordering::Relaxed),
-                                    "cache_fill_receiver lagged — events silently dropped"
-                                );
+                                )
+                                .in_scope(|| ());
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                tracing::error!(
-                                    target: "obix::persistent_cache",
-                                    "cache_fill broadcast channel closed; cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.persistent_cache.cache_fill_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }
@@ -414,10 +417,11 @@ where
                                 }
                             }
                             None => {
-                                tracing::error!(
-                                    target: "obix::persistent_cache",
-                                    "notification_receiver channel closed; cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.persistent_cache.notification_channel_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }

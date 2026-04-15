@@ -198,10 +198,11 @@ where
                                 let _ = sender.send(ephemeral_cache.clone());
                             }
                             None => {
-                                tracing::error!(
-                                    target: "obix::ephemeral_cache",
-                                    "backfill_request channel closed; ephemeral cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.ephemeral_cache.backfill_channel_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }
@@ -226,18 +227,20 @@ where
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::error!(
-                                    target: "obix::ephemeral_cache",
+                                tracing::error_span!(
+                                    "obix.ephemeral_cache.cache_fill_lagged",
+                                    otel.status_code = "ERROR",
                                     dropped = n,
-                                    "ephemeral cache_fill_receiver lagged — events silently dropped"
-                                );
+                                )
+                                .in_scope(|| ());
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                tracing::error!(
-                                    target: "obix::ephemeral_cache",
-                                    "ephemeral cache_fill broadcast closed; cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.ephemeral_cache.cache_fill_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }
@@ -276,10 +279,11 @@ where
                                 }
                             }
                             None => {
-                                tracing::error!(
-                                    target: "obix::ephemeral_cache",
-                                    "ephemeral notification_receiver channel closed; cache loop shutting down"
-                                );
+                                tracing::error_span!(
+                                    "obix.ephemeral_cache.notification_channel_closed",
+                                    otel.status_code = "ERROR",
+                                )
+                                .in_scope(|| ());
                                 break;
                             }
                         }

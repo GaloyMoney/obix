@@ -81,13 +81,13 @@ where
                     this.maybe_add_to_cache(event);
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    tracing::warn!(
-                        target: "obix::persistent_listener",
+                    tracing::warn_span!(
+                        "obix.persistent_listener.lagged",
                         dropped = n,
                         last_returned_sequence = u64::from(this.last_returned_sequence),
                         latest_known = u64::from(this.latest_known),
-                        "broadcast receiver lagged — listener dropped events (will recover via backfill if latest_known advances)"
-                    );
+                    )
+                    .in_scope(|| ());
                 }
                 Poll::Pending => break,
             }
