@@ -198,11 +198,7 @@ where
                                 let _ = sender.send(ephemeral_cache.clone());
                             }
                             None => {
-                                tracing::error_span!(
-                                    "obix.ephemeral_cache.backfill_channel_closed",
-                                    otel.status_code = "ERROR",
-                                )
-                                .in_scope(|| ());
+                                record_backfill_channel_closed();
                                 break;
                             }
                         }
@@ -227,20 +223,11 @@ where
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::error_span!(
-                                    "obix.ephemeral_cache.cache_fill_lagged",
-                                    otel.status_code = "ERROR",
-                                    dropped = n,
-                                )
-                                .in_scope(|| ());
+                                record_cache_fill_lagged(n);
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                tracing::error_span!(
-                                    "obix.ephemeral_cache.cache_fill_closed",
-                                    otel.status_code = "ERROR",
-                                )
-                                .in_scope(|| ());
+                                record_cache_fill_closed();
                                 break;
                             }
                         }
@@ -279,11 +266,7 @@ where
                                 }
                             }
                             None => {
-                                tracing::error_span!(
-                                    "obix.ephemeral_cache.notification_channel_closed",
-                                    otel.status_code = "ERROR",
-                                )
-                                .in_scope(|| ());
+                                record_notification_channel_closed();
                                 break;
                             }
                         }
@@ -294,3 +277,31 @@ where
         Ok(OwnedTaskHandle::new(handle))
     }
 }
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.backfill_channel_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_backfill_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.cache_fill_lagged",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_cache_fill_lagged(dropped: u64) {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.cache_fill_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_cache_fill_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.notification_channel_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_notification_channel_closed() {}

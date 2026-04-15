@@ -93,8 +93,7 @@ where
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => return Poll::Ready(Some(event)),
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    tracing::warn_span!("obix.ephemeral_listener.lagged", dropped = n,)
-                        .in_scope(|| ());
+                    record_lagged(n);
                     continue;
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
@@ -103,3 +102,6 @@ where
         }
     }
 }
+
+#[tracing::instrument(name = "obix.ephemeral_listener.lagged", level = "warn")]
+fn record_lagged(dropped: u64) {}

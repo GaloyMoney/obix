@@ -33,14 +33,7 @@ where
 {
     tokio::spawn(async move {
         match AssertUnwindSafe(fut).catch_unwind().await {
-            Ok(()) => {
-                tracing::error_span!(
-                    "obix.supervisor.task_exited",
-                    otel.status_code = "ERROR",
-                    task = task_name,
-                )
-                .in_scope(|| ());
-            }
+            Ok(()) => record_task_exited(task_name),
             Err(panic) => {
                 let msg = if let Some(s) = panic.downcast_ref::<&str>() {
                     (*s).to_string()
@@ -49,14 +42,24 @@ where
                 } else {
                     "<unknown panic payload>".to_string()
                 };
-                tracing::error_span!(
-                    "obix.supervisor.task_panicked",
-                    otel.status_code = "ERROR",
-                    task = task_name,
-                    panic = %msg,
-                )
-                .in_scope(|| ());
+                record_task_panicked(task_name, &msg);
             }
         }
     })
 }
+
+#[tracing::instrument(
+    name = "obix.supervisor.task_exited",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", task = %task),
+)]
+fn record_task_exited(task: &'static str) {}
+
+#[tracing::instrument(
+    name = "obix.supervisor.task_panicked",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", task = %task, panic = %panic),
+)]
+fn record_task_panicked(task: &'static str, panic: &str) {}

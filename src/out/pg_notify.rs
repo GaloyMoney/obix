@@ -27,12 +27,7 @@ where
             let notification = match listener.recv().await {
                 Ok(notification) => notification,
                 Err(e) => {
-                    tracing::error_span!(
-                        "obix.pg_listener.recv_error",
-                        otel.status_code = "ERROR",
-                        error = %e,
-                    )
-                    .in_scope(|| ());
+                    record_recv_error(&e);
                     break;
                 }
             };
@@ -49,12 +44,7 @@ where
 
             // If send fails, receiver is dropped, so break
             if let Err(e) = result {
-                tracing::error_span!(
-                    "obix.pg_listener.forward_failed",
-                    otel.status_code = "ERROR",
-                    error = %e,
-                )
-                .in_scope(|| ());
+                record_forward_failed(&e);
                 break;
             }
         }
@@ -62,3 +52,19 @@ where
 
     Ok(OwnedTaskHandle::new(handle))
 }
+
+#[tracing::instrument(
+    name = "obix.pg_listener.recv_error",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error),
+)]
+fn record_recv_error(error: &sqlx::Error) {}
+
+#[tracing::instrument(
+    name = "obix.pg_listener.forward_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error),
+)]
+fn record_forward_failed<T>(error: &tokio::sync::mpsc::error::SendError<T>) {}
