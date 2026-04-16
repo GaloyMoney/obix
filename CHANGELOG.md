@@ -1,3 +1,15 @@
+# [obix release v0.2.23](https://github.com/GaloyMoney/obix/releases/tag/0.2.23)
+
+
+
+### Bug Fixes
+
+- Proactively fill sequence gaps in cache broadcast path (#44)
+
+### Miscellaneous Tasks
+
+- Bump tokio from 1.51.1 to 1.52.0 (#50)
+
 # [obix release v0.2.22](https://github.com/GaloyMoney/obix/releases/tag/0.2.22)
 
 
