@@ -1,3 +1,11 @@
+# [obix release v0.2.22](https://github.com/GaloyMoney/obix/releases/tag/0.2.22)
+
+
+
+### Features
+
+- Surface silent failures in cache loop, pg-listener, and listeners (#48)
+
 # [obix release v0.2.21](https://github.com/GaloyMoney/obix/releases/tag/0.2.21)
 
 
