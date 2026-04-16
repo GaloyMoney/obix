@@ -279,6 +279,62 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Publish an event (seq N)
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event");
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Create a gap by consuming a sequence number without inserting a row
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+
+    // Publish another event (seq N+2, skipping the consumed N+1)
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Should receive the gap-filled placeholder (None payload) followed by the real event
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive gap-filled placeholder");
+    assert!(
+        gap_event.payload.is_none(),
+        "gap-filled event should have None payload"
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive real event after gap");
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
