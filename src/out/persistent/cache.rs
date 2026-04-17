@@ -137,8 +137,16 @@ where
         let sequence = event.sequence;
         let highest_known = highest_known_sequence.load(Ordering::Relaxed);
 
-        // Skip events that are too old to be useful
-        let threshold = highest_known.saturating_sub(cache_size as u64);
+        // Skip events that are too old to be useful, but never let the
+        // threshold move past the broadcast cursor — events still required
+        // for the contiguity loop to advance (sequence > last_broadcast_sequence)
+        // must always reach the cache. Without this clamp, a burst that
+        // advances `highest_known` ahead of `last_broadcast_sequence`
+        // silently drops the events between them and permanently breaks
+        // broadcast (see lana-bank#5035).
+        let threshold = highest_known
+            .saturating_sub(cache_size as u64)
+            .min(u64::from(last_broadcast_sequence));
         if u64::from(sequence) <= threshold {
             return (cache, last_broadcast_sequence);
         }
