@@ -1,3 +1,11 @@
+# [obix release v0.2.24](https://github.com/GaloyMoney/obix/releases/tag/0.2.24)
+
+
+
+### Bug Fixes
+
+- Clamp skip_too_old threshold to last_broadcast_sequence (#49)
+
 # [obix release v0.2.23](https://github.com/GaloyMoney/obix/releases/tag/0.2.23)
 
 
