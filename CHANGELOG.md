@@ -1,3 +1,13 @@
+# [obix release v0.2.26](https://github.com/GaloyMoney/obix/releases/tag/0.2.26)
+
+
+
+### Miscellaneous Tasks
+
+- Bump job to 0.6.22 (#55)
+- Bump tokio from 1.52.0 to 1.52.1 (#51)
+- Bump job / es-entity
+
 # [obix release v0.2.25](https://github.com/GaloyMoney/obix/releases/tag/0.2.25)
 
 
