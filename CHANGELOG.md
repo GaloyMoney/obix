@@ -1,3 +1,15 @@
+# [obix release v0.2.28](https://github.com/GaloyMoney/obix/releases/tag/0.2.28)
+
+
+
+### Miscellaneous Tasks
+
+- Bump job from 0.6.25 to 0.6.26 (#67)
+- Replace docker-compose with nix process-compose for dev deps (#64)
+- Bump serde_json in the all-dependencies group (#63)
+- Bump tokio from 1.52.1 to 1.52.3 (#59)
+- Align dependabot policy with job/es-entity/cala (#61)
+
 # [obix release v0.2.27](https://github.com/GaloyMoney/obix/releases/tag/0.2.27)
 
 
