@@ -15,6 +15,7 @@ where
     sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     pre_commit_events: Vec<P>,
     post_commit_events: Vec<PersistentOutboxEvent<P>>,
+    batch_size: usize,
     _phantom: PhantomData<Tables>,
 }
 
@@ -26,11 +27,13 @@ where
     pub fn new(
         sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         events: impl IntoIterator<Item = impl Into<P>>,
+        batch_size: usize,
     ) -> Self {
         Self {
             sender,
             pre_commit_events: events.into_iter().map(Into::into).collect(),
             post_commit_events: Vec::new(),
+            batch_size,
             _phantom: PhantomData,
         }
     }
@@ -45,7 +48,17 @@ where
         mut self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        let persisted = Tables::persist_events(&mut op, self.pre_commit_events.drain(..)).await?;
+        let batch_size = self.batch_size.max(1);
+        let events = std::mem::take(&mut self.pre_commit_events);
+        let mut persisted = Vec::with_capacity(events.len());
+        let mut events = events.into_iter();
+        loop {
+            let chunk: Vec<P> = events.by_ref().take(batch_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            persisted.extend(Tables::persist_events(&mut op, chunk.into_iter()).await?);
+        }
         self.post_commit_events = persisted;
         PreCommitRet::ok(self, op)
     }

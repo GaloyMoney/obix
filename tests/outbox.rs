@@ -279,6 +279,63 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn large_batch_persisted_in_bounded_chunks() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let batch_size = 5;
+    let total = 23;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .persist_events_batch_size(batch_size)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..10).map(TestEvent::Ping))
+        .await?;
+    outbox
+        .publish_all_persisted(&mut op, (10..total).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
+
+    let mut events = Vec::new();
+    for i in 0..total {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+            .await
+            .unwrap_or_else(|_| panic!("timeout waiting for event {i}"))
+            .unwrap_or_else(|| panic!("expected event {i} but got None"));
+        events.push(event);
+    }
+
+    assert_eq!(events.len() as u64, total, "all events should be persisted");
+
+    let mut last_sequence: Option<EventSequence> = None;
+    for (i, event) in events.iter().enumerate() {
+        assert!(
+            matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64),
+            "event {i} payload should match publish order",
+        );
+        if let Some(prev) = last_sequence {
+            assert!(
+                event.sequence > prev,
+                "sequences must be strictly increasing across chunk boundaries",
+            );
+        }
+        last_sequence = Some(event.sequence);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 

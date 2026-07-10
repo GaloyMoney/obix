@@ -29,6 +29,7 @@ where
 {
     pool: sqlx::PgPool,
     event_buffer_size: usize,
+    persist_events_batch_size: usize,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
@@ -44,6 +45,7 @@ where
         Self {
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
+            persist_events_batch_size: self.persist_events_batch_size,
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
@@ -79,6 +81,7 @@ where
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
+            persist_events_batch_size: config.persist_events_batch_size,
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
@@ -106,6 +109,7 @@ where
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
             events,
+            self.persist_events_batch_size,
         );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
