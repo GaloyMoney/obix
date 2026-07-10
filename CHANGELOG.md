@@ -1,3 +1,17 @@
+# [obix release v0.2.29](https://github.com/GaloyMoney/obix/releases/tag/0.2.29)
+
+
+
+### Bug Fixes
+
+- Bound persistent_outbox_events insert into chunked sub-batches (#73)
+
+### Miscellaneous Tasks
+
+- Bump chrono in the all-dependencies group (#69)
+- Bump es-entity to 0.10.40 (#68)
+- Bump serial_test in the all-dependencies group (#66)
+
 # [obix release v0.2.28](https://github.com/GaloyMoney/obix/releases/tag/0.2.28)
 
 
