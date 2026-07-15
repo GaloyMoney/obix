@@ -7,11 +7,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::out::event::*;
-use crate::out::pg_notify::NotifyMessage;
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
+    out::{event::*, pg_notify::NotifyMessage},
     sequence::EventSequence,
 };
 
@@ -413,11 +412,6 @@ where
                                 }
 
                                 if resync_needed {
-                                    // The LISTEN connection dropped and any
-                                    // notifications sent meanwhile are gone.
-                                    // Re-read the head from the table; the
-                                    // proactive gap fill below then pages the
-                                    // missed range into the cache.
                                     match Tables::highest_known_persistent_sequence(&pool).await {
                                         Ok(head) => {
                                             highest_known_sequence.fetch_max(

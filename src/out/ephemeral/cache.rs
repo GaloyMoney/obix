@@ -3,11 +3,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use std::sync::Arc;
 
-use crate::out::event::*;
-use crate::out::pg_notify::NotifyMessage;
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
+    out::{event::*, pg_notify::NotifyMessage},
 };
 
 pub struct CacheHandle<P>
@@ -266,19 +265,6 @@ where
                                 }
 
                                 if resync_needed {
-                                    // The LISTEN connection dropped and any
-                                    // notifications sent meanwhile are gone —
-                                    // reload the current per-type state from
-                                    // the table. Applied inline (not via
-                                    // cache_fill, which also carries live
-                                    // short-circuit events) and guarded by
-                                    // recency: the reload races live
-                                    // deliveries, and a row read before a
-                                    // newer event was applied must not
-                                    // overwrite or re-broadcast over it.
-                                    // recorded_at is the only ordering the
-                                    // table carries, so equal-timestamp rows
-                                    // are treated as already known.
                                     match Tables::load_ephemeral_events::<P>(&pool, None).await {
                                         Ok(events) => {
                                             for event in events {
