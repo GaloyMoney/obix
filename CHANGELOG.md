@@ -1,3 +1,16 @@
+# [obix release v0.2.30](https://github.com/GaloyMoney/obix/releases/tag/0.2.30)
+
+
+
+### Bug Fixes
+
+- Survive LISTEN connection loss with reconnect + cache resync (#75)
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group across 1 directory with 3 updates (#71)
+- Bump job to 0.6.28 (#74)
+
 # [obix release v0.2.29](https://github.com/GaloyMoney/obix/releases/tag/0.2.29)
 
 
