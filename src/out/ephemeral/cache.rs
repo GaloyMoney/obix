@@ -122,17 +122,6 @@ where
         }
     }
 
-    async fn fetch_all_events(
-        pool: sqlx::PgPool,
-        cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    ) {
-        if let Ok(events) = Tables::load_ephemeral_events::<P>(&pool, None).await {
-            for event in events {
-                let _ = cache_fill_sender.send(Arc::new(event));
-            }
-        }
-    }
-
     fn handle_ephemeral_notification(
         pool: &sqlx::PgPool,
         payload: &str,
@@ -280,11 +269,36 @@ where
                                     // The LISTEN connection dropped and any
                                     // notifications sent meanwhile are gone —
                                     // reload the current per-type state from
-                                    // the table.
-                                    tokio::spawn(Self::fetch_all_events(
-                                        pool.clone(),
-                                        cache_fill_sender.clone(),
-                                    ));
+                                    // the table. Applied inline (not via
+                                    // cache_fill, which also carries live
+                                    // short-circuit events) and guarded by
+                                    // recency: the reload races live
+                                    // deliveries, and a row read before a
+                                    // newer event was applied must not
+                                    // overwrite or re-broadcast over it.
+                                    // recorded_at is the only ordering the
+                                    // table carries, so equal-timestamp rows
+                                    // are treated as already known.
+                                    match Tables::load_ephemeral_events::<P>(&pool, None).await {
+                                        Ok(events) => {
+                                            for event in events {
+                                                let stale = ephemeral_cache
+                                                    .get(&event.event_type)
+                                                    .is_some_and(|cached| {
+                                                        cached.recorded_at >= event.recorded_at
+                                                    });
+                                                if !stale {
+                                                    ephemeral_cache =
+                                                        Self::insert_into_cache_and_broadcast(
+                                                            ephemeral_cache,
+                                                            Arc::new(event),
+                                                            &ephemeral_event_sender,
+                                                        );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => record_resync_failed(&e),
+                                    }
                                 }
                             }
                             None => {
@@ -327,3 +341,11 @@ fn record_cache_fill_closed() {}
     fields(otel.status_code = "ERROR"),
 )]
 fn record_notification_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.resync_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error),
+)]
+fn record_resync_failed(error: &sqlx::Error) {}

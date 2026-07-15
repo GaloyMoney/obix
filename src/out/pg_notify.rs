@@ -39,8 +39,8 @@ where
     let handle = spawn_supervised("obix::pg_listener", async move {
         loop {
             // `try_recv` (unlike `recv`) surfaces connection loss as
-            // `Ok(None)` after sqlx has already reconnected and re-LISTENed.
-            // `recv` would swallow that marker — and any notifications sent
+            // `Ok(None)` after sqlx has already reconnected and re-issued
+            // LISTEN. `recv` would swallow that marker — and any notifications sent
             // while the connection was down would be silently lost with no
             // resync, stalling every consumer until the next notification.
             match listener.try_recv().await {
@@ -67,8 +67,8 @@ where
                 }
                 Ok(None) => {
                     // Connection was lost; sqlx already reconnected and
-                    // re-LISTENed. Tell both caches to resync for whatever
-                    // was notified during the gap.
+                    // re-issued LISTEN. Tell both caches to resync for
+                    // whatever was notified during the gap.
                     record_connection_lost();
                     if send_resync(&persistent_notification_tx, &ephemeral_notification_tx)
                         .await

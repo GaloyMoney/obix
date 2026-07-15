@@ -573,7 +573,7 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
     // NOTIFY fires at that same statement's commit, before any client-side
     // reconnect round trip can complete — so the notification is
     // deterministically sent while no LISTEN connection exists. (Publishing
-    // in a separate statement is racy: sqlx's eager reconnect re-LISTENs off
+    // in a separate statement is racy: sqlx's eager reconnect re-subscribes off
     // a warm pool connection faster than a second round trip.)
     sqlx::query(
         r#"
