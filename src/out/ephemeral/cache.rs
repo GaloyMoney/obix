@@ -3,10 +3,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use std::sync::Arc;
 
-use crate::out::event::*;
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
+    out::{event::*, pg_notify::NotifyMessage},
 };
 
 pub struct CacheHandle<P>
@@ -71,7 +71,7 @@ where
     pub async fn init(
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
-        ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -180,7 +180,7 @@ where
         >,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        mut ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -235,33 +235,55 @@ where
 
                     result = ephemeral_notification_rx.recv() => {
                         match result {
-                            Some(notification) => {
-                                if let Some(event) = Self::process_notification(
-                                    notification,
-                                    &pool,
-                                    &ephemeral_cache,
-                                    &cache_fill_sender,
-                                ) {
-                                    ephemeral_cache = Self::insert_into_cache_and_broadcast(
-                                        ephemeral_cache,
-                                        Arc::new(event),
-                                        &ephemeral_event_sender,
-                                    );
+                            Some(message) => {
+                                let mut resync_needed = false;
+                                let mut messages = vec![message];
+                                // Process any additional buffered notifications
+                                while let Ok(message) = ephemeral_notification_rx.try_recv() {
+                                    messages.push(message);
+                                }
+                                for message in messages {
+                                    match message {
+                                        NotifyMessage::Notification(notification) => {
+                                            if let Some(event) = Self::process_notification(
+                                                notification,
+                                                &pool,
+                                                &ephemeral_cache,
+                                                &cache_fill_sender,
+                                            ) {
+                                                ephemeral_cache = Self::insert_into_cache_and_broadcast(
+                                                    ephemeral_cache,
+                                                    Arc::new(event),
+                                                    &ephemeral_event_sender,
+                                                );
+                                            }
+                                        }
+                                        NotifyMessage::Resync => {
+                                            resync_needed = true;
+                                        }
+                                    }
                                 }
 
-                                // Process any additional buffered notifications
-                                while let Ok(notification) = ephemeral_notification_rx.try_recv() {
-                                    if let Some(event) = Self::process_notification(
-                                        notification,
-                                        &pool,
-                                        &ephemeral_cache,
-                                        &cache_fill_sender,
-                                    ) {
-                                        ephemeral_cache = Self::insert_into_cache_and_broadcast(
-                                            ephemeral_cache,
-                                            Arc::new(event),
-                                            &ephemeral_event_sender,
-                                        );
+                                if resync_needed {
+                                    match Tables::load_ephemeral_events::<P>(&pool, None).await {
+                                        Ok(events) => {
+                                            for event in events {
+                                                let stale = ephemeral_cache
+                                                    .get(&event.event_type)
+                                                    .is_some_and(|cached| {
+                                                        cached.recorded_at >= event.recorded_at
+                                                    });
+                                                if !stale {
+                                                    ephemeral_cache =
+                                                        Self::insert_into_cache_and_broadcast(
+                                                            ephemeral_cache,
+                                                            Arc::new(event),
+                                                            &ephemeral_event_sender,
+                                                        );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => record_resync_failed(&e),
                                     }
                                 }
                             }
@@ -305,3 +327,11 @@ fn record_cache_fill_closed() {}
     fields(otel.status_code = "ERROR"),
 )]
 fn record_notification_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.resync_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error),
+)]
+fn record_resync_failed(error: &sqlx::Error) {}

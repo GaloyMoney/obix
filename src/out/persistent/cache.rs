@@ -7,10 +7,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::out::event::*;
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
+    out::{event::*, pg_notify::NotifyMessage},
     sequence::EventSequence,
 };
 
@@ -87,7 +87,7 @@ where
     pub async fn init(
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
-        persistent_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        persistent_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -291,7 +291,7 @@ where
         )>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-        mut notification_receiver: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        mut notification_receiver: mpsc::Receiver<NotifyMessage>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -379,40 +379,47 @@ where
 
                     result = notification_receiver.recv() => {
                         match result {
-                            Some(notification) => {
-                                if let Some(event) = Self::handle_notification(
-                                    &pool,
-                                    notification.payload(),
-                                    &persistent_cache,
-                                    &cache_fill_sender,
-                                ) {
-                                    (persistent_cache, last_broadcast_sequence) =
-                                        Self::insert_into_cache_and_maybe_broadcast(
-                                            persistent_cache,
-                                            Arc::new(event),
-                                            &highest_known_sequence,
-                                            &persistent_event_sender,
-                                            last_broadcast_sequence,
-                                            cache_size,
-                                        );
+                            Some(message) => {
+                                let mut resync_needed = false;
+                                let mut messages = vec![message];
+                                while let Ok(message) = notification_receiver.try_recv() {
+                                    messages.push(message);
+                                }
+                                for message in messages {
+                                    match message {
+                                        NotifyMessage::Notification(notification) => {
+                                            if let Some(event) = Self::handle_notification(
+                                                &pool,
+                                                notification.payload(),
+                                                &persistent_cache,
+                                                &cache_fill_sender,
+                                            ) {
+                                                (persistent_cache, last_broadcast_sequence) =
+                                                    Self::insert_into_cache_and_maybe_broadcast(
+                                                        persistent_cache,
+                                                        Arc::new(event),
+                                                        &highest_known_sequence,
+                                                        &persistent_event_sender,
+                                                        last_broadcast_sequence,
+                                                        cache_size,
+                                                    );
+                                            }
+                                        }
+                                        NotifyMessage::Resync => {
+                                            resync_needed = true;
+                                        }
+                                    }
                                 }
 
-                                while let Ok(notification) = notification_receiver.try_recv() {
-                                    if let Some(event) = Self::handle_notification(
-                                        &pool,
-                                        notification.payload(),
-                                        &persistent_cache,
-                                        &cache_fill_sender,
-                                    ) {
-                                        (persistent_cache, last_broadcast_sequence) =
-                                            Self::insert_into_cache_and_maybe_broadcast(
-                                                persistent_cache,
-                                                Arc::new(event),
-                                                &highest_known_sequence,
-                                                &persistent_event_sender,
-                                                last_broadcast_sequence,
-                                                cache_size,
+                                if resync_needed {
+                                    match Tables::highest_known_persistent_sequence(&pool).await {
+                                        Ok(head) => {
+                                            highest_known_sequence.fetch_max(
+                                                u64::from(head),
+                                                Ordering::AcqRel,
                                             );
+                                        }
+                                        Err(e) => record_resync_failed(&e),
                                     }
                                 }
                             }
@@ -505,3 +512,11 @@ fn record_cache_fill_closed() {}
     fields(otel.status_code = "ERROR"),
 )]
 fn record_notification_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.resync_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error),
+)]
+fn record_resync_failed(error: &sqlx::Error) {}
