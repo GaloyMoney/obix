@@ -521,3 +521,85 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Regression: an event whose NOTIFY fires while the LISTEN connection is
+/// down must still reach consumers.
+///
+/// Publishing through a plain transaction delivers exclusively via pg_notify
+/// (no same-process short-circuit hook), so the event below travels the wire
+/// path or not at all. The LISTEN backends are terminated *inside* the
+/// publishing transaction: they die at statement time and the NOTIFY fires at
+/// COMMIT moments later, guaranteeing it is sent while no listener connection
+/// exists — that notification is unrecoverably lost.
+///
+/// Before the fix the pump ran on `PgListener::recv()`, which silently
+/// swallows the reconnect marker, so a notification lost in the gap was never
+/// resynced and the consumer stalled forever (and when the internal reconnect
+/// itself failed, the pump task exited, dropping the notification senders and
+/// killing the cache loops outright — the sb-realtime staging wedge, where
+/// every outbox consumer froze mid-sequence while its listener job kept
+/// heartbeating). With the fix the pump surfaces the gap (`try_recv` +
+/// `NotifyMessage::Resync`) and the caches re-read the tables.
+#[tokio::test]
+#[file_serial]
+async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Baseline: the pg_notify path works.
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("baseline pg_notify delivery timed out"))?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(1))));
+
+    // Terminate every LISTEN backend and insert the event in ONE autocommit
+    // statement: the backends die mid-statement and the insert trigger's
+    // NOTIFY fires at that same statement's commit, before any client-side
+    // reconnect round trip can complete — so the notification is
+    // deterministically sent while no LISTEN connection exists. (Publishing
+    // in a separate statement is racy: sqlx's eager reconnect re-LISTENs off
+    // a warm pool connection faster than a second round trip.)
+    sqlx::query(
+        r#"
+        WITH kill AS (
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE pid <> pg_backend_pid() AND query LIKE 'LISTEN%'
+        )
+        INSERT INTO persistent_outbox_events (payload)
+        SELECT $1::jsonb FROM (SELECT count(*) FROM kill) _forced
+        "#,
+    )
+    .bind(r#"{"Ping": 2}"#)
+    .execute(&pool)
+    .await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "event published while the LISTEN connection was down was never delivered \
+                 (missed notification not resynced)"
+            )
+        })?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(2))));
+
+    Ok(())
+}

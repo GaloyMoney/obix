@@ -4,6 +4,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 
 use crate::out::event::*;
+use crate::out::pg_notify::NotifyMessage;
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
@@ -71,7 +72,7 @@ where
     pub async fn init(
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
-        ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -115,6 +116,17 @@ where
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     ) {
         if let Ok(events) = Tables::load_ephemeral_events::<P>(&pool, Some(event_type)).await {
+            for event in events {
+                let _ = cache_fill_sender.send(Arc::new(event));
+            }
+        }
+    }
+
+    async fn fetch_all_events(
+        pool: sqlx::PgPool,
+        cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+    ) {
+        if let Ok(events) = Tables::load_ephemeral_events::<P>(&pool, None).await {
             for event in events {
                 let _ = cache_fill_sender.send(Arc::new(event));
             }
@@ -180,7 +192,7 @@ where
         >,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut ephemeral_notification_rx: mpsc::Receiver<sqlx::postgres::PgNotification>,
+        mut ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -235,34 +247,44 @@ where
 
                     result = ephemeral_notification_rx.recv() => {
                         match result {
-                            Some(notification) => {
-                                if let Some(event) = Self::process_notification(
-                                    notification,
-                                    &pool,
-                                    &ephemeral_cache,
-                                    &cache_fill_sender,
-                                ) {
-                                    ephemeral_cache = Self::insert_into_cache_and_broadcast(
-                                        ephemeral_cache,
-                                        Arc::new(event),
-                                        &ephemeral_event_sender,
-                                    );
+                            Some(message) => {
+                                let mut resync_needed = false;
+                                let mut messages = vec![message];
+                                // Process any additional buffered notifications
+                                while let Ok(message) = ephemeral_notification_rx.try_recv() {
+                                    messages.push(message);
+                                }
+                                for message in messages {
+                                    match message {
+                                        NotifyMessage::Notification(notification) => {
+                                            if let Some(event) = Self::process_notification(
+                                                notification,
+                                                &pool,
+                                                &ephemeral_cache,
+                                                &cache_fill_sender,
+                                            ) {
+                                                ephemeral_cache = Self::insert_into_cache_and_broadcast(
+                                                    ephemeral_cache,
+                                                    Arc::new(event),
+                                                    &ephemeral_event_sender,
+                                                );
+                                            }
+                                        }
+                                        NotifyMessage::Resync => {
+                                            resync_needed = true;
+                                        }
+                                    }
                                 }
 
-                                // Process any additional buffered notifications
-                                while let Ok(notification) = ephemeral_notification_rx.try_recv() {
-                                    if let Some(event) = Self::process_notification(
-                                        notification,
-                                        &pool,
-                                        &ephemeral_cache,
-                                        &cache_fill_sender,
-                                    ) {
-                                        ephemeral_cache = Self::insert_into_cache_and_broadcast(
-                                            ephemeral_cache,
-                                            Arc::new(event),
-                                            &ephemeral_event_sender,
-                                        );
-                                    }
+                                if resync_needed {
+                                    // The LISTEN connection dropped and any
+                                    // notifications sent meanwhile are gone —
+                                    // reload the current per-type state from
+                                    // the table.
+                                    tokio::spawn(Self::fetch_all_events(
+                                        pool.clone(),
+                                        cache_fill_sender.clone(),
+                                    ));
                                 }
                             }
                             None => {
