@@ -430,31 +430,7 @@ checksum = "71d52128c990c3d4fa2cb357b4a9dedbd9a18bc6f4b09c04c81874a7e4b85e8a"
 dependencies = [
  "chrono",
  "derive_builder",
- "es-entity-macros 0.10.41",
- "im",
- "opentelemetry",
- "opentelemetry_sdk",
- "parking_lot",
- "pin-project",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "uuid",
-]
-
-[[package]]
-name = "es-entity"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b10239773bfe267aef2997b044ec77d794b9c986cc7620cb247d6a615860129"
-dependencies = [
- "chrono",
- "derive_builder",
- "es-entity-macros 0.11.1",
+ "es-entity-macros",
  "im",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -475,21 +451,6 @@ name = "es-entity-macros"
 version = "0.10.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86c9e15612548ff642ede03c81262d541e89392d71d86a6855c2ef2104bcb079"
-dependencies = [
- "convert_case",
- "darling 0.23.0",
- "pluralizer",
- "proc-macro2",
- "quote",
- "regex",
- "syn",
-]
-
-[[package]]
-name = "es-entity-macros"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8196c4a16efad694064949e98d06dbebce06583cbe74aa29dcd07a22c4cde1a9"
 dependencies = [
  "convert_case",
  "darling 0.23.0",
@@ -978,7 +939,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "derive_builder",
- "es-entity 0.10.41",
+ "es-entity",
  "futures",
  "rand 0.10.0",
  "serde",
@@ -1157,7 +1118,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "derive_builder",
- "es-entity 0.11.1",
+ "es-entity",
  "futures",
  "im",
  "job",
