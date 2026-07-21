@@ -117,7 +117,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                   AND sequence <= $1 + $2
                 ORDER BY sequence ASC
                 LIMIT $2
-            ) e ON true"#,
+            ) e ON true
+            ORDER BY e.sequence ASC"#,
             table_prefix, table_prefix
         );
 
@@ -392,6 +393,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     #set_context
                                 });
                             }
+                            // Gap-fill rows were appended after the page rows, so
+                            // re-establish the ascending order consumers rely on.
                             events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
                         }
 
