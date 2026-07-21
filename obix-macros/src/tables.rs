@@ -90,28 +90,34 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // Bounded range scan over the `sequence` index: O(page) instead of the
+        // previous generate_series + LEFT JOIN, which planned as a hash join
+        // over a full seq scan of the (append-only, unpruned) events table on
+        // every poll. The single-row `m` side always yields MAX(sequence) so
+        // the caller can compute the gap range even when the page is empty;
+        // sequence gaps within the page are detected caller-side and filled
+        // via fill_gaps_query, preserving the old placeholder semantics.
         let load_next_page_query = format!(
             r#"
-            WITH max_sequence AS (
-                SELECT COALESCE(MAX(sequence), 0) AS max FROM {}persistent_outbox_events
-            )
             SELECT
-              g.seq AS "sequence!: i64",
+              m.max_sequence AS "max_sequence!: i64",
+              e.sequence AS "sequence?: i64",
               e.id AS "id?",
               e.payload AS "payload?",
               e.tracing_context AS "tracing_context?",
               e.recorded_at AS "recorded_at?"
-            FROM
-                generate_series(LEAST($1 + 1, (SELECT max FROM max_sequence)),
-                  LEAST($1 + $2, (SELECT max FROM max_sequence)))
-                AS g(seq)
-            LEFT JOIN
-                {}persistent_outbox_events e ON g.seq = e.sequence
-            WHERE
-                g.seq > $1
-            ORDER BY
-                g.seq ASC
-            LIMIT $2"#,
+            FROM (
+                SELECT COALESCE(MAX(sequence), 0) AS max_sequence
+                FROM {}persistent_outbox_events
+            ) m
+            LEFT JOIN LATERAL (
+                SELECT sequence, id, payload, tracing_context, recorded_at
+                FROM {}persistent_outbox_events
+                WHERE sequence > $1
+                  AND sequence <= $1 + $2
+                ORDER BY sequence ASC
+                LIMIT $2
+            ) e ON true"#,
             table_prefix, table_prefix
         );
 
@@ -334,18 +340,23 @@ FROM {}persistent_outbox_events_sequence_seq",
                             buffer_size as i64,
                         ).fetch_all(&pool).await?;
 
+                        let max_sequence = rows
+                            .first()
+                            .map(|r| r.max_sequence)
+                            .unwrap_or_else(|| u64::from(from_sequence) as i64);
+
                         let mut events = Vec::new();
-                        let mut empty_ids = Vec::new();
+                        let mut present = std::collections::HashSet::new();
 
                         for row in rows {
-                            if row.id.is_none() {
-                                empty_ids.push(row.sequence);
+                            let Some(sequence) = row.sequence else {
                                 continue;
-                            }
+                            };
+                            present.insert(sequence);
                             #deserialize_context
                             events.push(#crate_name::out::PersistentOutboxEvent {
-                                id: #crate_name::out::OutboxEventId::from(row.id.expect("already checked")),
-                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                id: #crate_name::out::OutboxEventId::from(row.id.expect("matched row has id")),
+                                sequence: #crate_name::EventSequence::from(sequence as u64),
                                 payload: row
                                     .payload
                                     .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
@@ -353,6 +364,15 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 #set_context
                             });
                         }
+
+                        // Fill sequence gaps in the page with placeholder rows,
+                        // preserving contiguity for consumers (same semantics as
+                        // the old generate_series + LEFT JOIN page).
+                        let from = u64::from(from_sequence) as i64;
+                        let end = std::cmp::min(from + buffer_size as i64, max_sequence);
+                        let empty_ids: Vec<i64> = ((from + 1)..=end)
+                            .filter(|s| !present.contains(s))
+                            .collect();
 
                         if !empty_ids.is_empty() {
                             let gap_rows = sqlx::query!(
