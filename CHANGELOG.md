@@ -1,3 +1,11 @@
+# [obix release v0.2.32](https://github.com/GaloyMoney/obix/releases/tag/0.2.32)
+
+
+
+### Bug Fixes
+
+- Order poller pages in SQL, sort only after gap fill (#82)
+
 # [obix release v0.2.31](https://github.com/GaloyMoney/obix/releases/tag/0.2.31)
 
 
