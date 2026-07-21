@@ -1,3 +1,16 @@
+# [obix release v0.2.31](https://github.com/GaloyMoney/obix/releases/tag/0.2.31)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.11.2 and job to 0.6.30 (#81)
+- Bump es-entity to 0.11.1 (#77)
+
+### Performance
+
+- Replace poller full-table scan with bounded range scan (#78)
+
 # [obix release v0.2.30](https://github.com/GaloyMoney/obix/releases/tag/0.2.30)
 
 
