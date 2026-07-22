@@ -1,3 +1,11 @@
+# [obix release v0.3.0](https://github.com/GaloyMoney/obix/releases/tag/0.3.0)
+
+
+
+### Features
+
+- [**breaking**] Handler-controlled transaction scoping for event-handler jobs (#86)
+
 # [obix release v0.2.33](https://github.com/GaloyMoney/obix/releases/tag/0.2.33)
 
 
