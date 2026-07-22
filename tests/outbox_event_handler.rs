@@ -80,6 +80,21 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     jobs: &mut job::Jobs,
     handler: H,
 ) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+    init_outbox_with_handler_config(
+        pool,
+        jobs,
+        OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+        handler,
+    )
+    .await
+}
+
+async fn init_outbox_with_handler_config<H: OutboxEventHandler<TestEvent>>(
+    pool: &sqlx::PgPool,
+    jobs: &mut job::Jobs,
+    config: OutboxEventJobConfig,
+    handler: H,
+) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
     wipeout_outbox_tables(pool).await?;
     wipeout_outbox_job_tables(pool, JOB_TYPE).await?;
 
@@ -92,15 +107,93 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     .await?;
 
     outbox
-        .register_event_handler(
-            jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
-            handler,
-        )
+        .register_event_handler(jobs, config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(outbox)
+}
+
+fn fast_retry_settings() -> job::RetrySettings {
+    let mut settings = job::RetrySettings::repeat_indefinitely();
+    settings.min_backoff = std::time::Duration::from_millis(50);
+    settings.max_backoff = std::time::Duration::from_millis(100);
+    settings.backoff_jitter_pct = 0;
+    settings
+}
+
+async fn wait_for_n_deliveries(
+    received: &Mutex<Vec<u64>>,
+    n: usize,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        if received.lock().await.len() >= n {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!("Timeout waiting for {n} deliveries");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn checkpoint_sequence(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT je.execution_state_json FROM job_executions je \
+         JOIN jobs j ON j.id = je.id WHERE j.job_type = $1",
+    )
+    .bind(JOB_TYPE)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(json,)| json.get("sequence").and_then(|s| s.as_i64())))
+}
+
+struct BatchEffectHandler {
+    deliveries: Arc<Mutex<Vec<u64>>>,
+    fail_on_first: Option<u64>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OutboxEventHandler<TestEvent> for BatchEffectHandler {
+    async fn handle_persistent(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use es_entity::AtomicOperation;
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.deliveries.lock().await.push(*n);
+            if self.fail_on_first == Some(*n)
+                && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("injected mid-batch failure".into());
+            }
+            sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
+                .bind(*n as i64)
+                .execute(op.as_executor())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+async fn reset_batch_effects_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS test_batch_effects")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE TABLE test_batch_effects (n BIGINT PRIMARY KEY)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn batch_effect_rows(pool: &sqlx::PgPool) -> anyhow::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT n FROM test_batch_effects ORDER BY n")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
 #[tokio::test]
@@ -372,6 +465,249 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn batched_handler_processes_all_events_and_checkpoints_last_sequence() -> anyhow::Result<()>
+{
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        TestPersistentHandler {
+            received: received.clone(),
+        },
+    )
+    .await?;
+
+    // Publish all events before the job starts so they are buffered and
+    // drained into batches.
+    const N: u64 = 50;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    wait_for_n_deliveries(&received, N as usize, std::time::Duration::from_secs(10)).await?;
+
+    let events = received.lock().await;
+    assert_eq!(*events, (1..=N).collect::<Vec<_>>());
+    drop(events);
+
+    // The checkpoint eventually reflects the last event's sequence.
+    let last_sequence: i64 =
+        sqlx::query_scalar("SELECT MAX(sequence) FROM persistent_outbox_events")
+            .fetch_one(&pool)
+            .await?;
+    wait_for_checkpoint(&pool, last_sequence).await?;
+
+    Ok(())
+}
+
+async fn wait_for_checkpoint(pool: &sqlx::PgPool, expected: i64) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        if checkpoint_sequence(pool).await? == Some(expected) {
+            return Ok(());
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            anyhow::bail!(
+                "Timeout waiting for checkpoint to reach {expected}, at {:?}",
+                checkpoint_sequence(pool).await?
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn mid_batch_handler_error_replays_batch_exactly_once() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        .with_retry_settings(fast_retry_settings());
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        BatchEffectHandler {
+            deliveries: deliveries.clone(),
+            fail_on_first: Some(2),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    )
+    .await?;
+
+    // Publish before the job starts so events land in a single batch.
+    const N: u64 = 5;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // First batch attempt: event 1 handled, event 2 fails -> whole batch
+    // rolls back. Retry replays the entire batch; this time it succeeds.
+    let start = std::time::Instant::now();
+    loop {
+        if batch_effect_rows(&pool).await?.len() == N as usize {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            anyhow::bail!("Timeout waiting for all batch effects to commit");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Exactly-once DB effects despite the replay.
+    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
+
+    // Event 1 was delivered again on replay — proof the checkpoint is
+    // per-batch, not per-event (legacy per-event checkpointing would never
+    // redeliver event 1).
+    let deliveries = deliveries.lock().await;
+    let event_1_deliveries = deliveries.iter().filter(|&&n| n == 1).count();
+    assert!(
+        event_1_deliveries >= 2,
+        "expected event 1 to be replayed with the batch, deliveries: {deliveries:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn single_event_flushed_promptly_at_low_traffic() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        TestPersistentHandler {
+            received: received.clone(),
+        },
+    )
+    .await?;
+
+    jobs.start_poll().await?;
+
+    // Let the job start and go idle.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let published_at = std::time::Instant::now();
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // An idle listener must not wait for a full batch: the event is flushed
+    // as soon as the stream goes pending (well under any batch-size wait).
+    wait_for_n_deliveries(&received, 1, std::time::Duration::from_secs(2)).await?;
+    let latency = published_at.elapsed();
+    assert!(
+        latency < std::time::Duration::from_secs(2),
+        "single event took {latency:?} to be handled"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn batch_size_one_preserves_legacy_per_event_semantics() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        .with_retry_settings(fast_retry_settings())
+        .with_batch_size(1);
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        BatchEffectHandler {
+            deliveries: deliveries.clone(),
+            fail_on_first: Some(2),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    )
+    .await?;
+
+    const N: u64 = 3;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        if batch_effect_rows(&pool).await?.len() == N as usize {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            anyhow::bail!("Timeout waiting for all effects to commit");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Legacy semantics: event 1 committed in its own transaction before the
+    // failure on event 2, so it is never redelivered.
+    let deliveries = deliveries.lock().await;
+    let event_1_deliveries = deliveries.iter().filter(|&&n| n == 1).count();
+    assert_eq!(
+        event_1_deliveries, 1,
+        "with batch_size(1) event 1 must not be replayed, deliveries: {deliveries:?}"
+    );
+    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3]);
 
     Ok(())
 }
