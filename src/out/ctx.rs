@@ -20,8 +20,10 @@
 //!
 //! A deferred op is only ever open while there is ready backlog: the runner
 //! never awaits the stream while a transaction is open, so a pending stream
-//! is itself a flush trigger. Batching therefore rides bursts that already
-//! happened and adds no latency at low traffic.
+//! is itself a flush trigger — as is an interleaved ephemeral event (the op
+//! never spans the foreign `handle_ephemeral` await either). Batching
+//! therefore rides bursts that already happened and adds no latency at low
+//! traffic.
 //!
 //! Every flush — whichever of the triggers fires — runs
 //! [`on_flush`](super::OutboxEventHandler::on_flush), then persists the
@@ -179,7 +181,8 @@ impl BatchOp<'_> {
     /// Leave the op open so subsequent events can coalesce into it. The
     /// runner lands it when the ready backlog is drained, when the
     /// configured max batch size is reached, when a later event commits or
-    /// isolates, or on shutdown.
+    /// isolates, when an ephemeral event arrives (the op never spans the
+    /// foreign `handle_ephemeral` await), or on shutdown.
     pub fn defer(self) -> Handled {
         Handled {
             outcome: Outcome::Defer,

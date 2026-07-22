@@ -24,8 +24,9 @@ use crate::tables::MailboxTables;
 ///   into one transaction and one checkpoint write. The batch lands when the
 ///   ready backlog is drained (a deferred op is never held open waiting on
 ///   the network), when `max_batch_size` is reached, when a later event
-///   commits or isolates, or on shutdown. Requires the work to tolerate
-///   whole-batch replay after a mid-batch failure.
+///   commits or isolates, when an ephemeral event arrives, or on shutdown.
+///   Requires the work to tolerate whole-batch replay after a mid-batch
+///   failure.
 /// - [`consume_in_batch`](EventCtx::consume_in_batch) then
 ///   [`commit`](BatchOp::commit) — join the batch and close it with me.
 /// - [`consume_isolated`](EventCtx::consume_isolated) then
@@ -301,8 +302,23 @@ where
 
             match event {
                 OutboxEvent::Ephemeral(event) => {
-                    // Handled inline — ephemerals are an unordered
-                    // best-effort broadcast and never touch the batch op.
+                    // Ephemerals are an unordered best-effort broadcast and
+                    // never touch the batch op — but an open op must not
+                    // span the foreign `handle_ephemeral` await (and steady
+                    // ephemeral traffic must not starve the flush), so an
+                    // ephemeral arriving mid-batch lands the batch first.
+                    if op_slot.is_some() {
+                        let mut parts = CtxParts {
+                            op_slot: &mut op_slot,
+                            current_job: &mut current_job,
+                            state: &state,
+                            tracker: &mut tracker,
+                            on_flush: &on_flush,
+                        };
+                        flush_batch(&mut parts, "ephemeral")
+                            .await
+                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                    }
                     self.handler
                         .handle_ephemeral(&event)
                         .await
