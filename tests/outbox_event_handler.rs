@@ -1,7 +1,7 @@
 mod helpers;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use obix::{
     EventCtx, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox,
@@ -174,13 +174,11 @@ impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
     }
 }
 
-/// Slow deferring worker that also records ephemerals and snapshots the
-/// committed effect rows when an ephemeral runs — used to prove an
-/// ephemeral arriving mid-batch lands the open batch first.
+/// Slow deferring worker that also records ephemerals and counts flushes —
+/// used to prove an ephemeral arriving mid-batch lands the open batch first.
 struct SlowDeferringHandler {
-    pool: sqlx::PgPool,
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
-    rows_at_ephemeral: Arc<Mutex<usize>>,
+    flush_count: Arc<AtomicUsize>,
 }
 
 impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
@@ -208,11 +206,52 @@ impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);
-        let rows = batch_effect_rows(&self.pool)
-            .await
-            .expect("read effect rows")
-            .len();
-        *self.rows_at_ephemeral.lock().await = rows;
+        Ok(())
+    }
+
+    async fn on_flush(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flush_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Aggregator: accumulates event values in memory across deferred events and
+/// writes them back in `on_flush` — one write-back per batch, not per event.
+struct AccumulatingHandler {
+    pending: Arc<std::sync::Mutex<Vec<i64>>>,
+    flush_count: Arc<AtomicUsize>,
+}
+
+impl OutboxEventHandler<TestEvent> for AccumulatingHandler {
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping(n)) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        self.pending.lock().expect("lock").push(*n as i64);
+        let op = ctx.consume_in_batch().await?;
+        Ok(op.defer())
+    }
+
+    async fn on_flush(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use es_entity::AtomicOperation;
+        let drained: Vec<i64> = std::mem::take(&mut *self.pending.lock().expect("lock"));
+        for n in drained {
+            sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
+                .bind(n)
+                .execute(op.as_executor())
+                .await?;
+        }
+        self.flush_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -762,6 +801,61 @@ async fn skipped_events_advance_checkpoint_lazily() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn on_flush_coalesces_accumulated_writes() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let flush_count = Arc::new(AtomicUsize::new(0));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        AccumulatingHandler {
+            pending: Arc::new(std::sync::Mutex::new(Vec::new())),
+            flush_count: flush_count.clone(),
+        },
+    )
+    .await?;
+
+    // Publish before the job starts so the events arrive as ready backlog.
+    const N: u64 = 50;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    wait_for_effect_rows(&pool, N as usize).await?;
+    assert_eq!(
+        batch_effect_rows(&pool).await?,
+        (1..=N as i64).collect::<Vec<_>>()
+    );
+
+    // The write-backs were coalesced: strictly fewer flushes than events.
+    let flushes = flush_count.load(Ordering::SeqCst);
+    assert!(
+        flushes < N as usize,
+        "expected fewer flushes than events, got {flushes}"
+    );
+
+    // The checkpoint lands with the last batch. (Sequences are
+    // deterministic: the wipeout restarts identity at 1.)
+    wait_for_checkpoint(&pool, N as i64).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn ephemeral_arriving_mid_batch_lands_the_open_batch_first() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     reset_batch_effects_table(&pool).await?;
@@ -773,14 +867,13 @@ async fn ephemeral_arriving_mid_batch_lands_the_open_batch_first() -> anyhow::Re
     let mut jobs = job::Jobs::init(job_config).await?;
 
     let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
-    let rows_at_ephemeral = Arc::new(Mutex::new(0usize));
+    let flush_count = Arc::new(AtomicUsize::new(0));
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
         SlowDeferringHandler {
-            pool: pool.clone(),
             ephemeral_received: ephemeral_received.clone(),
-            rows_at_ephemeral: rows_at_ephemeral.clone(),
+            flush_count: flush_count.clone(),
         },
     )
     .await?;
@@ -809,18 +902,13 @@ async fn ephemeral_arriving_mid_batch_lands_the_open_batch_first() -> anyhow::Re
     wait_for_effect_rows(&pool, N as usize).await?;
     wait_for_n_deliveries(&ephemeral_received, 1, std::time::Duration::from_secs(5)).await?;
 
-    // The ephemeral truncated the open batch (flush reason "ephemeral"):
-    // the work buffered so far was already committed when the ephemeral
-    // handler ran, and the drain continued afterwards — the open
+    // The ephemeral truncated the open batch (flush reason "ephemeral"), so
+    // the drain took at least two flushes instead of one — and the open
     // transaction was never held across the ephemeral handler's await.
-    let rows_at_ephemeral = *rows_at_ephemeral.lock().await;
+    let flushes = flush_count.load(Ordering::SeqCst);
     assert!(
-        rows_at_ephemeral >= 1,
-        "expected the open batch to land before the ephemeral ran"
-    );
-    assert!(
-        rows_at_ephemeral < N as usize,
-        "expected the ephemeral to arrive mid-drain, rows_at_ephemeral: {rows_at_ephemeral}"
+        flushes >= 2,
+        "expected the mid-batch ephemeral to land the open batch, flushes: {flushes}"
     );
     assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
 

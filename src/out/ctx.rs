@@ -25,9 +25,10 @@
 //! therefore rides bursts that already happened and adds no latency at low
 //! traffic.
 //!
-//! Every flush — whichever of the triggers fires — persists the checkpoint
-//! at the last *fully handled* sequence (skips included), then commits:
-//! work and pointer are inseparable.
+//! Every flush — whichever of the triggers fires — runs
+//! [`on_flush`](super::OutboxEventHandler::on_flush), then persists the
+//! checkpoint at the last *fully handled* sequence (skips included), then
+//! commits: work and pointer are inseparable.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,17 @@ use crate::sequence::EventSequence;
 
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Type-erased [`on_flush`](super::OutboxEventHandler::on_flush) callback so
+/// that [`EventCtx::consume_isolated`] can flush the pending batch from
+/// within a handler invocation.
+pub(crate) type FlushHook = Box<
+    dyn for<'a> Fn(
+            &'a mut es_entity::DbOp<'static>,
+        ) -> futures::future::BoxFuture<'a, Result<(), HandlerError>>
+        + Send
+        + Sync,
+>;
 
 /// Persisted execution state of an outbox event-handler job: the sequence of
 /// the last fully handled persistent event.
@@ -62,6 +74,7 @@ pub(crate) struct CtxParts<'inv> {
     pub(crate) current_job: &'inv mut CurrentJob,
     pub(crate) state: &'inv OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
+    pub(crate) on_flush: &'inv FlushHook,
 }
 
 /// Proof that a persistent event was resolved in one of the legal ways.
@@ -178,7 +191,7 @@ pub struct BatchOp<'inv> {
 
 impl<'inv> BatchOp<'inv> {
     /// Land the whole batch (my work included) when the invocation returns:
-    /// checkpoint at my sequence → commit.
+    /// `on_flush` → checkpoint at my sequence → commit.
     pub fn commit(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Commit,
@@ -258,8 +271,8 @@ impl std::ops::DerefMut for IsolatedOp<'_> {
     }
 }
 
-/// Land the pending batch op, if any: checkpoint at the last fully handled
-/// sequence → commit. No-op when no op is open.
+/// Land the pending batch op, if any: `on_flush` → checkpoint at the last
+/// fully handled sequence → commit. No-op when no op is open.
 #[tracing::instrument(
     name = "outbox.flush_batch",
     skip_all,
@@ -277,6 +290,7 @@ pub(crate) async fn flush_batch(
     let Some(mut op) = parts.op_slot.take() else {
         return Ok(());
     };
+    (parts.on_flush)(&mut op).await?;
     parts
         .current_job
         .update_execution_state_in_op(&mut op, parts.state)

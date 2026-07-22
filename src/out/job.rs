@@ -34,6 +34,10 @@ use crate::tables::MailboxTables;
 ///   pending batch (work + checkpoint) lands before my work starts, and my
 ///   op commits at return. Exact legacy per-event semantics when nothing is
 ///   pending. Use for causally significant or risky work.
+///
+/// [`on_flush`](Self::on_flush) is called immediately before *any* batch op
+/// commits — the guaranteed write-back point for handlers that accumulate
+/// state across [`consume_in_batch`](EventCtx::consume_in_batch) calls.
 pub trait OutboxEventHandler<P>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -55,6 +59,20 @@ where
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
         let _ = event;
+        async { Ok(()) }
+    }
+
+    /// Called immediately before a batch op commits (any flush trigger,
+    /// including a later event's [`consume_isolated`](EventCtx::consume_isolated)
+    /// entry). Handlers that accumulate state across deferred events write
+    /// it back here — it lands in the same transaction as the batch and its
+    /// checkpoint.
+    fn on_flush(
+        &self,
+        op: &mut es_entity::DbOp<'_>,
+    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
+        let _ = op;
         async { Ok(()) }
     }
 }
@@ -206,6 +224,14 @@ where
             last_persist: tokio::time::Instant::now(),
         };
 
+        let on_flush: FlushHook = {
+            let handler = self.handler.clone();
+            Box::new(move |op| {
+                let handler = handler.clone();
+                Box::pin(async move { handler.on_flush(op).await })
+            })
+        };
+
         loop {
             let event = if op_slot.is_some() {
                 // A batch op is open: only take events that are already
@@ -219,6 +245,7 @@ where
                             current_job: &mut current_job,
                             state: &state,
                             tracker: &mut tracker,
+                            on_flush: &on_flush,
                         };
                         flush_batch(&mut parts, "stream_closed")
                             .await
@@ -231,6 +258,7 @@ where
                             current_job: &mut current_job,
                             state: &state,
                             tracker: &mut tracker,
+                            on_flush: &on_flush,
                         };
                         flush_batch(&mut parts, "backlog_drained")
                             .await
@@ -285,6 +313,7 @@ where
                             current_job: &mut current_job,
                             state: &state,
                             tracker: &mut tracker,
+                            on_flush: &on_flush,
                         };
                         flush_batch(&mut parts, "ephemeral")
                             .await
@@ -302,6 +331,7 @@ where
                             current_job: &mut current_job,
                             state: &state,
                             tracker: &mut tracker,
+                            on_flush: &on_flush,
                         },
                     };
                     // The Handled token is branded with the invocation
@@ -325,6 +355,7 @@ where
                                 current_job: &mut current_job,
                                 state: &state,
                                 tracker: &mut tracker,
+                                on_flush: &on_flush,
                             };
                             flush_batch(&mut parts, "commit")
                                 .await
@@ -337,6 +368,7 @@ where
                                     current_job: &mut current_job,
                                     state: &state,
                                     tracker: &mut tracker,
+                                    on_flush: &on_flush,
                                 };
                                 flush_batch(&mut parts, "batch_full")
                                     .await
