@@ -1,3 +1,11 @@
+# [obix release v0.2.33](https://github.com/GaloyMoney/obix/releases/tag/0.2.33)
+
+
+
+### Features
+
+- Add OpCursor for pre-commit reads of op-buffered events (#79)
+
 # [obix release v0.2.32](https://github.com/GaloyMoney/obix/releases/tag/0.2.32)
 
 
