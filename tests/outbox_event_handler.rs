@@ -637,14 +637,116 @@ async fn single_event_flushed_promptly_at_low_traffic() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // An idle listener must not wait for a full batch: the event is flushed
-    // as soon as the stream goes pending (well under any batch-size wait).
+    // An idle listener must not wait for a full batch: the event is
+    // handled within ~batch_flush_timeout (default 100ms).
     wait_for_n_deliveries(&received, 1, std::time::Duration::from_secs(2)).await?;
     let latency = published_at.elapsed();
     assert!(
         latency < std::time::Duration::from_secs(2),
         "single event took {latency:?} to be handled"
     );
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum Handled {
+    Persistent(u64),
+    Ephemeral(u64),
+}
+
+struct OrderRecordingHandler {
+    log: Arc<Mutex<Vec<Handled>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for OrderRecordingHandler {
+    async fn handle_persistent(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.log.lock().await.push(Handled::Persistent(*n));
+        }
+        Ok(())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let TestEvent::Ping(n) = &event.payload;
+        self.log.lock().await.push(Handled::Ephemeral(*n));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_arriving_mid_batch_is_handled_after_buffered_persistents() -> anyhow::Result<()>
+{
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let outbox =
+        init_outbox_with_handler(&pool, &mut jobs, OrderRecordingHandler { log: log.clone() })
+            .await?;
+
+    jobs.start_poll().await?;
+
+    // Let the job start and go idle.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Publish persistent, then ephemeral, then persistent in quick
+    // succession so the ephemeral arrives while the first persistent's
+    // batch is still open.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    outbox
+        .publish_ephemeral(
+            obix::out::EphemeralEventType::new("ordering_test"),
+            TestEvent::Ping(9),
+        )
+        .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(2))
+        .await?;
+    op.commit().await?;
+
+    // Ephemeral delivery is at-least-once; wait until the second
+    // persistent has been handled.
+    let start = std::time::Instant::now();
+    loop {
+        if log.lock().await.contains(&Handled::Persistent(2)) {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            anyhow::bail!("Timeout waiting for all events");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Stream order is preserved: the first delivery of the ephemeral
+    // happens only after the persistent buffered ahead of it has been
+    // handled, and before the persistent published after it.
+    let log = log.lock().await;
+    let pos = |h: &Handled| log.iter().position(|e| e == h).unwrap();
+    assert!(pos(&Handled::Persistent(1)) < pos(&Handled::Ephemeral(9)));
+    assert!(pos(&Handled::Ephemeral(9)) < pos(&Handled::Persistent(2)));
 
     Ok(())
 }

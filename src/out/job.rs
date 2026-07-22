@@ -62,14 +62,16 @@ impl OutboxEventJobConfig {
 
     /// Maximum number of persistent events handled per transaction /
     /// checkpoint. `1` preserves the legacy one-transaction-per-event
-    /// behavior.
+    /// behavior (and never waits to fill a batch).
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
     }
 
-    /// Upper bound on how long a partially filled batch stays open before
-    /// being committed.
+    /// How long a partially filled batch stays open collecting events
+    /// before being committed. Bounds the added processing latency of a
+    /// single event on an idle stream. `Duration::ZERO` restores
+    /// flush-on-pending behavior (no coalescing wait).
     pub fn with_batch_flush_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.batch_flush_timeout = timeout;
         self
@@ -197,34 +199,67 @@ where
                 None => return Ok(JobCompletion::RescheduleNow),
             }
 
-            // Drain ready events into the batch without blocking. Flush when
-            // the batch is full, the stream goes pending (idle streams never
-            // wait for a full batch), or the flush timeout caps the batch
-            // lifetime under a continuous feed.
+            // Fill the batch: drain ready events, then keep the batch open
+            // for the remainder of batch_flush_timeout to coalesce a
+            // continuous feed. Flush when the batch is full, the timeout
+            // expires, an ephemeral arrives (handled after the commit so
+            // stream order is preserved), the stream closes, or shutdown is
+            // requested.
             let batch_start = tokio::time::Instant::now();
             let mut flush_reason = "batch_full";
             let mut stream_closed = false;
+            let mut shutdown = false;
+            let mut pending_ephemeral = None;
             while batch.len() < self.batch_size {
-                if batch_start.elapsed() >= self.batch_flush_timeout {
+                let remaining = self
+                    .batch_flush_timeout
+                    .saturating_sub(batch_start.elapsed());
+                if remaining.is_zero() {
                     flush_reason = "flush_timeout";
                     break;
                 }
                 match stream.next().now_or_never() {
-                    Some(Some(OutboxEvent::Persistent(e))) => batch.push(e),
+                    Some(Some(OutboxEvent::Persistent(e))) => {
+                        batch.push(e);
+                        continue;
+                    }
                     Some(Some(OutboxEvent::Ephemeral(e))) => {
-                        self.handler
-                            .handle_ephemeral(&e)
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        flush_reason = "ephemeral";
+                        pending_ephemeral = Some(e);
+                        break;
                     }
                     Some(None) => {
                         flush_reason = "stream_closed";
                         stream_closed = true;
                         break;
                     }
-                    None => {
-                        flush_reason = "stream_pending";
+                    None => {}
+                }
+                tokio::select! {
+                    biased;
+                    _ = current_job.shutdown_requested() => {
+                        flush_reason = "shutdown";
+                        shutdown = true;
                         break;
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        flush_reason = "flush_timeout";
+                        break;
+                    }
+                    event = stream.next() => {
+                        match event {
+                            Some(OutboxEvent::Persistent(e)) => batch.push(e),
+                            Some(OutboxEvent::Ephemeral(e)) => {
+                                flush_reason = "ephemeral";
+                                pending_ephemeral = Some(e);
+                                break;
+                            }
+                            None => {
+                                flush_reason = "stream_closed";
+                                stream_closed = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -232,7 +267,14 @@ where
             self.process_batch(&mut current_job, &mut state, &mut batch, flush_reason)
                 .await?;
 
-            if stream_closed {
+            if let Some(e) = pending_ephemeral {
+                self.handler
+                    .handle_ephemeral(&e)
+                    .await
+                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+            }
+
+            if stream_closed || shutdown {
                 return Ok(JobCompletion::RescheduleNow);
             }
         }
