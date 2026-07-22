@@ -813,3 +813,139 @@ async fn batch_size_one_preserves_legacy_per_event_semantics() -> anyhow::Result
 
     Ok(())
 }
+
+#[tokio::test]
+#[file_serial]
+async fn zero_flush_timeout_still_batches_ready_events() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        .with_retry_settings(fast_retry_settings())
+        .with_batch_flush_timeout(std::time::Duration::ZERO);
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        BatchEffectHandler {
+            deliveries: deliveries.clone(),
+            fail_on_first: Some(2),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    )
+    .await?;
+
+    // Publish before the job starts so all events are buffered and must be
+    // drained into one batch without any coalescing wait.
+    const N: u64 = 5;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    let start = std::time::Instant::now();
+    loop {
+        if batch_effect_rows(&pool).await?.len() == N as usize {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            anyhow::bail!("Timeout waiting for all batch effects to commit");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Event 1 replayed => the zero-timeout drain still formed a multi-event
+    // batch (single-event batches would never redeliver event 1).
+    let deliveries = deliveries.lock().await;
+    let event_1_deliveries = deliveries.iter().filter(|&&n| n == 1).count();
+    assert!(
+        event_1_deliveries >= 2,
+        "expected ready events to be coalesced with zero timeout, deliveries: {deliveries:?}"
+    );
+    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
+
+    Ok(())
+}
+
+struct AlwaysFailPersistentWithEphemeralHandler {
+    ephemeral_received: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for AlwaysFailPersistentWithEphemeralHandler {
+    async fn handle_persistent(
+        &self,
+        _op: &mut es_entity::DbOp<'_>,
+        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("persistent always fails".into())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let TestEvent::Ping(n) = &event.payload;
+        self.ephemeral_received.lock().await.push(*n);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_is_handled_even_when_batch_fails() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
+    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        .with_retry_settings(fast_retry_settings());
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        AlwaysFailPersistentWithEphemeralHandler {
+            ephemeral_received: ephemeral_received.clone(),
+        },
+    )
+    .await?;
+
+    // Both buffered before the job starts: the ephemeral is drained into
+    // pending_ephemeral while the persistent batch is open, and the batch
+    // then fails.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+    outbox
+        .publish_ephemeral(
+            obix::out::EphemeralEventType::new("batch_failure_test"),
+            TestEvent::Ping(9),
+        )
+        .await?;
+
+    jobs.start_poll().await?;
+
+    // The ephemeral must be handled even though the persistent batch never
+    // commits.
+    wait_for_n_deliveries(&ephemeral_received, 1, std::time::Duration::from_secs(5)).await?;
+
+    Ok(())
+}

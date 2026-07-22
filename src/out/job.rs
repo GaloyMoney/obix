@@ -211,13 +211,8 @@ where
             let mut shutdown = false;
             let mut pending_ephemeral = None;
             while batch.len() < self.batch_size {
-                let remaining = self
-                    .batch_flush_timeout
-                    .saturating_sub(batch_start.elapsed());
-                if remaining.is_zero() {
-                    flush_reason = "flush_timeout";
-                    break;
-                }
+                // Drain immediately ready events first so a zero flush
+                // timeout still coalesces everything already buffered.
                 match stream.next().now_or_never() {
                     Some(Some(OutboxEvent::Persistent(e))) => {
                         batch.push(e);
@@ -234,6 +229,13 @@ where
                         break;
                     }
                     None => {}
+                }
+                let remaining = self
+                    .batch_flush_timeout
+                    .saturating_sub(batch_start.elapsed());
+                if remaining.is_zero() {
+                    flush_reason = "flush_timeout";
+                    break;
                 }
                 tokio::select! {
                     biased;
@@ -264,15 +266,23 @@ where
                 }
             }
 
-            self.process_batch(&mut current_job, &mut state, &mut batch, flush_reason)
-                .await?;
+            let batch_result = self
+                .process_batch(&mut current_job, &mut state, &mut batch, flush_reason)
+                .await;
 
+            // Handle the interleaved ephemeral even if the batch failed:
+            // ephemerals are a best-effort broadcast with no replay of their
+            // own, so dropping it behind a batch error could lose it. On
+            // batch failure it is handled ahead of the replayed persistents
+            // — acceptable, since ephemerals carry no durable ordering.
             if let Some(e) = pending_ephemeral {
                 self.handler
                     .handle_ephemeral(&e)
                     .await
                     .map_err(|e| e as Box<dyn std::error::Error>)?;
             }
+
+            batch_result.map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
             if stream_closed || shutdown {
                 return Ok(JobCompletion::RescheduleNow);
@@ -307,14 +317,11 @@ where
         state: &mut OutboxEventJobState,
         batch: &mut Vec<Arc<PersistentOutboxEvent<P>>>,
         flush_reason: &'static str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut op =
             es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
         for event in batch.drain(..) {
-            self.handler
-                .handle_persistent(&mut op, &event)
-                .await
-                .map_err(|e| e as Box<dyn std::error::Error>)?;
+            self.handler.handle_persistent(&mut op, &event).await?;
             state.sequence = event.sequence;
         }
         current_job
