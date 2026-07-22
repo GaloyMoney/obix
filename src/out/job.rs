@@ -42,12 +42,13 @@ pub trait OutboxEventHandler<P>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    fn handle_persistent(
+    fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &PersistentOutboxEvent<P>,
-    ) -> impl std::future::Future<Output = Result<Handled, Box<dyn std::error::Error + Send + Sync>>>
-    + Send {
+    ) -> impl std::future::Future<
+        Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send {
         let _ = event;
         async move { Ok(ctx.skip()) }
     }
@@ -221,7 +222,6 @@ where
             events_in_op: 0,
             persisted_seq: state.sequence,
             last_persist: tokio::time::Instant::now(),
-            invocation_consumed: false,
         };
 
         let on_flush: FlushHook = {
@@ -325,7 +325,6 @@ where
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                 }
                 OutboxEvent::Persistent(event) => {
-                    tracker.invocation_consumed = false;
                     let ctx = EventCtx {
                         parts: CtxParts {
                             op_slot: &mut op_slot,
@@ -335,22 +334,21 @@ where
                             on_flush: &on_flush,
                         },
                     };
-                    let handled = self
+                    // The Handled token is branded with the invocation
+                    // lifetime (it cannot leave this call) and every path
+                    // that mints one consumes the ctx — so the outcome is
+                    // authentic by construction. Extract it in the same
+                    // statement so the token (and with it the ctx borrows)
+                    // ends before the state advance below.
+                    let outcome = self
                         .handler
                         .handle_persistent(ctx, &event)
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(|e| e as Box<dyn std::error::Error>)?
+                        .outcome;
                     state.sequence = event.sequence;
-                    match handled.outcome {
-                        Outcome::Skip => {
-                            if tracker.invocation_consumed {
-                                return Err(
-                                    "handler consumed the event but returned a token from \
-                                     another invocation"
-                                        .into(),
-                                );
-                            }
-                        }
+                    match outcome {
+                        Outcome::Skip => {}
                         Outcome::Commit => {
                             let mut parts = CtxParts {
                                 op_slot: &mut op_slot,

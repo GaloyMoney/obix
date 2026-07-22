@@ -32,6 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::marker::PhantomData;
+
 use job::CurrentJob;
 
 use crate::sequence::EventSequence;
@@ -65,9 +67,6 @@ pub(crate) struct BatchTracker {
     pub(crate) persisted_seq: EventSequence,
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
-    /// Whether the current invocation consumed the event (used to reject
-    /// tokens smuggled across invocations).
-    pub(crate) invocation_consumed: bool,
 }
 
 pub(crate) struct CtxParts<'inv> {
@@ -84,9 +83,31 @@ pub(crate) struct CtxParts<'inv> {
 /// [`BatchOp::defer`] or [`IsolatedOp::commit`] — the type system forces
 /// every [`handle_persistent`](super::OutboxEventHandler::handle_persistent)
 /// invocation to decide the transactional fate of its event.
+///
+/// The token is branded with the invocation's lifetime, so it cannot leave
+/// the invocation that minted it: handlers are `'static`, so stashing a
+/// token for a later invocation does not compile —
+///
+/// ```compile_fail
+/// use obix::{EventCtx, Handled};
+///
+/// struct Evil {
+///     stash: std::sync::Mutex<Option<Handled<'static>>>,
+/// }
+///
+/// fn stash_it(ctx: EventCtx<'_>, evil: &Evil) {
+///     // error[E0521]: borrowed data escapes outside of function
+///     *evil.stash.lock().unwrap() = Some(ctx.skip());
+/// }
+/// ```
+///
+/// Combined with the entry verbs consuming the [`EventCtx`] (each invocation
+/// can mint exactly one token), the returned token is always *the* token of
+/// the current invocation, of the kind that actually happened.
 #[must_use = "return the Handled token from handle_persistent"]
-pub struct Handled {
+pub struct Handled<'inv> {
     pub(crate) outcome: Outcome,
+    pub(crate) _invocation: PhantomData<&'inv ()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +130,10 @@ impl<'inv> EventCtx<'inv> {
     /// This event is not for me — no transaction is opened, an open batch op
     /// is left untouched, and the checkpoint advances lazily (piggybacked on
     /// the next flush, or persisted on the configured checkpoint interval).
-    pub fn skip(self) -> Handled {
+    pub fn skip(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Skip,
+            _invocation: PhantomData,
         }
     }
 
@@ -135,7 +157,6 @@ impl<'inv> EventCtx<'inv> {
             );
         }
         parts.tracker.events_in_op += 1;
-        parts.tracker.invocation_consumed = true;
         Ok(BatchOp { parts })
     }
 
@@ -156,7 +177,6 @@ impl<'inv> EventCtx<'inv> {
                 .await?,
         );
         parts.tracker.events_in_op = 1;
-        parts.tracker.invocation_consumed = true;
         Ok(IsolatedOp { parts })
     }
 }
@@ -169,12 +189,13 @@ pub struct BatchOp<'inv> {
     parts: CtxParts<'inv>,
 }
 
-impl BatchOp<'_> {
+impl<'inv> BatchOp<'inv> {
     /// Land the whole batch (my work included) when the invocation returns:
     /// `on_flush` → checkpoint at my sequence → commit.
-    pub fn commit(self) -> Handled {
+    pub fn commit(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Commit,
+            _invocation: PhantomData,
         }
     }
 
@@ -183,9 +204,10 @@ impl BatchOp<'_> {
     /// configured max batch size is reached, when a later event commits or
     /// isolates, when an ephemeral event arrives (the op never spans the
     /// foreign `handle_ephemeral` await), or on shutdown.
-    pub fn defer(self) -> Handled {
+    pub fn defer(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Defer,
+            _invocation: PhantomData,
         }
     }
 }
@@ -218,12 +240,13 @@ pub struct IsolatedOp<'inv> {
     parts: CtxParts<'inv>,
 }
 
-impl IsolatedOp<'_> {
+impl<'inv> IsolatedOp<'inv> {
     /// Land my work and my checkpoint, atomically, when the invocation
     /// returns.
-    pub fn commit(self) -> Handled {
+    pub fn commit(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Commit,
+            _invocation: PhantomData,
         }
     }
 }

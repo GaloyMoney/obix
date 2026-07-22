@@ -26,11 +26,11 @@ struct SkippingObserver {
 }
 
 impl OutboxEventHandler<TestEvent> for SkippingObserver {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
         }
@@ -44,11 +44,11 @@ struct CheckpointingObserver {
 }
 
 impl OutboxEventHandler<TestEvent> for CheckpointingObserver {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
         }
@@ -78,11 +78,11 @@ struct TestBothHandler {
 }
 
 impl OutboxEventHandler<TestEvent> for TestBothHandler {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
         }
@@ -110,11 +110,11 @@ struct DeferringEffectHandler {
 }
 
 impl OutboxEventHandler<TestEvent> for DeferringEffectHandler {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -142,11 +142,11 @@ struct IsolatingEffectHandler {
 }
 
 impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -182,11 +182,11 @@ struct SlowDeferringHandler {
 }
 
 impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -226,11 +226,11 @@ struct AccumulatingHandler {
 }
 
 impl OutboxEventHandler<TestEvent> for AccumulatingHandler {
-    async fn handle_persistent(
+    async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'_>,
+        ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
         };
