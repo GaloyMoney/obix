@@ -37,6 +37,12 @@ where
             _phantom: PhantomData,
         }
     }
+
+    /// Events buffered on this hook, awaiting persistence at commit.
+    /// Backs the [`Outbox::cursor`](crate::out::Outbox::cursor) read API.
+    pub(crate) fn pending(&self) -> &[P] {
+        &self.pre_commit_events
+    }
 }
 
 impl<P, Tables> CommitHook for PersistEvents<P, Tables>
