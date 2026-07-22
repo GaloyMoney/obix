@@ -25,6 +25,9 @@ pub use inbox::{
     InboxIdempotencyKey, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
-pub use out::{CursorError, OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig};
+pub use out::{
+    BatchOp, CursorError, EventCtx, Handled, IsolatedOp, OpCursor, Outbox, OutboxEventHandler,
+    OutboxEventJobConfig,
+};
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
