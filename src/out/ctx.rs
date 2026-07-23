@@ -219,6 +219,45 @@ impl std::ops::DerefMut for BatchOp<'_> {
     }
 }
 
+/// Full delegation to the inner [`es_entity::DbOp`] — including the provided
+/// methods, which [`es_entity::DbOp`] overrides (`supports_hooks` is `true`,
+/// `commit_hook` returns registered hooks, `maybe_now`/`clock` carry the op's
+/// cached time and clock). Inheriting the trait defaults instead would
+/// silently report `supports_hooks() == false` and lose the op time.
+///
+/// This lets handlers pass `&mut op` directly to any
+/// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
+/// `spawn_in_op`, `publish_persisted_in_op`, …) without `&mut *op`.
+impl es_entity::AtomicOperation for BatchOp<'_> {
+    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        (**self).maybe_now()
+    }
+
+    fn clock(&self) -> &es_entity::clock::ClockHandle {
+        es_entity::AtomicOperation::clock(&**self)
+    }
+
+    fn connection(&mut self) -> &mut es_entity::db::Connection {
+        (**self).connection()
+    }
+
+    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
+        (**self).as_executor()
+    }
+
+    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
+        (**self).add_commit_hook(hook)
+    }
+
+    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
+        (**self).commit_hook::<H>()
+    }
+
+    fn supports_hooks(&self) -> bool {
+        (**self).supports_hooks()
+    }
+}
+
 /// An op holding exactly this event's work, fenced from the batch history.
 /// Derefs to [`es_entity::DbOp`]. The only exit is [`commit`](Self::commit) —
 /// isolation from future events is guaranteed by construction.
@@ -255,6 +294,38 @@ impl std::ops::DerefMut for IsolatedOp<'_> {
             .op_slot
             .as_mut()
             .expect("IsolatedOp always holds a materialized op")
+    }
+}
+
+/// Full delegation to the inner [`es_entity::DbOp`] — see the note on
+/// [`BatchOp`]'s impl for why every provided method is delegated too.
+impl es_entity::AtomicOperation for IsolatedOp<'_> {
+    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        (**self).maybe_now()
+    }
+
+    fn clock(&self) -> &es_entity::clock::ClockHandle {
+        es_entity::AtomicOperation::clock(&**self)
+    }
+
+    fn connection(&mut self) -> &mut es_entity::db::Connection {
+        (**self).connection()
+    }
+
+    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
+        (**self).as_executor()
+    }
+
+    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
+        (**self).add_commit_hook(hook)
+    }
+
+    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
+        (**self).commit_hook::<H>()
+    }
+
+    fn supports_hooks(&self) -> bool {
+        (**self).supports_hooks()
     }
 }
 

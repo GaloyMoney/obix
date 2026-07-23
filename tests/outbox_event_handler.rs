@@ -99,6 +99,20 @@ impl OutboxEventHandler<TestEvent> for TestBothHandler {
     }
 }
 
+/// Generic `*_in_op`-style helper: takes any `AtomicOperation`, so handlers
+/// can pass `&mut op` (a `BatchOp`/`IsolatedOp`) directly — exercising the
+/// direct `AtomicOperation` impls instead of the `&mut *op` deref.
+async fn insert_effect_in_op(
+    op: &mut impl es_entity::AtomicOperation,
+    n: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
+        .bind(n)
+        .execute(op.as_executor())
+        .await?;
+    Ok(())
+}
+
 /// Batch-safe worker: inserts one row per event inside the shared batch op
 /// and defers. Optionally fails the first time a given event value is seen.
 /// Sleeps briefly per event so the backfill keeps the ready backlog ahead of
@@ -125,10 +139,12 @@ impl OutboxEventHandler<TestEvent> for DeferringEffectHandler {
         if self.fail_on_first == Some(*n) && !self.failed.swap(true, Ordering::SeqCst) {
             return Err("injected mid-batch failure".into());
         }
-        sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
-            .bind(*n as i64)
-            .execute(op.as_executor())
-            .await?;
+        // Provided-method delegation pinned: inheriting the trait default
+        // would report false here (DbOp overrides it to true).
+        if !op.supports_hooks() {
+            return Err("BatchOp must delegate supports_hooks to the inner DbOp".into());
+        }
+        insert_effect_in_op(&mut op, *n as i64).await?;
         Ok(op.defer())
     }
 }
@@ -147,7 +163,6 @@ impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
         ctx: EventCtx<'inv>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
         };
@@ -155,20 +170,14 @@ impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         if *n == self.isolate_on {
             let mut op = ctx.consume_isolated().await?;
-            sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
-                .bind(*n as i64)
-                .execute(op.as_executor())
-                .await?;
+            insert_effect_in_op(&mut op, *n as i64).await?;
             if !self.fail_isolated_once.swap(true, Ordering::SeqCst) {
                 return Err("injected isolated failure".into());
             }
             Ok(op.commit())
         } else {
             let mut op = ctx.consume_in_batch().await?;
-            sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
-                .bind(*n as i64)
-                .execute(op.as_executor())
-                .await?;
+            insert_effect_in_op(&mut op, *n as i64).await?;
             Ok(op.defer())
         }
     }
