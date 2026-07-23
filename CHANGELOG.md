@@ -1,3 +1,11 @@
+# [obix release v0.3.1](https://github.com/GaloyMoney/obix/releases/tag/0.3.1)
+
+
+
+### Features
+
+- Implement AtomicOperation directly on BatchOp and IsolatedOp (#88)
+
 # [obix release v0.3.0](https://github.com/GaloyMoney/obix/releases/tag/0.3.0)
 
 
