@@ -1,3 +1,12 @@
+# [obix release v0.3.3](https://github.com/GaloyMoney/obix/releases/tag/0.3.3)
+
+
+
+### Miscellaneous Tasks
+
+- Bump job to 0.6.32 (#91)
+- Bump es-entity to 0.11.6 (#90)
+
 # [obix release v0.3.2](https://github.com/GaloyMoney/obix/releases/tag/0.3.2)
 
 
