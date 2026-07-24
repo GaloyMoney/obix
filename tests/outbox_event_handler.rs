@@ -177,6 +177,58 @@ async fn insert_effect_in_op(
     Ok(())
 }
 
+/// The collect-path sibling of [`SlowDeferringHandler`]: a slow worker whose
+/// batch is open purely through the accumulator (`collected > 0`, no op) —
+/// proving an ephemeral cannot interrupt a collect-only batch either.
+struct SlowCollectingHandler {
+    pool: sqlx::PgPool,
+    persistent_seen: Arc<Mutex<Vec<u64>>>,
+    ephemeral_received: Arc<Mutex<Vec<u64>>>,
+    rows_at_ephemeral: Arc<Mutex<usize>>,
+}
+
+impl OutboxEventHandler<TestEvent> for SlowCollectingHandler {
+    type Batch = Vec<i64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<i64>>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping(n)) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        self.persistent_seen.lock().await.push(*n);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        Ok(ctx.collect(*n as i64))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut obix::FlushOp<'_>,
+        items: Vec<i64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for n in items {
+            insert_effect_in_op(op, n).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let TestEvent::Ping(n) = &event.payload;
+        self.ephemeral_received.lock().await.push(*n);
+        let rows = batch_effect_rows(&self.pool)
+            .await
+            .expect("read effect rows")
+            .len();
+        *self.rows_at_ephemeral.lock().await = rows;
+        Ok(())
+    }
+}
+
 /// Batch-safe worker: inserts one row per event inside the shared batch op
 /// and defers. Optionally fails the first time a given event value is seen.
 /// Sleeps briefly per event so the backfill keeps the ready backlog ahead of
@@ -1215,6 +1267,72 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
     assert_eq!(
         rows_at_ephemeral, N as usize,
         "expected the ephemeral to run at the batch boundary, after the whole batch landed"
+    );
+    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_never_interrupts_a_collect_only_batch() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let persistent_seen = Arc::new(Mutex::new(Vec::new()));
+    let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
+    let rows_at_ephemeral = Arc::new(Mutex::new(0usize));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        SlowCollectingHandler {
+            pool: pool.clone(),
+            persistent_seen: persistent_seen.clone(),
+            ephemeral_received: ephemeral_received.clone(),
+            rows_at_ephemeral: rows_at_ephemeral.clone(),
+        },
+    )
+    .await?;
+
+    const N: u64 = 5;
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // Same evidence-gated timing as the deferring variant: the second
+    // delivery proves the first event already collected, so the batch is
+    // open (via `collected > 0` — no op exists on this path) when the
+    // ephemeral arrives.
+    wait_for_n_deliveries(&persistent_seen, 2, std::time::Duration::from_secs(10)).await?;
+    outbox
+        .publish_ephemeral(
+            obix::out::EphemeralEventType::new("mid_collect"),
+            TestEvent::Ping(9),
+        )
+        .await?;
+
+    wait_for_effect_rows(&pool, N as usize).await?;
+    wait_for_n_deliveries(&ephemeral_received, 1, std::time::Duration::from_secs(5)).await?;
+
+    // A collect-only batch holds no op — it is open purely through the
+    // accumulator — and the ephemeral still cannot interrupt it: all N
+    // items flushed in one batch before the ephemeral handler ran.
+    let rows_at_ephemeral = *rows_at_ephemeral.lock().await;
+    assert_eq!(
+        rows_at_ephemeral, N as usize,
+        "expected the ephemeral to run after the collect-only batch flushed"
     );
     assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
 
