@@ -8,7 +8,7 @@ use crate::out::event::PersistentOutboxEvent;
 /// Shared snapshot of an outbox's registered post-persist hooks.
 pub(crate) type PostPersistHooks<P> = Arc<[Arc<dyn PostPersistHook<P>>]>;
 
-/// In-transaction callback invoked after this outbox's events are INSERTed
+/// In-transaction callback invoked after this outbox's events are inserted
 /// (sequences assigned) but before the surrounding operation commits.
 ///
 /// Register on an outbox via
