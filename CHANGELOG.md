@@ -1,3 +1,7 @@
+# [obix release v0.4.1](https://github.com/GaloyMoney/obix/releases/tag/0.4.1)
+
+
+
 # [obix release v0.4.0](https://github.com/GaloyMoney/obix/releases/tag/0.4.0)
 
 
