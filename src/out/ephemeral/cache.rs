@@ -3,6 +3,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use std::sync::Arc;
 
+pub(crate) type EphemeralCacheMapEntry<P> = (EphemeralMailboxKey, Arc<EphemeralOutboxEvent<P>>);
+pub(crate) type EphemeralCacheMap<P> =
+    im::HashMap<EphemeralMailboxKey, Arc<EphemeralOutboxEvent<P>>>;
+
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
@@ -14,9 +18,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_receiver: Option<broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>>,
-    backfill_request: mpsc::UnboundedSender<
-        oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
-    >,
+    backfill_request: mpsc::UnboundedSender<oneshot::Sender<EphemeralCacheMap<P>>>,
 }
 
 impl<P> CacheHandle<P>
@@ -29,9 +31,7 @@ where
             .expect("receiver already taken")
     }
 
-    pub fn request_current_ephemeral_events(
-        &self,
-    ) -> oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>> {
+    pub fn request_current_ephemeral_events(&self) -> oneshot::Receiver<EphemeralCacheMap<P>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.backfill_request.send(tx);
         rx
@@ -44,9 +44,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    backfill_request_send: mpsc::UnboundedSender<
-        oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
-    >,
+    backfill_request_send: mpsc::UnboundedSender<oneshot::Sender<EphemeralCacheMap<P>>>,
     cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     _cache_loop_handle: OwnedTaskHandle,
     _phantom: std::marker::PhantomData<Tables>,
@@ -99,20 +97,21 @@ where
     }
 
     fn insert_into_cache_and_broadcast(
-        cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
+        cache: EphemeralCacheMap<P>,
         event: Arc<EphemeralOutboxEvent<P>>,
         ephemeral_event_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    ) -> im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> {
+    ) -> EphemeralCacheMap<P> {
+        let key = (event.event_type.clone(), event.conflation_key.clone());
         // Last-write-wins by recorded_at: notification-triggered fetches for
-        // the same event type can complete out of order — a strictly older
-        // event must never overwrite (or be broadcast after) a newer one.
-        if let Some(cached) = cache.get(&event.event_type)
+        // the same (event_type, conflation_key) can complete out of order —
+        // a strictly older event must never overwrite (or be broadcast
+        // after) a newer one.
+        if let Some(cached) = cache.get(&key)
             && cached.recorded_at > event.recorded_at
         {
             return cache;
         }
-        let event_type = event.event_type.clone();
-        let cache = cache.update(event_type, event.clone());
+        let cache = cache.update(key, event.clone());
         let _ = ephemeral_event_sender.send(event);
         cache
     }
@@ -139,14 +138,10 @@ where
     /// credentials. `recorded_at` bounds that fetch: when the in-process
     /// cache already holds an event at least as recent (the publisher's
     /// post-commit broadcast beat the NOTIFY), the hint is a no-op.
-    fn handle_ephemeral_notification(
-        payload: &str,
-        cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
-    ) -> Option<EphemeralEventType> {
+    fn handle_ephemeral_notification(payload: &str) -> Option<EphemeralEventType> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
             event_type: EphemeralEventType,
-            recorded_at: chrono::DateTime<chrono::Utc>,
         }
 
         let header: NotificationHeader = match serde_json::from_str(payload) {
@@ -157,22 +152,18 @@ where
             }
         };
 
-        let cache_is_current = cache
-            .get(&header.event_type)
-            .is_some_and(|cached| cached.recorded_at >= header.recorded_at);
-        if cache_is_current {
-            None
-        } else {
-            Some(header.event_type)
-        }
+        // The hint carries only event_type (no conflation_key), so we
+        // cannot check per-key freshness against the cache. Always fetch —
+        // the LWW guard in insert_into_cache_and_broadcast prevents a stale
+        // fetch result from overwriting or re-broadcasting a newer event.
+        Some(header.event_type)
     }
 
     fn process_notification(
         notification: sqlx::postgres::PgNotification,
-        cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
     ) -> Option<EphemeralEventType> {
         if notification.channel() == Tables::ephemeral_outbox_events_channel() {
-            Self::handle_ephemeral_notification(notification.payload(), cache)
+            Self::handle_ephemeral_notification(notification.payload())
         } else {
             None
         }
@@ -182,9 +173,7 @@ where
         pool: &sqlx::PgPool,
         _config: &MailboxConfig,
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-        mut backfill_request: mpsc::UnboundedReceiver<
-            oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
-        >,
+        mut backfill_request: mpsc::UnboundedReceiver<oneshot::Sender<EphemeralCacheMap<P>>>,
         mut cache_fill_receiver: broadcast::Receiver<Arc<EphemeralOutboxEvent<P>>>,
         cache_fill_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
@@ -192,8 +181,10 @@ where
         let pool = pool.clone();
 
         let handle = spawn_supervised("obix::ephemeral_cache_loop", async move {
-            let mut ephemeral_cache: im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> =
-                im::HashMap::new();
+            let mut ephemeral_cache: im::HashMap<
+                (EphemeralEventType, EphemeralEventKey),
+                Arc<EphemeralOutboxEvent<P>>,
+            > = im::HashMap::new();
 
             loop {
                 tokio::select! {
@@ -263,10 +254,7 @@ where
                                     match message {
                                         NotifyMessage::Notification(notification) => {
                                             if let Some(event_type) =
-                                                Self::process_notification(
-                                                    notification,
-                                                    &ephemeral_cache,
-                                                )
+                                                Self::process_notification(notification)
                                             {
                                                 types_to_fetch.insert(event_type);
                                             }
@@ -289,7 +277,10 @@ where
                                         Ok(events) => {
                                             for event in events {
                                                 let stale = ephemeral_cache
-                                                    .get(&event.event_type)
+                                                    .get(&(
+                                                        event.event_type.clone(),
+                                                        event.conflation_key.clone(),
+                                                    ))
                                                     .is_some_and(|cached| {
                                                         cached.recorded_at >= event.recorded_at
                                                     });

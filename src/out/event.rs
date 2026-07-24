@@ -73,6 +73,40 @@ impl std::fmt::Display for EphemeralEventType {
     }
 }
 
+/// Conflation key for the ephemeral mailbox. Events published with the same
+/// `(event_type, conflation_key)` overwrite each other in the mailbox;
+/// events with different keys coexist as independent latest-state slots. The
+/// default (empty) key preserves the original one-row-per-`event_type`
+/// behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct EphemeralEventKey(Cow<'static, str>);
+impl EphemeralEventKey {
+    pub const fn new(name: &'static str) -> Self {
+        Self(Cow::Borrowed(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EphemeralEventKey {
+    fn from(s: String) -> Self {
+        Self(Cow::Owned(s))
+    }
+}
+
+impl std::fmt::Display for EphemeralEventKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Mailbox slot identifier: one latest-state slot per
+/// `(event_type, conflation_key)` pair.
+pub type EphemeralMailboxKey = (EphemeralEventType, EphemeralEventKey);
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
 pub struct EphemeralOutboxEvent<T>
@@ -80,6 +114,8 @@ where
     T: Serialize + DeserializeOwned + Send,
 {
     pub event_type: EphemeralEventType,
+    #[serde(default)]
+    pub conflation_key: EphemeralEventKey,
     pub payload: T,
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,

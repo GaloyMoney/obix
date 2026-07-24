@@ -174,14 +174,35 @@ where
         Ok(())
     }
 
+    /// Publish an ephemeral event with the default (empty) conflation key:
+    /// it overwrites the single mailbox slot for `event_type`.
     pub async fn publish_ephemeral(
         &self,
         event_type: EphemeralEventType,
         event: impl Into<P>,
     ) -> Result<(), sqlx::Error> {
+        self.publish_ephemeral_with_key(event_type, EphemeralEventKey::default(), event)
+            .await
+    }
+
+    /// Publish an ephemeral event into the mailbox slot identified by
+    /// `(event_type, conflation_key)`: it overwrites only that slot, leaving
+    /// slots with other keys untouched.
+    pub async fn publish_ephemeral_with_key(
+        &self,
+        event_type: EphemeralEventType,
+        conflation_key: EphemeralEventKey,
+        event: impl Into<P>,
+    ) -> Result<(), sqlx::Error> {
         let now = self.clock.manual_now();
-        let event =
-            Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
+        let event = Tables::persist_ephemeral_event(
+            &self.pool,
+            now,
+            event_type,
+            conflation_key,
+            event.into(),
+        )
+        .await?;
         let _ = self
             .ephemeral_cache
             .cache_fill_sender()
@@ -189,6 +210,7 @@ where
         Ok(())
     }
 
+    /// [`publish_ephemeral`](Self::publish_ephemeral) within `op`.
     pub async fn publish_ephemeral_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -198,6 +220,28 @@ where
         let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
             self.ephemeral_cache.cache_fill_sender().clone(),
             event_type,
+            event,
+        );
+        if let Err(hook) = op.add_commit_hook(hook) {
+            use es_entity::hooks::CommitHook;
+            hook.force_execute_pre_commit(op).await?;
+        }
+        Ok(())
+    }
+
+    /// [`publish_ephemeral_with_key`](Self::publish_ephemeral_with_key) within
+    /// `op`.
+    pub async fn publish_ephemeral_with_key_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        event_type: EphemeralEventType,
+        conflation_key: EphemeralEventKey,
+        event: impl Into<P>,
+    ) -> Result<(), sqlx::Error> {
+        let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::with_key(
+            self.ephemeral_cache.cache_fill_sender().clone(),
+            event_type,
+            conflation_key,
             event,
         );
         if let Err(hook) = op.add_commit_hook(hook) {

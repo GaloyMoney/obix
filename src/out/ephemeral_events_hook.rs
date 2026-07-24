@@ -4,11 +4,12 @@ use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
-use crate::out::event::{EphemeralEventType, EphemeralOutboxEvent};
+use crate::out::event::{EphemeralEventKey, EphemeralEventType, EphemeralOutboxEvent};
 use crate::tables::MailboxTables;
 
 pub struct EphemeralEvent<P> {
     pub event_type: EphemeralEventType,
+    pub conflation_key: EphemeralEventKey,
     pub payload: P,
 }
 
@@ -33,10 +34,20 @@ where
         event_type: EphemeralEventType,
         event: impl Into<P>,
     ) -> Self {
+        Self::with_key(sender, event_type, EphemeralEventKey::default(), event)
+    }
+
+    pub fn with_key(
+        sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+        event_type: EphemeralEventType,
+        conflation_key: EphemeralEventKey,
+        event: impl Into<P>,
+    ) -> Self {
         Self {
             sender,
             pre_commit_events: vec![EphemeralEvent {
                 event_type,
+                conflation_key,
                 payload: event.into(),
             }],
             post_commit_events: Vec::new(),
@@ -55,9 +66,13 @@ where
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
         for event in self.pre_commit_events.drain(..) {
-            let persisted =
-                Tables::persist_ephemeral_event_in_op(&mut op, event.event_type, event.payload)
-                    .await?;
+            let persisted = Tables::persist_ephemeral_event_in_op(
+                &mut op,
+                event.event_type,
+                event.conflation_key,
+                event.payload,
+            )
+            .await?;
             self.post_commit_events.push(persisted);
         }
         PreCommitRet::ok(self, op)

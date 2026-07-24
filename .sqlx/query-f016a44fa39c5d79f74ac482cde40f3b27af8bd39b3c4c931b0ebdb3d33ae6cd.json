@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT event_type, payload, tracing_context, recorded_at\n            FROM ephemeral_outbox_events\n            WHERE event_type = $1\n            ORDER BY recorded_at",
+  "query": "\n            SELECT event_type, conflation_key, payload, tracing_context, recorded_at\n            FROM ephemeral_outbox_events\n            ORDER BY recorded_at",
   "describe": {
     "columns": [
       {
@@ -10,31 +10,35 @@
       },
       {
         "ordinal": 1,
+        "name": "conflation_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
         "name": "payload",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "tracing_context",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "recorded_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
+      false,
       false,
       false,
       true,
       false
     ]
   },
-  "hash": "4698a743d0635c94ccd212692571e9b4dffe3e863503f2e2493cf417b5b45939"
+  "hash": "f016a44fa39c5d79f74ac482cde40f3b27af8bd39b3c4c931b0ebdb3d33ae6cd"
 }
