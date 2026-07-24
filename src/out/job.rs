@@ -52,6 +52,13 @@ pub enum EventSubscription {
 ///   tolerate whole-batch replay after a mid-batch failure.
 /// - [`consume_in_batch`](EventCtx::consume_in_batch) then
 ///   [`commit`](BatchOp::commit) — join the batch and close it with me.
+/// - [`consume_in_batch`](EventCtx::consume_in_batch) then
+///   [`collect_with`](BatchOp::collect_with) / the
+///   [`collect`](BatchOp::collect) sugar — both channels for one event:
+///   direct work in the shared batch op now, plus an item contributed to
+///   the [`Batch`](Self::Batch) accumulator, applied via
+///   [`flush`](Self::flush) when the batch lands. Defer-like exit: the op
+///   stays open for subsequent events.
 /// - [`consume_isolated`](EventCtx::consume_isolated) then
 ///   [`commit`](IsolatedOp::commit) — my event is its own atomic unit: the
 ///   pending batch (items + work + checkpoint) lands before my work starts,

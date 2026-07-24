@@ -423,6 +423,44 @@ impl OutboxEventHandler<TestEvent> for MixedHandler {
     }
 }
 
+/// Both channels per event: writes one row directly into the shared batch
+/// op, then exits via [`obix::BatchOp`]'s `collect` — the defer-like exit
+/// that also contributes an item (`n + 100`) to the accumulator.
+struct OpWorkThenCollectHandler {
+    flush_sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for OpWorkThenCollectHandler {
+    type Batch = Vec<i64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<i64>>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping(n)) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let n = *n as i64;
+        let mut op = ctx.consume_in_batch().await?;
+        insert_effect_in_op(&mut op, n).await?;
+        Ok(op.collect(n + 100))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut obix::FlushOp<'_>,
+        items: Vec<i64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flush_sizes.lock().await.push(items.len());
+        for n in items {
+            insert_effect_in_op(op, n).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Collects everything except one event value, which it handles isolated —
 /// the isolation fence must land the collected items (and their checkpoint)
 /// before the isolated op exists, so the isolated failure replays alone.
@@ -1407,6 +1445,64 @@ async fn mixed_collect_and_defer_land_in_one_batch() -> anyhow::Result<()> {
     // checkpoint for all four.
     assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4]);
     assert_eq!(*flush_sizes.lock().await, vec![2]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn batch_op_collect_contributes_item_and_defers() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    reset_batch_effects_table(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let flush_sizes = Arc::new(Mutex::new(Vec::new()));
+    // max_batch_size == N pins single-counting: if the collect exit counted
+    // its event against the batch size again (on top of consume_in_batch),
+    // the batch would force-flush halfway through the burst.
+    const N: u64 = 4;
+    let config =
+        OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).with_max_batch_size(N as usize);
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        OpWorkThenCollectHandler {
+            flush_sizes: flush_sizes.clone(),
+        },
+    )
+    .await?;
+
+    // Publish before the job starts so the events arrive as ready backlog.
+    let mut op = outbox.begin_op().await?;
+    for n in 1..=N {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    wait_for_effect_rows(&pool, 2 * N as usize).await?;
+    wait_for_checkpoint(&pool, N as i64).await?;
+
+    // Each event landed twice: its direct op write at handle time and its
+    // collected item at flush time — one batch, one transaction, one
+    // checkpoint for all of it.
+    assert_eq!(
+        batch_effect_rows(&pool).await?,
+        vec![1, 2, 3, 4, 101, 102, 103, 104]
+    );
+    // One flush for the whole burst — each event counted once toward
+    // max_batch_size (a double count would have split it into two flushes
+    // of 2).
+    assert_eq!(*flush_sizes.lock().await, vec![N as usize]);
 
     Ok(())
 }
