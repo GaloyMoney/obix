@@ -1,3 +1,12 @@
+# [obix release v0.4.0](https://github.com/GaloyMoney/obix/releases/tag/0.4.0)
+
+
+
+### Features
+
+- [**breaking**] Collect/flush statement batching, two-stream runner, sealed op guards (#95)
+- PostPersistHook — in-tx callbacks on outbox persist (#96)
+
 # [obix release v0.3.3](https://github.com/GaloyMoney/obix/releases/tag/0.3.3)
 
 
