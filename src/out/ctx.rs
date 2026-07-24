@@ -24,8 +24,12 @@
 //! stream while a batch is pending, so a pending stream is itself a flush
 //! trigger. Batching therefore rides bursts that already happened and adds
 //! no latency at low traffic. Ephemeral events travel on their own stream
-//! and are handled between batches — they never interrupt a batch and a
-//! transaction never spans the foreign `handle_ephemeral` await.
+//! and are handled between batches — they never interrupt a batch, a
+//! transaction never spans the foreign `handle_ephemeral` await, and between
+//! batches the two streams race fairly so neither can starve the other.
+//! Handlers that only consume one stream should declare it via
+//! [`SUBSCRIPTION`](super::OutboxEventHandler::SUBSCRIPTION) — the other
+//! stream is then never subscribed at all.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
 //! items to the handler's [`flush`](super::OutboxEventHandler::flush) inside

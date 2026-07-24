@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use obix::{
-    EventCtx, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox,
+    EventCtx, EventSubscription, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -409,6 +410,103 @@ impl OutboxEventHandler<TestEvent> for CollectThenIsolateHandler {
         for n in items {
             insert_effect_in_op(&mut *op, n).await?;
         }
+        Ok(())
+    }
+}
+
+/// `All`-subscription probe with a deliberately slow ephemeral path: under a
+/// saturating ephemeral flood the ephemeral stream is *always* ready, so any
+/// static priority toward it would starve persistent progress forever — the
+/// fair race must still deliver persistent events.
+struct FairnessProbeHandler {
+    persistent_received: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for FairnessProbeHandler {
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.persistent_received.lock().await.push(*n);
+        }
+        Ok(ctx.skip())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        _event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Slower than the flood's inter-arrival time: the ephemeral channel
+        // never goes empty while the flood runs.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        Ok(())
+    }
+}
+
+/// Declares `PersistentOnly`: the ephemeral stream must never even be
+/// subscribed — the (dead-code) `handle_ephemeral` override must never run.
+struct PersistentOnlyHandler {
+    persistent_received: Arc<Mutex<Vec<u64>>>,
+    ephemeral_received: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for PersistentOnlyHandler {
+    const SUBSCRIPTION: EventSubscription = EventSubscription::PersistentOnly;
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.persistent_received.lock().await.push(*n);
+        }
+        Ok(ctx.skip())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let TestEvent::Ping(n) = &event.payload;
+        self.ephemeral_received.lock().await.push(*n);
+        Ok(())
+    }
+}
+
+/// Declares `EphemeralOnly`: no persistent deliveries and no checkpoint
+/// machinery — the job must never write execution state.
+struct EphemeralOnlyHandler {
+    persistent_received: Arc<Mutex<Vec<u64>>>,
+    ephemeral_received: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for EphemeralOnlyHandler {
+    const SUBSCRIPTION: EventSubscription = EventSubscription::EphemeralOnly;
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.persistent_received.lock().await.push(*n);
+        }
+        Ok(ctx.skip())
+    }
+
+    async fn handle_ephemeral(
+        &self,
+        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let TestEvent::Ping(n) = &event.payload;
+        self.ephemeral_received.lock().await.push(*n);
         Ok(())
     }
 }
@@ -1417,6 +1515,175 @@ async fn single_collected_event_flushes_promptly_at_low_traffic() -> anyhow::Res
         "single collected event took {latency:?} to land"
     );
     assert_eq!(*flush_sizes.lock().await, vec![1]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn continuous_ephemeral_traffic_does_not_starve_persistent_events() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let persistent_received = Arc::new(Mutex::new(Vec::new()));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        FairnessProbeHandler {
+            persistent_received: persistent_received.clone(),
+        },
+    )
+    .await?;
+
+    jobs.start_poll().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Saturating flood: inter-arrival (~5ms) is shorter than the handler's
+    // ephemeral handling time (15ms), so the ephemeral stream is always
+    // ready. A static ephemeral-first priority would never poll the
+    // persistent stream again.
+    let flood_outbox = outbox.clone();
+    let flood = tokio::spawn(async move {
+        let event_type = obix::out::EphemeralEventType::new("flood");
+        loop {
+            if flood_outbox
+                .publish_ephemeral(event_type.clone(), TestEvent::Ping(0))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+
+    // Let the flood saturate the channel before the persistent event lands.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // The fair race guarantees the persistent stream keeps winning boundary
+    // slots despite the flood.
+    let delivered =
+        wait_for_n_deliveries(&persistent_received, 1, std::time::Duration::from_secs(5)).await;
+    flood.abort();
+    delivered?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn persistent_only_handler_never_subscribes_ephemerals() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let persistent_received = Arc::new(Mutex::new(Vec::new()));
+    let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        PersistentOnlyHandler {
+            persistent_received: persistent_received.clone(),
+            ephemeral_received: ephemeral_received.clone(),
+        },
+    )
+    .await?;
+
+    jobs.start_poll().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let event_type = obix::out::EphemeralEventType::new("unsubscribed");
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(99))
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    wait_for_n_deliveries(&persistent_received, 1, std::time::Duration::from_secs(5)).await?;
+
+    // Settle, then prove the dead-code contract: the ephemeral stream was
+    // never subscribed, so the handler's override never ran.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(*persistent_received.lock().await, vec![1]);
+    assert!(
+        ephemeral_received.lock().await.is_empty(),
+        "PersistentOnly handler must never receive ephemeral events"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_only_handler_skips_checkpoint_machinery() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let persistent_received = Arc::new(Mutex::new(Vec::new()));
+    let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
+    let outbox = init_outbox_with_handler(
+        &pool,
+        &mut jobs,
+        EphemeralOnlyHandler {
+            persistent_received: persistent_received.clone(),
+            ephemeral_received: ephemeral_received.clone(),
+        },
+    )
+    .await?;
+
+    jobs.start_poll().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    let event_type = obix::out::EphemeralEventType::new("only");
+    outbox
+        .publish_ephemeral(event_type, TestEvent::Ping(7))
+        .await?;
+
+    wait_for_n_deliveries(&ephemeral_received, 1, std::time::Duration::from_secs(5)).await?;
+
+    // Settle, then prove both halves of the contract: no persistent
+    // delivery, and no execution state ever written (the job sheds the
+    // whole checkpoint machinery, not just the stream).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        persistent_received.lock().await.is_empty(),
+        "EphemeralOnly handler must never receive persistent events"
+    );
+    assert_eq!(
+        checkpoint_sequence(&pool).await?,
+        None,
+        "EphemeralOnly job must never write execution state"
+    );
 
     Ok(())
 }
