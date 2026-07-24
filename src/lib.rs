@@ -27,7 +27,7 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     BatchOp, CursorError, EventCtx, Handled, IsolatedOp, OpCursor, Outbox, OutboxEventHandler,
-    OutboxEventJobConfig,
+    OutboxEventJobConfig, PostPersistHook,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
