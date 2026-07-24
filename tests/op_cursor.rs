@@ -48,18 +48,18 @@ async fn cursor_sees_only_events_published_after_creation() -> anyhow::Result<()
         .publish_all_persisted(&mut op, [SourceEvent::Posted(1), SourceEvent::Posted(2)])
         .await?;
 
-    let new = outbox.new_events(&op, &mut cursor);
+    let new = outbox.take_published_since(&op, &mut cursor);
     assert_eq!(new, [SourceEvent::Posted(1), SourceEvent::Posted(2)]);
 
     // The read advanced the cursor — nothing new now.
-    assert!(outbox.new_events(&op, &mut cursor).is_empty());
+    assert!(outbox.take_published_since(&op, &mut cursor).is_empty());
 
     // Stream-style continuation: a later publish is picked up by the same cursor.
     outbox
         .publish_persisted_in_op(&mut op, SourceEvent::Posted(3))
         .await?;
     assert_eq!(
-        outbox.new_events(&op, &mut cursor),
+        outbox.take_published_since(&op, &mut cursor),
         [SourceEvent::Posted(3)]
     );
 
@@ -86,13 +86,13 @@ async fn peek_does_not_advance() -> anyhow::Result<()> {
         .publish_all_persisted(&mut op, [SourceEvent::Posted(1), SourceEvent::Posted(2)])
         .await?;
 
-    assert_eq!(outbox.peek_new(&op, &cursor).len(), 2);
+    assert_eq!(outbox.peek_published_since(&op, &cursor).len(), 2);
     // Peeking again yields the same events — no advance.
-    assert_eq!(outbox.peek_new(&op, &cursor).len(), 2);
+    assert_eq!(outbox.peek_published_since(&op, &cursor).len(), 2);
 
     // A consuming read advances past them.
-    assert_eq!(outbox.new_events(&op, &mut cursor).len(), 2);
-    assert!(outbox.peek_new(&op, &cursor).is_empty());
+    assert_eq!(outbox.take_published_since(&op, &mut cursor).len(), 2);
+    assert!(outbox.peek_published_since(&op, &cursor).is_empty());
 
     op.commit().await?;
     Ok(())
@@ -127,14 +127,14 @@ async fn cursor_is_scoped_to_its_outbox() -> anyhow::Result<()> {
         .await?;
 
     assert!(
-        dest.new_events(&op, &mut dest_cursor).is_empty(),
+        dest.take_published_since(&op, &mut dest_cursor).is_empty(),
         "a cursor must not see another outbox's events"
     );
 
     dest.publish_persisted_in_op(&mut op, DestEvent::Mapped(1))
         .await?;
     assert_eq!(
-        dest.new_events(&op, &mut dest_cursor),
+        dest.take_published_since(&op, &mut dest_cursor),
         [DestEvent::Mapped(1)]
     );
 
@@ -180,7 +180,7 @@ async fn mapped_republish_commits_atomically() -> anyhow::Result<()> {
         .await?;
 
     // Inline, per-use-case mapping at the call site.
-    let mapped = source.map_new(&op, &mut cursor, |e| match e {
+    let mapped = source.map_published_since(&op, &mut cursor, |e| match e {
         SourceEvent::Posted(n) if *n % 2 == 1 => Some(DestEvent::Mapped(*n)),
         _ => None,
     });
@@ -221,7 +221,7 @@ async fn mapped_republish_rolls_back_atomically() -> anyhow::Result<()> {
             .publish_all_persisted(&mut op, [SourceEvent::Posted(1), SourceEvent::Posted(2)])
             .await?;
 
-        let mapped = source.map_new(&op, &mut cursor, |e| {
+        let mapped = source.map_published_since(&op, &mut cursor, |e| {
             let SourceEvent::Posted(n) = e;
             Some(DestEvent::Mapped(*n))
         });

@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
 use crate::out::event::PersistentOutboxEvent;
+use crate::out::post_persist_hook::PostPersistHooks;
 use crate::tables::MailboxTables;
 
 pub struct PersistEvents<P, Tables>
@@ -16,6 +17,10 @@ where
     pre_commit_events: Vec<P>,
     post_commit_events: Vec<PersistentOutboxEvent<P>>,
     batch_size: usize,
+    /// Snapshot of the outbox's registered post-persist hooks, taken when
+    /// this commit hook is constructed (i.e. at the operation's first
+    /// publish). Merged publishes keep the first snapshot.
+    post_persist_hooks: PostPersistHooks<P>,
     _phantom: PhantomData<Tables>,
 }
 
@@ -28,12 +33,14 @@ where
         sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
         events: impl IntoIterator<Item = impl Into<P>>,
         batch_size: usize,
+        post_persist_hooks: PostPersistHooks<P>,
     ) -> Self {
         Self {
             sender,
             pre_commit_events: events.into_iter().map(Into::into).collect(),
             post_commit_events: Vec::new(),
             batch_size,
+            post_persist_hooks,
             _phantom: PhantomData,
         }
     }
@@ -63,7 +70,11 @@ where
             if chunk.is_empty() {
                 break;
             }
-            persisted.extend(Tables::persist_events(&mut op, chunk.into_iter()).await?);
+            let persisted_chunk = Tables::persist_events(&mut op, chunk.into_iter()).await?;
+            for hook in self.post_persist_hooks.iter() {
+                hook.on_persisted(&mut op, &persisted_chunk).await?;
+            }
+            persisted.extend(persisted_chunk);
         }
         self.post_commit_events = persisted;
         PreCommitRet::ok(self, op)

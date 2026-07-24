@@ -7,16 +7,17 @@ use std::marker::PhantomData;
 /// its events on a single (merged) commit hook — nothing is written to the
 /// database until `op.commit()`. An `OpCursor` marks a position in that buffer
 /// so the events published *after* it can be read back before commit via
-/// [`Outbox::new_events`](super::Outbox::new_events) /
-/// [`Outbox::map_new`](super::Outbox::map_new) — e.g. to atomically republish a
-/// mapped projection of one outbox's events onto another outbox in the same
-/// transaction.
+/// [`Outbox::take_published_since`](super::Outbox::take_published_since) /
+/// [`Outbox::map_published_since`](super::Outbox::map_published_since) — e.g.
+/// to atomically republish a mapped projection of one outbox's events onto
+/// another outbox in the same transaction.
 ///
 /// The cursor is pure state — all reads go through the [`Outbox`](super::Outbox)
 /// (mirroring how [`EventSequence`](crate::EventSequence) is a passive token
 /// passed to [`listen_persisted`](super::Outbox::listen_persisted)). Advancing
 /// reads take `&mut OpCursor`; the non-advancing
-/// [`peek_new`](super::Outbox::peek_new) takes `&OpCursor`. The type parameters
+/// [`peek_published_since`](super::Outbox::peek_published_since) takes
+/// `&OpCursor`. The type parameters
 /// pin the cursor to its outbox's payload/table types, so a cursor from one
 /// outbox cannot be used with another.
 ///
