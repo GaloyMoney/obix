@@ -3,31 +3,37 @@
 //! Every persistent event delivered to an
 //! [`OutboxEventHandler`](super::OutboxEventHandler) comes with an
 //! [`EventCtx`] that the handler must resolve into a [`Handled`] token by
-//! choosing exactly one of three entry verbs:
+//! choosing exactly one of four entry verbs — a monotone cost ladder:
 //!
 //! | verb | meaning | cost |
 //! |------|---------|------|
 //! | [`EventCtx::skip`] | not my event | zero — no transaction is opened |
+//! | [`EventCtx::collect_with`] (and the [`collect`](EventCtx::collect) sugar) | contribute an item to the pending batch's accumulator | zero at collect time — one [`flush`](super::OutboxEventHandler::flush) call per batch applies all items |
 //! | [`EventCtx::consume_in_batch`] | do work joined to the pending batch op | shares one transaction (and one checkpoint) with neighboring events |
 //! | [`EventCtx::consume_isolated`] | land the pending batch first, then do my work in a fresh op | my event is its own atomic unit, fenced from history |
 //!
-//! and — when work was done — one of two exit verbs:
+//! and — when an op was taken — one of two exit verbs:
 //!
 //! | verb | meaning |
 //! |------|---------|
 //! | [`BatchOp::commit`] / [`IsolatedOp::commit`] | land the op (work + checkpoint, atomically) when the invocation returns |
 //! | [`BatchOp::defer`] | leave the op open so subsequent events can coalesce into it |
 //!
-//! A deferred op is only ever open while there is ready backlog: the runner
-//! never awaits the stream while a transaction is open, so a pending stream
-//! is itself a flush trigger — as is an interleaved ephemeral event (the op
-//! never spans the foreign `handle_ephemeral` await either). Batching
-//! therefore rides bursts that already happened and adds no latency at low
-//! traffic.
+//! A pending batch — an open op, collected items, or both — only ever exists
+//! while there is ready persistent backlog: the runner never awaits the
+//! stream while a batch is pending, so a pending stream is itself a flush
+//! trigger. Batching therefore rides bursts that already happened and adds
+//! no latency at low traffic. Ephemeral events travel on their own stream
+//! and are handled between batches — they never interrupt a batch and a
+//! transaction never spans the foreign `handle_ephemeral` await.
 //!
-//! Every flush — whichever of the triggers fires — persists the checkpoint
-//! at the last *fully handled* sequence (skips included), then commits:
-//! work and pointer are inseparable.
+//! Every flush — whichever of the triggers fires — first hands all collected
+//! items to the handler's [`flush`](super::OutboxEventHandler::flush) inside
+//! the batch transaction, then persists the checkpoint at the last *fully
+//! handled* sequence (skips included), then commits: items, work and pointer
+//! are inseparable. A failed flush rolls everything back and replays the
+//! whole batch (items are re-collected), so collected work must tolerate
+//! wholesale replay — the same contract as [`defer`](BatchOp::defer).
 
 use serde::{Deserialize, Serialize};
 
@@ -49,8 +55,13 @@ pub(crate) struct OutboxEventJobState {
 
 /// Book-keeping the runner shares with [`EventCtx`].
 pub(crate) struct BatchTracker {
-    /// Number of events whose work is in the currently open op.
+    /// Number of events contributing to the pending batch (consumed into the
+    /// op or collected into the accumulator) — drives `max_batch_size`.
     pub(crate) events_in_op: usize,
+    /// Number of events that collected items since the last flush. Nonzero
+    /// means the accumulator is dirty: the batch is open even without an op,
+    /// and no checkpoint may be persisted before the items are flushed.
+    pub(crate) collected: usize,
     /// Highest sequence whose checkpoint has been persisted to the database.
     pub(crate) persisted_seq: EventSequence,
     /// When the checkpoint was last persisted (any flush or standalone write).
@@ -66,7 +77,8 @@ pub(crate) struct CtxParts<'inv> {
 
 /// Proof that a persistent event was resolved in one of the legal ways.
 ///
-/// Only obtainable from [`EventCtx::skip`], [`BatchOp::commit`],
+/// Only obtainable from [`EventCtx::skip`], [`EventCtx::collect_with`] (or
+/// its [`collect`](EventCtx::collect) sugar), [`BatchOp::commit`],
 /// [`BatchOp::defer`] or [`IsolatedOp::commit`] — the type system forces
 /// every [`handle_persistent`](super::OutboxEventHandler::handle_persistent)
 /// invocation to decide the transactional fate of its event.
@@ -100,6 +112,7 @@ pub struct Handled<'inv> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Skip,
+    Collect,
     Commit,
     Defer,
 }
@@ -107,19 +120,46 @@ pub(crate) enum Outcome {
 /// Per-event decision point handed to
 /// [`handle_persistent`](super::OutboxEventHandler::handle_persistent).
 ///
-/// See the [module docs](self) for the semantics of the three entry verbs.
-#[must_use = "resolve the EventCtx via skip / consume_in_batch / consume_isolated"]
-pub struct EventCtx<'inv> {
+/// Generic over the handler's
+/// [`Batch`](super::OutboxEventHandler::Batch) accumulator `B` (defaulting
+/// to `()` for handlers that never collect). See the [module docs](self)
+/// for the semantics of the four entry verbs.
+#[must_use = "resolve the EventCtx via skip / collect / consume_in_batch / consume_isolated"]
+pub struct EventCtx<'inv, B = ()> {
     pub(crate) parts: CtxParts<'inv>,
+    pub(crate) batch: &'inv mut B,
+    pub(crate) flusher: &'inv dyn ItemFlush<B>,
 }
 
-impl<'inv> EventCtx<'inv> {
+impl<'inv, B> EventCtx<'inv, B> {
     /// This event is not for me — no transaction is opened, an open batch op
     /// is left untouched, and the checkpoint advances lazily (piggybacked on
     /// the next flush, or persisted on the configured checkpoint interval).
     pub fn skip(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Skip,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Contribute to the pending batch's accumulator — a pure memory write:
+    /// no transaction is opened and no statement is executed now. The runner
+    /// hands the accumulated batch to the handler's
+    /// [`flush`](super::OutboxEventHandler::flush) exactly once per batch
+    /// landing, inside the transaction that commits the checkpoint.
+    ///
+    /// Like [`defer`](BatchOp::defer), collected work shares fate with its
+    /// neighbors and must tolerate whole-batch replay: on a failed flush the
+    /// events replay and their items are re-collected.
+    ///
+    /// For `Vec` and `HashMap` accumulators the [`collect`](Self::collect)
+    /// sugar is usually more convenient.
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        self.parts.tracker.events_in_op += 1;
+        self.parts.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
             _invocation: PhantomData,
         }
     }
@@ -147,24 +187,55 @@ impl<'inv> EventCtx<'inv> {
         Ok(BatchOp { parts })
     }
 
-    /// Land the pending batch first (its work and its checkpoint, at the
-    /// last fully handled sequence), then hand back a fresh op: this event
-    /// is its own atomic unit, sharing no fate with history — and none with
-    /// the future either, since [`IsolatedOp`] only offers
-    /// [`commit`](IsolatedOp::commit).
+    /// Land the pending batch first (its collected items, its work and its
+    /// checkpoint, at the last fully handled sequence), then hand back a
+    /// fresh op: this event is its own atomic unit, sharing no fate with
+    /// history — and none with the future either, since [`IsolatedOp`] only
+    /// offers [`commit`](IsolatedOp::commit).
     ///
     /// This is the failure-isolation fence: if this event's work fails, only
     /// this event replays; and it is the exact legacy per-event semantics
     /// when no batch is pending.
-    pub async fn consume_isolated(self) -> Result<IsolatedOp<'inv>, HandlerError> {
-        let mut parts = self.parts;
-        flush_batch(&mut parts, "isolated_entry").await?;
+    pub async fn consume_isolated(self) -> Result<IsolatedOp<'inv>, HandlerError>
+    where
+        B: Default,
+    {
+        let EventCtx {
+            mut parts,
+            batch,
+            flusher,
+        } = self;
+        flush_batch(&mut parts, batch, flusher, "isolated_entry").await?;
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await?,
         );
         parts.tracker.events_in_op = 1;
         Ok(IsolatedOp { parts })
+    }
+}
+
+impl<'inv, T> EventCtx<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators:
+    /// append one item to the pending batch.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> EventCtx<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap` accumulators:
+    /// keyed last-write-wins insert. Persistent events arrive in ascending
+    /// sequence, so within a batch this naturally keeps the newest item per
+    /// key — the coalescing fold (N updates per key → 1 flushed entry).
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
     }
 }
 
@@ -200,10 +271,9 @@ impl<'inv> BatchOp<'inv> {
     }
 
     /// Leave the op open so subsequent events can coalesce into it. The
-    /// runner lands it when the ready backlog is drained, when the
-    /// configured max batch size is reached, when a later event commits or
-    /// isolates, when an ephemeral event arrives (the op never spans the
-    /// foreign `handle_ephemeral` await), or on shutdown.
+    /// runner lands it when the ready persistent backlog is drained, when
+    /// the configured max batch size is reached, when a later event commits
+    /// or isolates, or on shutdown.
     pub fn defer(self) -> Handled<'inv> {
         Handled {
             outcome: Outcome::Defer,
@@ -337,25 +407,161 @@ impl es_entity::AtomicOperation for IsolatedOp<'_> {
     }
 }
 
-/// Land the pending batch op, if any: checkpoint at the last fully handled
-/// sequence → commit. No-op when no op is open.
+pub(crate) type BoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Object-safe bridge from the runner (and [`EventCtx::consume_isolated`]'s
+/// entry fence) to the handler's typed
+/// [`flush`](super::OutboxEventHandler::flush) — erases the handler type so
+/// [`EventCtx`] only needs to know the accumulator `B`.
+pub(crate) trait ItemFlush<B>: Send + Sync {
+    fn flush_items<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+        items: B,
+    ) -> BoxFuture<'a, Result<(), HandlerError>>;
+}
+
+/// Restricted view of the batch op handed to
+/// [`flush`](super::OutboxEventHandler::flush) — everything an
+/// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else.
+///
+/// Committing belongs to the runner: after `flush` returns `Ok`, the
+/// checkpoint is written and the transaction commits — items, work and
+/// pointer land atomically. There is no access to the raw
+/// [`es_entity::DbOp`], mirroring [`BatchOp`]/[`IsolatedOp`]'s sealing.
+pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
+
+impl<'a> FlushOp<'a> {
+    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>) -> Self {
+        Self(op)
+    }
+}
+
+/// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
+/// [`BatchOp`]'s impl for why every provided method is delegated too.
+/// `add_commit_hook` delegation is what lets a flush body publish onto the
+/// batch op (e.g. `publish_all_persisted`) with the events buffered on the
+/// runner's commit.
+impl es_entity::AtomicOperation for FlushOp<'_> {
+    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.0.maybe_now()
+    }
+
+    fn clock(&self) -> &es_entity::clock::ClockHandle {
+        es_entity::AtomicOperation::clock(self.0)
+    }
+
+    fn connection(&mut self) -> &mut es_entity::db::Connection {
+        self.0.connection()
+    }
+
+    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
+        self.0.as_executor()
+    }
+
+    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
+        self.0.add_commit_hook(hook)
+    }
+
+    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
+        self.0.commit_hook::<H>()
+    }
+
+    fn supports_hooks(&self) -> bool {
+        self.0.supports_hooks()
+    }
+}
+
+/// A batch flush failed. Carries the sequence range actually at fault, so
+/// the failure is not misattributed to the (innocent) event whose verb
+/// happened to trigger the landing — e.g. a later event entering
+/// [`consume_isolated`](EventCtx::consume_isolated).
+///
+/// Propagates through `handle_persistent` as a boxed error; downcast to
+/// re-attribute in logs or traces.
+#[derive(Debug)]
+pub struct FlushError {
+    /// Which trigger landed the batch (`"backlog_drained"`, `"batch_full"`,
+    /// `"commit"`, `"isolated_entry"`, `"shutdown"`, `"stream_closed"`).
+    pub reason: &'static str,
+    /// The batch covers sequences strictly after this (the last durable
+    /// checkpoint)…
+    pub after: EventSequence,
+    /// …through this (the last fully handled event).
+    pub through: EventSequence,
+    pub source: HandlerError,
+}
+
+impl std::fmt::Display for FlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "flush of batch ({}, {}] failed (reason={}): {}",
+            self.after, self.through, self.reason, self.source
+        )
+    }
+}
+
+impl std::error::Error for FlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Land the pending batch, if any: hand collected items to the handler's
+/// flush (inside the batch transaction, opening one if only items are
+/// pending) → checkpoint at the last fully handled sequence → commit. No-op
+/// when nothing is pending.
 #[tracing::instrument(
     name = "outbox.flush_batch",
     skip_all,
     fields(
         reason = reason,
         batch_size = parts.tracker.events_in_op,
+        collected = parts.tracker.collected,
         checkpoint_seq = u64::from(parts.state.sequence),
     ),
     err
 )]
-pub(crate) async fn flush_batch(
+pub(crate) async fn flush_batch<B: Default>(
     parts: &mut CtxParts<'_>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B>,
     reason: &'static str,
 ) -> Result<(), HandlerError> {
-    let Some(mut op) = parts.op_slot.take() else {
+    if parts.op_slot.is_none() && parts.tracker.collected == 0 {
         return Ok(());
-    };
+    }
+    if parts.tracker.collected > 0 {
+        if parts.op_slot.is_none() {
+            *parts.op_slot = Some(
+                es_entity::DbOp::init_with_clock(
+                    parts.current_job.pool(),
+                    parts.current_job.clock(),
+                )
+                .await?,
+            );
+        }
+        // Drain before the call: on error the items are dropped with the op,
+        // and the replayed events re-collect them — the accumulator never
+        // leaks stale state into a retry.
+        let items = std::mem::take(batch);
+        parts.tracker.collected = 0;
+        let op = parts.op_slot.as_mut().expect("op was materialized above");
+        if let Err(source) = flusher.flush_items(op, items).await {
+            return Err(Box::new(FlushError {
+                reason,
+                after: parts.tracker.persisted_seq,
+                through: parts.state.sequence,
+                source,
+            }));
+        }
+    }
+    let mut op = parts
+        .op_slot
+        .take()
+        .expect("a pending batch always has an op by now");
     parts
         .current_job
         .update_execution_state_in_op(&mut op, parts.state)
