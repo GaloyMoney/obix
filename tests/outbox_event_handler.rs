@@ -284,7 +284,7 @@ impl OutboxEventHandler<TestEvent> for CollectingHandler {
         }
         self.flush_sizes.lock().await.push(items.len());
         for n in items {
-            insert_effect_in_op(&mut *op, n).await?;
+            insert_effect_in_op(op, n).await?;
         }
         Ok(())
     }
@@ -320,7 +320,7 @@ impl OutboxEventHandler<TestEvent> for CoalescingHandler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_sizes.lock().await.push(items.len());
         for (_key, latest) in items {
-            insert_effect_in_op(&mut *op, latest).await?;
+            insert_effect_in_op(op, latest).await?;
         }
         Ok(())
     }
@@ -362,7 +362,7 @@ impl OutboxEventHandler<TestEvent> for MixedHandler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_sizes.lock().await.push(items.len());
         for n in items {
-            insert_effect_in_op(&mut *op, n).await?;
+            insert_effect_in_op(op, n).await?;
         }
         Ok(())
     }
@@ -408,7 +408,7 @@ impl OutboxEventHandler<TestEvent> for CollectThenIsolateHandler {
         items: Vec<i64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for n in items {
-            insert_effect_in_op(&mut *op, n).await?;
+            insert_effect_in_op(op, n).await?;
         }
         Ok(())
     }
