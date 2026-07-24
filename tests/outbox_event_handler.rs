@@ -254,9 +254,12 @@ impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
 /// Slow deferring worker that also records ephemerals and snapshots the
 /// committed effect rows when an ephemeral runs — used to prove an
 /// ephemeral arriving mid-batch never interrupts the batch: it is handled
-/// at the batch boundary, after the full batch has landed.
+/// at the batch boundary, after the full batch has landed. Records each
+/// persistent delivery (before its slow sleep) so the test can publish the
+/// ephemeral only once the batch is provably open.
 struct SlowDeferringHandler {
     pool: sqlx::PgPool,
+    persistent_seen: Arc<Mutex<Vec<u64>>>,
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
     rows_at_ephemeral: Arc<Mutex<usize>>,
 }
@@ -273,6 +276,7 @@ impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
         };
+        self.persistent_seen.lock().await.push(*n);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let mut op = ctx.consume_in_batch().await?;
         sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
@@ -1159,6 +1163,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
+    let persistent_seen = Arc::new(Mutex::new(Vec::new()));
     let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
     let rows_at_ephemeral = Arc::new(Mutex::new(0usize));
     let outbox = init_outbox_with_handler(
@@ -1166,6 +1171,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
         &mut jobs,
         SlowDeferringHandler {
             pool: pool.clone(),
+            persistent_seen: persistent_seen.clone(),
             ephemeral_received: ephemeral_received.clone(),
             rows_at_ephemeral: rows_at_ephemeral.clone(),
         },
@@ -1173,7 +1179,11 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
     .await?;
 
     // Publish a backlog of slow (100ms each) deferring events, then publish
-    // an ephemeral while the batch is guaranteed to still be open mid-drain.
+    // an ephemeral while the batch is guaranteed to be open mid-drain: the
+    // second delivery proves the first event already deferred into an open
+    // op (a fixed sleep here flakes on slow runners — the job may not have
+    // started consuming yet, and an ephemeral handled before the batch
+    // opens sees zero rows without violating the invariant under test).
     const N: u64 = 5;
     let mut op = outbox.begin_op().await?;
     for n in 1..=N {
@@ -1185,7 +1195,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    wait_for_n_deliveries(&persistent_seen, 2, std::time::Duration::from_secs(10)).await?;
     outbox
         .publish_ephemeral(
             obix::out::EphemeralEventType::new("mid_batch"),
