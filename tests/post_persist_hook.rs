@@ -74,11 +74,15 @@ fn default_config() -> MailboxConfig {
         .expect("Couldn't build MailboxConfig")
 }
 
+/// Chunks recorded by [`RecordingHook`]: per invocation, the (sequence,
+/// payload) pairs it saw.
+type RecordedChunks = Arc<Mutex<Vec<Vec<(u64, SourceEvent)>>>>;
+
 /// Records every chunk the hook sees (sequence + payload), plus the row
 /// counts visible through the op's connection (inside the tx) and through
 /// the pool (outside the tx) at invocation time.
 struct RecordingHook {
-    chunks: Arc<Mutex<Vec<Vec<(u64, SourceEvent)>>>>,
+    chunks: RecordedChunks,
     in_tx_counts: Arc<Mutex<Vec<i64>>>,
     outside_tx_counts: Arc<Mutex<Vec<i64>>>,
     pool: sqlx::PgPool,
@@ -229,13 +233,15 @@ async fn hook_sees_persisted_events_pre_commit() -> anyhow::Result<()> {
 
     op.commit().await?;
 
-    let chunks = chunks.lock().unwrap();
-    assert_eq!(chunks.len(), 1, "one chunk for a small publish");
-    assert_eq!(
-        chunks[0],
-        [(1, SourceEvent::Source(1)), (2, SourceEvent::Source(2))],
-        "hook sees persisted events with assigned sequences"
-    );
+    {
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 1, "one chunk for a small publish");
+        assert_eq!(
+            chunks[0],
+            [(1, SourceEvent::Source(1)), (2, SourceEvent::Source(2))],
+            "hook sees persisted events with assigned sequences"
+        );
+    }
     assert_eq!(
         in_tx_counts.lock().unwrap().as_slice(),
         [2],
