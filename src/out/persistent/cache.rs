@@ -51,6 +51,18 @@ where
     }
 }
 
+/// How long after a gap-fill attempt the same stalled sequence is
+/// retried (the attempt itself may have raced a still-uncommitted row).
+const GAP_REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Bookkeeping for the sequence the broadcast cursor is stalled on.
+struct GapFillState {
+    /// When the stall was first observed. The first fill is withheld until
+    /// `MailboxConfig::gap_fill_grace` has elapsed since this instant.
+    first_seen: std::time::Instant,
+    last_attempt: Option<std::time::Instant>,
+}
+
 #[derive(Debug)]
 pub struct PersistentOutboxEventCache<P, Tables>
 where
@@ -298,6 +310,7 @@ where
         let cache_size = config.event_cache_size;
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
+        let gap_fill_grace = config.gap_fill_grace;
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
@@ -305,9 +318,22 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
-            let mut gap_fill_in_progress_for: Option<(EventSequence, std::time::Instant)> = None;
+            // State of the sequence the broadcast is stalled on: when the
+            // stall was first observed and when the last gap fill was
+            // attempted. Reset whenever the broadcast cursor advances.
+            let mut gap_state: Option<(EventSequence, GapFillState)> = None;
 
             loop {
+                // Wake up exactly when the next gap-fill action falls due,
+                // so a stalled broadcast is filled even when no further
+                // events or notifications arrive.
+                let gap_fill_at = gap_state.as_ref().map(|(_, state)| {
+                    tokio::time::Instant::from_std(match state.last_attempt {
+                        None => state.first_seen + gap_fill_grace,
+                        Some(attempted) => attempted + GAP_REFILL_INTERVAL,
+                    })
+                });
+
                 tokio::select! {
                     biased;
 
@@ -429,24 +455,48 @@ where
                             }
                         }
                     }
+
+                    _ = async {
+                        match gap_fill_at {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
                 }
 
                 // Proactive gap fill: if broadcasting is stuck waiting for a missing
                 // sequence, trigger load_next_page which will fill the gap via
-                // fill_gaps_query.
+                // fill_gaps_query. The first fill is delayed by `gap_fill_grace`:
+                // most gaps are transactions that hold a sequence but have not
+                // committed yet, and the gap-fill upsert blocks on exactly those
+                // in-flight rows (ON CONFLICT speculative insertion) until they
+                // commit — filling immediately pays a blocked connection per gap
+                // for what a brief wait resolves without any DB work.
                 let next_needed = last_broadcast_sequence.next();
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
                 if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
                 {
-                    let should_fill = match gap_fill_in_progress_for {
-                        Some((seq, started)) if seq == last_broadcast_sequence => {
-                            started.elapsed() > std::time::Duration::from_secs(1)
-                        }
-                        _ => true,
+                    let now = std::time::Instant::now();
+                    if !matches!(&gap_state, Some((seq, _)) if *seq == last_broadcast_sequence) {
+                        gap_state = Some((
+                            last_broadcast_sequence,
+                            GapFillState {
+                                first_seen: now,
+                                last_attempt: None,
+                            },
+                        ));
+                    }
+                    let should_fill = match &gap_state {
+                        Some((_, state)) => match state.last_attempt {
+                            None => state.first_seen.elapsed() >= gap_fill_grace,
+                            Some(attempted) => attempted.elapsed() >= GAP_REFILL_INTERVAL,
+                        },
+                        None => false,
                     };
                     if should_fill {
-                        gap_fill_in_progress_for =
-                            Some((last_broadcast_sequence, std::time::Instant::now()));
+                        if let Some((_, state)) = &mut gap_state {
+                            state.last_attempt = Some(now);
+                        }
                         tokio::spawn(Self::fill_gap(
                             pool.clone(),
                             last_broadcast_sequence,
@@ -455,7 +505,7 @@ where
                         ));
                     }
                 } else {
-                    gap_fill_in_progress_for = None;
+                    gap_state = None;
                 }
 
                 if persistent_cache.len() > high_water {

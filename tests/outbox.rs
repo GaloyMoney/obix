@@ -392,6 +392,146 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_secs(2))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Publish an event (seq N)
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event");
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Burn a sequence number (gap at N+1), then publish seq N+2
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Within the grace period nothing may be yielded: no premature
+    // placeholder for the gap, and the real event is contiguous-blocked
+    // behind it.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), listener.next())
+            .await
+            .is_err(),
+        "no gap-fill placeholder before the grace period elapses"
+    );
+
+    // After the grace period the placeholder arrives, then the real event.
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive gap-filled placeholder after grace period");
+    assert!(
+        gap_event.payload.is_none(),
+        "gap-filled event should have None payload"
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive real event after gap");
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Default grace (250ms) — the in-flight transaction below commits well
+    // within it, so the gap must resolve with the real row, never a
+    // placeholder.
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Publish an event (seq N)
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event");
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Insert seq N+1 directly in a transaction that stays open…
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 7}"#)
+        .execute(&mut *tx)
+        .await?;
+
+    // …while a later event (seq N+2) commits first, creating the classic
+    // allocation-order vs commit-order gap.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Nothing is yielded while the gap is unresolved (contiguous broadcast).
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.next())
+            .await
+            .is_err(),
+        "no event may be yielded while the gap sequence is uncommitted"
+    );
+
+    // Commit the in-flight transaction within the grace period: the gap
+    // resolves with the real event, not a placeholder.
+    tx.commit().await?;
+
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive the committed gap event");
+    assert!(
+        matches!(gap_event.payload, Some(TestEvent::Ping(7))),
+        "gap must resolve with the real committed event, got {:?}",
+        gap_event.payload
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive real event after gap");
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
