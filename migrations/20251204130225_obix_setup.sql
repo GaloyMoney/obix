@@ -8,25 +8,15 @@ CREATE TABLE persistent_outbox_events (
   seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Notifications carry only the sequence: the listener fetches the row by
+-- sequence (the `payload_omitted` path), keeping row_to_json of potentially
+-- large payloads and 8KB NOTIFY messages off the writer's critical path.
 CREATE FUNCTION notify_persistent_outbox_events() RETURNS TRIGGER AS $$
-DECLARE
-  payload TEXT;
-  payload_size INTEGER;
 BEGIN
-  payload := row_to_json(NEW);
-  payload_size := octet_length(payload);
-  IF payload_size > 8000 THEN
-    payload := json_build_object(
-      'id', NEW.id,
-      'sequence', NEW.sequence,
-      'payload', NULL,
-      'payload_omitted', true,
-      'tracing_context', NEW.tracing_context,
-      'recorded_at', NEW.recorded_at,
-      'seen_at', NEW.seen_at
-    )::TEXT;
-  END IF;
-  PERFORM pg_notify('persistent_outbox_events', payload);
+  PERFORM pg_notify(
+    'persistent_outbox_events',
+    json_build_object('sequence', NEW.sequence, 'payload_omitted', true)::TEXT
+  );
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
