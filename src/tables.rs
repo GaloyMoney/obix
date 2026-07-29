@@ -33,6 +33,19 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// Load the committed events in `(after_sequence, up_to_sequence]` with
+    /// a plain SELECT. Unlike [`load_next_page`](Self::load_next_page) this
+    /// never writes placeholder rows for sequence gaps — sequences absent
+    /// from the result belong to in-flight transactions and are left to the
+    /// grace-period gap fill.
+    fn load_events_in_range<P>(
+        pool: &sqlx::PgPool,
+        after_sequence: EventSequence,
+        up_to_sequence: EventSequence,
+    ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
     fn persist_ephemeral_event<P>(
         pool: &sqlx::PgPool,
         now: Option<chrono::DateTime<chrono::Utc>>,

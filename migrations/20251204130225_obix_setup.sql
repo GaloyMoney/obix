@@ -8,22 +8,12 @@ CREATE TABLE persistent_outbox_events (
   seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Notifications carry only the sequence: the listener fetches the row by
--- sequence (the `payload_omitted` path), keeping row_to_json of potentially
--- large payloads and 8KB NOTIFY messages off the writer's critical path.
-CREATE FUNCTION notify_persistent_outbox_events() RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify(
-    'persistent_outbox_events',
-    json_build_object('sequence', NEW.sequence, 'payload_omitted', true)::TEXT
-  );
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER persistent_outbox_events_notify
-  AFTER INSERT ON persistent_outbox_events
-  FOR EACH ROW EXECUTE FUNCTION notify_persistent_outbox_events();
+-- No notify trigger: obix's insert statement emits a single
+-- {min_sequence, max_sequence} pg_notify per statement (see
+-- persist_events in obix-macros), keeping payload serialization and
+-- per-row NOTIFY traffic off the writer's critical path entirely.
+-- Rows inserted outside obix do not notify; listeners discover them
+-- via the grace-period gap-fill / resync paths.
 
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (

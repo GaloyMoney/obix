@@ -51,6 +51,17 @@ where
     }
 }
 
+/// Outcome of parsing a `{min_sequence, max_sequence}` notification.
+struct NotifiedRange {
+    /// Highest sequence the notification proves committed.
+    max_sequence: EventSequence,
+    /// Sub-range of the notified sequences missing from the cache as
+    /// `(after, up_to)` — exclusive lower bound, inclusive upper — or
+    /// `None` when every notified sequence is already cached (the warm
+    /// in-process path: the post-commit broadcast beat the NOTIFY).
+    missing: Option<(EventSequence, EventSequence)>,
+}
+
 /// Bookkeeping for the sequence the broadcast cursor is stalled on.
 struct GapFillState {
     /// Grace period before the first fill (`MailboxConfig::gap_fill_grace`).
@@ -286,48 +297,55 @@ where
         }
     }
 
-    async fn fetch_event_by_sequence(
+    /// Fetch the notified-but-uncached range with a SELECT-only scan. Never
+    /// writes placeholders: sequences absent from the result belong to
+    /// transactions that were still in flight when the notification was
+    /// sent and remain the grace-period gap fill's responsibility.
+    async fn fetch_notified_range(
         pool: sqlx::PgPool,
-        sequence: EventSequence,
+        after: EventSequence,
+        up_to: EventSequence,
         cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
     ) {
-        let start_after = EventSequence::from(u64::from(sequence).saturating_sub(1));
-        if let Ok(events) = Tables::load_next_page::<P>(&pool, start_after, 1).await
-            && let Some(event) = events.into_iter().next()
-            && event.sequence == sequence
-        {
-            let _ = cache_fill_sender.send(Arc::new(event));
+        if let Ok(events) = Tables::load_events_in_range::<P>(&pool, after, up_to).await {
+            for event in events {
+                let _ = cache_fill_sender.send(Arc::new(event));
+            }
         }
     }
 
+    /// Parse a `{min_sequence, max_sequence}` notification (emitted once per
+    /// insert statement by the publisher) and decide what must be fetched.
+    /// Returns `None` for unparseable payloads.
     fn handle_notification(
-        pool: &sqlx::PgPool,
         payload: &str,
         cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
-        cache_fill_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
-    ) -> Option<PersistentOutboxEvent<P>> {
+    ) -> Option<NotifiedRange> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
-            sequence: EventSequence,
-            #[serde(default)]
-            payload_omitted: bool,
+            min_sequence: EventSequence,
+            max_sequence: EventSequence,
         }
 
         let header: NotificationHeader = serde_json::from_str(payload).ok()?;
 
-        if header.payload_omitted {
-            if cache.contains_key(&header.sequence) {
-                return None;
-            }
-            tokio::spawn(Self::fetch_event_by_sequence(
-                pool.clone(),
-                header.sequence,
-                cache_fill_sender.clone(),
-            ));
-            None
-        } else {
-            serde_json::from_str(payload).ok()
-        }
+        let mut missing_sequences = (u64::from(header.min_sequence)
+            ..=u64::from(header.max_sequence))
+            .map(EventSequence::from)
+            .filter(|sequence| !cache.contains_key(sequence));
+
+        let missing = missing_sequences.next().map(|first| {
+            let last = missing_sequences.next_back().unwrap_or(first);
+            (
+                EventSequence::from(u64::from(first).saturating_sub(1)),
+                last,
+            )
+        });
+
+        Some(NotifiedRange {
+            max_sequence: header.max_sequence,
+            missing,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -440,6 +458,7 @@ where
                         match result {
                             Some(message) => {
                                 let mut resync_needed = false;
+                                let mut fetch_range: Option<(EventSequence, EventSequence)> = None;
                                 let mut messages = vec![message];
                                 while let Ok(message) = notification_receiver.try_recv() {
                                     messages.push(message);
@@ -447,27 +466,47 @@ where
                                 for message in messages {
                                     match message {
                                         NotifyMessage::Notification(notification) => {
-                                            if let Some(event) = Self::handle_notification(
-                                                &pool,
+                                            if let Some(notified) = Self::handle_notification(
                                                 notification.payload(),
                                                 &persistent_cache,
-                                                &cache_fill_sender,
                                             ) {
-                                                (persistent_cache, last_broadcast_sequence) =
-                                                    Self::insert_into_cache_and_maybe_broadcast(
-                                                        persistent_cache,
-                                                        Arc::new(event),
-                                                        &highest_known_sequence,
-                                                        &persistent_event_sender,
-                                                        last_broadcast_sequence,
-                                                        cache_size,
-                                                    );
+                                                // Watermark: the notification proves everything
+                                                // up to `max_sequence` is committed. Advancing
+                                                // highest_known on receipt (not on fetch
+                                                // completion) makes the grace-period gap fill
+                                                // the retry path for a slow or failed range
+                                                // fetch instead of a silent stall.
+                                                highest_known_sequence.fetch_max(
+                                                    u64::from(notified.max_sequence),
+                                                    Ordering::AcqRel,
+                                                );
+                                                if let Some((after, up_to)) = notified.missing {
+                                                    fetch_range = Some(match fetch_range {
+                                                        Some((lo, hi)) => {
+                                                            (lo.min(after), hi.max(up_to))
+                                                        }
+                                                        None => (after, up_to),
+                                                    });
+                                                }
                                             }
                                         }
                                         NotifyMessage::Resync => {
                                             resync_needed = true;
                                         }
                                     }
+                                }
+
+                                // One SELECT-only fetch per drained batch: a burst of
+                                // notifications coalesces into a single indexed range
+                                // scan instead of a lookup per event. Already-cached
+                                // rows inside the range are deduplicated on insert.
+                                if let Some((after, up_to)) = fetch_range {
+                                    tokio::spawn(Self::fetch_notified_range(
+                                        pool.clone(),
+                                        after,
+                                        up_to,
+                                        cache_fill_sender.clone(),
+                                    ));
                                 }
 
                                 if resync_needed {

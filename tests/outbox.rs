@@ -131,6 +131,42 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn event_batch_via_pg_notify() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // A bare transaction has no commit hooks, so nothing reaches the cache
+    // via the in-process broadcast: delivery depends entirely on the single
+    // {min_sequence, max_sequence} NOTIFY emitted by the insert statement
+    // and the SELECT-only range fetch it triggers.
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..5).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    for i in 0..5 {
+        let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await?
+        else {
+            anyhow::bail!("expected event {i} from listener");
+        };
+        assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
