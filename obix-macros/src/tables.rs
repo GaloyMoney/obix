@@ -68,14 +68,40 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // Notifications ride the insert statement itself: one
+        // {min_sequence, max_sequence} pg_notify per statement, aggregated
+        // from the rows the CTE already materializes — no per-row trigger,
+        // no row_to_json of payloads, no transition table. Listeners fetch
+        // the notified range back with a SELECT-only scan
+        // (load_events_in_range).
+        //
+        // INVARIANT: `notified` must remain referenced by the outer query
+        // (the LEFT JOIN below). Postgres never executes an unreferenced
+        // SELECT CTE — notifications would silently stop and cross-process
+        // delivery would degrade to the grace-period gap-fill path
+        // (events_via_pg_notify hangs if this regresses). HAVING COUNT(*) > 0
+        // suppresses the aggregate's empty-input row so an empty insert
+        // notifies nothing.
         let persist_events_query = format!(
             r#"WITH new_events AS (
-                   INSERT INTO {}persistent_outbox_events (payload, tracing_context, recorded_at)
+                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
                    SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
                    RETURNING id, sequence, recorded_at
+               ),
+               notified AS (
+                   SELECT pg_notify(
+                       '{channel}',
+                       json_build_object('min_sequence', MIN(sequence), 'max_sequence', MAX(sequence))::TEXT
+                   )
+                   FROM new_events
+                   HAVING COUNT(*) > 0
                )
-               SELECT * FROM new_events"#,
-            table_prefix
+               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
+               FROM new_events ne
+               LEFT JOIN notified ON TRUE
+               ORDER BY ne.sequence"#,
+            tbl = table_prefix,
+            channel = persistent_outbox_events_channel,
         );
 
         let persist_ephemeral_events_query = format!(
@@ -120,6 +146,16 @@ FROM {}persistent_outbox_events_sequence_seq",
             ) e ON true
             ORDER BY e.sequence ASC"#,
             table_prefix, table_prefix
+        );
+
+        let load_events_in_range_query = format!(
+            r#"
+            SELECT id, sequence, payload, tracing_context, recorded_at
+            FROM {}persistent_outbox_events
+            WHERE sequence > $1
+              AND sequence <= $2
+            ORDER BY sequence ASC"#,
+            table_prefix
         );
 
         let load_ephemeral_events_query_all = format!(
@@ -398,6 +434,42 @@ FROM {}persistent_outbox_events_sequence_seq",
                             events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
                         }
 
+                        Ok(events)
+                    }
+                }
+
+                fn load_events_in_range<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after_sequence: #crate_name::EventSequence,
+                    up_to_sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_events_in_range_query,
+                            after_sequence as #crate_name::EventSequence,
+                            up_to_sequence as #crate_name::EventSequence,
+                        ).fetch_all(&pool).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                #deserialize_context
+                                #crate_name::out::PersistentOutboxEvent {
+                                    id: #crate_name::out::OutboxEventId::from(row.id),
+                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                    payload: row
+                                        .payload
+                                        .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
+                                    recorded_at: row.recorded_at,
+                                    #set_context
+                                }
+                            })
+                            .collect();
                         Ok(events)
                     }
                 }
