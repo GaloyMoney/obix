@@ -19,7 +19,7 @@ mod tables;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-pub use config::{DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig};
+pub use config::{DEFAULT_GAP_FILL_GRACE, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig};
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,

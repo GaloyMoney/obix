@@ -51,16 +51,55 @@ where
     }
 }
 
-/// How long after a gap-fill attempt the same stalled sequence is
-/// retried (the attempt itself may have raced a still-uncommitted row).
-const GAP_REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Bookkeeping for the sequence the broadcast cursor is stalled on.
 struct GapFillState {
+    /// Grace period before the first fill (`MailboxConfig::gap_fill_grace`).
+    grace: std::time::Duration,
+    /// The sequence the broadcast cursor is stalled on. The state is
+    /// discarded when the cursor advances past it.
+    stalled_on: EventSequence,
     /// When the stall was first observed. The first fill is withheld until
-    /// `MailboxConfig::gap_fill_grace` has elapsed since this instant.
-    first_seen: std::time::Instant,
-    last_attempt: Option<std::time::Instant>,
+    /// `grace` has elapsed since this instant.
+    first_seen: tokio::time::Instant,
+    last_attempt: Option<tokio::time::Instant>,
+}
+
+impl GapFillState {
+    /// How long after a gap-fill attempt the same stalled sequence is
+    /// retried (the attempt itself may have raced a still-uncommitted row).
+    const REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn new(grace: std::time::Duration, stalled_on: EventSequence) -> Self {
+        Self {
+            grace,
+            stalled_on,
+            first_seen: tokio::time::Instant::now(),
+            last_attempt: None,
+        }
+    }
+
+    /// Whether this state tracks the sequence the broadcast cursor is
+    /// currently stalled on.
+    fn is_up_to_date(&self, stalled_on: EventSequence) -> bool {
+        self.stalled_on == stalled_on
+    }
+
+    /// When the next gap-fill action falls due: `grace` after the stall was
+    /// first observed, or [`Self::REFILL_INTERVAL`] after the last attempt.
+    fn next_fill_due(&self) -> tokio::time::Instant {
+        match self.last_attempt {
+            None => self.first_seen + self.grace,
+            Some(attempted) => attempted + Self::REFILL_INTERVAL,
+        }
+    }
+
+    fn fill_is_due(&self) -> bool {
+        self.next_fill_due() <= tokio::time::Instant::now()
+    }
+
+    fn record_attempt(&mut self) {
+        self.last_attempt = Some(tokio::time::Instant::now());
+    }
 }
 
 #[derive(Debug)]
@@ -318,21 +357,15 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
-            // State of the sequence the broadcast is stalled on: when the
-            // stall was first observed and when the last gap fill was
-            // attempted. Reset whenever the broadcast cursor advances.
-            let mut gap_state: Option<(EventSequence, GapFillState)> = None;
+            // Bookkeeping for the sequence the broadcast is stalled on.
+            // Reset whenever the broadcast cursor advances.
+            let mut gap_state: Option<GapFillState> = None;
 
             loop {
                 // Wake up exactly when the next gap-fill action falls due,
                 // so a stalled broadcast is filled even when no further
                 // events or notifications arrive.
-                let gap_fill_at = gap_state.as_ref().map(|(_, state)| {
-                    tokio::time::Instant::from_std(match state.last_attempt {
-                        None => state.first_seen + gap_fill_grace,
-                        Some(attempted) => attempted + GAP_REFILL_INTERVAL,
-                    })
-                });
+                let gap_fill_at = gap_state.as_ref().map(GapFillState::next_fill_due);
 
                 tokio::select! {
                     biased;
@@ -476,27 +509,17 @@ where
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
                 if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
                 {
-                    let now = std::time::Instant::now();
-                    if !matches!(&gap_state, Some((seq, _)) if *seq == last_broadcast_sequence) {
-                        gap_state = Some((
-                            last_broadcast_sequence,
-                            GapFillState {
-                                first_seen: now,
-                                last_attempt: None,
-                            },
-                        ));
+                    if gap_state
+                        .as_ref()
+                        .is_some_and(|state| !state.is_up_to_date(last_broadcast_sequence))
+                    {
+                        gap_state = None;
                     }
-                    let should_fill = match &gap_state {
-                        Some((_, state)) => match state.last_attempt {
-                            None => state.first_seen.elapsed() >= gap_fill_grace,
-                            Some(attempted) => attempted.elapsed() >= GAP_REFILL_INTERVAL,
-                        },
-                        None => false,
-                    };
-                    if should_fill {
-                        if let Some((_, state)) = &mut gap_state {
-                            state.last_attempt = Some(now);
-                        }
+                    let state = gap_state.get_or_insert_with(|| {
+                        GapFillState::new(gap_fill_grace, last_broadcast_sequence)
+                    });
+                    if state.fill_is_due() {
+                        state.record_attempt();
                         tokio::spawn(Self::fill_gap(
                             pool.clone(),
                             last_broadcast_sequence,
