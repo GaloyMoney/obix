@@ -470,12 +470,6 @@ where
                                                 notification.payload(),
                                                 &persistent_cache,
                                             ) {
-                                                // Watermark: the notification proves everything
-                                                // up to `max_sequence` is committed. Advancing
-                                                // highest_known on receipt (not on fetch
-                                                // completion) makes the grace-period gap fill
-                                                // the retry path for a slow or failed range
-                                                // fetch instead of a silent stall.
                                                 highest_known_sequence.fetch_max(
                                                     u64::from(notified.max_sequence),
                                                     Ordering::AcqRel,
@@ -496,10 +490,6 @@ where
                                     }
                                 }
 
-                                // One SELECT-only fetch per drained batch: a burst of
-                                // notifications coalesces into a single indexed range
-                                // scan instead of a lookup per event. Already-cached
-                                // rows inside the range are deduplicated on insert.
                                 if let Some((after, up_to)) = fetch_range {
                                     tokio::spawn(Self::fetch_notified_range(
                                         pool.clone(),

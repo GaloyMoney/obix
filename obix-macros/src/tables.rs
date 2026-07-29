@@ -148,13 +148,6 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix, table_prefix
         );
 
-        // SELECT-only companion to load_next_page for notified ranges: the
-        // caller knows every sequence in the range was committed when the
-        // notification was sent, so no placeholder writes and no MAX probe
-        // are needed. Sequences absent from the result belong to
-        // transactions whose interleaved allocations were still in flight —
-        // they stay with the grace-period gap fill (the only path allowed
-        // to write placeholders).
         let load_events_in_range_query = format!(
             r#"
             SELECT id, sequence, payload, tracing_context, recorded_at

@@ -8,13 +8,6 @@ CREATE TABLE persistent_outbox_events (
   seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- No notify trigger: obix's insert statement emits a single
--- {min_sequence, max_sequence} pg_notify per statement (see
--- persist_events in obix-macros), keeping payload serialization and
--- per-row NOTIFY traffic off the writer's critical path entirely.
--- Rows inserted outside obix do not notify; listeners discover them
--- via the grace-period gap-fill / resync paths.
-
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (
   event_type VARCHAR NOT NULL UNIQUE,
