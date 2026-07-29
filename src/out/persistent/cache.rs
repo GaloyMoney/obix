@@ -316,7 +316,7 @@ where
 
     /// Parse a `{min_sequence, max_sequence}` notification (emitted once per
     /// insert statement by the publisher) and decide what must be fetched.
-    /// Returns `None` for unparseable payloads.
+    /// Returns `None` for unparsable payloads.
     fn handle_notification(
         payload: &str,
         cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
