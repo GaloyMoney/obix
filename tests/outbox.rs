@@ -779,3 +779,66 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
 
     Ok(())
 }
+
+// Rows written into a shared database by a different event enum (e.g.
+// test-only module tags) must neither crash the reader nor stall the
+// pipeline: the undeserializable payload is skipped with placeholder
+// semantics (`None`) and later events still flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, OutboxEvent)]
+#[serde(tag = "module")]
+enum ForeignEvent {
+    CoreParty {
+        id: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[tokio::test]
+#[file_serial]
+async fn unknown_payload_is_skipped_and_pipeline_advances() -> anyhow::Result<()> {
+    use obix::{MailboxTables as _, out::Outbox};
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    let config = MailboxConfig::builder()
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    // Publish via a foreign event enum, like tests sharing the database do.
+    let foreign = Outbox::<ForeignEvent, helpers::TestTables>::init(&pool, config.clone()).await?;
+    let mut op = pool.begin().await?;
+    foreign
+        .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
+        .await?;
+    op.commit().await?;
+
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+    let mut listener = outbox.listen_persisted(Some(obix::EventSequence::from(0)));
+
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let events =
+        helpers::TestTables::load_next_page::<TestEvent>(&pool, obix::EventSequence::from(0), 10)
+            .await?;
+    assert_eq!(events.len(), 2);
+    assert!(events[0].payload.is_none());
+    assert!(matches!(events[1].payload, Some(TestEvent::Ping(0))));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(first.payload.is_none());
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(matches!(second.payload, Some(TestEvent::Ping(0))));
+
+    Ok(())
+}

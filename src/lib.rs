@@ -31,3 +31,8 @@ pub use out::{
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
+#[doc(hidden)]
+pub use tables::{
+    record_ephemeral_payload_deserialize_failed, record_persistent_payload_deserialize_failed,
+    record_tracing_context_deserialize_failed,
+};

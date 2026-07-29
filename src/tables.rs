@@ -13,6 +13,43 @@ use crate::{
 #[cfg_attr(feature = "default-tables", obix(crate = "crate"))]
 pub struct DefaultMailboxTables;
 
+/// Invoked from `MailboxTables` derive output when a stored persistent event
+/// payload cannot be deserialized into the caller's event type (e.g. rows
+/// written into a shared database by a different event enum). The payload is
+/// treated as a placeholder (`None`) so the sequence still advances — a
+/// single unknown event must neither crash nor stall the whole event
+/// pipeline.
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.persistent_payload_deserialize_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, sequence = sequence)
+)]
+pub fn record_persistent_payload_deserialize_failed(error: &serde_json::Error, sequence: u64) {}
+
+/// Same as [`record_persistent_payload_deserialize_failed`] but for the
+/// tracing context envelope; the event is kept with no context attached.
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.tracing_context_deserialize_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error)
+)]
+pub fn record_tracing_context_deserialize_failed(error: &serde_json::Error) {}
+
+/// Invoked from `MailboxTables` derive output when a stored ephemeral event
+/// payload cannot be deserialized; the event is dropped from the result.
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.ephemeral_payload_deserialize_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, event_type = %event_type)
+)]
+pub fn record_ephemeral_payload_deserialize_failed(error: &serde_json::Error, event_type: &str) {}
+
 pub trait MailboxTables: Send + Sync + 'static {
     fn highest_known_persistent_sequence<'a>(
         op: impl es_entity::IntoOneTimeExecutor<'a>,
