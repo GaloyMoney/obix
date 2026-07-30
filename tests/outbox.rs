@@ -779,3 +779,80 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
 
     Ok(())
 }
+
+// Rows written into a shared database by a different event enum (e.g.
+// test-only module tags) must neither crash the reader nor be silently
+// dropped: the event is still delivered — in order, with `decode_failure`
+// carrying the raw payload and the serde error — and later events flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "module")]
+enum ForeignEvent {
+    CoreParty { id: u64 },
+}
+
+#[tokio::test]
+#[file_serial]
+async fn undecodable_payload_is_delivered_with_decode_failure() -> anyhow::Result<()> {
+    use obix::{MailboxTables as _, out::Outbox};
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    let config = MailboxConfig::builder()
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    // Publish via a foreign event enum, like tests sharing the database do.
+    let foreign = Outbox::<ForeignEvent, helpers::TestTables>::init(&pool, config.clone()).await?;
+    let mut op = pool.begin().await?;
+    foreign
+        .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
+        .await?;
+    op.commit().await?;
+
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    // The load path delivers the poison row with the raw JSON and the serde
+    // error attached, and the valid row intact.
+    let events =
+        helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
+    assert_eq!(events.len(), 2);
+    assert!(events[0].payload.is_none());
+    let failure = events[0]
+        .decode_failure
+        .as_ref()
+        .expect("undecodable row must carry decode_failure");
+    assert_eq!(
+        failure.raw,
+        serde_json::json!({"module": "CoreParty", "id": 1})
+    );
+    assert!(
+        !failure.error.is_empty(),
+        "decode_failure must carry the serde error"
+    );
+    assert!(matches!(events[1].payload, Some(TestEvent::Ping(0))));
+    assert!(events[1].decode_failure.is_none());
+
+    // Raw listeners receive the poison event too — nothing is dropped from
+    // the stream and later events still arrive, in order.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(first.payload.is_none());
+    assert!(first.decode_failure.is_some());
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+    assert!(matches!(second.payload, Some(TestEvent::Ping(0))));
+    assert!(second.decode_failure.is_none());
+
+    Ok(())
+}

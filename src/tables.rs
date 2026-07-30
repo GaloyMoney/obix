@@ -4,7 +4,7 @@ use es_entity::hooks::HookOperation;
 
 use crate::{
     inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
-    out::{EphemeralEventType, EphemeralOutboxEvent, PersistentOutboxEvent},
+    out::{DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, PersistentOutboxEvent},
     sequence::*,
 };
 
@@ -12,6 +12,68 @@ use crate::{
 #[cfg_attr(feature = "default-tables", derive(obix_macros::MailboxTables))]
 #[cfg_attr(feature = "default-tables", obix(crate = "crate"))]
 pub struct DefaultMailboxTables;
+
+/// Decode a stored persistent payload, invoked from `MailboxTables` derive
+/// output. A payload that does not decode into the caller's event type (e.g.
+/// a variant the consumer does not know yet, or a row written by a different
+/// event enum sharing the table) must neither panic — a single poison row
+/// previously wedged the whole pipeline in a hot panic/retry loop — nor be
+/// silently dropped: the event is delivered with a [`DecodeFailure`]
+/// attached and its fate is decided by consumer policy (see
+/// [`OutboxEventHandler::on_undecodable`](crate::OutboxEventHandler::on_undecodable)).
+#[doc(hidden)]
+pub fn decode_persistent_payload<P: serde::de::DeserializeOwned>(
+    raw: serde_json::Value,
+    sequence: u64,
+) -> (Option<P>, Option<DecodeFailure>) {
+    match P::deserialize(&raw) {
+        Ok(payload) => (Some(payload), None),
+        Err(error) => {
+            record_persistent_payload_undecodable(&error, sequence);
+            (
+                None,
+                Some(DecodeFailure {
+                    error: error.to_string(),
+                    raw,
+                }),
+            )
+        }
+    }
+}
+
+#[tracing::instrument(
+    name = "obix.tables.persistent_payload_undecodable",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, sequence = sequence)
+)]
+fn record_persistent_payload_undecodable(error: &serde_json::Error, sequence: u64) {}
+
+/// Invoked from `MailboxTables` derive output when a stored ephemeral event
+/// payload cannot be deserialized; the event is dropped from the result.
+/// Unlike the persistent stream (ordered, guaranteed delivery — see
+/// [`decode_persistent_payload`]) the ephemeral stream is best-effort
+/// last-value by design, so dropping is the honest degradation.
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.ephemeral_payload_undecodable",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, event_type = %event_type)
+)]
+pub fn record_ephemeral_payload_undecodable(error: &serde_json::Error, event_type: &str) {}
+
+/// Invoked from `MailboxTables` derive output when the tracing-context
+/// envelope cannot be deserialized; the event is kept with no context
+/// attached (the context is delivery metadata, not payload data).
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.tracing_context_undecodable",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error)
+)]
+pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 
 pub trait MailboxTables: Send + Sync + 'static {
     fn highest_known_persistent_sequence<'a>(

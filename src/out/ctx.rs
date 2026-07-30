@@ -487,7 +487,8 @@ impl es_entity::AtomicOperation for FlushOp<'_> {
 #[derive(Debug)]
 pub struct FlushError {
     /// Which trigger landed the batch (`"backlog_drained"`, `"batch_full"`,
-    /// `"commit"`, `"isolated_entry"`, `"shutdown"`, `"stream_closed"`).
+    /// `"commit"`, `"isolated_entry"`, `"shutdown"`, `"stream_closed"`,
+    /// `"undecodable_event"`).
     pub reason: &'static str,
     /// The batch covers sequences strictly after this (the last durable
     /// checkpoint)…

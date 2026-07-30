@@ -113,6 +113,24 @@ where
     }
 }
 
+/// A stored payload that could not be decoded into the consumer's event type
+/// (e.g. a variant the consumer's enum does not know yet, or a row written by
+/// a different event enum sharing the table).
+///
+/// Carried on [`PersistentOutboxEvent::decode_failure`]: the event is still
+/// delivered — in order, with its sequence — so no consumer ever silently
+/// misses an event. What happens next is consumer policy; see
+/// [`OutboxEventHandler::on_undecodable`](crate::OutboxEventHandler::on_undecodable)
+/// (default: fail the handler job, parking its checkpoint *before* this
+/// event).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecodeFailure {
+    /// The payload column exactly as stored.
+    pub raw: serde_json::Value,
+    /// The serde error message.
+    pub error: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistentOutboxEvent<T>
 where
@@ -122,6 +140,12 @@ where
     pub sequence: EventSequence,
     #[serde(bound = "T: DeserializeOwned")]
     pub payload: Option<T>,
+    /// `Some` iff the stored payload failed to decode into `T` — then
+    /// [`payload`](Self::payload) is `None` *and* this carries the raw JSON
+    /// plus the serde error. A plain sequence placeholder (nothing was ever
+    /// committed at this sequence) has both fields `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_failure: Option<DecodeFailure>,
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
@@ -135,6 +159,7 @@ where
             id: self.id,
             sequence: self.sequence,
             payload: self.payload.clone(),
+            decode_failure: self.decode_failure.clone(),
             tracing_context: self.tracing_context.clone(),
             recorded_at: self.recorded_at,
         }
