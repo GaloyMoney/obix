@@ -96,6 +96,43 @@ where
         async move { Ok(ctx.skip()) }
     }
 
+    /// Handle a persistent event whose stored payload could not be decoded
+    /// into `P` — delivered as the persistent stream's `Err` arm and never
+    /// as an ordinary event, so it cannot reach
+    /// [`handle_persistent`](Self::handle_persistent). The
+    /// [`UndecodableEventError`] carries the event's identity and the raw
+    /// payload + serde error (`error.failure`).
+    ///
+    /// The runner lands the pending batch *before* invoking this — like
+    /// [`handle_ephemeral`](Self::handle_ephemeral), nothing is pending
+    /// while it runs and no batch transaction spans the await, and work
+    /// completed up to the event is durable regardless of the outcome.
+    ///
+    /// The default fails with the error as-is: a payload the consumer
+    /// cannot decode is a runtime bug (schema drift, a producer ahead of
+    /// this consumer, foreign rows in the table) that must surface loudly,
+    /// not silently pass by. On `Err` the job fails with its checkpoint
+    /// parked at the sequence *before* the event — every retry re-reads the
+    /// event from the database, so deploying a consumer that understands
+    /// the payload resumes the pipeline automatically, in order, with
+    /// nothing skipped.
+    ///
+    /// Override and return `Ok(())` only when this handler genuinely wants
+    /// to move past payloads it cannot decode — an explicit, auditable
+    /// decision (consider recording `error.failure` somewhere durable
+    /// first). The checkpoint then advances over the event exactly as for a
+    /// [`skip`](EventCtx::skip). Any work done here must tolerate replay
+    /// (the event is redelivered if the acknowledgement's checkpoint was
+    /// not yet persisted at a crash).
+    fn handle_undecodable(
+        &self,
+        error: &UndecodableEventError,
+    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
+        let error = error.clone();
+        async move { Err(error.into()) }
+    }
+
     /// Apply everything collected since the last flush. Called at most once
     /// per batch landing, inside the batch transaction, before the
     /// checkpoint commits — items and pointer land atomically.
@@ -157,7 +194,7 @@ enum NextDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    Persistent(Option<Arc<PersistentOutboxEvent<P>>>),
+    Persistent(Option<Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>>),
     Ephemeral(Arc<EphemeralOutboxEvent<P>>),
 }
 
@@ -385,13 +422,13 @@ where
         };
 
         loop {
-            let event = if op_slot.is_some() || tracker.collected > 0 {
+            let item = if op_slot.is_some() || tracker.collected > 0 {
                 // A batch is pending (an open op, collected items, or both):
                 // only take persistent events that are already buffered —
                 // the batch is never held open waiting on the network. A
                 // pending stream is itself the flush trigger.
                 match persistent.next().now_or_never() {
-                    Some(Some(event)) => event,
+                    Some(Some(item)) => item,
                     Some(None) => {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
@@ -464,7 +501,7 @@ where
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                         continue;
                     }
-                    NextDelivery::Persistent(Some(event)) => event,
+                    NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
                         if tracker.persisted_seq < state.sequence {
                             persist_checkpoint(&mut current_job, &state)
@@ -472,6 +509,45 @@ where
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
                         return Ok(JobCompletion::RescheduleNow);
+                    }
+                }
+            };
+
+            // An undecodable payload arrives as the stream's `Err` arm and
+            // never reaches handle_persistent: handle_undecodable decides its
+            // fate. The pending batch lands FIRST — completed work and its
+            // checkpoint (at the sequence *before* this event) are durable
+            // regardless of the outcome, and no batch transaction spans the
+            // foreign handle_undecodable await (the same fence as
+            // consume_isolated's entry). Then `Ok` acknowledges the event
+            // (the checkpoint advances over it like a skip); any `Err` — the
+            // default — fails the job with the checkpoint parked before the
+            // event, so every retry re-reads it and nothing is ever skipped.
+            let event = match item {
+                Ok(event) => event,
+                Err(undecodable) => {
+                    let mut parts = CtxParts {
+                        op_slot: &mut op_slot,
+                        current_job: &mut current_job,
+                        state: &state,
+                        tracker: &mut tracker,
+                    };
+                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
+                        .await
+                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                    match self.handler.handle_undecodable(&undecodable).await {
+                        Ok(()) => {
+                            state.sequence = undecodable.sequence;
+                            continue;
+                        }
+                        Err(error) => {
+                            if tracker.persisted_seq < state.sequence {
+                                persist_checkpoint(&mut current_job, &state)
+                                    .await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            }
+                            return Err(error as Box<dyn std::error::Error>);
+                        }
                     }
                 }
             };

@@ -4,7 +4,7 @@ use std::{pin::Pin, task::Poll};
 
 use super::{
     ephemeral::{CacheHandle as EphemeralCacheHandle, EphemeralOutboxListener},
-    event::OutboxEvent,
+    event::{OutboxEvent, UndecodableEventError},
     persistent::{CacheHandle as PersistentCacheHandle, PersistentOutboxListener},
 };
 use crate::sequence::EventSequence;
@@ -46,7 +46,9 @@ impl<P> Stream for AllOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = OutboxEvent<P>;
+    /// Undecodable persistent events surface as the `Err` arm (see
+    /// [`PersistentOutboxListener`]); ephemeral events are always `Ok`.
+    type Item = Result<OutboxEvent<P>, UndecodableEventError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -57,11 +59,11 @@ where
         let result = if this.poll_count.is_multiple_of(2) {
             Pin::new(&mut this.persistent_listener)
                 .poll_next(cx)
-                .map(|opt| opt.map(OutboxEvent::Persistent))
+                .map(|opt| opt.map(|item| item.map(OutboxEvent::Persistent)))
         } else {
             Pin::new(&mut this.ephemeral_listener)
                 .poll_next(cx)
-                .map(|opt| opt.map(OutboxEvent::Ephemeral))
+                .map(|opt| opt.map(|event| Ok(OutboxEvent::Ephemeral(event))))
         };
 
         this.poll_count = this.poll_count.wrapping_add(1);

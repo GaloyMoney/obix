@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
-use crate::out::event::PersistentOutboxEvent;
+use crate::out::event::{PersistentDelivery, PersistentOutboxEvent, UndecodableEventError};
 use crate::sequence::EventSequence;
 
 pub struct PersistentOutboxListener<P>
@@ -13,11 +13,11 @@ where
 {
     last_returned_sequence: EventSequence,
     latest_known: EventSequence,
-    event_receiver: BroadcastStream<Arc<PersistentOutboxEvent<P>>>,
+    event_receiver: BroadcastStream<PersistentDelivery<P>>,
     buffer_size: usize,
-    local_cache: BTreeMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+    local_cache: BTreeMap<EventSequence, PersistentDelivery<P>>,
     cache_handle: CacheHandle<P>,
-    backfill_receiver: Option<ReceiverStream<Arc<PersistentOutboxEvent<P>>>>,
+    backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
 }
 
 impl<P> PersistentOutboxListener<P>
@@ -42,10 +42,11 @@ where
         }
     }
 
-    fn maybe_add_to_cache(&mut self, event: Arc<PersistentOutboxEvent<P>>) {
-        self.latest_known = self.latest_known.max(event.sequence);
-        if event.sequence > self.last_returned_sequence
-            && self.local_cache.insert(event.sequence, event).is_none()
+    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
+        let sequence = delivery.sequence();
+        self.latest_known = self.latest_known.max(sequence);
+        if sequence > self.last_returned_sequence
+            && self.local_cache.insert(sequence, delivery).is_none()
             && self.local_cache.len() > self.buffer_size
         {
             self.local_cache.pop_last();
@@ -66,7 +67,11 @@ impl<P> Stream for PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = Arc<PersistentOutboxEvent<P>>;
+    /// An undecodable event is yielded as the `Err` arm, in its sequence
+    /// position — the delivery of that event in degraded form. The stream
+    /// continues past it; whether the *consumer* moves past it is the
+    /// consumer's explicit decision (`?` fails loudly).
+    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -119,7 +124,7 @@ where
             }
             if seq == this.last_returned_sequence.next() {
                 this.last_returned_sequence = seq;
-                return Poll::Ready(Some(event));
+                return Poll::Ready(Some(event.into_item()));
             }
             this.local_cache.insert(seq, event);
             break;

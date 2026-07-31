@@ -97,6 +97,7 @@ async fn events_via_short_circuit() -> anyhow::Result<()> {
     let Some(event) = listener.next().await else {
         anyhow::bail!("expected event from listener");
     };
+    let event = event?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
     Ok(())
 }
@@ -125,6 +126,7 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
     let Some(event) = listener.next().await else {
         anyhow::bail!("expected event from listener");
     };
+    let event = event?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
     Ok(())
 }
@@ -160,6 +162,7 @@ async fn event_batch_via_pg_notify() -> anyhow::Result<()> {
         else {
             anyhow::bail!("expected event {i} from listener");
         };
+        let event = event?;
         assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i));
     }
     Ok(())
@@ -185,7 +188,11 @@ async fn events_via_cache() -> anyhow::Result<()> {
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
         .await?;
     op.commit().await?;
-    pre_listener.next().await.expect("event was cached");
+    pre_listener
+        .next()
+        .await
+        .expect("event was cached")
+        .expect("undecodable event");
 
     let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
 
@@ -194,6 +201,7 @@ async fn events_via_cache() -> anyhow::Result<()> {
     else {
         anyhow::bail!("expected event from listener");
     };
+    let event = event?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
 
     Ok(())
@@ -234,7 +242,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
             .await
             .expect("should receive event via PG backfill")
-            .expect("should have event");
+            .expect("should have event")?;
         events.push(event);
     }
 
@@ -285,7 +293,8 @@ async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
             .await
             .unwrap_or_else(|_| panic!("timeout waiting for event {}", i))
-            .unwrap_or_else(|| panic!("expected event {} but got None", i));
+            .unwrap_or_else(|| panic!("expected event {} but got None", i))
+            .unwrap_or_else(|e| panic!("undecodable event {}: {}", i, e));
         received_events.push(event);
     }
 
@@ -346,7 +355,8 @@ async fn large_batch_persisted_in_bounded_chunks() -> anyhow::Result<()> {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
             .await
             .unwrap_or_else(|_| panic!("timeout waiting for event {i}"))
-            .unwrap_or_else(|| panic!("expected event {i} but got None"));
+            .unwrap_or_else(|| panic!("expected event {i} but got None"))
+            .unwrap_or_else(|e| panic!("undecodable event {i}: {e}"));
         events.push(event);
     }
 
@@ -394,7 +404,7 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive first event");
+        .expect("should receive first event")?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
 
     // Create a gap by consuming a sequence number without inserting a row
@@ -412,7 +422,7 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
     // Should receive the gap-filled placeholder (None payload) followed by the real event
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
-        .expect("should receive gap-filled placeholder");
+        .expect("should receive gap-filled placeholder")?;
     assert!(
         gap_event.payload.is_none(),
         "gap-filled event should have None payload"
@@ -420,7 +430,7 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
 
     let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive real event after gap");
+        .expect("should receive real event after gap")?;
     assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
 
     Ok(())
@@ -451,7 +461,7 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive first event");
+        .expect("should receive first event")?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
 
     // Burn a sequence number (gap at N+1), then publish seq N+2
@@ -478,7 +488,7 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
     // After the grace period the placeholder arrives, then the real event.
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
-        .expect("should receive gap-filled placeholder after grace period");
+        .expect("should receive gap-filled placeholder after grace period")?;
     assert!(
         gap_event.payload.is_none(),
         "gap-filled event should have None payload"
@@ -486,7 +496,7 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
 
     let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive real event after gap");
+        .expect("should receive real event after gap")?;
     assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
 
     Ok(())
@@ -519,7 +529,7 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive first event");
+        .expect("should receive first event")?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
 
     // Insert seq N+1 directly in a transaction that stays open…
@@ -551,7 +561,7 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
-        .expect("should receive the committed gap event");
+        .expect("should receive the committed gap event")?;
     assert!(
         matches!(gap_event.payload, Some(TestEvent::Ping(7))),
         "gap must resolve with the real committed event, got {:?}",
@@ -560,7 +570,7 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 
     let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
         .await?
-        .expect("should receive real event after gap");
+        .expect("should receive real event after gap")?;
     assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
 
     Ok(())
@@ -741,7 +751,7 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
         .await
         .map_err(|_| anyhow::anyhow!("baseline pg_notify delivery timed out"))?
-        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
     assert!(matches!(event.payload, Some(TestEvent::Ping(1))));
 
     // Terminate every LISTEN backend and insert the event in ONE autocommit
@@ -774,8 +784,89 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
                  (missed notification not resynced)"
             )
         })?
-        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))?;
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
     assert!(matches!(event.payload, Some(TestEvent::Ping(2))));
+
+    Ok(())
+}
+
+// Rows written into a shared database by a different event enum (e.g.
+// test-only module tags) must neither crash the reader nor be silently
+// dropped: the event is still delivered — in order, as the `Err` item
+// carrying the raw payload and the serde error — and later events flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "module")]
+enum ForeignEvent {
+    CoreParty { id: u64 },
+}
+
+#[tokio::test]
+#[file_serial]
+async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
+    use obix::{MailboxTables as _, out::Outbox};
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    let config = MailboxConfig::builder()
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    // Publish via a foreign event enum, like tests sharing the database do.
+    let foreign = Outbox::<ForeignEvent, helpers::TestTables>::init(&pool, config.clone()).await?;
+    let mut op = pool.begin().await?;
+    foreign
+        .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
+        .await?;
+    op.commit().await?;
+
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    // The load path delivers the poison row as its Err item — raw JSON and
+    // serde error attached, sequence position occupied — and the valid row
+    // intact.
+    let events =
+        helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
+    assert_eq!(events.len(), 2);
+    let poison = events[0]
+        .as_ref()
+        .expect_err("poison row must be the Err item");
+    assert_eq!(u64::from(poison.sequence), 1);
+    assert_eq!(
+        poison.failure.raw,
+        serde_json::json!({"module": "CoreParty", "id": 1})
+    );
+    assert!(
+        !poison.failure.error.is_empty(),
+        "the Err item must carry the serde error"
+    );
+    let decoded = events[1].as_ref().expect("valid row must be the Ok item");
+    assert!(matches!(decoded.payload, Some(TestEvent::Ping(0))));
+
+    // The raw stream delivers the poison event as its Err arm, in sequence
+    // position — the type forces every raw consumer to decide (`?` would
+    // fail loudly here) — and later events still arrive, in order.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream closed"))?;
+    let undecodable = first.expect_err("poison event must surface as the stream's Err arm");
+    assert_eq!(u64::from(undecodable.sequence), 1);
+    assert_eq!(
+        undecodable.failure.raw,
+        serde_json::json!({"module": "CoreParty", "id": 1})
+    );
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener stream closed"))??;
+    assert!(matches!(second.payload, Some(TestEvent::Ping(0))));
 
     Ok(())
 }

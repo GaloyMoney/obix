@@ -26,8 +26,14 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    BatchOp, CursorError, EventCtx, EventSubscription, FlushError, FlushOp, Handled, IsolatedOp,
-    OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig, PostPersistHook,
+    BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
+    IsolatedOp, OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig, PostPersistHook,
+    UndecodableEventError,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
+#[doc(hidden)]
+pub use tables::{
+    decode_persistent_event, record_ephemeral_payload_undecodable,
+    record_tracing_context_undecodable,
+};

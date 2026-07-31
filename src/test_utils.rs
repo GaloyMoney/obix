@@ -112,7 +112,11 @@ where
 
     let event = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let event = listener.next().await.expect("stream should not end");
+            let event = listener
+                .next()
+                .await
+                .expect("stream should not end")
+                .expect("undecodable event on outbox stream");
             if let Some(extracted) = event.as_event::<IE>().and_then(|e| matches(&result, e)) {
                 return extracted;
             }

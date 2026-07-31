@@ -37,9 +37,14 @@ impl ToTokens for MailboxTables {
             quote! {
                 let tracing_context = row.tracing_context
                     .filter(|v| !v.is_null())
-                    .map(|p| {
-                        #crate_name::prelude::serde_json::from_value(p)
-                            .expect("Could not deserialize tracing context")
+                    .and_then(|p| {
+                        match #crate_name::prelude::serde_json::from_value(p) {
+                            Ok(context) => Some(context),
+                            Err(error) => {
+                                #crate_name::record_tracing_context_undecodable(&error);
+                                None
+                            }
+                        }
                     });
             },
         );
@@ -364,7 +369,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     from_sequence: #crate_name::EventSequence,
                     buffer_size: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
                 {
@@ -391,15 +396,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                             };
                             present.insert(sequence);
                             #deserialize_context
-                            events.push(#crate_name::out::PersistentOutboxEvent {
-                                id: #crate_name::out::OutboxEventId::from(row.id.expect("matched row has id")),
-                                sequence: #crate_name::EventSequence::from(sequence as u64),
-                                payload: row
-                                    .payload
-                                    .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
-                                recorded_at: row.recorded_at.unwrap_or_default(),
-                                #set_context
-                            });
+                            events.push(#crate_name::decode_persistent_event(
+                                #crate_name::out::OutboxEventId::from(row.id.expect("matched row has id")),
+                                sequence as u64,
+                                row.recorded_at.unwrap_or_default(),
+                                tracing_context,
+                                row.payload,
+                            ));
                         }
 
                         // Fill sequence gaps in the page with placeholder rows,
@@ -419,19 +422,20 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                             for row in gap_rows {
                                 #deserialize_context
-                                events.push(#crate_name::out::PersistentOutboxEvent {
-                                    id: #crate_name::out::OutboxEventId::from(row.id),
-                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    payload: row
-                                        .payload
-                                        .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
-                                    recorded_at: row.recorded_at,
-                                    #set_context
-                                });
+                                events.push(#crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                ));
                             }
                             // Gap-fill rows were appended after the page rows, so
                             // re-establish the ascending order consumers rely on.
-                            events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
+                            events.sort_by_key(|item| match item {
+                                Ok(event) => event.sequence,
+                                Err(error) => error.sequence,
+                            });
                         }
 
                         Ok(events)
@@ -442,7 +446,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     after_sequence: #crate_name::EventSequence,
                     up_to_sequence: #crate_name::EventSequence,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
                 {
@@ -459,15 +463,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| {
                                 #deserialize_context
-                                #crate_name::out::PersistentOutboxEvent {
-                                    id: #crate_name::out::OutboxEventId::from(row.id),
-                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    payload: row
-                                        .payload
-                                        .map(|p| #crate_name::prelude::serde_json::from_value(p).expect("Could not deserialize payload")),
-                                    recorded_at: row.recorded_at,
-                                    #set_context
-                                }
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                )
                             })
                             .collect();
                         Ok(events)
@@ -509,9 +511,14 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                         let events = rows
                             .into_iter()
-                            .map(|(event_type_str, payload_json, tracing_context_json, recorded_at)| {
-                                let payload = #crate_name::prelude::serde_json::from_value(payload_json)
-                                    .expect("Couldn't deserialize payload");
+                            .filter_map(|(event_type_str, payload_json, tracing_context_json, recorded_at)| {
+                                let payload = match #crate_name::prelude::serde_json::from_value(payload_json) {
+                                    Ok(payload) => payload,
+                                    Err(error) => {
+                                        #crate_name::record_ephemeral_payload_undecodable(&error, &event_type_str);
+                                        return None;
+                                    }
+                                };
                                 let event_type = #crate_name::prelude::serde_json::from_value(
                                     #crate_name::prelude::serde_json::Value::String(event_type_str)
                                 ).expect("Couldn't deserialize event_type");
@@ -526,12 +533,12 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 };
                                 #deserialize_context
 
-                                #crate_name::out::EphemeralOutboxEvent {
+                                Some(#crate_name::out::EphemeralOutboxEvent {
                                     event_type,
                                     payload,
                                     #set_context
                                     recorded_at,
-                                }
+                                })
                             })
                             .collect::<Vec<_>>();
                         Ok(events)

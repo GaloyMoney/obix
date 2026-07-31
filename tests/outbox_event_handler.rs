@@ -41,6 +41,61 @@ impl OutboxEventHandler<TestEvent> for SkippingObserver {
     }
 }
 
+/// A different event enum sharing the same physical table — publishing
+/// through it plants a row the `TestEvent` consumers cannot decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "module")]
+enum ForeignEvent {
+    CoreParty { id: u64 },
+}
+
+async fn publish_foreign_poison(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let foreign = Outbox::<ForeignEvent, TestTables>::init(
+        pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut op = pool.begin().await?;
+    foreign
+        .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
+        .await?;
+    op.commit().await?;
+    Ok(())
+}
+
+/// Overrides `handle_undecodable` to explicitly acknowledge undecodable
+/// events (returning `Ok` instead of failing with the error), recording
+/// their sequences.
+struct AckingObserver {
+    received: Arc<Mutex<Vec<u64>>>,
+    acked: Arc<Mutex<Vec<u64>>>,
+}
+
+impl OutboxEventHandler<TestEvent> for AckingObserver {
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.received.lock().await.push(*n);
+        }
+        Ok(ctx.skip())
+    }
+
+    async fn handle_undecodable(
+        &self,
+        error: &obix::UndecodableEventError,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.acked.lock().await.push(u64::from(error.sequence));
+        Ok(())
+    }
+}
+
 /// Legacy-style observer: one isolated op + checkpoint per event.
 struct CheckpointingObserver {
     received: Arc<Mutex<Vec<u64>>>,
@@ -1684,6 +1739,166 @@ async fn ephemeral_only_handler_skips_checkpoint_machinery() -> anyhow::Result<(
         None,
         "EphemeralOnly job must never write execution state"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Phase 1: Ping(1) at seq 1, an undecodable foreign event at seq 2,
+    // Ping(2) at seq 3. The default policy treats the poison event as a
+    // runtime bug: the job fails with its checkpoint parked at seq 1 —
+    // Ping(2) must NOT be delivered and nothing is ever skipped.
+    let received = Arc::new(Mutex::new(Vec::new()));
+    {
+        let job_config = job::JobSvcConfig::builder()
+            .pool(pool.clone())
+            .build()
+            .unwrap();
+        let mut jobs = job::Jobs::init(job_config).await?;
+
+        let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+            .with_retry_settings(fast_retry_settings())
+            .with_checkpoint_interval(std::time::Duration::from_millis(100));
+        let outbox = init_outbox_with_handler_config(
+            &pool,
+            &mut jobs,
+            config,
+            SkippingObserver {
+                received: received.clone(),
+            },
+        )
+        .await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+            .await?;
+        op.commit().await?;
+
+        publish_foreign_poison(&pool).await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(2))
+            .await?;
+        op.commit().await?;
+
+        jobs.start_poll().await?;
+
+        // The checkpoint is persisted at seq 1 before the job errors, then
+        // every retry re-reads the poison event and fails again: the
+        // checkpoint stays parked and Ping(2) stays undelivered.
+        wait_for_checkpoint(&pool, 1).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(*received.lock().await, vec![1]);
+        assert_eq!(checkpoint_sequence(&pool).await?, Some(1));
+
+        jobs.shutdown().await?;
+    }
+
+    // Phase 2: operator remediation — NULL the poison payload (an explicit,
+    // auditable act that turns the row into an ordinary sequence
+    // placeholder) and restart the consumer. The pipeline resumes exactly
+    // where it parked: nothing before the poison event replays, nothing
+    // after it was lost.
+    sqlx::query("UPDATE persistent_outbox_events SET payload = NULL WHERE sequence = 2")
+        .execute(&pool)
+        .await?;
+
+    let received_after = Arc::new(Mutex::new(Vec::new()));
+    {
+        let job_config = job::JobSvcConfig::builder()
+            .pool(pool.clone())
+            .build()
+            .unwrap();
+        let mut jobs = job::Jobs::init(job_config).await?;
+
+        let outbox = Outbox::<TestEvent, TestTables>::init(
+            &pool,
+            MailboxConfig::builder()
+                .build()
+                .expect("Couldn't build MailboxConfig"),
+        )
+        .await?;
+        outbox
+            .register_event_handler(
+                &mut jobs,
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                    .with_retry_settings(fast_retry_settings())
+                    .with_checkpoint_interval(std::time::Duration::from_millis(100)),
+                SkippingObserver {
+                    received: received_after.clone(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        jobs.start_poll().await?;
+
+        wait_for_n_deliveries(&received_after, 1, std::time::Duration::from_secs(5)).await?;
+        assert_eq!(*received_after.lock().await, vec![2]);
+        wait_for_checkpoint(&pool, 3).await?;
+
+        jobs.shutdown().await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn handle_undecodable_ok_moves_past_poison_event() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let acked = Arc::new(Mutex::new(Vec::new()));
+    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        .with_checkpoint_interval(std::time::Duration::from_millis(100));
+    let outbox = init_outbox_with_handler_config(
+        &pool,
+        &mut jobs,
+        config,
+        AckingObserver {
+            received: received.clone(),
+            acked: acked.clone(),
+        },
+    )
+    .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    publish_foreign_poison(&pool).await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(2))
+        .await?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // handle_undecodable is invoked instead of handle_persistent; its Ok
+    // moves the pipeline past the poison event without failing the job.
+    wait_for_n_deliveries(&received, 2, std::time::Duration::from_secs(5)).await?;
+    assert_eq!(*received.lock().await, vec![1, 2]);
+    assert_eq!(*acked.lock().await, vec![2]);
+    wait_for_checkpoint(&pool, 3).await?;
+
+    jobs.shutdown().await?;
 
     Ok(())
 }
