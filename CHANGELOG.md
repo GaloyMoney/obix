@@ -1,3 +1,11 @@
+# [obix release v0.5.0](https://github.com/GaloyMoney/obix/releases/tag/0.5.0)
+
+
+
+### Features
+
+- [**breaking**] Deliver undecodable payloads as errors instead of panicking (#104)
+
 # [obix release v0.4.3](https://github.com/GaloyMoney/obix/releases/tag/0.4.3)
 
 
