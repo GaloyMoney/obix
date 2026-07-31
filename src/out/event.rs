@@ -117,14 +117,10 @@ where
 /// (e.g. a variant the consumer's enum does not know yet, or a row written by
 /// a different event enum sharing the table).
 ///
-/// Carried on [`PersistentOutboxEvent::decode_failure`] through the internal
-/// delivery plumbing (the poison event must ride the cache/broadcast
-/// machinery as an ordinary sequenced event, or contiguity would break). At
-/// the consumption boundaries it surfaces as [`UndecodableEventError`]: the
-/// listener streams yield it as their `Err` arm, and the handler-job runner
-/// hands it to
-/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)
-/// (default: fail the job, parking its checkpoint *before* the event).
+/// Carried inside [`UndecodableEventError`], which is how such an event
+/// travels everywhere: the `Err` arm of the
+/// [`MailboxTables`](crate::MailboxTables) load results, of the internal
+/// delivery plumbing, and of the listener streams.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodeFailure {
     /// The payload column exactly as stored.
@@ -134,17 +130,19 @@ pub struct DecodeFailure {
 }
 
 /// A persistent event whose stored payload could not be decoded into the
-/// consumer's event type, delivered as the `Err` arm of
+/// consumer's event type. Everything undecodable-shaped is this one type,
+/// always in an `Err` arm: the
+/// [`MailboxTables`](crate::MailboxTables) load results, the
 /// [`PersistentOutboxListener`](crate::out::PersistentOutboxListener) /
-/// [`AllOutboxListener`](crate::out::AllOutboxListener).
+/// [`AllOutboxListener`](crate::out::AllOutboxListener) stream items, and
+/// the error the default
+/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)
+/// fails the handler job with.
 ///
 /// The `Err` item IS the delivery of that event — in order, in its sequence
 /// position — so no consumer can pass over an undecodable payload without an
 /// explicit decision: `?` (e.g. via `TryStreamExt::try_next`) fails loudly,
-/// and matching the `Err` arm is the visible opt-out. It is also what the
-/// default
-/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)
-/// fails the handler job with.
+/// and matching the `Err` arm is the visible opt-out.
 ///
 /// [`Display`](std::fmt::Display) prints the serde error only — the raw
 /// payload is available on [`failure`](Self::failure) but never hits log
@@ -159,19 +157,36 @@ pub struct UndecodableEventError {
     pub failure: DecodeFailure,
 }
 
-impl UndecodableEventError {
-    /// The `Err`-arm view of an event carrying a decode failure; `None` for
-    /// decoded events and plain placeholders.
-    pub(crate) fn try_from_event<T>(event: &PersistentOutboxEvent<T>) -> Option<Self>
-    where
-        T: Serialize + DeserializeOwned + Send,
-    {
-        event.decode_failure.as_ref().map(|failure| Self {
-            id: event.id,
-            sequence: event.sequence,
-            recorded_at: event.recorded_at,
-            failure: failure.clone(),
-        })
+/// Internal transport for the persistent delivery plumbing (cache,
+/// broadcast, backfill): an undecodable event rides it as the `Err` arm so
+/// it still occupies its sequence position — the contiguity machinery treats
+/// both arms alike. `Arc` on both arms keeps broadcast fan-out cheap; the
+/// listeners unwrap to the public owned [`UndecodableEventError`] at their
+/// yield boundary.
+pub(crate) type PersistentDelivery<P> =
+    Result<Arc<PersistentOutboxEvent<P>>, Arc<UndecodableEventError>>;
+
+/// The sequence a delivery occupies, whichever arm it is.
+pub(crate) fn delivery_sequence<P>(delivery: &PersistentDelivery<P>) -> EventSequence
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    match delivery {
+        Ok(event) => event.sequence,
+        Err(error) => error.sequence,
+    }
+}
+
+/// Wrap a freshly loaded item into the internal delivery transport.
+pub(crate) fn into_delivery<P>(
+    item: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
+) -> PersistentDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    match item {
+        Ok(event) => Ok(Arc::new(event)),
+        Err(error) => Err(Arc::new(error)),
     }
 }
 
@@ -182,17 +197,13 @@ where
 {
     pub id: OutboxEventId,
     pub sequence: EventSequence,
+    /// `None` is a sequence placeholder: nothing to process at this
+    /// sequence (a gap from a rolled-back transaction, or a payload
+    /// explicitly NULLed by an operator). An *undecodable* payload never
+    /// appears here — it travels as [`UndecodableEventError`], the `Err`
+    /// arm of the load results and listener streams.
     #[serde(bound = "T: DeserializeOwned")]
     pub payload: Option<T>,
-    /// `Some` iff the stored payload failed to decode into `T` — then
-    /// [`payload`](Self::payload) is `None` *and* this carries the raw JSON
-    /// plus the serde error. A plain sequence placeholder (nothing was ever
-    /// committed at this sequence) has both fields `None`. The listener
-    /// streams never yield an event with this set as an `Ok` item — it is
-    /// translated into their `Err` arm ([`UndecodableEventError`]) at the
-    /// consumption boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decode_failure: Option<DecodeFailure>,
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
@@ -206,7 +217,6 @@ where
             id: self.id,
             sequence: self.sequence,
             payload: self.payload.clone(),
-            decode_failure: self.decode_failure.clone(),
             tracing_context: self.tracing_context.clone(),
             recorded_at: self.recorded_at,
         }

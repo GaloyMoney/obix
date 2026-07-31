@@ -4,7 +4,7 @@ use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
-use crate::out::event::PersistentOutboxEvent;
+use crate::out::event::{PersistentDelivery, PersistentOutboxEvent};
 use crate::out::post_persist_hook::PostPersistHooks;
 use crate::tables::MailboxTables;
 
@@ -13,7 +13,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    sender: broadcast::Sender<PersistentDelivery<P>>,
     pre_commit_events: Vec<P>,
     post_commit_events: Vec<PersistentOutboxEvent<P>>,
     batch_size: usize,
@@ -30,7 +30,7 @@ where
     Tables: MailboxTables,
 {
     pub fn new(
-        sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        sender: broadcast::Sender<PersistentDelivery<P>>,
         events: impl IntoIterator<Item = impl Into<P>>,
         batch_size: usize,
         post_persist_hooks: PostPersistHooks<P>,
@@ -82,7 +82,7 @@ where
 
     fn post_commit(self) {
         for event in self.post_commit_events {
-            let _ = self.sender.send(event.into());
+            let _ = self.sender.send(Ok(Arc::new(event)));
         }
     }
 

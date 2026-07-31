@@ -792,7 +792,7 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
 
 // Rows written into a shared database by a different event enum (e.g.
 // test-only module tags) must neither crash the reader nor be silently
-// dropped: the event is still delivered — in order, with `decode_failure`
+// dropped: the event is still delivered — in order, as the `Err` item
 // carrying the raw payload and the serde error — and later events flow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "module")]
@@ -802,7 +802,7 @@ enum ForeignEvent {
 
 #[tokio::test]
 #[file_serial]
-async fn undecodable_payload_is_delivered_with_decode_failure() -> anyhow::Result<()> {
+async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
     use obix::{MailboxTables as _, out::Outbox};
 
     let pool = init_pool().await?;
@@ -829,26 +829,26 @@ async fn undecodable_payload_is_delivered_with_decode_failure() -> anyhow::Resul
         .await?;
     op.commit().await?;
 
-    // The load path delivers the poison row with the raw JSON and the serde
-    // error attached, and the valid row intact.
+    // The load path delivers the poison row as its Err item — raw JSON and
+    // serde error attached, sequence position occupied — and the valid row
+    // intact.
     let events =
         helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
     assert_eq!(events.len(), 2);
-    assert!(events[0].payload.is_none());
-    let failure = events[0]
-        .decode_failure
+    let poison = events[0]
         .as_ref()
-        .expect("undecodable row must carry decode_failure");
+        .expect_err("poison row must be the Err item");
+    assert_eq!(u64::from(poison.sequence), 1);
     assert_eq!(
-        failure.raw,
+        poison.failure.raw,
         serde_json::json!({"module": "CoreParty", "id": 1})
     );
     assert!(
-        !failure.error.is_empty(),
-        "decode_failure must carry the serde error"
+        !poison.failure.error.is_empty(),
+        "the Err item must carry the serde error"
     );
-    assert!(matches!(events[1].payload, Some(TestEvent::Ping(0))));
-    assert!(events[1].decode_failure.is_none());
+    let decoded = events[1].as_ref().expect("valid row must be the Ok item");
+    assert!(matches!(decoded.payload, Some(TestEvent::Ping(0))));
 
     // The raw stream delivers the poison event as its Err arm, in sequence
     // position — the type forces every raw consumer to decide (`?` would
@@ -867,7 +867,6 @@ async fn undecodable_payload_is_delivered_with_decode_failure() -> anyhow::Resul
         .await?
         .ok_or_else(|| anyhow::anyhow!("listener stream closed"))??;
     assert!(matches!(second.payload, Some(TestEvent::Ping(0))));
-    assert!(second.decode_failure.is_none());
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
-use crate::out::event::{PersistentOutboxEvent, UndecodableEventError};
+use crate::out::event::{PersistentDelivery, PersistentOutboxEvent, UndecodableEventError};
 use crate::sequence::EventSequence;
 
 pub struct PersistentOutboxListener<P>
@@ -13,11 +13,11 @@ where
 {
     last_returned_sequence: EventSequence,
     latest_known: EventSequence,
-    event_receiver: BroadcastStream<Arc<PersistentOutboxEvent<P>>>,
+    event_receiver: BroadcastStream<PersistentDelivery<P>>,
     buffer_size: usize,
-    local_cache: BTreeMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+    local_cache: BTreeMap<EventSequence, PersistentDelivery<P>>,
     cache_handle: CacheHandle<P>,
-    backfill_receiver: Option<ReceiverStream<Arc<PersistentOutboxEvent<P>>>>,
+    backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
 }
 
 impl<P> PersistentOutboxListener<P>
@@ -42,10 +42,11 @@ where
         }
     }
 
-    fn maybe_add_to_cache(&mut self, event: Arc<PersistentOutboxEvent<P>>) {
-        self.latest_known = self.latest_known.max(event.sequence);
-        if event.sequence > self.last_returned_sequence
-            && self.local_cache.insert(event.sequence, event).is_none()
+    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
+        let sequence = crate::out::event::delivery_sequence(&delivery);
+        self.latest_known = self.latest_known.max(sequence);
+        if sequence > self.last_returned_sequence
+            && self.local_cache.insert(sequence, delivery).is_none()
             && self.local_cache.len() > self.buffer_size
         {
             self.local_cache.pop_last();
@@ -123,9 +124,9 @@ where
             }
             if seq == this.last_returned_sequence.next() {
                 this.last_returned_sequence = seq;
-                return Poll::Ready(Some(match UndecodableEventError::try_from_event(&event) {
-                    Some(error) => Err(error),
-                    None => Ok(event),
+                return Poll::Ready(Some(match event {
+                    Ok(event) => Ok(event),
+                    Err(error) => Err((*error).clone()),
                 }));
             }
             this.local_cache.insert(seq, event);

@@ -34,6 +34,6 @@ pub use sequence::EventSequence;
 pub use tables::MailboxTables;
 #[doc(hidden)]
 pub use tables::{
-    decode_persistent_payload, record_ephemeral_payload_undecodable,
+    decode_persistent_event, record_ephemeral_payload_undecodable,
     record_tracing_context_undecodable,
 };

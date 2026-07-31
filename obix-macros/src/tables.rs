@@ -292,7 +292,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
                                 recorded_at: row.recorded_at,
                                 payload: Some(payload),
-                                decode_failure: None,
                                 #set_context
                             })
                             .collect::<Vec<_>>();
@@ -370,7 +369,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     from_sequence: #crate_name::EventSequence,
                     buffer_size: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
                 {
@@ -397,18 +396,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                             };
                             present.insert(sequence);
                             #deserialize_context
-                            let (payload, decode_failure) = match row.payload {
-                                Some(payload) => #crate_name::decode_persistent_payload(payload, sequence as u64),
-                                None => (None, None),
-                            };
-                            events.push(#crate_name::out::PersistentOutboxEvent {
-                                id: #crate_name::out::OutboxEventId::from(row.id.expect("matched row has id")),
-                                sequence: #crate_name::EventSequence::from(sequence as u64),
-                                payload,
-                                decode_failure,
-                                recorded_at: row.recorded_at.unwrap_or_default(),
-                                #set_context
-                            });
+                            events.push(#crate_name::decode_persistent_event(
+                                #crate_name::out::OutboxEventId::from(row.id.expect("matched row has id")),
+                                sequence as u64,
+                                row.recorded_at.unwrap_or_default(),
+                                tracing_context,
+                                row.payload,
+                            ));
                         }
 
                         // Fill sequence gaps in the page with placeholder rows,
@@ -428,22 +422,20 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                             for row in gap_rows {
                                 #deserialize_context
-                                let (payload, decode_failure) = match row.payload {
-                                    Some(payload) => #crate_name::decode_persistent_payload(payload, row.sequence as u64),
-                                    None => (None, None),
-                                };
-                                events.push(#crate_name::out::PersistentOutboxEvent {
-                                    id: #crate_name::out::OutboxEventId::from(row.id),
-                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    payload,
-                                    decode_failure,
-                                    recorded_at: row.recorded_at,
-                                    #set_context
-                                });
+                                events.push(#crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                ));
                             }
                             // Gap-fill rows were appended after the page rows, so
                             // re-establish the ascending order consumers rely on.
-                            events.sort_by(|a, b| a.sequence.cmp(&b.sequence));
+                            events.sort_by_key(|item| match item {
+                                Ok(event) => event.sequence,
+                                Err(error) => error.sequence,
+                            });
                         }
 
                         Ok(events)
@@ -454,7 +446,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     after_sequence: #crate_name::EventSequence,
                     up_to_sequence: #crate_name::EventSequence,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
                 {
@@ -471,18 +463,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| {
                                 #deserialize_context
-                                let (payload, decode_failure) = match row.payload {
-                                    Some(payload) => #crate_name::decode_persistent_payload(payload, row.sequence as u64),
-                                    None => (None, None),
-                                };
-                                #crate_name::out::PersistentOutboxEvent {
-                                    id: #crate_name::out::OutboxEventId::from(row.id),
-                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    payload,
-                                    decode_failure,
-                                    recorded_at: row.recorded_at,
-                                    #set_context
-                                }
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                )
                             })
                             .collect();
                         Ok(events)

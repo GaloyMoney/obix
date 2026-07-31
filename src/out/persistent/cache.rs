@@ -19,9 +19,8 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     highest_known_sequence: Arc<AtomicU64>,
-    persistent_event_receiver: Option<broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>>,
-    backfill_request:
-        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<Arc<PersistentOutboxEvent<P>>>)>,
+    persistent_event_receiver: Option<broadcast::Receiver<PersistentDelivery<P>>>,
+    backfill_request: mpsc::UnboundedSender<(EventSequence, mpsc::Sender<PersistentDelivery<P>>)>,
     backfill_buffer_size: usize,
 }
 
@@ -33,7 +32,7 @@ where
         EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed))
     }
 
-    pub fn persistent_event_stream(&mut self) -> BroadcastStream<Arc<PersistentOutboxEvent<P>>> {
+    pub fn persistent_event_stream(&mut self) -> BroadcastStream<PersistentDelivery<P>> {
         BroadcastStream::new(
             self.persistent_event_receiver
                 .take()
@@ -44,7 +43,7 @@ where
     pub fn request_old_persistent_events(
         &self,
         start_after: EventSequence,
-    ) -> ReceiverStream<Arc<PersistentOutboxEvent<P>>> {
+    ) -> ReceiverStream<PersistentDelivery<P>> {
         let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
         let _ = self.backfill_request.send((start_after, tx));
         ReceiverStream::new(rx)
@@ -119,11 +118,11 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     highest_known_sequence: Arc<AtomicU64>,
-    persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    persistent_event_sender: broadcast::Sender<PersistentDelivery<P>>,
     backfill_request_send:
-        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<Arc<PersistentOutboxEvent<P>>>)>,
+        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<PersistentDelivery<P>>)>,
     backfill_buffer_size: usize,
-    cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+    cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
     _cache_loop_handle: OwnedTaskHandle,
     _phantom: std::marker::PhantomData<Tables>,
 }
@@ -142,7 +141,7 @@ where
         }
     }
 
-    pub fn cache_fill_sender(&self) -> broadcast::Sender<Arc<PersistentOutboxEvent<P>>> {
+    pub fn cache_fill_sender(&self) -> broadcast::Sender<PersistentDelivery<P>> {
         self.cache_fill_sender.clone()
     }
 
@@ -184,19 +183,19 @@ where
     }
 
     fn insert_into_cache_and_maybe_broadcast(
-        cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
-        event: Arc<PersistentOutboxEvent<P>>,
+        cache: im::OrdMap<EventSequence, PersistentDelivery<P>>,
+        event: PersistentDelivery<P>,
         highest_known_sequence: &AtomicU64,
-        persistent_event_sender: &broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        persistent_event_sender: &broadcast::Sender<PersistentDelivery<P>>,
         mut last_broadcast_sequence: EventSequence,
         cache_size: usize,
     ) -> (
-        im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        im::OrdMap<EventSequence, PersistentDelivery<P>>,
         EventSequence,
     ) {
         use std::ops::Bound;
 
-        let sequence = event.sequence;
+        let sequence = delivery_sequence(&event);
         let highest_known = highest_known_sequence.load(Ordering::Relaxed);
 
         // Skip events that are too old to be useful, but never let the
@@ -239,12 +238,12 @@ where
     async fn fill_gap(
         pool: sqlx::PgPool,
         from_sequence: EventSequence,
-        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         buffer_size: usize,
     ) {
         if let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await {
-            for event in events {
-                let _ = cache_fill_sender.send(Arc::new(event));
+            for item in events {
+                let _ = cache_fill_sender.send(into_delivery(item));
             }
         }
     }
@@ -252,9 +251,9 @@ where
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
         start_after: EventSequence,
-        sender: mpsc::Sender<Arc<PersistentOutboxEvent<P>>>,
-        cache_snapshot: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
-        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        sender: mpsc::Sender<PersistentDelivery<P>>,
+        cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
+        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
         buffer_size: usize,
     ) {
@@ -271,11 +270,11 @@ where
             match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
                 Ok(events) if events.is_empty() => break,
                 Ok(events) => {
-                    for event in events {
-                        let seq = event.sequence;
-                        let event = Arc::new(event);
-                        let _ = cache_fill_sender.send(event.clone());
-                        if sender.send(event).await.is_err() {
+                    for item in events {
+                        let delivery = into_delivery(item);
+                        let seq = delivery_sequence(&delivery);
+                        let _ = cache_fill_sender.send(delivery.clone());
+                        if sender.send(delivery).await.is_err() {
                             return;
                         }
                         current_sequence = seq;
@@ -305,11 +304,11 @@ where
         pool: sqlx::PgPool,
         after: EventSequence,
         up_to: EventSequence,
-        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
     ) {
         if let Ok(events) = Tables::load_events_in_range::<P>(&pool, after, up_to).await {
-            for event in events {
-                let _ = cache_fill_sender.send(Arc::new(event));
+            for item in events {
+                let _ = cache_fill_sender.send(into_delivery(item));
             }
         }
     }
@@ -319,7 +318,7 @@ where
     /// Returns `None` for unparsable payloads.
     fn handle_notification(
         payload: &str,
-        cache: &im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>>,
+        cache: &im::OrdMap<EventSequence, PersistentDelivery<P>>,
     ) -> Option<NotifiedRange> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
@@ -352,14 +351,14 @@ where
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
-        persistent_event_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        persistent_event_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest_known_sequence: Arc<AtomicU64>,
         mut backfill_request: mpsc::UnboundedReceiver<(
             EventSequence,
-            mpsc::Sender<Arc<PersistentOutboxEvent<P>>>,
+            mpsc::Sender<PersistentDelivery<P>>,
         )>,
-        mut cache_fill_receiver: broadcast::Receiver<Arc<PersistentOutboxEvent<P>>>,
-        cache_fill_sender: broadcast::Sender<Arc<PersistentOutboxEvent<P>>>,
+        mut cache_fill_receiver: broadcast::Receiver<PersistentDelivery<P>>,
+        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
@@ -372,7 +371,7 @@ where
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
         let handle = spawn_supervised("obix::persistent_cache_loop", async move {
-            let mut persistent_cache: im::OrdMap<EventSequence, Arc<PersistentOutboxEvent<P>>> =
+            let mut persistent_cache: im::OrdMap<EventSequence, PersistentDelivery<P>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
             // Bookkeeping for the sequence the broadcast is stalled on.
