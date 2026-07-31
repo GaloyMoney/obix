@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
 pub use self::job::{
-    EventSubscription, OutboxEventHandler, OutboxEventJobConfig, UndecodableAction,
-    UndecodableEventError,
+    EventSubscription, OutboxEventHandler, OutboxEventJobConfig, UndecodableEventError,
 };
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;

@@ -20,7 +20,7 @@ pub struct DefaultMailboxTables;
 /// previously wedged the whole pipeline in a hot panic/retry loop — nor be
 /// silently dropped: the event is delivered with a [`DecodeFailure`]
 /// attached and its fate is decided by consumer policy (see
-/// [`OutboxEventHandler::on_undecodable`](crate::OutboxEventHandler::on_undecodable)).
+/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)).
 #[doc(hidden)]
 pub fn decode_persistent_payload<P: serde::de::DeserializeOwned>(
     raw: serde_json::Value,

@@ -120,7 +120,7 @@ where
 /// Carried on [`PersistentOutboxEvent::decode_failure`]: the event is still
 /// delivered — in order, with its sequence — so no consumer ever silently
 /// misses an event. What happens next is consumer policy; see
-/// [`OutboxEventHandler::on_undecodable`](crate::OutboxEventHandler::on_undecodable)
+/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)
 /// (default: fail the handler job, parking its checkpoint *before* this
 /// event).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

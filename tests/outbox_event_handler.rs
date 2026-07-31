@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use obix::{
     EventCtx, EventSubscription, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
-    UndecodableAction, out::Outbox,
+    out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -65,8 +65,9 @@ async fn publish_foreign_poison(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Overrides `on_undecodable` to explicitly acknowledge undecodable events,
-/// recording their sequences.
+/// Overrides `handle_undecodable` to explicitly acknowledge undecodable
+/// events (returning `Ok` instead of the default error), recording their
+/// sequences.
 struct AckingObserver {
     received: Arc<Mutex<Vec<u64>>>,
     acked: Arc<Mutex<Vec<u64>>>,
@@ -86,12 +87,12 @@ impl OutboxEventHandler<TestEvent> for AckingObserver {
         Ok(ctx.skip())
     }
 
-    async fn on_undecodable(
+    async fn handle_undecodable(
         &self,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> UndecodableAction {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.acked.lock().await.push(u64::from(event.sequence));
-        UndecodableAction::Ack
+        Ok(())
     }
 }
 
@@ -1850,7 +1851,7 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
 
 #[tokio::test]
 #[file_serial]
-async fn on_undecodable_ack_moves_past_poison_event() -> anyhow::Result<()> {
+async fn handle_undecodable_ok_moves_past_poison_event() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
     let job_config = job::JobSvcConfig::builder()
@@ -1890,8 +1891,8 @@ async fn on_undecodable_ack_moves_past_poison_event() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
-    // The explicit ack is consulted instead of handle_persistent, and the
-    // pipeline moves past the poison event without failing the job.
+    // handle_undecodable is invoked instead of handle_persistent; its Ok
+    // moves the pipeline past the poison event without failing the job.
     wait_for_n_deliveries(&received, 2, std::time::Duration::from_secs(5)).await?;
     assert_eq!(*received.lock().await, vec![1, 2]);
     assert_eq!(*acked.lock().await, vec![2]);

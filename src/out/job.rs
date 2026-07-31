@@ -28,31 +28,12 @@ pub enum EventSubscription {
     EphemeralOnly,
 }
 
-/// Fate of a persistent event whose stored payload could not be decoded into
-/// the handler's event type, decided by
-/// [`OutboxEventHandler::on_undecodable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UndecodableAction {
-    /// The default: treat the undecodable payload as a runtime bug. The
-    /// runner lands the pending batch, persists the checkpoint at the
-    /// sequence *before* this event, and fails the job — the job retry
-    /// machinery (with its configured backoff) re-reads the event from the
-    /// database on every attempt, so the pipeline resumes on its own once a
-    /// consumer that understands the payload is deployed. Nothing is ever
-    /// skipped.
-    Fail,
-    /// Explicitly acknowledge the event and move past it. The checkpoint
-    /// advances over the event exactly as for a
-    /// [`skip`](super::EventCtx::skip) — an unambiguous, per-handler opt-in
-    /// to drop payloads this handler cannot decode.
-    Ack,
-}
-
-/// A persistent event's stored payload could not be decoded into the
-/// handler's event type and the handler's
-/// [`on_undecodable`](OutboxEventHandler::on_undecodable) policy chose
-/// [`Fail`](UndecodableAction::Fail). Propagates as the handler job's error;
-/// the job's checkpoint is parked at the sequence before the event.
+/// The error the default
+/// [`handle_undecodable`](OutboxEventHandler::handle_undecodable) fails
+/// with: a persistent event's stored payload could not be decoded into the
+/// handler's event type. Propagates as the handler job's error; the job's
+/// checkpoint is parked at the sequence *before* the event, so every retry
+/// re-reads it and nothing is ever skipped.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "undecodable persistent outbox event {id} at sequence {sequence} (checkpoint parked before it): {error}"
@@ -132,32 +113,44 @@ where
         async move { Ok(ctx.skip()) }
     }
 
-    /// Policy for a persistent event whose stored payload could not be
-    /// decoded into `P` (the event arrives with
+    /// Handle a persistent event whose stored payload could not be decoded
+    /// into `P` (the event arrives with
     /// [`decode_failure`](PersistentOutboxEvent::decode_failure) set and no
-    /// payload). The runner consults this *instead of*
+    /// payload). The runner invokes this *instead of*
     /// [`handle_persistent`](Self::handle_persistent) — an undecodable event
     /// never reaches the normal handling path.
     ///
-    /// Defaults to [`Fail`](UndecodableAction::Fail): the job lands its
-    /// pending batch, parks its checkpoint before the event and errors — a
-    /// payload the consumer cannot decode is a runtime bug (schema drift, a
-    /// producer ahead of this consumer, foreign rows in the table) that must
-    /// surface loudly, not silently pass by. Because the event is re-read
-    /// from the database on every job retry, deploying a consumer that
-    /// understands the payload resumes the pipeline automatically, in order,
-    /// with nothing skipped.
+    /// The default fails with [`UndecodableEventError`]: a payload the
+    /// consumer cannot decode is a runtime bug (schema drift, a producer
+    /// ahead of this consumer, foreign rows in the table) that must surface
+    /// loudly, not silently pass by. On any `Err` the runner lands the
+    /// pending batch, parks the checkpoint at the sequence *before* the
+    /// event and fails the job — every retry re-reads the event from the
+    /// database, so deploying a consumer that understands the payload
+    /// resumes the pipeline automatically, in order, with nothing skipped.
     ///
-    /// Override to return [`Ack`](UndecodableAction::Ack) only when this
-    /// handler genuinely wants to drop payloads it cannot decode — an
-    /// explicit, auditable decision (consider recording
-    /// `event.decode_failure` somewhere first).
-    fn on_undecodable(
+    /// Override and return `Ok(())` only when this handler genuinely wants
+    /// to move past payloads it cannot decode — an explicit, auditable
+    /// decision (consider recording `event.decode_failure` somewhere
+    /// durable first). The checkpoint then advances over the event exactly
+    /// as for a [`skip`](EventCtx::skip). No transaction is opened on this
+    /// path; like [`handle_ephemeral`](Self::handle_ephemeral), any work
+    /// done here must tolerate replay.
+    fn handle_undecodable(
         &self,
         event: &PersistentOutboxEvent<P>,
-    ) -> impl std::future::Future<Output = UndecodableAction> + Send {
-        let _ = event;
-        async { UndecodableAction::Fail }
+    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
+        let error = UndecodableEventError {
+            id: event.id,
+            sequence: event.sequence,
+            error: event
+                .decode_failure
+                .as_ref()
+                .map(|failure| failure.error.clone())
+                .unwrap_or_default(),
+        };
+        async move { Err(error.into()) }
     }
 
     /// Apply everything collected since the last flush. Called at most once
@@ -541,17 +534,19 @@ where
             };
 
             // An undecodable payload never reaches the normal handling path:
-            // the handler's on_undecodable policy decides between failing the
-            // job — pending batch landed, checkpoint parked at the sequence
+            // the handler's handle_undecodable decides its fate. `Ok`
+            // acknowledges the event (the checkpoint advances over it like a
+            // skip); any `Err` — the default — fails the job with the
+            // pending batch landed and the checkpoint parked at the sequence
             // *before* the event, so every retry re-reads it and nothing is
-            // ever skipped (the default) — and explicitly acknowledging it.
-            if let Some(failure) = &event.decode_failure {
-                match self.handler.on_undecodable(&event).await {
-                    UndecodableAction::Ack => {
+            // ever skipped.
+            if event.decode_failure.is_some() {
+                match self.handler.handle_undecodable(&event).await {
+                    Ok(()) => {
                         state.sequence = event.sequence;
                         continue;
                     }
-                    UndecodableAction::Fail => {
+                    Err(error) => {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
@@ -566,11 +561,7 @@ where
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
-                        return Err(Box::new(UndecodableEventError {
-                            id: event.id,
-                            sequence: event.sequence,
-                            error: failure.error.clone(),
-                        }));
+                        return Err(error as Box<dyn std::error::Error>);
                     }
                 }
             }
