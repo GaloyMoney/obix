@@ -103,22 +103,27 @@ where
     /// [`UndecodableEventError`] carries the event's identity and the raw
     /// payload + serde error (`error.failure`).
     ///
+    /// The runner lands the pending batch *before* invoking this — like
+    /// [`handle_ephemeral`](Self::handle_ephemeral), nothing is pending
+    /// while it runs and no batch transaction spans the await, and work
+    /// completed up to the event is durable regardless of the outcome.
+    ///
     /// The default fails with the error as-is: a payload the consumer
     /// cannot decode is a runtime bug (schema drift, a producer ahead of
     /// this consumer, foreign rows in the table) that must surface loudly,
-    /// not silently pass by. On any `Err` the runner lands the pending
-    /// batch, parks the checkpoint at the sequence *before* the event and
-    /// fails the job — every retry re-reads the event from the database, so
-    /// deploying a consumer that understands the payload resumes the
-    /// pipeline automatically, in order, with nothing skipped.
+    /// not silently pass by. On `Err` the job fails with its checkpoint
+    /// parked at the sequence *before* the event — every retry re-reads the
+    /// event from the database, so deploying a consumer that understands
+    /// the payload resumes the pipeline automatically, in order, with
+    /// nothing skipped.
     ///
     /// Override and return `Ok(())` only when this handler genuinely wants
     /// to move past payloads it cannot decode — an explicit, auditable
     /// decision (consider recording `error.failure` somewhere durable
     /// first). The checkpoint then advances over the event exactly as for a
-    /// [`skip`](EventCtx::skip). No transaction is opened on this path;
-    /// like [`handle_ephemeral`](Self::handle_ephemeral), any work done
-    /// here must tolerate replay.
+    /// [`skip`](EventCtx::skip). Any work done here must tolerate replay
+    /// (the event is redelivered if the acknowledgement's checkpoint was
+    /// not yet persisted at a crash).
     fn handle_undecodable(
         &self,
         error: &UndecodableEventError,
@@ -510,36 +515,41 @@ where
 
             // An undecodable payload arrives as the stream's `Err` arm and
             // never reaches handle_persistent: handle_undecodable decides its
-            // fate. `Ok` acknowledges the event (the checkpoint advances over
-            // it like a skip); any `Err` — the default — fails the job with
-            // the pending batch landed and the checkpoint parked at the
-            // sequence *before* the event, so every retry re-reads it and
-            // nothing is ever skipped.
+            // fate. The pending batch lands FIRST — completed work and its
+            // checkpoint (at the sequence *before* this event) are durable
+            // regardless of the outcome, and no batch transaction spans the
+            // foreign handle_undecodable await (the same fence as
+            // consume_isolated's entry). Then `Ok` acknowledges the event
+            // (the checkpoint advances over it like a skip); any `Err` — the
+            // default — fails the job with the checkpoint parked before the
+            // event, so every retry re-reads it and nothing is ever skipped.
             let event = match item {
                 Ok(event) => event,
-                Err(undecodable) => match self.handler.handle_undecodable(&undecodable).await {
-                    Ok(()) => {
-                        state.sequence = undecodable.sequence;
-                        continue;
-                    }
-                    Err(error) => {
-                        let mut parts = CtxParts {
-                            op_slot: &mut op_slot,
-                            current_job: &mut current_job,
-                            state: &state,
-                            tracker: &mut tracker,
-                        };
-                        flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
-                        if tracker.persisted_seq < state.sequence {
-                            persist_checkpoint(&mut current_job, &state)
-                                .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                Err(undecodable) => {
+                    let mut parts = CtxParts {
+                        op_slot: &mut op_slot,
+                        current_job: &mut current_job,
+                        state: &state,
+                        tracker: &mut tracker,
+                    };
+                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
+                        .await
+                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                    match self.handler.handle_undecodable(&undecodable).await {
+                        Ok(()) => {
+                            state.sequence = undecodable.sequence;
+                            continue;
                         }
-                        return Err(error as Box<dyn std::error::Error>);
+                        Err(error) => {
+                            if tracker.persisted_seq < state.sequence {
+                                persist_checkpoint(&mut current_job, &state)
+                                    .await
+                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            }
+                            return Err(error as Box<dyn std::error::Error>);
+                        }
                     }
-                },
+                }
             };
 
             let ctx = EventCtx {
