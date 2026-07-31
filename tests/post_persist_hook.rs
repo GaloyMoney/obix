@@ -567,7 +567,7 @@ async fn reposted_events_reach_destination_listener() -> anyhow::Result<()> {
 
     let deadline = std::time::Duration::from_secs(5);
     let received = tokio::time::timeout(deadline, async {
-        while let Some(event) = listener.next().await {
+        while let Some(Ok(event)) = listener.next().await {
             if event.payload == Some(DestEvent::Mapped(9)) {
                 return true;
             }

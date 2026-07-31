@@ -66,8 +66,8 @@ async fn publish_foreign_poison(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 }
 
 /// Overrides `handle_undecodable` to explicitly acknowledge undecodable
-/// events (returning `Ok` instead of the default error), recording their
-/// sequences.
+/// events (returning `Ok` instead of failing with the error), recording
+/// their sequences.
 struct AckingObserver {
     received: Arc<Mutex<Vec<u64>>>,
     acked: Arc<Mutex<Vec<u64>>>,
@@ -89,9 +89,9 @@ impl OutboxEventHandler<TestEvent> for AckingObserver {
 
     async fn handle_undecodable(
         &self,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        error: &obix::UndecodableEventError,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.acked.lock().await.push(u64::from(event.sequence));
+        self.acked.lock().await.push(u64::from(error.sequence));
         Ok(())
     }
 }

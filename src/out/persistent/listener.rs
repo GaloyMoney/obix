@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
-use crate::out::event::PersistentOutboxEvent;
+use crate::out::event::{PersistentOutboxEvent, UndecodableEventError};
 use crate::sequence::EventSequence;
 
 pub struct PersistentOutboxListener<P>
@@ -66,7 +66,11 @@ impl<P> Stream for PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = Arc<PersistentOutboxEvent<P>>;
+    /// An undecodable event is yielded as the `Err` arm, in its sequence
+    /// position — the delivery of that event in degraded form. The stream
+    /// continues past it; whether the *consumer* moves past it is the
+    /// consumer's explicit decision (`?` fails loudly).
+    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -119,7 +123,10 @@ where
             }
             if seq == this.last_returned_sequence.next() {
                 this.last_returned_sequence = seq;
-                return Poll::Ready(Some(event));
+                return Poll::Ready(Some(match UndecodableEventError::try_from_event(&event) {
+                    Some(error) => Err(error),
+                    None => Ok(event),
+                }));
             }
             this.local_cache.insert(seq, event);
             break;

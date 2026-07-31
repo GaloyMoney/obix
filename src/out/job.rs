@@ -9,7 +9,7 @@ use job::{
 
 use super::ctx::*;
 use super::{EphemeralOutboxListener, Outbox, event::*};
-use crate::{sequence::EventSequence, tables::MailboxTables};
+use crate::tables::MailboxTables;
 
 /// Which delivery streams an event-handler job subscribes to — see
 /// [`OutboxEventHandler::SUBSCRIPTION`].
@@ -26,23 +26,6 @@ pub enum EventSubscription {
     All,
     PersistentOnly,
     EphemeralOnly,
-}
-
-/// The error the default
-/// [`handle_undecodable`](OutboxEventHandler::handle_undecodable) fails
-/// with: a persistent event's stored payload could not be decoded into the
-/// handler's event type. Propagates as the handler job's error; the job's
-/// checkpoint is parked at the sequence *before* the event, so every retry
-/// re-reads it and nothing is ever skipped.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "undecodable persistent outbox event {id} at sequence {sequence} (checkpoint parked before it): {error}"
-)]
-pub struct UndecodableEventError {
-    pub id: OutboxEventId,
-    pub sequence: EventSequence,
-    /// The serde error message.
-    pub error: String,
 }
 
 /// Handles the events of one outbox listener job.
@@ -114,42 +97,34 @@ where
     }
 
     /// Handle a persistent event whose stored payload could not be decoded
-    /// into `P` (the event arrives with
-    /// [`decode_failure`](PersistentOutboxEvent::decode_failure) set and no
-    /// payload). The runner invokes this *instead of*
-    /// [`handle_persistent`](Self::handle_persistent) — an undecodable event
-    /// never reaches the normal handling path.
+    /// into `P` — delivered as the persistent stream's `Err` arm and never
+    /// as an ordinary event, so it cannot reach
+    /// [`handle_persistent`](Self::handle_persistent). The
+    /// [`UndecodableEventError`] carries the event's identity and the raw
+    /// payload + serde error (`error.failure`).
     ///
-    /// The default fails with [`UndecodableEventError`]: a payload the
-    /// consumer cannot decode is a runtime bug (schema drift, a producer
-    /// ahead of this consumer, foreign rows in the table) that must surface
-    /// loudly, not silently pass by. On any `Err` the runner lands the
-    /// pending batch, parks the checkpoint at the sequence *before* the
-    /// event and fails the job — every retry re-reads the event from the
-    /// database, so deploying a consumer that understands the payload
-    /// resumes the pipeline automatically, in order, with nothing skipped.
+    /// The default fails with the error as-is: a payload the consumer
+    /// cannot decode is a runtime bug (schema drift, a producer ahead of
+    /// this consumer, foreign rows in the table) that must surface loudly,
+    /// not silently pass by. On any `Err` the runner lands the pending
+    /// batch, parks the checkpoint at the sequence *before* the event and
+    /// fails the job — every retry re-reads the event from the database, so
+    /// deploying a consumer that understands the payload resumes the
+    /// pipeline automatically, in order, with nothing skipped.
     ///
     /// Override and return `Ok(())` only when this handler genuinely wants
     /// to move past payloads it cannot decode — an explicit, auditable
-    /// decision (consider recording `event.decode_failure` somewhere
-    /// durable first). The checkpoint then advances over the event exactly
-    /// as for a [`skip`](EventCtx::skip). No transaction is opened on this
-    /// path; like [`handle_ephemeral`](Self::handle_ephemeral), any work
-    /// done here must tolerate replay.
+    /// decision (consider recording `error.failure` somewhere durable
+    /// first). The checkpoint then advances over the event exactly as for a
+    /// [`skip`](EventCtx::skip). No transaction is opened on this path;
+    /// like [`handle_ephemeral`](Self::handle_ephemeral), any work done
+    /// here must tolerate replay.
     fn handle_undecodable(
         &self,
-        event: &PersistentOutboxEvent<P>,
+        error: &UndecodableEventError,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
-        let error = UndecodableEventError {
-            id: event.id,
-            sequence: event.sequence,
-            error: event
-                .decode_failure
-                .as_ref()
-                .map(|failure| failure.error.clone())
-                .unwrap_or_default(),
-        };
+        let error = error.clone();
         async move { Err(error.into()) }
     }
 
@@ -214,7 +189,7 @@ enum NextDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    Persistent(Option<Arc<PersistentOutboxEvent<P>>>),
+    Persistent(Option<Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>>),
     Ephemeral(Arc<EphemeralOutboxEvent<P>>),
 }
 
@@ -442,13 +417,13 @@ where
         };
 
         loop {
-            let event = if op_slot.is_some() || tracker.collected > 0 {
+            let item = if op_slot.is_some() || tracker.collected > 0 {
                 // A batch is pending (an open op, collected items, or both):
                 // only take persistent events that are already buffered —
                 // the batch is never held open waiting on the network. A
                 // pending stream is itself the flush trigger.
                 match persistent.next().now_or_never() {
-                    Some(Some(event)) => event,
+                    Some(Some(item)) => item,
                     Some(None) => {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
@@ -521,7 +496,7 @@ where
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                         continue;
                     }
-                    NextDelivery::Persistent(Some(event)) => event,
+                    NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
                         if tracker.persisted_seq < state.sequence {
                             persist_checkpoint(&mut current_job, &state)
@@ -533,17 +508,18 @@ where
                 }
             };
 
-            // An undecodable payload never reaches the normal handling path:
-            // the handler's handle_undecodable decides its fate. `Ok`
-            // acknowledges the event (the checkpoint advances over it like a
-            // skip); any `Err` — the default — fails the job with the
-            // pending batch landed and the checkpoint parked at the sequence
-            // *before* the event, so every retry re-reads it and nothing is
-            // ever skipped.
-            if event.decode_failure.is_some() {
-                match self.handler.handle_undecodable(&event).await {
+            // An undecodable payload arrives as the stream's `Err` arm and
+            // never reaches handle_persistent: handle_undecodable decides its
+            // fate. `Ok` acknowledges the event (the checkpoint advances over
+            // it like a skip); any `Err` — the default — fails the job with
+            // the pending batch landed and the checkpoint parked at the
+            // sequence *before* the event, so every retry re-reads it and
+            // nothing is ever skipped.
+            let event = match item {
+                Ok(event) => event,
+                Err(undecodable) => match self.handler.handle_undecodable(&undecodable).await {
                     Ok(()) => {
-                        state.sequence = event.sequence;
+                        state.sequence = undecodable.sequence;
                         continue;
                     }
                     Err(error) => {
@@ -563,8 +539,8 @@ where
                         }
                         return Err(error as Box<dyn std::error::Error>);
                     }
-                }
-            }
+                },
+            };
 
             let ctx = EventCtx {
                 parts: CtxParts {

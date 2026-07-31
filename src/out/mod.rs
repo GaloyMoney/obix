@@ -16,9 +16,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
-pub use self::job::{
-    EventSubscription, OutboxEventHandler, OutboxEventJobConfig, UndecodableEventError,
-};
+pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
