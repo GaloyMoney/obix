@@ -43,7 +43,7 @@ where
     }
 
     fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
-        let sequence = crate::out::event::delivery_sequence(&delivery);
+        let sequence = delivery.sequence();
         self.latest_known = self.latest_known.max(sequence);
         if sequence > self.last_returned_sequence
             && self.local_cache.insert(sequence, delivery).is_none()
@@ -124,10 +124,7 @@ where
             }
             if seq == this.last_returned_sequence.next() {
                 this.last_returned_sequence = seq;
-                return Poll::Ready(Some(match event {
-                    Ok(event) => Ok(event),
-                    Err(error) => Err((*error).clone()),
-                }));
+                return Poll::Ready(Some(event.into_item()));
             }
             this.local_cache.insert(seq, event);
             break;

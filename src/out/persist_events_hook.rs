@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
@@ -82,7 +82,7 @@ where
 
     fn post_commit(self) {
         for event in self.post_commit_events {
-            let _ = self.sender.send(Ok(Arc::new(event)));
+            let _ = self.sender.send(PersistentDelivery::from(Ok(event)));
         }
     }
 

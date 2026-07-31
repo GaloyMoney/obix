@@ -161,32 +161,55 @@ pub struct UndecodableEventError {
 /// broadcast, backfill): an undecodable event rides it as the `Err` arm so
 /// it still occupies its sequence position — the contiguity machinery treats
 /// both arms alike. `Arc` on both arms keeps broadcast fan-out cheap; the
-/// listeners unwrap to the public owned [`UndecodableEventError`] at their
-/// yield boundary.
-pub(crate) type PersistentDelivery<P> =
-    Result<Arc<PersistentOutboxEvent<P>>, Arc<UndecodableEventError>>;
+/// listeners unwrap to the public owned [`UndecodableEventError`] via
+/// [`into_item`](Self::into_item) at their yield boundary.
+pub(crate) struct PersistentDelivery<P>(
+    Result<Arc<PersistentOutboxEvent<P>>, Arc<UndecodableEventError>>,
+)
+where
+    P: Serialize + DeserializeOwned + Send;
 
-/// The sequence a delivery occupies, whichever arm it is.
-pub(crate) fn delivery_sequence<P>(delivery: &PersistentDelivery<P>) -> EventSequence
+impl<P> PersistentDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    match delivery {
-        Ok(event) => event.sequence,
-        Err(error) => error.sequence,
+    /// The sequence this delivery occupies, whichever arm it is.
+    pub(crate) fn sequence(&self) -> EventSequence {
+        match &self.0 {
+            Ok(event) => event.sequence,
+            Err(error) => error.sequence,
+        }
+    }
+
+    /// Unwrap into the public listener stream item, cloning the `Err` arm
+    /// out of its transport `Arc`.
+    pub(crate) fn into_item(self) -> Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError> {
+        match self.0 {
+            Ok(event) => Ok(event),
+            Err(error) => Err((*error).clone()),
+        }
     }
 }
 
 /// Wrap a freshly loaded item into the internal delivery transport.
-pub(crate) fn into_delivery<P>(
-    item: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
-) -> PersistentDelivery<P>
+impl<P> From<Result<PersistentOutboxEvent<P>, UndecodableEventError>> for PersistentDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    match item {
-        Ok(event) => Ok(Arc::new(event)),
-        Err(error) => Err(Arc::new(error)),
+    fn from(item: Result<PersistentOutboxEvent<P>, UndecodableEventError>) -> Self {
+        Self(match item {
+            Ok(event) => Ok(Arc::new(event)),
+            Err(error) => Err(Arc::new(error)),
+        })
+    }
+}
+
+impl<P> Clone for PersistentDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 

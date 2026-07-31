@@ -195,7 +195,7 @@ where
     ) {
         use std::ops::Bound;
 
-        let sequence = delivery_sequence(&event);
+        let sequence = event.sequence();
         let highest_known = highest_known_sequence.load(Ordering::Relaxed);
 
         // Skip events that are too old to be useful, but never let the
@@ -243,7 +243,7 @@ where
     ) {
         if let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await {
             for item in events {
-                let _ = cache_fill_sender.send(into_delivery(item));
+                let _ = cache_fill_sender.send(PersistentDelivery::from(item));
             }
         }
     }
@@ -271,8 +271,8 @@ where
                 Ok(events) if events.is_empty() => break,
                 Ok(events) => {
                     for item in events {
-                        let delivery = into_delivery(item);
-                        let seq = delivery_sequence(&delivery);
+                        let delivery = PersistentDelivery::from(item);
+                        let seq = delivery.sequence();
                         let _ = cache_fill_sender.send(delivery.clone());
                         if sender.send(delivery).await.is_err() {
                             return;
@@ -308,7 +308,7 @@ where
     ) {
         if let Ok(events) = Tables::load_events_in_range::<P>(&pool, after, up_to).await {
             for item in events {
-                let _ = cache_fill_sender.send(into_delivery(item));
+                let _ = cache_fill_sender.send(PersistentDelivery::from(item));
             }
         }
     }
