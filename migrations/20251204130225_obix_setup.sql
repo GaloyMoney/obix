@@ -11,7 +11,6 @@ CREATE TABLE persistent_outbox_events (
   payload JSONB,
   tracing_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
 
