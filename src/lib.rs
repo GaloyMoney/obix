@@ -19,7 +19,10 @@ mod tables;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-pub use config::{DEFAULT_GAP_FILL_GRACE, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig};
+pub use config::{
+    DEFAULT_GAP_FILL_GRACE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
+    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
+};
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,
@@ -27,8 +30,8 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
-    IsolatedOp, OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig, PostPersistHook,
-    UndecodableEventError,
+    IsolatedOp, OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig,
+    PartitionMaintainerConfig, PostPersistHook, UndecodableEventError,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
