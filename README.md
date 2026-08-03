@@ -126,7 +126,7 @@ You can copy the default migration and add your prefix to all table names, seque
 
 ### Partition maintenance
 
-`persistent_outbox_events` is range-partitioned by `sequence`. The migration ships an initial partition covering the first 10 million sequences plus an always-present `DEFAULT` partition, so an insert can **never** fail to route. To keep explicit partitions created ahead of the sequence head (and `DEFAULT` empty), register the partition maintainer once at startup:
+`persistent_outbox_events` is range-partitioned by `sequence`. The migration ships an initial partition covering the first 2 million sequences (~1.5 GB) plus an always-present `DEFAULT` partition, so an insert can **never** fail to route. To keep explicit partitions created ahead of the sequence head (and `DEFAULT` empty), register the partition maintainer once at startup:
 
 ```rust
 use obix::PartitionMaintainerConfig;

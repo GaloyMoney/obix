@@ -28,6 +28,7 @@ pub(crate) use job::{PartitionMaintainerJobData, PartitionMaintainerJobInitializ
 
 use std::marker::PhantomData;
 
+use crate::config::DEFAULT_PARTITION_WIDTH;
 use crate::tables::MailboxTables;
 
 /// Per-partition storage parameters, applied on every partition
@@ -43,11 +44,12 @@ const PARTITION_STORAGE_PARAMS: &str = "autovacuum_vacuum_insert_scale_factor = 
      fillfactor = 100";
 
 /// Maintains the RANGE partitions of `persistent_outbox_events`: caches the
-/// pool and sizing config (`width` / `premake`) so the registration premake and
-/// the maintainer job share one configured handle. Cheap to clone.
+/// pool and `premake` margin so the registration premake and the maintainer job
+/// share one configured handle. Cheap to clone. Partition *width* is the fixed
+/// [`DEFAULT_PARTITION_WIDTH`] constant (coupled to the migration's `p0`), not a
+/// per-instance parameter.
 pub struct Partitions<Tables = crate::tables::DefaultMailboxTables> {
     pool: sqlx::PgPool,
-    width: u64,
     premake: u64,
     _phantom: PhantomData<Tables>,
 }
@@ -56,7 +58,6 @@ impl<Tables> Clone for Partitions<Tables> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
-            width: self.width,
             premake: self.premake,
             _phantom: PhantomData,
         }
@@ -67,13 +68,10 @@ impl<Tables> Partitions<Tables>
 where
     Tables: MailboxTables,
 {
-    /// `width` is the span (in `sequence` units) of each partition; `premake`
-    /// is how many partitions ahead of the head to keep created. `width` is
-    /// clamped to at least 1.
-    pub fn new(pool: &sqlx::PgPool, width: u64, premake: u64) -> Self {
+    /// `premake` is how many partitions ahead of the head to keep created.
+    pub fn new(pool: &sqlx::PgPool, premake: u64) -> Self {
         Self {
             pool: pool.clone(),
-            width: width.max(1),
             premake,
             _phantom: PhantomData,
         }
@@ -100,10 +98,10 @@ where
     pub async fn ensure(&self) -> Result<(), sqlx::Error> {
         let table = Tables::persistent_outbox_events_table();
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
-        let first = head / self.width;
+        let first = head / DEFAULT_PARTITION_WIDTH;
         for k in first..=first + self.premake {
-            let lo = k * self.width;
-            let hi = (k + 1) * self.width;
+            let lo = k * DEFAULT_PARTITION_WIDTH;
+            let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
                  FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",
@@ -149,11 +147,11 @@ where
         ) else {
             return Ok(());
         };
-        let min_k = (min_seq as u64) / self.width;
+        let min_k = (min_seq as u64) / DEFAULT_PARTITION_WIDTH;
         // Cover the stranded rows AND stay `premake` partitions ahead of the
         // head (the top of the strand is the head), so the maintainer's next
         // tick has nothing to do and steady state resumes immediately.
-        let max_k = (max_seq as u64) / self.width + self.premake;
+        let max_k = (max_seq as u64) / DEFAULT_PARTITION_WIDTH + self.premake;
 
         // One transaction: detach DEFAULT (so the explicit CREATEs have no
         // default to validate against and no overlap), create the covering
@@ -173,8 +171,8 @@ where
         .execute(&mut *tx)
         .await?;
         for k in min_k..=max_k {
-            let lo = k * self.width;
-            let hi = (k + 1) * self.width;
+            let lo = k * DEFAULT_PARTITION_WIDTH;
+            let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
             sqlx::query(&format!(
                 "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
                  FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",

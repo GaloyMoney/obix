@@ -1,57 +1,33 @@
--- Persistent outbox events — RANGE-partitioned by `sequence`.
+-- Persistent outbox events: a RANGE-partitioned table.
 --
--- Stage 1 of the partitioning plan: partition-by-sequence only, nothing
--- dropped, so the gapless-sequence + replay-from-zero contract is fully
--- intact. Total on-disk size is unchanged; the wins are per-operation cost,
--- vacuum trajectory and index locality.
---
---   * Partition key is `sequence` specifically. `fill_gaps_query` and the
---     persist path arbitrate on `ON CONFLICT (sequence)`, and a partitioned
---     parent's PK/unique constraint MUST include the partition key. Making
---     `sequence` the PRIMARY KEY turns the per-partition unique index into
---     the global `ON CONFLICT` arbiter for free, and simultaneously removes
---     the random-UUID PK index (the ~8x WAL-amplification win).
---   * `id` is demoted to a plain, unindexed column: it is only ever
---     RETURNING-ed, never a query predicate, but is retained for the public
---     `OutboxEventId` on `PersistentOutboxEvent`.
---   * `BIGSERIAL` preserves the sequence object name
---     `persistent_outbox_events_sequence_seq`, which `highest_known_query`
---     reads by name — do NOT rename it. The single shared sequence is what
---     guarantees global monotonic ordering across partitions.
---   * The DEFAULT partition is a structural backstop so an INSERT can never
---     fail to route (SQLSTATE 23514) into a caller's business commit. The
---     partition-maintainer job (see `src/out/partition`) keeps an explicit
---     partition covering [head, head + margin] so DEFAULT stays empty.
+-- Partitioned by `sequence` with a DEFAULT catch-all partition, so an insert
+-- can never fail to route. The primary key is `sequence` (a partitioned
+-- table's PK must include the partition key); `id` is a plain column.
+-- Partitions are pre-created ahead of the head by the maintainer job in
+-- `src/out/partition`.
 CREATE TABLE persistent_outbox_events (
   id UUID NOT NULL DEFAULT gen_random_uuid(),
   sequence BIGSERIAL,
-  payload JSONB COMPRESSION lz4,
-  tracing_context JSONB COMPRESSION lz4,
+  payload JSONB,
+  tracing_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
 
--- Initial explicit partition, deliberately wide so ordinary test volumes
--- never need the maintainer running. Per-partition storage params are set on
--- the CREATE (they are NOT inherited from the parent on PARTITION OF):
--- insert-driven autovacuum at a fixed threshold keeps each partition vacuumed
--- at a steady cadence, and autovacuum_freeze_min_age = 0 freezes on the first
--- insert-driven vacuum, defusing anti-wraparound on an append-only table.
--- (The per-table reloption is `autovacuum_freeze_min_age`; the bare
--- `vacuum_freeze_min_age` is a GUC, not a storage parameter, and Postgres
--- rejects it in WITH (...).)
+-- Initial partition. Its range MUST equal DEFAULT_PARTITION_WIDTH (a fixed
+-- constant) so maintainer-created partitions tile onto it without overlapping.
+-- Storage params are set per-partition (not inherited via PARTITION OF).
 CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
-  FOR VALUES FROM (0) TO (10000000)
+  FOR VALUES FROM (0) TO (2000000)
   WITH (autovacuum_vacuum_insert_scale_factor = 0.0,
         autovacuum_vacuum_insert_threshold = 50000,
         autovacuum_freeze_min_age = 0,
         fillfactor = 100);
 
--- Always-empty backstop: guarantees INSERT routing never fails even if the
--- maintainer falls behind. Rows landing here are still read normally; a
--- non-empty DEFAULT is a layout repair (see `recover_default_partition`),
--- not a correctness failure.
+-- Always-empty backstop so INSERT routing never fails if the maintainer falls
+-- behind. Rows landing here are still read normally; draining them is a layout
+-- repair (`Partitions::recover_default`), not a correctness failure.
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 

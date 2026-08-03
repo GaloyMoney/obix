@@ -37,7 +37,6 @@ where
     pool: sqlx::PgPool,
     event_buffer_size: usize,
     persist_events_batch_size: usize,
-    partition_width: u64,
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
@@ -72,7 +71,6 @@ where
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
             persist_events_batch_size: self.persist_events_batch_size,
-            partition_width: self.partition_width,
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
@@ -112,7 +110,6 @@ where
             pool,
             event_buffer_size: config.event_buffer_size,
             persist_events_batch_size: config.persist_events_batch_size,
-            partition_width: config.partition_width,
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache: Arc::new(persistent_cache),
@@ -362,8 +359,7 @@ where
         jobs: &mut ::job::Jobs,
         config: PartitionMaintainerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let partitions =
-            Partitions::<Tables>::new(&self.pool, self.partition_width, self.partition_premake);
+        let partitions = Partitions::<Tables>::new(&self.pool, self.partition_premake);
 
         // The synchronous write path must never wait on the async maintainer,
         // so premake covering the head BEFORE registering the job.
