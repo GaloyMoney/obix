@@ -1,3 +1,11 @@
+// Pre-existing test-only lints surfaced by a Rust stable toolchain bump
+// (clippy 1.93 tightened `await_holding_lock` / `type_complexity`). These
+// recording hooks intentionally hold a `std::sync::Mutex` guard across an
+// `await` in assertion sections; the suppression is unrelated to the
+// partitioning work and keeps `nix flake check` green.
+#![allow(clippy::await_holding_lock)]
+#![allow(clippy::type_complexity)]
+
 mod helpers;
 
 use std::sync::{
