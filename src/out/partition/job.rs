@@ -11,13 +11,12 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
 
 use job::{
     CurrentJob, Job, JobCompletion, JobInitializer, JobRunner, JobSpawner, JobType, RetrySettings,
 };
 
-use super::ensure_partitions;
+use super::Partitions;
 use crate::tables::MailboxTables;
 
 /// Registration surface for the partition maintainer, mirroring
@@ -53,13 +52,10 @@ pub(crate) struct PartitionMaintainerJobInitializer<Tables>
 where
     Tables: MailboxTables,
 {
-    pool: sqlx::PgPool,
+    partitions: Partitions<Tables>,
     job_type: JobType,
     retry_settings: RetrySettings,
-    width: u64,
-    premake: u64,
     interval: std::time::Duration,
-    _phantom: PhantomData<Tables>,
 }
 
 impl<Tables> PartitionMaintainerJobInitializer<Tables>
@@ -67,20 +63,15 @@ where
     Tables: MailboxTables,
 {
     pub fn new(
-        pool: &sqlx::PgPool,
+        partitions: Partitions<Tables>,
         config: &PartitionMaintainerConfig,
-        width: u64,
-        premake: u64,
         interval: std::time::Duration,
     ) -> Self {
         Self {
-            pool: pool.clone(),
+            partitions,
             job_type: config.job_type.clone(),
             retry_settings: config.retry_settings.clone(),
-            width,
-            premake,
             interval,
-            _phantom: PhantomData,
         }
     }
 }
@@ -105,11 +96,8 @@ where
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(PartitionMaintainerJobRunner::<Tables> {
-            pool: self.pool.clone(),
-            width: self.width,
-            premake: self.premake,
+            partitions: self.partitions.clone(),
             interval: self.interval,
-            _phantom: PhantomData,
         }))
     }
 }
@@ -118,11 +106,8 @@ struct PartitionMaintainerJobRunner<Tables>
 where
     Tables: MailboxTables,
 {
-    pool: sqlx::PgPool,
-    width: u64,
-    premake: u64,
+    partitions: Partitions<Tables>,
     interval: std::time::Duration,
-    _phantom: PhantomData<Tables>,
 }
 
 #[async_trait]
@@ -137,10 +122,11 @@ where
         // Re-run on an internal timer rather than round-tripping through the job
         // scheduler each tick: the job stays resident and only falls out of the
         // loop on shutdown (reschedule to resume after restart) or on an
-        // `ensure_partitions` error (propagated below — the scheduler then
-        // retries per `retry_settings`, which is the alert).
+        // `ensure` error (propagated below — the scheduler then retries per
+        // `retry_settings`, which is the alert).
         loop {
-            ensure_partitions::<Tables>(&self.pool, self.width, self.premake)
+            self.partitions
+                .ensure()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 

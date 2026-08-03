@@ -31,7 +31,7 @@ pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
     IsolatedOp, OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig,
-    PartitionMaintainerConfig, PostPersistHook, UndecodableEventError,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, UndecodableEventError,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

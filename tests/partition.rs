@@ -103,7 +103,9 @@ async fn prepare_outbox(
     wipeout_outbox_tables(pool).await?;
     reset_partitions_to_baseline(pool).await?;
     if premake_p1 {
-        obix::out::ensure_partitions::<TestTables>(pool, WIDTH, PREMAKE).await?;
+        obix::out::Partitions::<TestTables>::new(pool, WIDTH, PREMAKE)
+            .ensure()
+            .await?;
     }
     set_sequence(pool, head).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(
@@ -341,7 +343,9 @@ async fn default_fill_then_recover() -> anyhow::Result<()> {
     assert_contiguous_replay(&pool).await?;
 
     // Recover.
-    obix::out::recover_default_partition::<TestTables>(&pool, WIDTH, PREMAKE).await?;
+    obix::out::Partitions::<TestTables>::new(&pool, WIDTH, PREMAKE)
+        .recover_default()
+        .await?;
 
     assert_eq!(default_row_count(&pool).await?, 0, "DEFAULT drained");
     assert!(

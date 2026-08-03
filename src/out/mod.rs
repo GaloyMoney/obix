@@ -24,7 +24,7 @@ use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
 pub use event::*;
 pub use op_cursor::{CursorError, OpCursor};
-pub use partition::{PartitionMaintainerConfig, ensure_partitions, recover_default_partition};
+pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
 pub use persistent::PersistentOutboxListener;
 pub use post_persist_hook::PostPersistHook;
@@ -362,20 +362,16 @@ where
         jobs: &mut ::job::Jobs,
         config: PartitionMaintainerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let partitions =
+            Partitions::<Tables>::new(&self.pool, self.partition_width, self.partition_premake);
+
         // The synchronous write path must never wait on the async maintainer,
         // so premake covering the head BEFORE registering the job.
-        partition::ensure_partitions::<Tables>(
-            &self.pool,
-            self.partition_width,
-            self.partition_premake,
-        )
-        .await?;
+        partitions.ensure().await?;
 
         let initializer = partition::PartitionMaintainerJobInitializer::<Tables>::new(
-            &self.pool,
+            partitions,
             &config,
-            self.partition_width,
-            self.partition_premake,
             self.partition_maintainer_interval,
         );
         let spawner = jobs.add_initializer(initializer);
