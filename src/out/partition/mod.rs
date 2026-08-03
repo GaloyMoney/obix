@@ -7,7 +7,7 @@
 //!   * the **`DEFAULT` partition** (shipped in the migration) means an INSERT
 //!     can never fail to route — worst case a row lands in `DEFAULT`, which is
 //!     still read normally; and
-//!   * this **maintainer job** keeps an explicit partition covering
+//!   * the **maintainer job** ([`job`]) keeps an explicit partition covering
 //!     `[head, head + premake * width]` so `DEFAULT` stays empty in steady
 //!     state.
 //!
@@ -16,24 +16,26 @@
 //! *shape* optimisation: falling behind degrades layout (rows in `DEFAULT`),
 //! never correctness. DDL is therefore kept entirely out of the commit path
 //! (it takes locks and would wreck commit latency).
+//!
+//! This module holds the DDL primitives ([`ensure_partitions`],
+//! [`recover_default_partition`]); the timer-driven job that drives them lives
+//! in [`job`].
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+mod job;
 
-use job::{
-    CurrentJob, Job, JobCompletion, JobInitializer, JobRunner, JobSpawner, JobType, RetrySettings,
-};
+pub use job::PartitionMaintainerConfig;
+pub(crate) use job::{PartitionMaintainerJobData, PartitionMaintainerJobInitializer};
 
 use crate::tables::MailboxTables;
 
-/// Per-partition storage parameters, applied on every partition the maintainer
-/// creates. These are **not** inherited from the parent on `PARTITION OF`, so
-/// they must be set on each `CREATE` — kept in lock-step with the `p0`
-/// partition shipped in the migration. A fixed insert *threshold* (not the
-/// default 0.2 scale factor) keeps each partition vacuumed at a steady cadence
-/// as it grows; `autovacuum_freeze_min_age = 0` freezes on the first
-/// insert-driven vacuum, defusing anti-wraparound on an append-only table.
+/// Per-partition storage parameters, applied on every partition
+/// [`ensure_partitions`] / [`recover_default_partition`] create. These are
+/// **not** inherited from the parent on `PARTITION OF`, so they must be set on
+/// each `CREATE` — kept in lock-step with the `p0` partition shipped in the
+/// migration. A fixed insert *threshold* (not the default 0.2 scale factor)
+/// keeps each partition vacuumed at a steady cadence as it grows;
+/// `autovacuum_freeze_min_age = 0` freezes on the first insert-driven vacuum,
+/// defusing anti-wraparound on an append-only table.
 const PARTITION_STORAGE_PARAMS: &str = "autovacuum_vacuum_insert_scale_factor = 0.0, \
      autovacuum_vacuum_insert_threshold = 50000, \
      autovacuum_freeze_min_age = 0, \
@@ -176,130 +178,4 @@ where
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// Registration surface for the partition maintainer, mirroring
-/// [`OutboxEventJobConfig`](crate::out::OutboxEventJobConfig): the job-scheduling
-/// details (type + retry policy). The width / premake / poll-interval come from
-/// the [`MailboxConfig`](crate::MailboxConfig) the outbox was initialised with.
-#[derive(Clone)]
-pub struct PartitionMaintainerConfig {
-    pub job_type: JobType,
-    pub retry_settings: RetrySettings,
-}
-
-impl PartitionMaintainerConfig {
-    pub fn new(job_type: JobType) -> Self {
-        Self {
-            job_type,
-            retry_settings: RetrySettings::repeat_indefinitely(),
-        }
-    }
-
-    pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
-        self.retry_settings = settings;
-        self
-    }
-}
-
-/// The maintainer holds no durable execution state: each tick is idempotent
-/// off the current sequence head, so nothing needs to survive a restart.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct PartitionMaintainerJobData {}
-
-pub(crate) struct PartitionMaintainerJobInitializer<Tables>
-where
-    Tables: MailboxTables,
-{
-    pool: sqlx::PgPool,
-    job_type: JobType,
-    retry_settings: RetrySettings,
-    width: u64,
-    premake: u64,
-    interval: std::time::Duration,
-    _phantom: PhantomData<Tables>,
-}
-
-impl<Tables> PartitionMaintainerJobInitializer<Tables>
-where
-    Tables: MailboxTables,
-{
-    pub fn new(
-        pool: &sqlx::PgPool,
-        config: &PartitionMaintainerConfig,
-        width: u64,
-        premake: u64,
-        interval: std::time::Duration,
-    ) -> Self {
-        Self {
-            pool: pool.clone(),
-            job_type: config.job_type.clone(),
-            retry_settings: config.retry_settings.clone(),
-            width,
-            premake,
-            interval,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<Tables> JobInitializer for PartitionMaintainerJobInitializer<Tables>
-where
-    Tables: MailboxTables,
-{
-    type Config = PartitionMaintainerJobData;
-
-    fn job_type(&self) -> JobType {
-        self.job_type.clone()
-    }
-
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        self.retry_settings.clone()
-    }
-
-    fn init(
-        &self,
-        _job: &Job,
-        _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(PartitionMaintainerJobRunner::<Tables> {
-            pool: self.pool.clone(),
-            width: self.width,
-            premake: self.premake,
-            interval: self.interval,
-            _phantom: PhantomData,
-        }))
-    }
-}
-
-struct PartitionMaintainerJobRunner<Tables>
-where
-    Tables: MailboxTables,
-{
-    pool: sqlx::PgPool,
-    width: u64,
-    premake: u64,
-    interval: std::time::Duration,
-    _phantom: PhantomData<Tables>,
-}
-
-#[async_trait]
-impl<Tables> JobRunner for PartitionMaintainerJobRunner<Tables>
-where
-    Tables: MailboxTables,
-{
-    async fn run(
-        &self,
-        mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
-        if current_job.is_shutdown_requested() {
-            return Ok(JobCompletion::RescheduleNow);
-        }
-
-        ensure_partitions::<Tables>(&self.pool, self.width, self.premake)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
-        Ok(JobCompletion::RescheduleIn(self.interval))
-    }
 }
