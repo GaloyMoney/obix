@@ -173,6 +173,64 @@ async fn gap_fill_across_partition_boundary() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// No maintainer registered: a gap that tips over the boundary is still filled,
+/// with the placeholder routed into the `DEFAULT` backstop. Confirms gap-fill
+/// "just works" across the p0/DEFAULT boundary without any explicit partition
+/// beyond p0.
+#[tokio::test]
+#[file_serial]
+async fn gap_fill_routes_placeholder_into_default() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    // No p1: sequences at/above the boundary land in DEFAULT.
+    let outbox = prepare_outbox(&pool, BOUNDARY - 2, false).await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // seq BOUNDARY-1, in p0
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("first event")?;
+    assert_eq!(first.sequence, EventSequence::from((BOUNDARY - 1) as u64));
+
+    // Burn BOUNDARY → a gap whose placeholder must route into DEFAULT.
+    sqlx::query("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .execute(&pool)
+        .await?;
+
+    // seq BOUNDARY+1, in DEFAULT
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    let gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("gap placeholder")?;
+    assert_eq!(gap.sequence, EventSequence::from(BOUNDARY as u64));
+    assert!(gap.payload.is_none(), "gap event has None payload");
+
+    let real = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("real event after gap")?;
+    assert_eq!(real.sequence, EventSequence::from((BOUNDARY + 1) as u64));
+    assert!(matches!(real.payload, Some(TestEvent::Ping(1))));
+
+    // The gap placeholder (BOUNDARY) and the real event (BOUNDARY+1) both
+    // landed in DEFAULT; the p0 row (BOUNDARY-1) did not.
+    assert_eq!(
+        default_row_count(&pool).await?,
+        2,
+        "placeholder + real event routed into DEFAULT"
+    );
+    Ok(())
+}
+
 /// §9.2 — a single publish batch whose sequences straddle two partitions
 /// persists (routing each row to its partition) and delivers in order.
 #[tokio::test]
