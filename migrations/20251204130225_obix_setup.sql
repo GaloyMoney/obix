@@ -1,6 +1,6 @@
 -- Persistent outbox events
 CREATE TABLE persistent_outbox_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id UUID PRIMARY KEY DEFAULT uuidv7(),
   sequence BIGSERIAL UNIQUE,
   payload JSONB,
   tracing_context JSONB,
@@ -49,7 +49,7 @@ EXCEPTION
 END $$;
 
 CREATE TABLE inbox_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id UUID PRIMARY KEY DEFAULT uuidv7(),
   idempotency_key VARCHAR UNIQUE,
   payload JSONB NOT NULL,
   status InboxEventStatus NOT NULL DEFAULT 'pending',
