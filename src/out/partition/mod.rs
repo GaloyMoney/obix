@@ -54,26 +54,6 @@ pub struct Partitions<Tables = crate::tables::DefaultMailboxTables> {
     _phantom: PhantomData<Tables>,
 }
 
-/// Serialize partition-creating sessions cluster-wide for the duration of
-/// `tx`: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` is **not**
-/// concurrency-safe — two sessions that both observe the partition missing can
-/// race, and the loser gets `DuplicateTable` / a catalog `unique_violation`.
-/// Registration runs [`Partitions::ensure`] synchronously on every instance at
-/// startup, so without this lock multi-instance deploys could fail
-/// registration on some nodes and leave no maintainer running. Keyed on the
-/// table name so different parents don't block each other; hash collisions
-/// only cause spurious (harmless) serialization.
-async fn partition_ddl_lock(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("obix:partition-ddl:{table}"))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 impl<Tables> Clone for Partitions<Tables> {
     fn clone(&self) -> Self {
         Self {
@@ -97,6 +77,28 @@ where
         }
     }
 
+    /// Serialize partition-creating sessions cluster-wide for the duration of
+    /// `tx`: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` is **not**
+    /// concurrency-safe — two sessions that both observe the partition missing
+    /// can race, and the loser gets `DuplicateTable` / a catalog
+    /// `unique_violation`. Registration runs [`ensure`](Self::ensure)
+    /// synchronously on every instance at startup, so without this lock
+    /// multi-instance deploys could fail registration on some nodes and leave no
+    /// maintainer running. Keyed on the table name so different parents don't
+    /// block each other; hash collisions only cause spurious (harmless)
+    /// serialization.
+    async fn ddl_lock(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), sqlx::Error> {
+        let table = Tables::persistent_outbox_events_table();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("obix:partition-ddl:{table}"))
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Pre-create the explicit partitions covering
     /// `[head, head + premake * width]`.
     ///
@@ -105,8 +107,8 @@ where
     /// registration (before serving traffic) and on every maintainer tick.
     /// Concurrent callers (multi-instance startup, a tick overlapping an
     /// operator repair) are serialized on a cluster-wide advisory lock
-    /// (`partition_ddl_lock`), because `IF NOT EXISTS` alone does not make
-    /// concurrent `PARTITION OF` creation safe.
+    /// ([`ddl_lock`](Self::ddl_lock)), because `IF NOT EXISTS` alone does not
+    /// make concurrent `PARTITION OF` creation safe.
     ///
     /// The partition covering index `k` spans `[k * width, (k + 1) * width)` and
     /// is named `{table}_p{k}`, tiling seamlessly onto the migration's
@@ -124,7 +126,7 @@ where
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
         let first = head / DEFAULT_PARTITION_WIDTH;
         let mut tx = self.pool.begin().await?;
-        partition_ddl_lock(&mut tx, table).await?;
+        self.ddl_lock(&mut tx).await?;
         for k in first..=first + self.premake {
             let lo = k * DEFAULT_PARTITION_WIDTH;
             let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
@@ -186,9 +188,9 @@ where
         // two-phase (detach, then move online) would leave the top-of-log rows
         // detached during the move and MAX(sequence) would regress. The
         // advisory lock serializes the CREATEs against concurrent `ensure`
-        // ticks (see `partition_ddl_lock`).
+        // ticks (see [`ddl_lock`](Self::ddl_lock)).
         let mut tx = self.pool.begin().await?;
-        partition_ddl_lock(&mut tx, table).await?;
+        self.ddl_lock(&mut tx).await?;
         sqlx::query(&format!(
             "ALTER TABLE {table} DETACH PARTITION {default_child}"
         ))
