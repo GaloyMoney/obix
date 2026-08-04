@@ -139,7 +139,7 @@ outbox
     .await?;
 ```
 
-Partition width, how many partitions to keep ahead, and the maintainer's poll interval come from `MailboxConfig` (`partition_width` / `partition_premake` / `partition_maintainer_interval`).
+How many partitions to keep ahead and the maintainer's poll interval come from `MailboxConfig` (`partition_premake` / `partition_maintainer_interval`). Partition width is deliberately **not** configurable: it is the fixed `DEFAULT_PARTITION_WIDTH` constant, coupled to the initial partition's range in the shipped migration.
 
 **Registration is optional and the outbox never breaks without it.** If you never register the maintainer, everything keeps working: once `sequence` passes the initial partition's upper bound, new rows land in the `DEFAULT` partition, which is still read, gap-filled, and replayed exactly like any other partition. You only forfeit the per-partition vacuum/freeze/cache-locality benefits (equivalent to the pre-partitioning single-table behaviour). A non-empty `DEFAULT` is a *layout* concern, not a correctness one — alert on it, and use [`Partitions::recover_default`](https://docs.rs/obix) to fold any stranded rows back into explicit partitions in a single transaction (never regressing `MAX(sequence)`).
 

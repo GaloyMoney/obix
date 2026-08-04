@@ -105,7 +105,7 @@ where
     /// registration (before serving traffic) and on every maintainer tick.
     /// Concurrent callers (multi-instance startup, a tick overlapping an
     /// operator repair) are serialized on a cluster-wide advisory lock
-    /// ([`partition_ddl_lock`]), because `IF NOT EXISTS` alone does not make
+    /// (`partition_ddl_lock`), because `IF NOT EXISTS` alone does not make
     /// concurrent `PARTITION OF` creation safe.
     ///
     /// The partition covering index `k` spans `[k * width, (k + 1) * width)` and
@@ -196,7 +196,7 @@ where
         // two-phase (detach, then move online) would leave the top-of-log rows
         // detached during the move and MAX(sequence) would regress. The
         // advisory lock serializes the CREATEs against concurrent `ensure`
-        // ticks (see [`partition_ddl_lock`]).
+        // ticks (see `partition_ddl_lock`).
         let mut tx = self.pool.begin().await?;
         partition_ddl_lock(&mut tx, table).await?;
         sqlx::query(&format!(

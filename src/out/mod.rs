@@ -347,13 +347,14 @@ where
     /// the maintainer will, over time, pile everything into `DEFAULT` — still
     /// correct (reads see those rows), but it forfeits the per-partition
     /// vacuum/locality wins and eventually needs a
-    /// [`recover_default_partition`] repair. **Register this at startup.**
+    /// [`Partitions::recover_default`] repair. **Register this at startup.**
     ///
     /// Runs one premake pass **synchronously before returning** (so traffic
     /// that starts immediately still routes into an explicit partition), then
-    /// spawns the recurring job. Partition width / premake margin / poll
-    /// interval come from the [`MailboxConfig`](crate::MailboxConfig) this
-    /// outbox was initialised with.
+    /// spawns the recurring job. Premake margin / poll interval come from the
+    /// [`MailboxConfig`] this outbox was initialised with; partition width is
+    /// the fixed [`DEFAULT_PARTITION_WIDTH`] constant (coupled to the
+    /// migration's initial partition).
     pub async fn register_partition_maintainer(
         &self,
         jobs: &mut ::job::Jobs,
