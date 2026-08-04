@@ -458,6 +458,7 @@ where
                             Some(message) => {
                                 let mut resync_needed = false;
                                 let mut fetch_range: Option<(EventSequence, EventSequence)> = None;
+                                let mut claimed_head: Option<EventSequence> = None;
                                 let mut messages = vec![message];
                                 while let Ok(message) = notification_receiver.try_recv() {
                                     messages.push(message);
@@ -469,10 +470,13 @@ where
                                                 notification.payload(),
                                                 &persistent_cache,
                                             ) {
-                                                highest_known_sequence.fetch_max(
-                                                    u64::from(notified.max_sequence),
-                                                    Ordering::AcqRel,
-                                                );
+                                                // NOT applied to
+                                                // highest_known_sequence yet —
+                                                // see the clamp below.
+                                                claimed_head = Some(match claimed_head {
+                                                    Some(max) => max.max(notified.max_sequence),
+                                                    None => notified.max_sequence,
+                                                });
                                                 if let Some((after, up_to)) = notified.missing {
                                                     fetch_range = Some(match fetch_range {
                                                         Some((lo, hi)) => {
@@ -489,22 +493,66 @@ where
                                     }
                                 }
 
-                                if let Some((after, up_to)) = fetch_range {
-                                    tokio::spawn(Self::fetch_notified_range(
-                                        pool.clone(),
-                                        after,
-                                        up_to,
-                                        cache_fill_sender.clone(),
-                                    ));
-                                }
-
-                                if resync_needed {
+                                // A NOTIFY payload is unauthenticated: any role able to
+                                // connect to this database can signal any channel. A
+                                // forged {min, max} claiming a huge max_sequence must
+                                // neither advance highest_known_sequence to a phantom
+                                // value (which would pin the gap-fill loop below,
+                                // grinding a fill query every second forever) NOR drive
+                                // an unbounded range scan — the same forged
+                                // {min:1, max:i64::MAX} would otherwise spawn a
+                                // fetch_notified_range(0, i64::MAX) streaming the
+                                // entire table tail through cache_fill on every forgery.
+                                //
+                                // Both the head advance and the fetch up_to are clamped
+                                // to the sequence's authoritative last_value, which is
+                                // >= any legitimately notified sequence (so free for
+                                // real notifications, protective for forged ones).
+                                //
+                                // last_value advances at nextval (pre-commit), so a
+                                // forged claim inside (committed_head, last_value]
+                                // still passes the clamp and can trigger a grace-period
+                                // gap-fill against in-flight sequences — but that work
+                                // is bounded by last_value and self-heals via the
+                                // ON CONFLICT speculative-insert block, so it never
+                                // stalls. On a transient head-read failure the fetch is
+                                // skipped (rather than fired unclamped); a subsequent
+                                // notification or resync retries.
+                                let current_head =
+                                    highest_known_sequence.load(Ordering::Relaxed);
+                                let claim_advances = claimed_head
+                                    .is_some_and(|claimed| u64::from(claimed) > current_head);
+                                if claim_advances || resync_needed || fetch_range.is_some() {
                                     match Tables::highest_known_persistent_sequence(&pool).await {
                                         Ok(head) => {
+                                            let confirmed_head = claimed_head
+                                                .map(|claimed| {
+                                                    EventSequence::from(
+                                                        u64::from(claimed)
+                                                            .min(u64::from(head)),
+                                                    )
+                                                })
+                                                .unwrap_or(head);
                                             highest_known_sequence.fetch_max(
-                                                u64::from(head),
+                                                u64::from(confirmed_head),
                                                 Ordering::AcqRel,
                                             );
+                                            if let Some((after, up_to)) = fetch_range {
+                                                let clamped_up_to = EventSequence::from(
+                                                    u64::from(up_to)
+                                                        .min(u64::from(confirmed_head)),
+                                                );
+                                                if u64::from(after)
+                                                    < u64::from(clamped_up_to)
+                                                {
+                                                    tokio::spawn(Self::fetch_notified_range(
+                                                        pool.clone(),
+                                                        after,
+                                                        clamped_up_to,
+                                                        cache_fill_sender.clone(),
+                                                    ));
+                                                }
+                                            }
                                         }
                                         Err(e) => record_resync_failed(&e),
                                     }

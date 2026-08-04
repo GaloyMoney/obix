@@ -12,6 +12,7 @@ Implementation of the outbox pattern backed by PostgreSQL and [sqlx](https://doc
 - Persistent events stored in PostgreSQL with sequential ordering
 - Ephemeral events for transient state updates
 - Real-time event delivery via PostgreSQL NOTIFY/LISTEN
+- Database-verified delivery: notifications carry only hints (sequence ranges / event type + timestamp), never payloads — a forged or snooped `pg_notify` can neither inject events nor leak payloads
 - Event caching for efficient replay and new listener catchup
 - Automatic backfill from database for events not in cache
 - Large payload handling with automatic database fallback

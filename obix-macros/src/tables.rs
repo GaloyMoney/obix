@@ -18,7 +18,41 @@ fn default_crate_name() -> syn::LitStr {
 
 pub fn derive(ast: syn::DeriveInput) -> darling::Result<proc_macro2::TokenStream> {
     let tables = MailboxTables::from_derive_input(&ast)?;
+    tables.validate_prefix()?;
     Ok(quote!(#tables))
+}
+
+impl MailboxTables {
+    /// The prefix is interpolated verbatim into SQL identifiers (table,
+    /// sequence and channel names) and into the `pg_notify('<channel>', ...)`
+    /// string literal of the generated persist query. Restricting it to a
+    /// plain identifier charset makes SQL injection through the derive
+    /// attribute unrepresentable; the length bound keeps the longest derived
+    /// name — `{prefix}_persistent_outbox_events_sequence_seq`, i.e.
+    /// prefix + 38 bytes — inside PostgreSQL's 63-byte identifier limit.
+    fn validate_prefix(&self) -> darling::Result<()> {
+        let Some(prefix) = &self.prefix else {
+            return Ok(());
+        };
+        let value = prefix.value();
+        let valid = !value.is_empty()
+            && value.len() <= 25
+            && value
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if valid {
+            Ok(())
+        } else {
+            Err(darling::Error::custom(format!(
+                "invalid obix tbl_prefix `{value}`: must be 1-25 characters, start with an \
+                 ASCII letter or underscore, and contain only ASCII letters, digits and \
+                 underscores (it is interpolated into generated SQL identifiers)"
+            ))
+            .with_span(prefix))
+        }
+    }
 }
 
 impl ToTokens for MailboxTables {
@@ -530,9 +564,15 @@ FROM {}persistent_outbox_events_sequence_seq",
                                         return None;
                                     }
                                 };
-                                let event_type = #crate_name::prelude::serde_json::from_value(
-                                    #crate_name::prelude::serde_json::Value::String(event_type_str)
-                                ).expect("Couldn't deserialize event_type");
+                                let event_type = match #crate_name::prelude::serde_json::from_value(
+                                    #crate_name::prelude::serde_json::Value::String(event_type_str.clone())
+                                ) {
+                                    Ok(event_type) => event_type,
+                                    Err(error) => {
+                                        #crate_name::record_ephemeral_event_type_undecodable(&error, &event_type_str);
+                                        return None;
+                                    }
+                                };
 
                                 let row = {
                                     struct TempRow {
@@ -606,7 +646,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .ok_or(#crate_name::inbox::InboxError::NotFound(id))?;
 
                         let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                            .expect("Invalid inbox event status in database");
+                            .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
 
                         Ok(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
@@ -641,9 +681,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| {
                                 let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                                    .expect("Invalid inbox event status in database");
+                                    .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
 
-                                #crate_name::inbox::InboxEvent {
+                                Ok(#crate_name::inbox::InboxEvent {
                                     id: #crate_name::inbox::InboxEventId::from(row.id),
                                     idempotency_key: row.idempotency_key,
                                     payload: row.payload,
@@ -651,9 +691,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     error: row.error,
                                     recorded_at: row.recorded_at,
                                     processed_at: row.processed_at,
-                                }
+                                })
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, #crate_name::inbox::InboxError>>()?;
 
                         Ok(events)
                     }
