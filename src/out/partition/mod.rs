@@ -54,6 +54,26 @@ pub struct Partitions<Tables = crate::tables::DefaultMailboxTables> {
     _phantom: PhantomData<Tables>,
 }
 
+/// Serialize partition-creating sessions cluster-wide for the duration of
+/// `tx`: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` is **not**
+/// concurrency-safe — two sessions that both observe the partition missing can
+/// race, and the loser gets `DuplicateTable` / a catalog `unique_violation`.
+/// Registration runs [`Partitions::ensure`] synchronously on every instance at
+/// startup, so without this lock multi-instance deploys could fail
+/// registration on some nodes and leave no maintainer running. Keyed on the
+/// table name so different parents don't block each other; hash collisions
+/// only cause spurious (harmless) serialization.
+async fn partition_ddl_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("obix:partition-ddl:{table}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 impl<Tables> Clone for Partitions<Tables> {
     fn clone(&self) -> Self {
         Self {
@@ -83,6 +103,10 @@ where
     /// Idempotent — every partition is created with `CREATE TABLE IF NOT
     /// EXISTS`, so re-running is cheap and safe. Called both synchronously at
     /// registration (before serving traffic) and on every maintainer tick.
+    /// Concurrent callers (multi-instance startup, a tick overlapping an
+    /// operator repair) are serialized on a cluster-wide advisory lock
+    /// ([`partition_ddl_lock`]), because `IF NOT EXISTS` alone does not make
+    /// concurrent `PARTITION OF` creation safe.
     ///
     /// The partition covering index `k` spans `[k * width, (k + 1) * width)` and
     /// is named `{table}_p{k}`, tiling seamlessly onto the migration's
@@ -99,6 +123,8 @@ where
         let table = Tables::persistent_outbox_events_table();
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
         let first = head / DEFAULT_PARTITION_WIDTH;
+        let mut tx = self.pool.begin().await?;
+        partition_ddl_lock(&mut tx, table).await?;
         for k in first..=first + self.premake {
             let lo = k * DEFAULT_PARTITION_WIDTH;
             let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
@@ -106,9 +132,9 @@ where
                 "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
                  FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",
             );
-            sqlx::query(&ddl).execute(&self.pool).await?;
+            sqlx::query(&ddl).execute(&mut *tx).await?;
         }
-        Ok(())
+        tx.commit().await
     }
 
     /// Repair a non-empty `DEFAULT` partition: rows landed there because the
@@ -132,6 +158,16 @@ where
         let table = Tables::persistent_outbox_events_table();
         let default_child = format!("{table}_default");
         let default_old = format!("{table}_default_old");
+
+        // Clean up the artifact of an earlier repair that crashed before its
+        // final DROP (only possible from a run predating the in-transaction
+        // DROP below): it would otherwise collide with the RENAME below and
+        // block the repair entirely. Such a leftover is guaranteed drained —
+        // the row move commits in the same transaction as the rename — so
+        // dropping it loses nothing.
+        sqlx::query(&format!("DROP TABLE IF EXISTS {default_old}"))
+            .execute(&self.pool)
+            .await?;
 
         // Range of stranded sequences. `MIN`/`MAX` are NULL when DEFAULT is
         // empty — nothing to repair.
@@ -158,8 +194,11 @@ where
         // partitions and a fresh DEFAULT, then move the stranded rows back into
         // the parent — where they route into the new explicit partitions. A
         // two-phase (detach, then move online) would leave the top-of-log rows
-        // detached during the move and MAX(sequence) would regress.
+        // detached during the move and MAX(sequence) would regress. The
+        // advisory lock serializes the CREATEs against concurrent `ensure`
+        // ticks (see [`partition_ddl_lock`]).
         let mut tx = self.pool.begin().await?;
+        partition_ddl_lock(&mut tx, table).await?;
         sqlx::query(&format!(
             "ALTER TABLE {table} DETACH PARTITION {default_child}"
         ))
@@ -193,11 +232,12 @@ where
         ))
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-
+        // Drop the drained artifact in the same transaction: atomic with the
+        // repair, so a crash can never leave `{table}_default_old` behind to
+        // collide with the next repair's RENAME.
         sqlx::query(&format!("DROP TABLE {default_old}"))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+        tx.commit().await
     }
 }

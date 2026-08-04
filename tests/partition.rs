@@ -269,6 +269,75 @@ async fn assert_replayable(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A leftover `{table}_default_old` from an interrupted earlier repair (crash
+/// before the artifact DROP) must not block the next repair: recovery drops
+/// the drained artifact up front and proceeds normally.
+#[tokio::test]
+#[file_serial]
+async fn recover_cleans_up_interrupted_leftover() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = prepare_outbox(&pool, BOUNDARY - 2).await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(
+            &mut op,
+            [TestEvent::Ping(0), TestEvent::Ping(1), TestEvent::Ping(2)],
+        )
+        .await?;
+    op.commit().await?;
+    assert_eq!(default_row_count(&pool).await?, 2);
+
+    // Simulate the artifact a crashed repair would have left behind (it is
+    // always drained — the row move commits with the rename).
+    sqlx::query(
+        "CREATE TABLE persistent_outbox_events_default_old (LIKE persistent_outbox_events)",
+    )
+    .execute(&pool)
+    .await?;
+
+    obix::out::Partitions::<TestTables>::new(&pool, PREMAKE)
+        .recover_default()
+        .await?;
+
+    assert_eq!(default_row_count(&pool).await?, 0, "DEFAULT drained");
+    assert!(
+        !relation_exists(&pool, "persistent_outbox_events_default_old").await?,
+        "leftover artifact cleaned up"
+    );
+    assert_eq!(max_sequence(&pool).await?, Some(BOUNDARY + 1));
+    assert_replayable(&pool).await?;
+    Ok(())
+}
+
+/// Concurrent `ensure` calls (multi-instance startup, a maintainer tick
+/// overlapping an operator repair) must not fail with a creation race: the
+/// advisory lock serializes creators so every caller succeeds.
+#[tokio::test]
+#[file_serial]
+async fn concurrent_ensure_does_not_race() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipeout_outbox_tables(&pool).await?;
+    reset_partitions_to_baseline(&pool).await?;
+    set_sequence(&pool, BOUNDARY - 10).await?;
+
+    let results = futures::future::join_all((0..8).map(|_| {
+        let pool = pool.clone();
+        async move {
+            obix::out::Partitions::<TestTables>::new(&pool, PREMAKE)
+                .ensure()
+                .await
+        }
+    }))
+    .await;
+    for r in results {
+        r?;
+    }
+    let deepest = format!("persistent_outbox_events_p{PREMAKE}");
+    assert!(relation_exists(&pool, &deepest).await?);
+    Ok(())
+}
+
 /// Replay-from-zero contract is unchanged by partitioning: a `BEGIN` listener
 /// returns the full contiguous stream. `TRUNCATE ... RESTART IDENTITY` on the
 /// partitioned parent cascades to every partition and resets the sequence.
