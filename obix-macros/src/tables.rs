@@ -67,6 +67,13 @@ impl ToTokens for MailboxTables {
         let persistent_outbox_events_channel = format!("{}persistent_outbox_events", table_prefix);
         let ephemeral_outbox_events_channel = format!("{}ephemeral_outbox_events", table_prefix);
 
+        // Base table name for the partition maintainer. Same string the
+        // channel builds, but exposed under its own method so the maintainer
+        // reads "the table" rather than "the notify channel"; it derives child
+        // partition names (`{table}_p{k}`) and the sequence-object name
+        // (`{table}_sequence_seq`) from it.
+        let persistent_outbox_events_table = format!("{}persistent_outbox_events", table_prefix);
+
         let highest_known_query = format!(
             "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
 FROM {}persistent_outbox_events_sequence_seq",
@@ -234,6 +241,10 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn ephemeral_outbox_events_channel() -> &'static str {
                     #ephemeral_outbox_events_channel
+                }
+
+                fn persistent_outbox_events_table() -> &'static str {
+                    #persistent_outbox_events_table
                 }
 
                 // === Outbox methods ===

@@ -5,6 +5,7 @@ mod ephemeral_events_hook;
 mod event;
 mod job;
 mod op_cursor;
+mod partition;
 mod persist_events_hook;
 mod persistent;
 mod pg_notify;
@@ -23,6 +24,7 @@ use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
 pub use event::*;
 pub use op_cursor::{CursorError, OpCursor};
+pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
 pub use persistent::PersistentOutboxListener;
 pub use post_persist_hook::PostPersistHook;
@@ -35,6 +37,8 @@ where
     pool: sqlx::PgPool,
     event_buffer_size: usize,
     persist_events_batch_size: usize,
+    partition_premake: u64,
+    partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
@@ -67,6 +71,8 @@ where
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
             persist_events_batch_size: self.persist_events_batch_size,
+            partition_premake: self.partition_premake,
+            partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
@@ -104,6 +110,8 @@ where
             pool,
             event_buffer_size: config.event_buffer_size,
             persist_events_batch_size: config.persist_events_batch_size,
+            partition_premake: config.partition_premake,
+            partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
@@ -326,6 +334,49 @@ where
         let spawner = jobs.add_initializer(initializer);
         spawner
             .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())
+            .await?;
+        Ok(())
+    }
+
+    /// Register the partition maintainer for `persistent_outbox_events`: a
+    /// timer-scheduled job that pre-creates RANGE partitions ahead of the
+    /// sequence head so inserts always route into an explicit partition rather
+    /// than the `DEFAULT` backstop.
+    ///
+    /// A consumer that applies the partitioned migration but never registers
+    /// the maintainer will, over time, pile everything into `DEFAULT` — still
+    /// correct (reads see those rows), but it forfeits the per-partition
+    /// vacuum/locality wins and eventually needs a
+    /// [`Partitions::recover_default`] repair. **Register this at startup.**
+    ///
+    /// Runs one premake pass **synchronously before returning** (so traffic
+    /// that starts immediately still routes into an explicit partition), then
+    /// spawns the recurring job. Premake margin / poll interval come from the
+    /// [`MailboxConfig`] this outbox was initialised with; partition width is
+    /// the fixed [`DEFAULT_PARTITION_WIDTH`] constant (coupled to the
+    /// migration's initial partition).
+    pub async fn register_partition_maintainer(
+        &self,
+        jobs: &mut ::job::Jobs,
+        config: PartitionMaintainerConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let partitions = Partitions::<Tables>::new(&self.pool, self.partition_premake);
+
+        // The synchronous write path must never wait on the async maintainer,
+        // so premake covering the head BEFORE registering the job.
+        partitions.ensure().await?;
+
+        let initializer = partition::PartitionMaintainerJobInitializer::<Tables>::new(
+            partitions,
+            &config,
+            self.partition_maintainer_interval,
+        );
+        let spawner = jobs.add_initializer(initializer);
+        spawner
+            .spawn_unique(
+                ::job::JobId::new(),
+                partition::PartitionMaintainerJobData::default(),
+            )
             .await?;
         Ok(())
     }

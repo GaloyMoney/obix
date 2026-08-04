@@ -168,6 +168,12 @@ pub trait MailboxTables: Send + Sync + 'static {
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
 
+    /// Base name of the persistent outbox events table (honouring any table
+    /// prefix). The partition maintainer derives child partition names
+    /// (`{table}_p{k}`) and the sequence-object name (`{table}_sequence_seq`)
+    /// from it.
+    fn persistent_outbox_events_table() -> &'static str;
+
     // === Inbox methods ===
 
     fn insert_inbox_event<P>(

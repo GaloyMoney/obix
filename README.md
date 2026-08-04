@@ -93,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
 
 The outbox pattern requires two PostgreSQL tables (`persistent_outbox_events` and `ephemeral_outbox_events`). You must apply the migration to create these tables before using the library.
 
+> **Breaking change:** `persistent_outbox_events` is **range-partitioned by `sequence`** (primary key on `sequence`, `id` demoted to a plain column). Upgrading from a pre-partitioning version is a breaking schema change with no in-place data migration — recreate the table from the shipped migration. See [Partition maintenance](#partition-maintenance) below.
+
 #### Option 1: Copy the migration file
 
 Copy the migration file into your project's migrations directory:
@@ -121,6 +123,25 @@ let outbox = Outbox::<MyEvent, MyAppTables>::init(&pool, MailboxConfig::builder(
 When using a custom prefix, you'll need to create a modified migration with your prefix. For example, with prefix `myapp`, the tables would be named `myapp_persistent_outbox_events` and `myapp_ephemeral_outbox_events`.
 
 You can copy the default migration and add your prefix to all table names, sequence names, and channel names in the SQL.
+
+### Partition maintenance
+
+`persistent_outbox_events` is range-partitioned by `sequence`. The migration ships an initial partition covering the first 2 million sequences (~1.5 GB) plus an always-present `DEFAULT` partition, so an insert can **never** fail to route. To keep explicit partitions created ahead of the sequence head (and `DEFAULT` empty), register the partition maintainer once at startup:
+
+```rust
+use obix::PartitionMaintainerConfig;
+
+outbox
+    .register_partition_maintainer(
+        &mut jobs,
+        PartitionMaintainerConfig::new(job::JobType::new("outbox-partition-maintainer")),
+    )
+    .await?;
+```
+
+How many partitions to keep ahead and the maintainer's poll interval come from `MailboxConfig` (`partition_premake` / `partition_maintainer_interval`). Partition width is deliberately **not** configurable: it is the fixed `DEFAULT_PARTITION_WIDTH` constant, coupled to the initial partition's range in the shipped migration.
+
+**Registration is optional and the outbox never breaks without it.** If you never register the maintainer, everything keeps working: once `sequence` passes the initial partition's upper bound, new rows land in the `DEFAULT` partition, which is still read, gap-filled, and replayed exactly like any other partition. You only forfeit the per-partition vacuum/freeze/cache-locality benefits (equivalent to the pre-partitioning single-table behaviour). A non-empty `DEFAULT` is a *layout* concern, not a correctness one — alert on it, and use [`Partitions::recover_default`](https://docs.rs/obix) to fold any stranded rows back into explicit partitions in a single transaction (never regressing `MAX(sequence)`).
 
 ### Event Types
 

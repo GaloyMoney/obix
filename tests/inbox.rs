@@ -252,21 +252,21 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
         .expect("Event should be created");
     op.commit().await?;
 
-    // Wait for first processing (should return ReprocessIn)
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Wait for the first processing (handler returns ReprocessIn), then for the
+    // runner to settle the event back to Pending. Poll rather than race a fixed
+    // sleep: on a loaded CI runner the job can still be mid-run (status
+    // Processing) after any fixed delay, which flaked the status assertion.
+    wait_for_executions(&execution_times, 1, std::time::Duration::from_secs(5)).await?;
+    assert_eq!(execution_times.lock().await[0], initial_time);
 
-    // Verify first execution happened
-    let (times_len, first_execution_time) = {
-        let times = execution_times.lock().await;
-        (times.len(), times[0])
-    };
-    assert_eq!(times_len, 1);
-    assert_eq!(first_execution_time, initial_time);
-
-    // Event should be Pending (scheduled for reprocessing), not Completed
-    let event = inbox.find_event_by_id(event_id).await?;
-    let event_status = event.status;
-    assert_eq!(event_status, InboxEventStatus::Pending);
+    // Event should be Pending (scheduled for reprocessing), not Completed.
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Pending,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
 
     // Advance clock by 20 seconds (not enough - needs 30s)
     controller.advance(std::time::Duration::from_secs(20)).await;
@@ -279,16 +279,14 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
     };
     assert_eq!(times_len, 1);
 
-    // Advance clock by another 11 seconds (total 31s - past the 30s threshold)
+    // Advance clock by another 11 seconds (total 31s - past the 30s threshold);
+    // the reprocess fires. Poll for the second execution rather than racing.
     controller.advance(std::time::Duration::from_secs(11)).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // Now it should have executed again
-    let (times_len, delay) = {
+    wait_for_executions(&execution_times, 2, std::time::Duration::from_secs(5)).await?;
+    let delay = {
         let times = execution_times.lock().await;
-        (times.len(), times[1] - times[0])
+        times[1] - times[0]
     };
-    assert_eq!(times_len, 2);
     assert!(delay >= chrono::Duration::seconds(31));
 
     wait_for_inbox_status(
@@ -300,4 +298,25 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Poll until `execution_times` holds at least `n` entries, or time out.
+/// Positive state assertions must poll rather than race a fixed sleep — a loaded
+/// CI runner can lag arbitrarily behind wall-clock.
+async fn wait_for_executions<T>(
+    execution_times: &Arc<Mutex<Vec<T>>>,
+    n: usize,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let len = execution_times.lock().await.len();
+        if len >= n {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!("timed out waiting for {n} executions (have {len})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
