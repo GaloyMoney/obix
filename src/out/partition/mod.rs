@@ -159,16 +159,6 @@ where
         let default_child = format!("{table}_default");
         let default_old = format!("{table}_default_old");
 
-        // Clean up the artifact of an earlier repair that crashed before its
-        // final DROP (only possible from a run predating the in-transaction
-        // DROP below): it would otherwise collide with the RENAME below and
-        // block the repair entirely. Such a leftover is guaranteed drained —
-        // the row move commits in the same transaction as the rename — so
-        // dropping it loses nothing.
-        sqlx::query(&format!("DROP TABLE IF EXISTS {default_old}"))
-            .execute(&self.pool)
-            .await?;
-
         // Range of stranded sequences. `MIN`/`MAX` are NULL when DEFAULT is
         // empty — nothing to repair.
         let bounds = sqlx::query(&format!(
