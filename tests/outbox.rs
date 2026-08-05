@@ -708,6 +708,171 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     Ok(())
 }
 
+// SECURITY regression: a forged pg_notify on the ephemeral channel must not
+// inject events. LISTEN/NOTIFY has no per-channel authorization in
+// PostgreSQL — any role able to connect can signal any channel — so the
+// notification is only a hint; the event must come from the table (and a
+// forged hint with no matching row must yield nothing).
+#[tokio::test]
+#[file_serial]
+async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_ephemeral();
+
+    // Fully-formed forged event, as the pre-fix listener would have accepted
+    // and broadcast directly from the notification body.
+    sqlx::query("SELECT pg_notify('ephemeral_outbox_events', $1)")
+        .bind(
+            serde_json::json!({
+                "event_type": "forged_type",
+                "payload": {"Ping": 999},
+                "tracing_context": null,
+                "recorded_at": chrono::Utc::now(),
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await?;
+
+    // Nothing may arrive: the hint references no row in the table.
+    let forged = tokio::time::timeout(std::time::Duration::from_millis(500), listener.next()).await;
+    assert!(
+        forged.is_err(),
+        "forged ephemeral notification must not be delivered, got {forged:?}"
+    );
+
+    // The listener is still alive: a legitimately published event arrives.
+    let event_type = obix::out::EphemeralEventType::new("legit_type");
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(1))
+        .await?;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("listener must still deliver legitimate events");
+    assert_eq!(event.event_type, event_type);
+    assert!(matches!(event.payload, TestEvent::Ping(1)));
+
+    Ok(())
+}
+
+// An ephemeral event written by another process (straight SQL insert,
+// bypassing this process's in-process publish broadcast) must still reach
+// listeners: the trigger's {event_type, recorded_at} hint triggers a
+// fetch from the table with the listener's own credentials.
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_ephemeral();
+
+    sqlx::query("INSERT INTO ephemeral_outbox_events (event_type, payload) VALUES ($1, $2)")
+        .bind("external_type")
+        .bind(serde_json::json!({"Ping": 7}))
+        .execute(&pool)
+        .await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("externally written ephemeral event must be delivered via the hint + fetch path");
+    assert_eq!(event.event_type.as_str(), "external_type");
+    assert!(matches!(event.payload, TestEvent::Ping(7)));
+
+    Ok(())
+}
+
+// SECURITY regression: a forged {min_sequence, max_sequence} notification
+// on the persistent channel must not (a) advance the cache head past the
+// database's actual sequence, (b) synthesize phantom events, (c) drive an
+// unbounded range scan over a populated table, or (d) stall real delivery.
+// Unlike the ephemeral forgery test this runs against a POPULATED table, so
+// the range-fetch amplification (fetch_notified_range(0, i64::MAX) streaming
+// the whole tail) is actually exercised and the clamp is tested.
+#[tokio::test]
+#[file_serial]
+async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    // Populate the table so the forged range fetch has real rows to amplify
+    // over if the clamp were absent.
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..5).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    sqlx::query("SELECT pg_notify('persistent_outbox_events', $1)")
+        .bind(
+            serde_json::json!({
+                "min_sequence": 1,
+                "max_sequence": i64::MAX,
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await?;
+
+    // The forged claim is clamped to the real head, so no phantom events
+    // beyond the committed 5 are synthesized. (The 5 real events may arrive
+    // from the clamped fetch — that's correct, not a forgery.)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    while let Ok(Some(item)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), listener.next()).await
+    {
+        let event = item?;
+        let n = event.payload.as_ref().and_then(|p| match p {
+            TestEvent::Ping(n) => Some(*n),
+            _ => None,
+        });
+        assert!(
+            n.is_some_and(|n| n < 5),
+            "forged persistent notification must not deliver events beyond the real head, got {event:?}"
+        );
+    }
+
+    // Real delivery still works, promptly (the forged head must not wedge
+    // the contiguity machinery).
+    let mut op = pool.begin().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(99))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("listener must still deliver after a forged notification")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(99))));
+
+    Ok(())
+}
+
 /// Regression: an event whose NOTIFY fires while the LISTEN connection is
 /// down must still reach consumers.
 ///

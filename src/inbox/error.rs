@@ -8,6 +8,8 @@ pub enum InboxError {
     Job(#[from] job::error::JobError),
     #[error("InboxError - NotFound: {0}")]
     NotFound(super::InboxEventId),
+    #[error("InboxError - InvalidStatus: {0}")]
+    InvalidStatus(String),
     #[error("InboxError - Deserialization: {0}")]
     Deserialization(#[from] serde_json::Error),
 }

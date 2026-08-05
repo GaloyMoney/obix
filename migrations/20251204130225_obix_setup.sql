@@ -38,23 +38,20 @@ CREATE TABLE ephemeral_outbox_events (
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- SECURITY: the ephemeral notification is a hint, not a transport.
+--
+-- PostgreSQL performs no authorization on LISTEN/NOTIFY channels: any role
+-- able to connect to the database could LISTEN and harvest payloads with no
+-- table grant, or pg_notify a forged event consumers would accept. The
+-- notification therefore carries only {event_type, recorded_at}; listeners
+-- always fetch the payload from the table with their own credentials
+-- (recorded_at lets them skip the fetch when their cache is already current).
 CREATE FUNCTION notify_ephemeral_outbox_events() RETURNS TRIGGER AS $$
-DECLARE
-  payload TEXT;
-  payload_size INTEGER;
 BEGIN
-  payload := row_to_json(NEW);
-  payload_size := octet_length(payload);
-  IF payload_size > 8000 THEN
-    payload := json_build_object(
-      'event_type', NEW.event_type,
-      'payload', NULL,
-      'payload_omitted', true,
-      'tracing_context', NEW.tracing_context,
-      'recorded_at', NEW.recorded_at
-    )::TEXT;
-  END IF;
-  PERFORM pg_notify('ephemeral_outbox_events', payload);
+  PERFORM pg_notify(
+    'ephemeral_outbox_events',
+    json_build_object('event_type', NEW.event_type, 'recorded_at', NEW.recorded_at)::TEXT
+  );
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;

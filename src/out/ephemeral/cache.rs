@@ -103,6 +103,14 @@ where
         event: Arc<EphemeralOutboxEvent<P>>,
         ephemeral_event_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
     ) -> im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>> {
+        // Last-write-wins by recorded_at: notification-triggered fetches for
+        // the same event type can complete out of order — a strictly older
+        // event must never overwrite (or be broadcast after) a newer one.
+        if let Some(cached) = cache.get(&event.event_type)
+            && cached.recorded_at > event.recorded_at
+        {
+            return cache;
+        }
         let event_type = event.event_type.clone();
         let cache = cache.update(event_type, event.clone());
         let _ = ephemeral_event_sender.send(event);
@@ -121,51 +129,50 @@ where
         }
     }
 
+    /// Handle a `{event_type, recorded_at}` notification hint.
+    ///
+    /// The payload is NEVER taken from the notification body. PostgreSQL
+    /// performs no authorization on LISTEN/NOTIFY channels — any role able
+    /// to connect to this database can signal any channel — so a
+    /// notification is only ever a hint that something changed; the event
+    /// itself is always (re-)fetched from the table with this process's own
+    /// credentials. `recorded_at` bounds that fetch: when the in-process
+    /// cache already holds an event at least as recent (the publisher's
+    /// post-commit broadcast beat the NOTIFY), the hint is a no-op.
     fn handle_ephemeral_notification(
-        pool: &sqlx::PgPool,
         payload: &str,
         cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
-        cache_fill_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    ) -> Option<EphemeralOutboxEvent<P>> {
+    ) -> Option<EphemeralEventType> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
-            event_type: String,
-            #[serde(default)]
-            payload_omitted: bool,
+            event_type: EphemeralEventType,
+            recorded_at: chrono::DateTime<chrono::Utc>,
         }
 
-        let header: NotificationHeader = serde_json::from_str(payload).ok()?;
-        let event_type = serde_json::from_value(serde_json::Value::String(header.event_type))
-            .expect("Couldn't deserialize event_type");
-
-        if header.payload_omitted {
-            if cache.contains_key(&event_type) {
+        let header: NotificationHeader = match serde_json::from_str(payload) {
+            Ok(header) => header,
+            Err(error) => {
+                record_notification_undecodable(&error);
                 return None;
             }
-            tokio::spawn(Self::fetch_event_by_type(
-                pool.clone(),
-                event_type,
-                cache_fill_sender.clone(),
-            ));
+        };
+
+        let cache_is_current = cache
+            .get(&header.event_type)
+            .is_some_and(|cached| cached.recorded_at >= header.recorded_at);
+        if cache_is_current {
             None
         } else {
-            serde_json::from_str(payload).ok()
+            Some(header.event_type)
         }
     }
 
     fn process_notification(
         notification: sqlx::postgres::PgNotification,
-        pool: &sqlx::PgPool,
         cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
-        cache_fill_sender: &broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    ) -> Option<EphemeralOutboxEvent<P>> {
+    ) -> Option<EphemeralEventType> {
         if notification.channel() == Tables::ephemeral_outbox_events_channel() {
-            Self::handle_ephemeral_notification(
-                pool,
-                notification.payload(),
-                cache,
-                cache_fill_sender,
-            )
+            Self::handle_ephemeral_notification(notification.payload(), cache)
         } else {
             None
         }
@@ -242,26 +249,39 @@ where
                                 while let Ok(message) = ephemeral_notification_rx.try_recv() {
                                     messages.push(message);
                                 }
+                                // Collect the unique event types that need a
+                                // fetch. A burst of N notifications for the
+                                // same type is drained against one cache
+                                // snapshot (fetches are async, the cache is
+                                // unchanged during the drain), so deduping
+                                // here collapses them into a single fetch
+                                // rather than N redundant broadcasts of the
+                                // same latest event.
+                                let mut types_to_fetch =
+                                    std::collections::HashSet::<EphemeralEventType>::new();
                                 for message in messages {
                                     match message {
                                         NotifyMessage::Notification(notification) => {
-                                            if let Some(event) = Self::process_notification(
-                                                notification,
-                                                &pool,
-                                                &ephemeral_cache,
-                                                &cache_fill_sender,
-                                            ) {
-                                                ephemeral_cache = Self::insert_into_cache_and_broadcast(
-                                                    ephemeral_cache,
-                                                    Arc::new(event),
-                                                    &ephemeral_event_sender,
-                                                );
+                                            if let Some(event_type) =
+                                                Self::process_notification(
+                                                    notification,
+                                                    &ephemeral_cache,
+                                                )
+                                            {
+                                                types_to_fetch.insert(event_type);
                                             }
                                         }
                                         NotifyMessage::Resync => {
                                             resync_needed = true;
                                         }
                                     }
+                                }
+                                for event_type in types_to_fetch {
+                                    tokio::spawn(Self::fetch_event_by_type(
+                                        pool.clone(),
+                                        event_type,
+                                        cache_fill_sender.clone(),
+                                    ));
                                 }
 
                                 if resync_needed {
@@ -335,3 +355,11 @@ fn record_notification_channel_closed() {}
     fields(otel.status_code = "ERROR", error = %error),
 )]
 fn record_resync_failed(error: &sqlx::Error) {}
+
+#[tracing::instrument(
+    name = "obix.ephemeral_cache.notification_undecodable",
+    level = "warn",
+    skip_all,
+    fields(error = %error),
+)]
+fn record_notification_undecodable(error: &serde_json::Error) {}

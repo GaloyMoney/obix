@@ -87,6 +87,18 @@ fn record_persistent_payload_undecodable(error: &serde_json::Error, sequence: u6
 )]
 pub fn record_ephemeral_payload_undecodable(error: &serde_json::Error, event_type: &str) {}
 
+/// Invoked from `MailboxTables` derive output when a stored ephemeral row's
+/// `event_type` cannot be deserialized (schema drift or foreign rows); the
+/// event is dropped from the result, like an undecodable payload.
+#[doc(hidden)]
+#[tracing::instrument(
+    name = "obix.tables.ephemeral_event_type_undecodable",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, event_type = %event_type)
+)]
+pub fn record_ephemeral_event_type_undecodable(error: &serde_json::Error, event_type: &str) {}
+
 /// Invoked from `MailboxTables` derive output when the tracing-context
 /// envelope cannot be deserialized; the event is kept with no context
 /// attached (the context is delivery metadata, not payload data).
