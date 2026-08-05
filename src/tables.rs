@@ -3,6 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use es_entity::hooks::HookOperation;
 
 use crate::{
+    archive::{ArchiveBoundary, ArchiveChunk, RawExportRow},
     inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{
         DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
@@ -185,6 +186,60 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// (`{table}_p{k}`) and the sequence-object name (`{table}_sequence_seq`)
     /// from it.
     fn persistent_outbox_events_table() -> &'static str;
+
+    // === Archive methods ===
+
+    /// The archive watermark: the highest sequence exported to object
+    /// storage and pruned from the live table, or `None` when nothing was
+    /// archived yet. Sequences at or below it must be read from the
+    /// archive — asking the live table for them would synthesize
+    /// placeholder rows and mask the archived events.
+    fn archive_watermark<'a>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+
+    /// All manifest chunks with `max_sequence > after_sequence`, ordered
+    /// by `min_sequence` — the files to walk when replaying archived
+    /// history.
+    fn list_archive_chunks_from<'a>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        after_sequence: EventSequence,
+    ) -> impl Future<Output = Result<Vec<ArchiveChunk>, sqlx::Error>> + Send;
+
+    /// Per (UTC) date of `recorded_at`, the highest sequence of that
+    /// date — as an [`ArchiveBoundary`] labeled with the ISO date — for
+    /// dates fully before `recorded_before`. Backs the default
+    /// age-based [`ArchiveBoundaryProvider`](crate::archive::ArchiveBoundaryProvider).
+    fn list_archivable_boundaries<'a>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        after_sequence: EventSequence,
+        recorded_before: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<Vec<ArchiveBoundary>, sqlx::Error>> + Send;
+
+    /// Raw rows in `(after_sequence, up_to_sequence]`, oldest first — the
+    /// export scan. Payloads stay as stored JSON: the archiver is
+    /// payload-type-agnostic.
+    fn load_raw_export_page<'a>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        after_sequence: EventSequence,
+        up_to_sequence: EventSequence,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<RawExportRow>, sqlx::Error>> + Send;
+
+    /// Record an exported chunk in the manifest and delete its events
+    /// from the live table, atomically (a single statement). Idempotent:
+    /// re-recording the same path is a no-op.
+    /// Record a chunk in the manifest and prune its events from the live
+    /// table in a single statement. The insert is guarded on contiguity
+    /// (`min_sequence` must follow the current watermark, or be an exact
+    /// re-record of an existing chunk — the idempotent rerun case); an
+    /// overlapping chunk fails with
+    /// [`ArchiveError::OverlappingChunk`](crate::archive::ArchiveError)
+    /// without deleting anything.
+    fn record_archive_chunk<'a>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        chunk: &ArchiveChunk,
+    ) -> impl Future<Output = Result<(), crate::archive::ArchiveError>> + Send;
 
     // === Inbox methods ===
 

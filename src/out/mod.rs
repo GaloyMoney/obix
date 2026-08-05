@@ -18,7 +18,13 @@ use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
 pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
-use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+use crate::{
+    archive::{ArchiveConfig, OutboxArchiverJobConfig},
+    config::*,
+    handle::OwnedTaskHandle,
+    sequence::EventSequence,
+    tables::*,
+};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
@@ -43,6 +49,7 @@ where
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     clock: ClockHandle,
+    archive_config: Option<ArchiveConfig>,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
     /// single `Arc` clone.
@@ -77,6 +84,7 @@ where
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             clock: self.clock.clone(),
+            archive_config: self.archive_config.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
         }
     }
@@ -101,8 +109,13 @@ where
         )
         .await?;
 
-        let persistent_cache =
-            PersistentOutboxEventCache::init(&pool, &config, persistent_notification_rx).await?;
+        let persistent_cache = PersistentOutboxEventCache::init(
+            &pool,
+            &config,
+            persistent_notification_rx,
+            config.archive.as_ref().map(ArchiveConfig::reader),
+        )
+        .await?;
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
@@ -116,6 +129,7 @@ where
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
             clock: config.clock.clone(),
+            archive_config: config.archive.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
         })
     }
@@ -318,6 +332,34 @@ where
             start_after,
             self.event_buffer_size,
         )
+    }
+
+    /// Register the archiver job sweeping settled spans of persistent
+    /// events to object storage (see [`archive`](crate::archive)).
+    /// Requires [`MailboxConfig::archive`] to have been set at
+    /// [`init`](Self::init) — returns
+    /// [`ArchiveError::NotConfigured`](crate::archive::ArchiveError)
+    /// otherwise.
+    pub async fn register_event_archiver(
+        &self,
+        jobs: &mut ::job::Jobs,
+        config: OutboxArchiverJobConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let archive = self
+            .archive_config
+            .clone()
+            .ok_or(crate::archive::ArchiveError::NotConfigured)?;
+        let initializer = crate::archive::OutboxArchiverJobInitializer::<Tables>::new(
+            &self.pool, archive, &config,
+        );
+        let spawner = jobs.add_initializer(initializer);
+        spawner
+            .spawn_unique(
+                ::job::JobId::new(),
+                crate::archive::OutboxArchiverJobData::default(),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn register_event_handler<H>(

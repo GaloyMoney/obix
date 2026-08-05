@@ -9,6 +9,7 @@ pub mod prelude {
     pub use sqlx;
 }
 
+pub mod archive;
 mod config;
 mod handle;
 pub mod inbox;
@@ -19,6 +20,11 @@ mod tables;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+pub use archive::{
+    ArchiveBoundary, ArchiveBoundaryProvider, ArchiveChunk, ArchiveConfig, ArchiveError,
+    ArchiveRunReport, Compression, DailyRetentionBoundary, EventArchiveStorage, EventArchiver,
+    InMemoryArchiveStorage, OutboxArchiverJobConfig,
+};
 pub use config::{
     DEFAULT_GAP_FILL_GRACE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
     DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,

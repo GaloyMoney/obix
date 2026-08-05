@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "TRUNCATE persistent_outbox_archive_chunks",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ab07d752b525d308aec4155d1ee2cce23e1297d945bf9025d73ebfd4f252188f"
+}

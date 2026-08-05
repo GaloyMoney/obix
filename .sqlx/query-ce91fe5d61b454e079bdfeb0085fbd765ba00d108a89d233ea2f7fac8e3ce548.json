@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO persistent_outbox_events (payload) VALUES ('null')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ce91fe5d61b454e079bdfeb0085fbd765ba00d108a89d233ea2f7fac8e3ce548"
+}

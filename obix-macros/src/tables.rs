@@ -231,6 +231,90 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // === Archive queries ===
+
+        let archive_watermark_query = format!(
+            "SELECT MAX(max_sequence) AS \"max_sequence?\" FROM {}persistent_outbox_archive_chunks",
+            table_prefix
+        );
+
+        let list_archive_chunks_query = format!(
+            r#"SELECT path, min_sequence, max_sequence
+            FROM {}persistent_outbox_archive_chunks
+            WHERE max_sequence > $1
+            ORDER BY min_sequence"#,
+            table_prefix
+        );
+
+        // History is bucketed by UTC date of recorded_at (the AT TIME
+        // ZONE makes the bucketing independent of the session TimeZone);
+        // the date becomes the boundary label.
+        let archivable_boundaries_query = format!(
+            r#"SELECT (recorded_at AT TIME ZONE 'UTC')::date AS "day!",
+                   MAX(sequence) AS "max_sequence!: i64"
+            FROM {}persistent_outbox_events
+            WHERE sequence > $1
+              AND recorded_at < $2
+            GROUP BY 1
+            ORDER BY 1"#,
+            table_prefix
+        );
+
+        let raw_export_page_query = format!(
+            r#"SELECT id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at
+            FROM {}persistent_outbox_events
+            WHERE sequence > $1
+              AND sequence <= $2
+            ORDER BY sequence
+            LIMIT $3"#,
+            table_prefix
+        );
+
+        // Manifest insert + prune in ONE statement: data-modifying CTEs
+        // execute exactly once even unreferenced, so the DELETE and the
+        // INSERT commit or fail together. ON CONFLICT makes re-recording
+        // after a crash a no-op; the DELETE is then naturally empty.
+        //
+        // Contiguity guard: the new chunk must continue the current
+        // watermark (`expected_min`) or be an exact re-record of an
+        // existing chunk (the idempotent rerun case). Anything else is
+        // an overlap — nothing is deleted or inserted; the caller
+        // detects it via the follow-up existence check and fails.
+        let record_archive_chunk_query = format!(
+            r#"WITH guard AS (
+                   SELECT COALESCE(MAX(max_sequence), 0) + 1 AS expected_min
+                   FROM {tbl}persistent_outbox_archive_chunks
+               ),
+               deleted AS (
+                   DELETE FROM {tbl}persistent_outbox_events
+                   WHERE sequence >= $2 AND sequence <= $3
+                     AND ((SELECT expected_min FROM guard) = $2
+                          OR EXISTS (SELECT 1 FROM {tbl}persistent_outbox_archive_chunks
+                                     WHERE path = $1 AND min_sequence = $2 AND max_sequence = $3))
+                   RETURNING sequence
+               ),
+               inserted AS (
+                   INSERT INTO {tbl}persistent_outbox_archive_chunks (path, min_sequence, max_sequence)
+                   SELECT $1, $2, $3
+                   WHERE (SELECT expected_min FROM guard) = $2
+                   ON CONFLICT (path) DO NOTHING
+                   RETURNING path
+               )
+               -- One round trip: the CTEs above execute regardless.
+               -- Data-modifying CTE effects are invisible to the outer
+               -- query, so "recorded" = inserted by this statement OR
+               -- already present beforehand (the idempotent rerun).
+               -- `false` means the contiguity guard rejected an
+               -- overlapping chunk — and nothing was deleted or
+               -- inserted.
+               SELECT EXISTS(SELECT 1 FROM inserted)
+                   OR EXISTS(
+                       SELECT 1 FROM {tbl}persistent_outbox_archive_chunks
+                       WHERE path = $1 AND min_sequence = $2 AND max_sequence = $3
+                   ) AS "recorded!""#,
+            tbl = table_prefix
+        );
+
         // === Inbox queries ===
         let insert_inbox_event_query = format!(
             r#"INSERT INTO {tbl}inbox_events (id, idempotency_key, payload, recorded_at)
@@ -518,6 +602,120 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
                         Ok(events)
+                    }
+                }
+
+                // === Archive methods ===
+
+                fn archive_watermark<'a>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let executor = op.into_executor();
+                    async {
+                        let row = executor
+                            .fetch_one(sqlx::query!(#archive_watermark_query))
+                            .await?;
+                        Ok(row.max_sequence.map(|s| #crate_name::EventSequence::from(s as u64)))
+                    }
+                }
+
+                fn list_archive_chunks_from<'a>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                    after_sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::archive::ArchiveChunk>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let executor = op.into_executor();
+                    async move {
+                        let rows = executor
+                            .fetch_all(sqlx::query!(
+                                #list_archive_chunks_query,
+                                after_sequence as #crate_name::EventSequence,
+                            ))
+                            .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::archive::ArchiveChunk {
+                                path: row.path,
+                                min_sequence: #crate_name::EventSequence::from(row.min_sequence as u64),
+                                max_sequence: #crate_name::EventSequence::from(row.max_sequence as u64),
+                            })
+                            .collect())
+                    }
+                }
+
+                fn list_archivable_boundaries<'a>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                    after_sequence: #crate_name::EventSequence,
+                    recorded_before: chrono::DateTime<chrono::Utc>,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::archive::ArchiveBoundary>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let executor = op.into_executor();
+                    async move {
+                        let rows = executor
+                            .fetch_all(sqlx::query!(
+                                #archivable_boundaries_query,
+                                after_sequence as #crate_name::EventSequence,
+                                recorded_before,
+                            ))
+                            .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::archive::ArchiveBoundary {
+                                label: row.day.to_string(),
+                                up_to_sequence: #crate_name::EventSequence::from(row.max_sequence as u64),
+                            })
+                            .collect())
+                    }
+                }
+
+                fn load_raw_export_page<'a>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                    after_sequence: #crate_name::EventSequence,
+                    up_to_sequence: #crate_name::EventSequence,
+                    limit: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::archive::RawExportRow>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let executor = op.into_executor();
+                    async move {
+                        let rows = executor
+                            .fetch_all(sqlx::query!(
+                                #raw_export_page_query,
+                                after_sequence as #crate_name::EventSequence,
+                                up_to_sequence as #crate_name::EventSequence,
+                                limit as i64,
+                            ))
+                            .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::archive::RawExportRow {
+                                id: #crate_name::out::OutboxEventId::from(row.id),
+                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                payload: row.payload,
+                                tracing_context: row.tracing_context,
+                                recorded_at: row.recorded_at,
+                            })
+                            .collect())
+                    }
+                }
+
+                fn record_archive_chunk<'a>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
+                    chunk: &#crate_name::archive::ArchiveChunk,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::archive::ArchiveError>> + Send {
+                    let executor = op.into_executor();
+                    async move {
+                        let recorded = executor
+                            .fetch_one(sqlx::query!(
+                                #record_archive_chunk_query,
+                                chunk.path,
+                                chunk.min_sequence as #crate_name::EventSequence,
+                                chunk.max_sequence as #crate_name::EventSequence,
+                            ))
+                            .await?
+                            .recorded;
+                        if !recorded {
+                            return Err(#crate_name::archive::ArchiveError::OverlappingChunk(
+                                format!("chunk {} [{}-{}] does not continue the archive watermark", chunk.path, chunk.min_sequence, chunk.max_sequence),
+                            ));
+                        }
+                        Ok(())
                     }
                 }
 
