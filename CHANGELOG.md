@@ -1,3 +1,21 @@
+# [obix release v0.6.0](https://github.com/GaloyMoney/obix/releases/tag/0.6.0)
+
+
+
+### Features
+
+- [**breaking**] Range-partition persistent_outbox_events by sequence (Stage 1) (#106)
+
+### Miscellaneous Tasks
+
+- Bump rustls-webpki 0.103.9 -> 0.103.13 (#110)
+- Pin nix dev postgres to 18 (#109)
+- Bump the all-dependencies group across 1 directory with 9 updates (#102)
+
+### Refactor
+
+- Make the partition DDL lock a method on Partitions
+
 # [obix release v0.5.0](https://github.com/GaloyMoney/obix/releases/tag/0.5.0)
 
 
