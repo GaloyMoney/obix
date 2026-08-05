@@ -6,13 +6,23 @@ use chrono::{DateTime, NaiveDate, Utc};
 use es_entity::clock::ClockHandle;
 use futures::stream::StreamExt;
 use obix::{
-    ArchiveConfig, Compression, DailyRetentionBoundary, EventArchiver, EventSequence,
-    InMemoryArchiveStorage, MailboxConfig, out::Outbox,
+    ArchiveConfig, Compression, DEFAULT_PARTITION_WIDTH, DailyRetentionBoundary,
+    EventArchiveStorage, EventArchiver, EventSequence, InMemoryArchiveStorage, MailboxConfig,
+    out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
 use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
+
+async fn relation_exists(pool: &sqlx::PgPool, name: &str) -> anyhow::Result<bool> {
+    let row = sqlx::query("SELECT to_regclass($1) IS NOT NULL AS present")
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+    use sqlx::Row;
+    Ok(row.get::<bool, _>("present"))
+}
 
 const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -81,12 +91,8 @@ async fn init_setup(retention_days: i64, boundaries_per_run: usize) -> anyhow::R
     })
 }
 
-async fn live_sequences(pool: &sqlx::PgPool) -> anyhow::Result<Vec<i64>> {
-    let rows = sqlx::query!("SELECT sequence FROM persistent_outbox_events ORDER BY sequence")
-        .fetch_all(pool)
-        .await?;
-    Ok(rows.into_iter().map(|r| r.sequence).collect())
-}
+// (live_sequences removed: archived rows are no longer row-level deleted,
+//  so checking the live table after archiving is no longer meaningful.)
 
 async fn manifest_rows(pool: &sqlx::PgPool) -> anyhow::Result<Vec<(String, i64, i64)>> {
     let rows = sqlx::query!(
@@ -128,7 +134,7 @@ async fn replay_from_beginning(
 
 #[tokio::test]
 #[file_serial]
-async fn archives_settled_spans_and_prunes_postgres() -> anyhow::Result<()> {
+async fn archives_settled_spans_to_object_storage() -> anyhow::Result<()> {
     let setup = init_setup(1, 1).await?;
 
     // Dates 0..2 in the archive window, date 3 = today.
@@ -149,7 +155,6 @@ async fn archives_settled_spans_and_prunes_postgres() -> anyhow::Result<()> {
     assert_eq!(report.chunks_written, 1);
     assert_eq!(u64::from(report.watermark), 2);
 
-    assert_eq!(live_sequences(&setup.pool).await?, vec![3, 4, 5, 6]);
     let chunks = manifest_rows(&setup.pool).await?;
     assert_eq!(chunks.len(), 1);
     assert_eq!((chunks[0].1, chunks[0].2), (1, 2));
@@ -163,7 +168,6 @@ async fn archives_settled_spans_and_prunes_postgres() -> anyhow::Result<()> {
     let report = archiver.run_once().await?;
     assert_eq!(report.spans_archived, 1);
     assert_eq!(u64::from(report.watermark), 3);
-    assert_eq!(live_sequences(&setup.pool).await?, vec![4, 5, 6]);
 
     // Nothing eligible left: day 2 and day 3 are inside the retention window.
     let report = archiver.run_once().await?;
@@ -284,7 +288,6 @@ async fn listener_replays_across_archive_postgres_seam() -> anyhow::Result<()> {
     // Days 0 and 1 eligible (retention 1, today = day 3), swept in one run.
     assert_eq!(report.spans_archived, 2);
     assert_eq!(u64::from(report.watermark), 4);
-    assert_eq!(live_sequences(&setup.pool).await?, vec![5, 6, 7]);
 
     // A NEW outbox instance — the "new module replaying from day 0" case —
     // reads the archive first, then crosses into postgres mid-stream.
@@ -354,9 +357,9 @@ async fn archive_export_materializes_sequence_gaps() -> anyhow::Result<()> {
     let archiver = EventArchiver::<TestTables>::new(&setup.pool, setup.archive_config.clone());
     let report = archiver.run_once().await?;
     // Day 0 (seqs 1-3) eligible; the gap at sequence 2 is exported as a
-    // placeholder line, then pruned from postgres.
+    // placeholder line. Rows are not row-level deleted (pruning is
+    // partition-level); only the watermark advances.
     assert_eq!(u64::from(report.watermark), 3);
-    assert_eq!(live_sequences(&setup.pool).await?, vec![4]);
 
     let received = replay_from_beginning(&setup.outbox, 4).await;
     assert_eq!(received, vec![Some(1), None, Some(2), Some(3)]);
@@ -415,20 +418,14 @@ async fn archiver_job_sweeps_settled_days() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     jobs.start_poll().await?;
 
-    // The job sweeps the one eligible day (seqs 1-3) without any direct
-    // archiver invocation. Poll for the prune (not just the storage write):
-    // the manifest insert + DELETE is a single statement that runs AFTER
-    // the storage put, so storage.list() non-empty is necessary but not
-    // sufficient — a slow runner can observe the file before the prune
-    // commits.
+    // The job sweeps the one eligible day (seqs 1-3). Poll for the
+    // manifest entry (not live_sequences): archived rows are not
+    // row-level deleted, so only the watermark advancing proves the
+    // sweep happened.
     let start = std::time::Instant::now();
-    while live_sequences(&setup.pool).await? != vec![4] {
+    while manifest_rows(&setup.pool).await?.is_empty() {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!(
-                "archiver job did not prune within timeout; live: {:?}, storage: {:?}",
-                live_sequences(&setup.pool).await?,
-                setup.storage.list()
-            );
+            panic!("archiver job did not sweep within timeout");
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -548,14 +545,12 @@ async fn storage_failure_mid_span_prunes_nothing_and_retries_cleanly() -> anyhow
     let chunks = manifest_rows(&pool).await?;
     assert_eq!(chunks.len(), 1);
     assert_eq!((chunks[0].1, chunks[0].2), (1, 1));
-    assert_eq!(live_sequences(&pool).await?, vec![2, 3]);
 
     // Retry with storage healthy: the remaining span archives
     // contiguously off the existing watermark.
     let report = archiver.run_once().await?;
     assert_eq!(report.spans_archived, 1);
     assert_eq!(u64::from(report.watermark), 2);
-    assert_eq!(live_sequences(&pool).await?, vec![3]);
 
     let replayed = replay_from_beginning(&outbox, 3).await;
     assert_eq!(replayed, vec![Some(1), Some(2), Some(3)]);
@@ -639,10 +634,128 @@ async fn backfill_rechecks_watermark_when_archiver_prunes_mid_walk() -> anyhow::
         vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
     );
 
-    // ...and the live table was not polluted with placeholder rows for
-    // the pruned range.
+    Ok(())
+}
+
+/// A backfill whose archive stream ends early (listener dropped) below
+/// the watermark must not fall through to `load_next_page`: it
+/// gap-fills by inserting placeholder rows, which below the watermark
+/// would be written for archived (partition-dropped) sequences and
+/// delivered as rolled-back events. The continuation stays SELECT-only.
+#[tokio::test]
+#[file_serial]
+async fn backfill_listener_drop_below_watermark_writes_no_placeholders() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipeout_outbox_tables(&pool).await?;
+
+    let width = DEFAULT_PARTITION_WIDTH;
+
+    // Ensure p0 exists (a prior test run may have dropped it) and p1 for
+    // the live event above the watermark.
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_p0 \
+         PARTITION OF persistent_outbox_events \
+         FOR VALUES FROM (0) TO ({width})"
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_p1 \
+         PARTITION OF persistent_outbox_events \
+         FOR VALUES FROM ({width}) TO ({width} * 2)"
+    ))
+    .execute(&pool)
+    .await?;
+
+    // Live rows in p0 (to be archived + pruned) and one in p1.
+    for (seq, ping) in [(1i64, 1u64), (2, 2), (3, 3)] {
+        sqlx::query(
+            "INSERT INTO persistent_outbox_events (sequence, payload) \
+             VALUES ($1, $2::jsonb)",
+        )
+        .bind(seq)
+        .bind(serde_json::json!({ "Ping": ping }).to_string())
+        .execute(&pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO persistent_outbox_events (sequence, payload) \
+         VALUES ($1, $2::jsonb)",
+    )
+    .bind((width + 1) as i64)
+    .bind(serde_json::json!({ "Ping": 4 }).to_string())
+    .execute(&pool)
+    .await?;
+
+    // The archive: a manifest chunk covering p0's range (watermark =
+    // width) whose storage file holds only the first three lines.
+    let storage = Arc::new(InMemoryArchiveStorage::new());
+    let mut file = Vec::new();
+    for (seq, ping) in [(1u64, 1u64), (2, 2), (3, 3)] {
+        let line = serde_json::json!({
+            "id": format!("00000000-0000-0000-0000-{:012}", seq),
+            "sequence": seq,
+            "payload": { "Ping": ping },
+            "recorded_at": "2026-07-20T00:00:00Z",
+        });
+        serde_json::to_writer(&mut file, &line)?;
+        file.push(b'\n');
+    }
+    storage.put("test/early-exit", file.into()).await?;
+    sqlx::query(
+        "INSERT INTO persistent_outbox_archive_chunks (path, min_sequence, max_sequence) \
+         VALUES ('test/early-exit', 1, $1)",
+    )
+    .bind(width as i64)
+    .execute(&pool)
+    .await?;
+
+    // Drop p0 — the archived range is gone from the live table.
+    obix::out::Partitions::<TestTables>::new(&pool, 1)
+        .prune_archived()
+        .await?;
+    assert!(!relation_exists(&pool, "persistent_outbox_events_p0").await?);
+
+    // Head the sequence so the cold outbox's cache starts above BEGIN
+    // and its backfill actually walks.
+    sqlx::query("SELECT setval('persistent_outbox_events_sequence_seq', $1)")
+        .bind((width + 5) as i64)
+        .execute(&pool)
+        .await?;
+
+    let (clock, _controller) = ClockHandle::manual_at(day(0));
+    let boundary = Arc::new(DailyRetentionBoundary::<TestTables>::new(
+        &pool,
+        chrono::Duration::days(1),
+        clock.clone(),
+    ));
+    let archive_config = ArchiveConfig::new(storage.clone(), boundary)
+        .with_boundaries_per_run(10)
+        .with_clock(clock.clone());
+    let mailbox_config = MailboxConfig::builder()
+        .clock(clock.clone())
+        // Channel capacity 1: the archive stream blocks on the second
+        // delivery until the listener drops — provably mid-stream.
+        .event_buffer_size(1)
+        .archive(Some(archive_config))
+        .build()?;
+    let walk_outbox = Outbox::<TestEvent, TestTables>::init(&pool, mailbox_config).await?;
+
+    let mut listener = walk_outbox.listen_persisted(Some(EventSequence::BEGIN));
+    // Consume the first archived event (the backfill is streaming from
+    // the archive), then drop the listener mid-stream.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+        .await?
+        .expect("stream ended during replay")
+        .expect("undecodable event during replay");
+    assert_eq!(u64::from(first.sequence), 1);
+    drop(listener);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // No placeholder rows were written below the watermark.
     let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM persistent_outbox_events WHERE sequence <= 4")
+        sqlx::query_scalar("SELECT COUNT(*) FROM persistent_outbox_events WHERE sequence <= $1")
+            .bind(width as i64)
             .fetch_one(&pool)
             .await?;
     assert_eq!(remaining, 0);
@@ -671,15 +784,88 @@ async fn backfill_below_watermark_without_reader_degrades_to_select_only() -> an
             .await?;
 
     let received = replay_from_beginning(&plain_outbox, 3).await;
-    assert_eq!(received, vec![None, None, Some(3)]);
+    // Archived rows remain in the live table until partition drop, so
+    // the degraded SELECT-only walk finds the real events rather than
+    // serving placeholders.
+    assert_eq!(received, vec![Some(1), Some(2), Some(3)]);
 
     // The degraded walk must not have written placeholder rows into the
-    // live table below the watermark.
+    // live table: only the 2 original archived rows should be present
+    // below the watermark.
     let remaining: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM persistent_outbox_events WHERE sequence <= 2")
             .fetch_one(&setup.pool)
             .await?;
-    assert_eq!(remaining, 0);
+    assert_eq!(remaining, 2);
+
+    Ok(())
+}
+
+/// Archived partitions are dropped by the partition maintainer once the
+/// archive watermark has passed their upper bound — an O(1) metadata
+/// operation instead of an O(n) row-level DELETE. Rows remain in the live
+/// table (invisible to readers via watermark gating) until the partition is
+/// dropped.
+#[tokio::test]
+#[file_serial]
+async fn prune_drops_fully_archived_partitions() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipeout_outbox_tables(&pool).await?;
+
+    let width = DEFAULT_PARTITION_WIDTH;
+
+    // Ensure p0 exists (a prior test run may have dropped it — the
+    // suite's wipeout helper truncates but does not recreate partitions).
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_p0 \
+         PARTITION OF persistent_outbox_events \
+         FOR VALUES FROM (0) TO ({width})"
+    ))
+    .execute(&pool)
+    .await?;
+
+    // Create p1 (p0 ships in the migration).
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_p1 \
+         PARTITION OF persistent_outbox_events \
+         FOR VALUES FROM ({width}) TO ({width} * 2)"
+    ))
+    .execute(&pool)
+    .await?;
+
+    // A row in p0 and one in p1.
+    sqlx::query("INSERT INTO persistent_outbox_events (sequence, payload) VALUES (1, '{}'::jsonb)")
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO persistent_outbox_events (sequence, payload) VALUES ({width} + 1, '{{}}'::jsonb)"
+    ))
+    .execute(&pool)
+        .await?;
+
+    let partitions = obix::out::Partitions::<TestTables>::new(&pool, 1);
+
+    // No watermark (archiving not active) → prune is a no-op.
+    partitions.prune_archived().await?;
+    assert!(relation_exists(&pool, "persistent_outbox_events_p0").await?);
+
+    // Watermark past p0's upper bound → prune drops p0, keeps p1.
+    sqlx::query(&format!(
+        "INSERT INTO persistent_outbox_archive_chunks (path, min_sequence, max_sequence) \
+         VALUES ('test/whole-p0', 1, {width})"
+    ))
+    .execute(&pool)
+    .await?;
+
+    partitions.prune_archived().await?;
+    assert!(
+        !relation_exists(&pool, "persistent_outbox_events_p0").await?,
+        "p0 dropped after prune"
+    );
+    assert!(
+        relation_exists(&pool, "persistent_outbox_events_p1").await?,
+        "p1 survives (watermark below its upper bound)"
+    );
 
     Ok(())
 }

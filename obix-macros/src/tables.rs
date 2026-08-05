@@ -270,28 +270,23 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
-        // Manifest insert + prune in ONE statement: data-modifying CTEs
-        // execute exactly once even unreferenced, so the DELETE and the
-        // INSERT commit or fail together. ON CONFLICT makes re-recording
-        // after a crash a no-op; the DELETE is then naturally empty.
+        // Manifest insert only. Rows are NOT deleted here: pruning is
+        // partition-level (the partition maintainer DETACH+DROPs whole
+        // partitions once the watermark passes their upper bound) rather
+        // than an O(n) row-level DELETE that generates WAL proportional
+        // to the archived span. Archived rows remain in the live table
+        // until their partition is dropped, but are invisible to readers
+        // (the watermark gates all reads below it).
         //
         // Contiguity guard: the new chunk must continue the current
         // watermark (`expected_min`) or be an exact re-record of an
         // existing chunk (the idempotent rerun case). Anything else is
-        // an overlap — nothing is deleted or inserted; the caller
-        // detects it via the follow-up existence check and fails.
+        // an overlap — nothing is inserted; the caller detects it via
+        // the follow-up existence check and fails.
         let record_archive_chunk_query = format!(
             r#"WITH guard AS (
                    SELECT COALESCE(MAX(max_sequence), 0) + 1 AS expected_min
                    FROM {tbl}persistent_outbox_archive_chunks
-               ),
-               deleted AS (
-                   DELETE FROM {tbl}persistent_outbox_events
-                   WHERE sequence >= $2 AND sequence <= $3
-                     AND ((SELECT expected_min FROM guard) = $2
-                          OR EXISTS (SELECT 1 FROM {tbl}persistent_outbox_archive_chunks
-                                     WHERE path = $1 AND min_sequence = $2 AND max_sequence = $3))
-                   RETURNING sequence
                ),
                inserted AS (
                    INSERT INTO {tbl}persistent_outbox_archive_chunks (path, min_sequence, max_sequence)
@@ -300,13 +295,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                    ON CONFLICT (path) DO NOTHING
                    RETURNING path
                )
-               -- One round trip: the CTEs above execute regardless.
-               -- Data-modifying CTE effects are invisible to the outer
-               -- query, so "recorded" = inserted by this statement OR
-               -- already present beforehand (the idempotent rerun).
-               -- `false` means the contiguity guard rejected an
-               -- overlapping chunk — and nothing was deleted or
-               -- inserted.
+               -- "recorded" = inserted by this statement OR already
+               -- present (the idempotent rerun). `false` means the
+               -- contiguity guard rejected an overlapping chunk.
                SELECT EXISTS(SELECT 1 FROM inserted)
                    OR EXISTS(
                        SELECT 1 FROM {tbl}persistent_outbox_archive_chunks

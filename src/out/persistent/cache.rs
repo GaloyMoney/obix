@@ -66,8 +66,14 @@ struct NotifiedRange {
 enum ArchiveStep {
     /// End this backfill; the listener re-requests one.
     Done,
-    /// Continue the pg walk from `sequence`, SELECT-only below
-    /// `degraded_below` when set.
+    /// Continue the pg walk from `sequence`. `degraded_below` bounds a
+    /// sub-range that must be served SELECT-only rather than via
+    /// [`Tables::load_next_page`]: sequences at or below an archive
+    /// watermark may have been pruned (their partition dropped), and
+    /// `load_next_page` gap-fills by inserting placeholder rows — which
+    /// below the watermark would write (and deliver) placeholders for
+    /// archived events into the live table. `Some(w)` means: while
+    /// `sequence < w`, walk SELECT-only.
     WalkFrom {
         sequence: EventSequence,
         degraded_below: Option<EventSequence>,
@@ -266,23 +272,32 @@ where
     /// storage, refreshing the watermark on every call. A no-op when the
     /// watermark has not passed `current_sequence`. Returns where the pg
     /// walk should resume, and whether it must degrade to SELECT-only
-    /// (watermark known but no archive reader configured).
+    /// (`degraded_below`: the walk may not use `load_next_page`, which
+    /// gap-fills by inserting placeholder rows — below the watermark
+    /// those would be written for archived sequences).
+    ///
+    /// `walk_upper_bound` bounds the SELECT-only walk when the watermark
+    /// itself is unknown (lookup failure): we cannot tell where the
+    /// archived range ends, so the whole walk must stay SELECT-only.
     async fn serve_archived_up_to_watermark(
         pool: &sqlx::PgPool,
         archive_reader: &Option<ArchiveReader>,
         current_sequence: EventSequence,
+        walk_upper_bound: EventSequence,
         sender: &mpsc::Sender<PersistentDelivery<P>>,
     ) -> ArchiveStep {
         let watermark = match Tables::archive_watermark(pool).await {
             Ok(watermark) => watermark,
-            // On a watermark lookup failure, fall through to the
-            // historical behavior — the archive is an optimization, not
-            // a reason to wedge live catch-up.
+            // Fail-open but never gap-fill: without the watermark we
+            // cannot tell where the archived range ends, so a
+            // `load_next_page` below it would INSERT placeholder rows
+            // for possibly-pruned sequences. Bound the SELECT-only walk
+            // at the sequence head — the loop ends there anyway.
             Err(error) => {
                 record_archive_watermark_failed(&error);
                 return ArchiveStep::WalkFrom {
                     sequence: current_sequence,
-                    degraded_below: None,
+                    degraded_below: Some(walk_upper_bound),
                 };
             }
         };
@@ -298,6 +313,20 @@ where
                     .stream_archived::<P, Tables>(pool, current_sequence, watermark, sender)
                     .await
                 {
+                    Ok(last_sent) if last_sent < watermark => {
+                        // The archive stream ended early — only possible
+                        // when the listener dropped mid-stream (a send
+                        // failed) or the chunks could not be fully
+                        // served. Resuming the pg walk from here would
+                        // be below the watermark: `load_next_page` would
+                        // gap-fill INSERT placeholders for archived
+                        // (possibly partition-dropped) sequences. Keep
+                        // the continuation SELECT-only instead.
+                        ArchiveStep::WalkFrom {
+                            sequence: last_sent,
+                            degraded_below: Some(watermark),
+                        }
+                    }
                     Ok(last_sent) => ArchiveStep::WalkFrom {
                         sequence: last_sent,
                         degraded_below: None,
@@ -375,14 +404,18 @@ where
         // concurrent archiver run may prune rows this walk was about to
         // read, and a one-time check cannot see that.
         loop {
-            // `degraded_below`: watermark known but no archive reader
-            // configured (misconfigured deployment) — the sub-watermark
-            // walk must be SELECT-only, `load_next_page` would INSERT
+            // `degraded_below`: sequences below this bound must be
+            // served SELECT-only — `load_next_page` would INSERT
             // placeholder rows for pruned sequences into the live table.
+            // Set when the archive reader is missing (misconfigured
+            // deployment), the archive stream ended early below the
+            // watermark (listener drop), or the watermark lookup failed
+            // (the whole walk degrades).
             let select_only_below = match Self::serve_archived_up_to_watermark(
                 &pool,
                 &archive_reader,
                 current_sequence,
+                highest,
                 &sender,
             )
             .await

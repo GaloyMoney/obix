@@ -50,7 +50,16 @@ async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()>
             .execute(pool)
             .await?;
     }
-    // Recovery recreates DEFAULT, but guard against a half-run leaving it gone.
+    // Recovery recreates DEFAULT, but guard against a half-run leaving it
+    // gone; the archive prune test drops p0 (testing partition-level
+    // pruning), so recreate it if a concurrent test removed it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_p0 \
+         PARTITION OF persistent_outbox_events \
+         FOR VALUES FROM (0) TO (2000000)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS persistent_outbox_events_default \
          PARTITION OF persistent_outbox_events DEFAULT",
