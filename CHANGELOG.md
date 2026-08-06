@@ -1,3 +1,15 @@
+# [obix release v0.7.0](https://github.com/GaloyMoney/obix/releases/tag/0.7.0)
+
+
+
+### Bug Fixes
+
+- [**breaking**] Stop trusting pg_notify payloads — notifications are hints, not transport (#107)
+
+### Miscellaneous Tasks
+
+- Bump es-entity 0.12.0, job 0.7.0, serial_test 4.0.1 (#112)
+
 # [obix release v0.6.0](https://github.com/GaloyMoney/obix/releases/tag/0.6.0)
 
 
