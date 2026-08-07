@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM job_executions \n        WHERE id IN (SELECT id FROM jobs WHERE job_type = 'test-inbox')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "48dbcf0dd94cd0c4b731e7c0c08abbc4b7abefbb19d0303ac77a48f4bf117d73"
+}

@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 use crate::{
+    archive::ArchiveReader,
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
     out::{event::*, pg_notify::NotifyMessage},
@@ -59,6 +60,36 @@ struct NotifiedRange {
     /// `None` when every notified sequence is already cached (the warm
     /// in-process path: the post-commit broadcast beat the NOTIFY).
     missing: Option<(EventSequence, EventSequence)>,
+}
+
+/// Result of the per-page archive-watermark (re-)check during backfill.
+enum ArchiveStep {
+    /// End this backfill; the listener re-requests one.
+    Done,
+    /// Continue the pg walk from `sequence`. `degraded_below` bounds a
+    /// sub-range that must be served SELECT-only rather than via
+    /// [`Tables::load_next_page`]: sequences at or below an archive
+    /// watermark may have been pruned (their partition dropped), and
+    /// `load_next_page` gap-fills by inserting placeholder rows — which
+    /// below the watermark would write (and deliver) placeholders for
+    /// archived events into the live table. `Some(w)` means: while
+    /// `sequence < w`, walk SELECT-only.
+    WalkFrom {
+        sequence: EventSequence,
+        degraded_below: Option<EventSequence>,
+    },
+}
+
+/// Shared dependencies handed to each backfill task.
+#[derive(Clone)]
+struct BackfillDeps<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pool: sqlx::PgPool,
+    cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+    buffer_size: usize,
+    archive_reader: Option<ArchiveReader>,
 }
 
 /// Bookkeeping for the sequence the broadcast cursor is stalled on.
@@ -149,6 +180,7 @@ where
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<NotifyMessage>,
+        archive_reader: Option<ArchiveReader>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -167,6 +199,7 @@ where
             cache_fill_recv,
             cache_fill_send.clone(),
             persistent_notification_rx,
+            archive_reader.clone(),
         )
         .await?;
 
@@ -235,6 +268,103 @@ where
         (cache, last_broadcast_sequence)
     }
 
+    /// Serve archived history `(current_sequence, watermark]` from object
+    /// storage, refreshing the watermark on every call. A no-op when the
+    /// watermark has not passed `current_sequence`. Returns where the pg
+    /// walk should resume, and whether it must degrade to SELECT-only
+    /// (`degraded_below`: the walk may not use `load_next_page`, which
+    /// gap-fills by inserting placeholder rows — below the watermark
+    /// those would be written for archived sequences).
+    ///
+    /// `walk_upper_bound` bounds the SELECT-only walk when the watermark
+    /// itself is unknown (lookup failure): we cannot tell where the
+    /// archived range ends, so the whole walk must stay SELECT-only.
+    async fn serve_archived_up_to_watermark(
+        pool: &sqlx::PgPool,
+        archive_reader: &Option<ArchiveReader>,
+        current_sequence: EventSequence,
+        walk_upper_bound: EventSequence,
+        sender: &mpsc::Sender<PersistentDelivery<P>>,
+    ) -> ArchiveStep {
+        let watermark = match Tables::archive_watermark(pool).await {
+            Ok(watermark) => watermark,
+            // Fail-open but never gap-fill: without the watermark we
+            // cannot tell where the archived range ends, so a
+            // `load_next_page` below it would INSERT placeholder rows
+            // for possibly-pruned sequences. Bound the SELECT-only walk
+            // at the sequence head — the loop ends there anyway.
+            Err(error) => {
+                record_archive_watermark_failed(&error);
+                return ArchiveStep::WalkFrom {
+                    sequence: current_sequence,
+                    degraded_below: Some(walk_upper_bound),
+                };
+            }
+        };
+        let Some(watermark) = watermark.filter(|w| current_sequence < *w) else {
+            return ArchiveStep::WalkFrom {
+                sequence: current_sequence,
+                degraded_below: None,
+            };
+        };
+        match archive_reader {
+            Some(reader) => {
+                match reader
+                    .stream_archived::<P, Tables>(pool, current_sequence, watermark, sender)
+                    .await
+                {
+                    Ok(last_sent) if last_sent < watermark => {
+                        // The archive stream ended early — only possible
+                        // when the listener dropped mid-stream (a send
+                        // failed) or the chunks could not be fully
+                        // served. Resuming the pg walk from here would
+                        // be below the watermark: `load_next_page` would
+                        // gap-fill INSERT placeholders for archived
+                        // (possibly partition-dropped) sequences. Keep
+                        // the continuation SELECT-only instead.
+                        ArchiveStep::WalkFrom {
+                            sequence: last_sent,
+                            degraded_below: Some(watermark),
+                        }
+                    }
+                    Ok(last_sent) => ArchiveStep::WalkFrom {
+                        sequence: last_sent,
+                        degraded_below: None,
+                    },
+                    Err(error) => {
+                        record_archive_backfill_failed(&error, u64::from(current_sequence));
+                        // The listener re-requests backfill as soon as
+                        // this one ends; delay so a storage outage
+                        // isn't a hot retry loop.
+                        tokio::time::sleep(ARCHIVE_BACKFILL_RETRY_DELAY).await;
+                        ArchiveStep::Done
+                    }
+                }
+            }
+            None => {
+                // Archiving ran on this deployment but this outbox has
+                // no archive configured: the archived range will come
+                // back as placeholders from a SELECT-only pg walk.
+                // Loud, not silent.
+                record_archive_reader_missing(u64::from(current_sequence), u64::from(watermark));
+                ArchiveStep::WalkFrom {
+                    sequence: current_sequence,
+                    degraded_below: Some(watermark),
+                }
+            }
+        }
+    }
+
+    fn placeholder_delivery(sequence: EventSequence) -> PersistentDelivery<P> {
+        PersistentDelivery::from(Ok::<_, UndecodableEventError>(PersistentOutboxEvent {
+            id: OutboxEventId::new(),
+            sequence,
+            payload: None,
+            tracing_context: None,
+            recorded_at: chrono::Utc::now(),
+        }))
+    }
+
     async fn fill_gap(
         pool: sqlx::PgPool,
         from_sequence: EventSequence,
@@ -249,22 +379,109 @@ where
     }
 
     async fn handle_backfill_request(
-        pool: sqlx::PgPool,
+        deps: BackfillDeps<P>,
         start_after: EventSequence,
         sender: mpsc::Sender<PersistentDelivery<P>>,
         cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
-        buffer_size: usize,
     ) {
         use std::ops::Bound;
 
+        let BackfillDeps {
+            pool,
+            cache_fill_sender,
+            buffer_size,
+            archive_reader,
+        } = deps;
         let mut current_sequence = start_after;
 
-        while current_sequence < highest {
+        // Archived history below the watermark no longer exists in
+        // postgres — a pg load for that range would synthesize
+        // placeholder rows and mask the archived events as rolled-back
+        // transactions. The watermark is therefore checked before every
+        // page — including the first — and sub-watermark history is
+        // served from the archive. The per-page re-check matters: a
+        // concurrent archiver run may prune rows this walk was about to
+        // read, and a one-time check cannot see that.
+        loop {
+            // `degraded_below`: sequences below this bound must be
+            // served SELECT-only — `load_next_page` would INSERT
+            // placeholder rows for pruned sequences into the live table.
+            // Set when the archive reader is missing (misconfigured
+            // deployment), the archive stream ended early below the
+            // watermark (listener drop), or the watermark lookup failed
+            // (the whole walk degrades).
+            let select_only_below = match Self::serve_archived_up_to_watermark(
+                &pool,
+                &archive_reader,
+                current_sequence,
+                highest,
+                &sender,
+            )
+            .await
+            {
+                ArchiveStep::Done => return,
+                ArchiveStep::WalkFrom {
+                    sequence,
+                    degraded_below,
+                } => {
+                    current_sequence = sequence;
+                    degraded_below
+                }
+            };
+            if current_sequence >= highest {
+                break;
+            }
             let next_needed = current_sequence.next();
             if cache_snapshot.contains_key(&next_needed) {
                 break;
+            }
+
+            if let Some(watermark) = select_only_below.filter(|w| current_sequence < *w) {
+                // Degraded sub-watermark walk (no archive reader
+                // configured): SELECT-only, placeholder deliveries are
+                // synthesized in memory — nothing is written back.
+                let window_end = watermark.min(EventSequence::from(
+                    u64::from(current_sequence) + buffer_size as u64,
+                ));
+                match Tables::load_events_in_range::<P>(&pool, current_sequence, window_end).await {
+                    Ok(events) => {
+                        let mut expected = current_sequence.next();
+                        for item in events {
+                            let delivery = PersistentDelivery::from(item);
+                            let seq = delivery.sequence();
+                            while expected < seq {
+                                let placeholder = Self::placeholder_delivery(expected);
+                                let _ = cache_fill_sender.send(placeholder.clone());
+                                if sender.send(placeholder).await.is_err() {
+                                    return;
+                                }
+                                expected = expected.next();
+                            }
+                            let _ = cache_fill_sender.send(delivery.clone());
+                            if sender.send(delivery).await.is_err() {
+                                return;
+                            }
+                            expected = seq.next();
+                        }
+                        // Sequences absent below the watermark are
+                        // pruned (archived) rows — placeholders.
+                        while expected <= window_end {
+                            let placeholder = Self::placeholder_delivery(expected);
+                            let _ = cache_fill_sender.send(placeholder.clone());
+                            if sender.send(placeholder).await.is_err() {
+                                return;
+                            }
+                            expected = expected.next();
+                        }
+                        current_sequence = window_end;
+                    }
+                    Err(e) => {
+                        record_backfill_failed(&e, u64::from(current_sequence));
+                        break;
+                    }
+                }
+                continue;
             }
 
             match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
@@ -360,6 +577,7 @@ where
         mut cache_fill_receiver: broadcast::Receiver<PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
+        archive_reader: Option<ArchiveReader>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -396,13 +614,16 @@ where
                                 );
 
                                 tokio::spawn(Self::handle_backfill_request(
-                                    pool.clone(),
+                                    BackfillDeps {
+                                        pool: pool.clone(),
+                                        cache_fill_sender: cache_fill_sender.clone(),
+                                        buffer_size: cache_size,
+                                        archive_reader: archive_reader.clone(),
+                                    },
                                     start_after,
                                     sender,
                                     cache_snapshot,
-                                    cache_fill_sender.clone(),
                                     highest,
-                                    cache_size,
                                 ));
                             }
                             None => {
@@ -620,6 +841,11 @@ where
     }
 }
 
+/// Delay before a failed archive backfill ends, so the listener's
+/// immediate re-request doesn't spin against an unavailable storage
+/// backend.
+const ARCHIVE_BACKFILL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tracing::instrument(name = "obix.persistent_cache.sequence_gap", level = "warn")]
 fn record_sequence_gap(last_broadcast_sequence: u64, next_in_cache: u64, highest_known: u64) {}
 
@@ -669,3 +895,27 @@ fn record_notification_channel_closed() {}
     fields(otel.status_code = "ERROR", error = %error),
 )]
 fn record_resync_failed(error: &sqlx::Error) {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.archive_backfill_failed",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", error = %error, current_sequence = current_sequence),
+)]
+fn record_archive_backfill_failed(error: &crate::archive::ArchiveError, current_sequence: u64) {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.archive_reader_missing",
+    level = "error",
+    skip_all,
+    fields(otel.status_code = "ERROR", start_after = start_after, watermark = watermark),
+)]
+fn record_archive_reader_missing(start_after: u64, watermark: u64) {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.archive_watermark_failed",
+    level = "warn",
+    skip_all,
+    fields(error = %error),
+)]
+fn record_archive_watermark_failed(error: &sqlx::Error) {}

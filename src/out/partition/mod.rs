@@ -232,4 +232,55 @@ where
             .await?;
         tx.commit().await
     }
+
+    /// Drop explicit partitions whose entire range has been archived (all
+    /// rows exported to object storage and recorded in the manifest). This
+    /// is the partition-level complement to archiving: the archiver exports
+    /// spans and advances the watermark; this method reclaims disk by
+    /// dropping partitions fully below the watermark.
+    ///
+    /// A no-op when no archive watermark exists (archiving not active).
+    /// Safe to call on every maintainer tick. Each partition is dropped in
+    /// its own transaction so a failure on one does not roll back the
+    /// others. `DROP TABLE` on a partition automatically removes it from
+    /// the parent's descriptor — no explicit `DETACH` needed.
+    pub async fn prune_archived(&self) -> Result<(), sqlx::Error> {
+        let table = Tables::persistent_outbox_events_table();
+        let Some(watermark) = Tables::archive_watermark(&self.pool).await? else {
+            return Ok(());
+        };
+        let watermark = u64::from(watermark);
+        let prefix = format!("{table}_p");
+
+        let rows = sqlx::query(&format!(
+            "SELECT c.relname FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE i.inhparent = '{table}'::regclass"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut to_drop = Vec::new();
+        for row in &rows {
+            use sqlx::Row;
+            let relname: String = row.get("relname");
+            let should_drop = relname
+                .strip_prefix(&prefix)
+                .and_then(|k| k.parse::<u64>().ok())
+                .is_some_and(|k| (k + 1) * DEFAULT_PARTITION_WIDTH <= watermark);
+            if should_drop {
+                to_drop.push(relname);
+            }
+        }
+
+        for name in to_drop {
+            let mut tx = self.pool.begin().await?;
+            self.ddl_lock(&mut tx).await?;
+            sqlx::query(&format!("DROP TABLE {name}"))
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Ok(())
+    }
 }

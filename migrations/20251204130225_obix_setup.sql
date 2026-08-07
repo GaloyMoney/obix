@@ -30,6 +30,24 @@ CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 
+-- Archived persistent outbox event chunks (exported to object storage)
+--
+-- One row per exported file: a contiguous sequence range of persistent
+-- outbox events that has been written to object storage (as JSONL) and
+-- pruned from persistent_outbox_events. MAX(max_sequence) is the archive
+-- watermark: everything at or below it must be read from the archive.
+-- Any grouping label (e.g. a calendar date) is encoded in a chunk's
+-- path; grouping semantics belong to the deployment, not to obix.
+CREATE TABLE persistent_outbox_archive_chunks (
+  path TEXT PRIMARY KEY,
+  min_sequence BIGINT NOT NULL,
+  max_sequence BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_persistent_outbox_archive_chunks_max_sequence
+  ON persistent_outbox_archive_chunks (max_sequence);
+
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (
   event_type VARCHAR NOT NULL UNIQUE,

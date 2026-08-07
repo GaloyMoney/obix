@@ -52,6 +52,9 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE ephemeral_outbox_events")
         .execute(pool)
         .await?;
+    sqlx::query!("TRUNCATE persistent_outbox_archive_chunks")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

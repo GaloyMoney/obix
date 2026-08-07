@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH guard AS (\n                   SELECT COALESCE(MAX(max_sequence), 0) + 1 AS expected_min\n                   FROM persistent_outbox_archive_chunks\n               ),\n               inserted AS (\n                   INSERT INTO persistent_outbox_archive_chunks (path, min_sequence, max_sequence)\n                   SELECT $1, $2, $3\n                   WHERE (SELECT expected_min FROM guard) = $2\n                   ON CONFLICT (path) DO NOTHING\n                   RETURNING path\n               )\n               -- \"recorded\" = inserted by this statement OR already\n               -- present (the idempotent rerun). `false` means the\n               -- contiguity guard rejected an overlapping chunk.\n               SELECT EXISTS(SELECT 1 FROM inserted)\n                   OR EXISTS(\n                       SELECT 1 FROM persistent_outbox_archive_chunks\n                       WHERE path = $1 AND min_sequence = $2 AND max_sequence = $3\n                   ) AS \"recorded!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "recorded!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "68888ed1a7488de0123096f711df716ec8e15abea7a59214f6bcd841891713b6"
+}

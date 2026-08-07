@@ -130,6 +130,13 @@ where
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
+            // Drop partitions fully below the archive watermark (a no-op
+            // when archiving is not configured).
+            self.partitions
+                .prune_archived()
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
             tokio::select! {
                 biased;
                 _ = current_job.shutdown_requested() => {

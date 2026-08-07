@@ -68,6 +68,13 @@ pub struct MailboxConfig {
     pub partition_maintainer_interval: std::time::Duration,
     #[builder(default = "Clock::handle().clone()")]
     pub clock: ClockHandle,
+    /// Cold-storage archiving of old persistent events (see
+    /// [`archive`](crate::archive)). When set, the outbox serves
+    /// pre-watermark history reads from the archive, and
+    /// [`Outbox::register_event_archiver`](crate::Outbox::register_event_archiver)
+    /// can schedule the sweep job.
+    #[builder(default)]
+    pub archive: Option<crate::archive::ArchiveConfig>,
 }
 
 impl MailboxConfig {
