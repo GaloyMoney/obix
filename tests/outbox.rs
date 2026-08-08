@@ -955,6 +955,177 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
     Ok(())
 }
 
+// Since 0.8 an app transaction on a hook-supporting op carries NO pg_notify
+// (the cluster-wide NOTIFY commit lock is off the app commit path); the
+// per-process debounced notifier emits the {min,max} hint out-of-band after
+// commit. A second Outbox instance can only learn about the event through
+// that hint — receipt well under the 10s idle-resync default proves the
+// debounced path works.
+#[tokio::test]
+#[file_serial]
+async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    let config = MailboxConfig::builder()
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
+    let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+
+    let mut listener_b = outbox_b.listen_persisted(None);
+
+    // DbOp supports commit hooks: the persist statement is the silent
+    // variant, so cross-process delivery depends on the debounced notify.
+    let mut op = outbox_a.begin_op().await?;
+    outbox_a
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener_b.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("debounced notify never reached the other instance"))?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    Ok(())
+}
+
+// A burst of commits must coalesce into far fewer NOTIFYs than commits —
+// that is the whole point of the debounced notifier. A raw PgListener on
+// the channel counts actual emissions; the final hint's max_sequence must
+// still cover the last committed batch (nothing coalesced away).
+#[tokio::test]
+#[file_serial]
+async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .notify_debounce(std::time::Duration::from_millis(100))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut raw_listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    raw_listener.listen("persistent_outbox_events").await?;
+
+    let n: u64 = 10;
+    for i in 0..n {
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(i))
+            .await?;
+        op.commit().await?;
+    }
+
+    // Collect notifications until the channel goes quiet for well over a
+    // debounce interval.
+    let mut payloads = Vec::new();
+    while let Ok(notification) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), raw_listener.recv()).await
+    {
+        payloads.push(notification?.payload().to_string());
+    }
+
+    assert!(
+        !payloads.is_empty(),
+        "the debounced notifier must emit at least one notification"
+    );
+    assert!(
+        (payloads.len() as u64) < n,
+        "a burst of {n} commits must coalesce into fewer notifications, got {}",
+        payloads.len()
+    );
+
+    #[derive(Deserialize)]
+    struct Header {
+        max_sequence: u64,
+    }
+    let last: Header = serde_json::from_str(payloads.last().expect("non-empty"))?;
+    assert_eq!(
+        last.max_sequence, n,
+        "the final hint's max_sequence must cover the last committed batch"
+    );
+
+    Ok(())
+}
+
+// Crash-window backstop: rows that never get ANY notification — a writer
+// dying between commit and notify, or an external process inserting via raw
+// SQL — must still be delivered. The cache's idle head-poll re-reads the
+// sequence head after `idle_resync_interval` of notification silence and
+// the gap-fill machinery fetches the rows.
+#[tokio::test]
+#[file_serial]
+async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .idle_resync_interval(std::time::Duration::from_millis(500))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Raw insert: no obix publish, no post_commit report, no NOTIFY at all.
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 42}"#)
+        .execute(&pool)
+        .await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("idle head-poll never delivered the unnotified event"))?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(42))));
+
+    Ok(())
+}
+
+// The bare-transaction path (no commit hooks -> post_commit never runs ->
+// the debounced notifier cannot observe the commit) keeps the legacy
+// in-transaction NOTIFY: cross-instance delivery must be prompt — well
+// under the 10s idle-resync default — proving the notifying query variant
+// is actually wired on the force-execute path.
+#[tokio::test]
+#[file_serial]
+async fn bare_transaction_publish_delivers_promptly_cross_instance() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    let config = MailboxConfig::builder()
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
+    let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+
+    let mut listener_b = outbox_b.listen_persisted(None);
+
+    let mut op = pool.begin().await?;
+    outbox_a
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener_b.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("in-tx notify of a bare-transaction publish never arrived"))?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    Ok(())
+}
+
 // Rows written into a shared database by a different event enum (e.g.
 // test-only module tags) must neither crash the reader nor be silently
 // dropped: the event is still delivered — in order, as the `Err` item
