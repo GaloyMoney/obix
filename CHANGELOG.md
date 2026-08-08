@@ -1,3 +1,15 @@
+# [obix release v0.7.1](https://github.com/GaloyMoney/obix/releases/tag/0.7.1)
+
+
+
+### Documentation
+
+- Add SECURITY.md (#113)
+
+### Features
+
+- Move pg_notify off the commit path (debounced per-process notifier) (#114)
+
 # [obix release v0.7.0](https://github.com/GaloyMoney/obix/releases/tag/0.7.0)
 
 
