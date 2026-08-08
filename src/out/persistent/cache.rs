@@ -313,8 +313,21 @@ where
         }
     }
 
-    /// Parse a `{min_sequence, max_sequence}` notification (emitted once per
-    /// insert statement by the publisher) and decide what must be fetched.
+    /// Authoritative head read (the O(1) sequence `last_value` query).
+    /// Logs and returns `None` on failure so callers skip their advance.
+    async fn read_confirmed_head(pool: &sqlx::PgPool) -> Option<EventSequence> {
+        match Tables::highest_known_persistent_sequence(pool).await {
+            Ok(head) => Some(head),
+            Err(e) => {
+                record_resync_failed(&e);
+                None
+            }
+        }
+    }
+
+    /// Parse a `{min_sequence, max_sequence}` notification (emitted per
+    /// debounce tick by each process's notifier, or in-transaction by
+    /// bare-transaction publishes) and decide what must be fetched.
     /// Returns `None` for unparsable payloads.
     fn handle_notification(
         payload: &str,
@@ -367,6 +380,7 @@ where
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let gap_fill_grace = config.gap_fill_grace;
+        let idle_resync_interval = config.idle_resync_interval;
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
@@ -374,9 +388,8 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, PersistentDelivery<P>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
-            // Bookkeeping for the sequence the broadcast is stalled on.
-            // Reset whenever the broadcast cursor advances.
             let mut gap_state: Option<GapFillState> = None;
+            let mut last_progress_at = tokio::time::Instant::now();
 
             loop {
                 // Wake up exactly when the next gap-fill action falls due,
@@ -416,6 +429,9 @@ where
                     result = cache_fill_receiver.recv() => {
                         match result {
                             Ok(event) => {
+                                let watermark_before =
+                                    highest_known_sequence.load(Ordering::Relaxed);
+
                                 (persistent_cache, last_broadcast_sequence) =
                                     Self::insert_into_cache_and_maybe_broadcast(
                                         persistent_cache,
@@ -436,6 +452,12 @@ where
                                             last_broadcast_sequence,
                                             cache_size,
                                         );
+                                }
+
+                                if highest_known_sequence.load(Ordering::Relaxed)
+                                    > watermark_before
+                                {
+                                    last_progress_at = tokio::time::Instant::now();
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -522,39 +544,37 @@ where
                                     highest_known_sequence.load(Ordering::Relaxed);
                                 let claim_advances = claimed_head
                                     .is_some_and(|claimed| u64::from(claimed) > current_head);
-                                if claim_advances || resync_needed || fetch_range.is_some() {
-                                    match Tables::highest_known_persistent_sequence(&pool).await {
-                                        Ok(head) => {
-                                            let confirmed_head = claimed_head
-                                                .map(|claimed| {
-                                                    EventSequence::from(
-                                                        u64::from(claimed)
-                                                            .min(u64::from(head)),
-                                                    )
-                                                })
-                                                .unwrap_or(head);
-                                            highest_known_sequence.fetch_max(
-                                                u64::from(confirmed_head),
-                                                Ordering::AcqRel,
-                                            );
-                                            if let Some((after, up_to)) = fetch_range {
-                                                let clamped_up_to = EventSequence::from(
-                                                    u64::from(up_to)
-                                                        .min(u64::from(confirmed_head)),
-                                                );
-                                                if u64::from(after)
-                                                    < u64::from(clamped_up_to)
-                                                {
-                                                    tokio::spawn(Self::fetch_notified_range(
-                                                        pool.clone(),
-                                                        after,
-                                                        clamped_up_to,
-                                                        cache_fill_sender.clone(),
-                                                    ));
-                                                }
-                                            }
+                                if (claim_advances || resync_needed || fetch_range.is_some())
+                                    && let Some(head) = Self::read_confirmed_head(&pool).await
+                                {
+                                    last_progress_at = tokio::time::Instant::now();
+                                    let confirmed_head = claimed_head
+                                        .map(|claimed| {
+                                            EventSequence::from(
+                                                u64::from(claimed)
+                                                    .min(u64::from(head)),
+                                            )
+                                        })
+                                        .unwrap_or(head);
+                                    highest_known_sequence.fetch_max(
+                                        u64::from(confirmed_head),
+                                        Ordering::AcqRel,
+                                    );
+                                    if let Some((after, up_to)) = fetch_range {
+                                        let clamped_up_to = EventSequence::from(
+                                            u64::from(up_to)
+                                                .min(u64::from(confirmed_head)),
+                                        );
+                                        if u64::from(after)
+                                            < u64::from(clamped_up_to)
+                                        {
+                                            tokio::spawn(Self::fetch_notified_range(
+                                                pool.clone(),
+                                                after,
+                                                clamped_up_to,
+                                                cache_fill_sender.clone(),
+                                            ));
                                         }
-                                        Err(e) => record_resync_failed(&e),
                                     }
                                 }
                             }
@@ -571,6 +591,16 @@ where
                             None => std::future::pending::<()>().await,
                         }
                     } => {}
+
+                    _ = tokio::time::sleep_until(last_progress_at + idle_resync_interval) => {
+                        if let Some(head) = Self::read_confirmed_head(&pool).await {
+                            highest_known_sequence.fetch_max(
+                                u64::from(head),
+                                Ordering::AcqRel,
+                            );
+                        }
+                        last_progress_at = tokio::time::Instant::now();
+                    }
                 }
 
                 // Proactive gap fill: if broadcasting is stuck waiting for a missing

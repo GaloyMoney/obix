@@ -4,6 +4,7 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod job;
+mod notifier;
 mod op_cursor;
 mod partition;
 mod persist_events_hook;
@@ -23,6 +24,7 @@ pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
 pub use event::*;
+use notifier::PersistentNotifier;
 pub use op_cursor::{CursorError, OpCursor};
 pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
@@ -42,6 +44,8 @@ where
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
+    /// Per-process debounced NOTIFY emitter.
+    notifier: PersistentNotifier,
     clock: ClockHandle,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
@@ -76,6 +80,7 @@ where
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
+            notifier: self.notifier.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
         }
@@ -106,6 +111,8 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
+        let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
+
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
@@ -115,6 +122,7 @@ where
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
+            notifier,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
         })
@@ -163,13 +171,16 @@ where
             .clone();
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
+            self.notifier.report_sender(),
             events,
             self.persist_events_batch_size,
             post_persist_hooks,
         );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
-            hook.force_execute_pre_commit(op).await?;
+            hook.with_in_tx_notify()
+                .force_execute_pre_commit(op)
+                .await?;
         }
         Ok(())
     }

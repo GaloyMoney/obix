@@ -10,6 +10,20 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 /// uncommitted rows (ON CONFLICT speculative insertion) until they commit.
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long the per-process notifier coalesces committed-batch reports
+/// before emitting one `pg_notify` wake-up hint. Notify-bearing commits
+/// serialize on a cluster-wide lock, so app transactions no longer notify;
+/// this bounds the added cross-process wake-up latency (in-process delivery
+/// is unaffected).
+pub const DEFAULT_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How long the persistent cache goes without authoritative progress (a
+/// newly-seen committed row or a confirmed head read) before polling the
+/// sequence head (the O(1) `last_value` query). Backstops lost wake-ups: a
+/// writer crashing between commit and notify, a dead remote notifier, or
+/// external writers that never notify.
+pub const DEFAULT_IDLE_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Width, in `sequence` units, of each `persistent_outbox_events` partition.
 ///
 /// A fixed schema constant, deliberately **not** runtime-configurable: it must
@@ -56,6 +70,14 @@ pub struct MailboxConfig {
     /// fill attempt are unaffected (fixed 1s interval).
     #[builder(default = "DEFAULT_GAP_FILL_GRACE")]
     pub gap_fill_grace: std::time::Duration,
+    /// Coalescing window of the per-process debounced notifier; see
+    /// [`DEFAULT_NOTIFY_DEBOUNCE`]. Deliberately no per-commit escape hatch.
+    #[builder(default = "DEFAULT_NOTIFY_DEBOUNCE")]
+    pub notify_debounce: std::time::Duration,
+    /// Progress-silence threshold before the persistent cache polls the
+    /// sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
+    #[builder(default = "DEFAULT_IDLE_RESYNC_INTERVAL")]
+    pub idle_resync_interval: std::time::Duration,
     /// How many partitions ahead of the head the maintainer keeps created;
     /// see [`DEFAULT_PARTITION_PREMAKE`]. (Partition *width* is the fixed
     /// [`DEFAULT_PARTITION_WIDTH`] constant, not configurable — it is coupled to

@@ -114,21 +114,30 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
-        // Notifications ride the insert statement itself: one
-        // {min_sequence, max_sequence} pg_notify per statement, aggregated
-        // from the rows the CTE already materializes — no per-row trigger,
-        // no row_to_json of payloads, no transition table. Listeners fetch
-        // the notified range back with a SELECT-only scan
-        // (load_events_in_range).
+        // No pg_notify here: notify-bearing commits serialize on a
+        // cluster-wide lock, so cross-process wake-up moved to the
+        // per-process debounced notifier (`src/out/notifier.rs`).
+        let persist_events_query = format!(
+            r#"WITH new_events AS (
+                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
+                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
+                   RETURNING id, sequence, recorded_at
+               )
+               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
+               FROM new_events ne
+               ORDER BY ne.sequence"#,
+            tbl = table_prefix,
+        );
+
+        // Kept only for publishes onto operations without commit-hook
+        // support (bare `sqlx::Transaction`): post_commit never runs there,
+        // so the insert statement itself must carry the {min, max} hint.
         //
         // INVARIANT: `notified` must remain referenced by the outer query
-        // (the LEFT JOIN below). Postgres never executes an unreferenced
-        // SELECT CTE — notifications would silently stop and cross-process
-        // delivery would degrade to the grace-period gap-fill path
-        // (events_via_pg_notify hangs if this regresses). HAVING COUNT(*) > 0
-        // suppresses the aggregate's empty-input row so an empty insert
-        // notifies nothing.
-        let persist_events_query = format!(
+        // (the LEFT JOIN below) — Postgres never executes an unreferenced
+        // SELECT CTE (events_via_pg_notify hangs if this regresses).
+        // HAVING COUNT(*) > 0 keeps an empty insert from notifying.
+        let persist_events_notifying_query = format!(
             r#"WITH new_events AS (
                    INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
                    SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
@@ -324,6 +333,55 @@ FROM {}persistent_outbox_events_sequence_seq",
                         }
                         let rows = sqlx::query!(
                             #persist_events_query,
+                            &serialized_events as _,
+                            tracing_json,
+                            now
+                        ).fetch_all(op.as_executor()).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .zip(payloads.into_iter())
+                            .map(|(row, payload)| #crate_name::out::PersistentOutboxEvent {
+                                id: #crate_name::out::OutboxEventId::from(row.id),
+                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                recorded_at: row.recorded_at,
+                                payload: Some(payload),
+                                #set_context
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(events)
+                    }
+                }
+
+                fn persist_events_notifying<'a, P>(
+                    op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
+                    events: impl Iterator<Item = P>,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
+                {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let now = op.maybe_now();
+
+                    let mut payloads = Vec::new();
+                    let serialized_events = events
+                        .map(|e| {
+                            let serialized_event =
+                                #crate_name::prelude::serde_json::to_value(&e).expect("Could not serialize payload");
+                            payloads.push(e);
+                            serialized_event
+                        })
+                        .collect::<Vec<_>>();
+
+                    #extract_tracing
+
+                    async move {
+                        if payloads.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let rows = sqlx::query!(
+                            #persist_events_notifying_query,
                             &serialized_events as _,
                             tracing_json,
                             now

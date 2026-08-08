@@ -123,6 +123,18 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// [`persist_events`](Self::persist_events) variant whose insert carries
+    /// the legacy in-transaction `pg_notify` hint. Only for operations
+    /// without commit-hook support (bare `sqlx::Transaction`), where
+    /// `post_commit` never runs and the debounced notifier cannot observe
+    /// the commit.
+    fn persist_events_notifying<'a, P>(
+        op: &mut HookOperation<'a>,
+        events: impl Iterator<Item = P>,
+    ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
     /// Each item is one sequence position: `Ok` for a decoded event or a
     /// plain placeholder (`payload: None`), `Err` for a stored payload that
     /// does not decode into `P` — delivered, not dropped, so the page stays
