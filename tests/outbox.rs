@@ -385,9 +385,14 @@ async fn large_batch_persisted_in_bounded_chunks() -> anyhow::Result<()> {
 async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
+    // Small grace + min-age so the placeholder for the lost sequence
+    // arrives quickly; with the defaults (2s grace, 5s min-age) the fill
+    // would be correct but slow for a test.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_millis(100))
+            .gap_fill_min_age(std::time::Duration::from_millis(200))
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -441,10 +446,13 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
 async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
+    // min_age well below grace so the grace period is what gates the
+    // first placeholder — the property under test here.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_secs(2))
+            .gap_fill_min_age(std::time::Duration::from_millis(100))
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -507,9 +515,9 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
 async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Default grace (250ms) — the in-flight transaction below commits well
-    // within it, so the gap must resolve with the real row, never a
-    // placeholder.
+    // Default grace (2s) and min-age (5s) — the in-flight transaction
+    // below commits well within both, so the gap must resolve with the
+    // real row, never a placeholder.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -572,6 +580,309 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
         .await?
         .expect("should receive real event after gap")?;
     assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn gap_fill_respects_min_age() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Grace far below min-age: fill attempts fire early but must stay
+    // read-only until the burned sequence is provably min_age old.
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_millis(100))
+            .gap_fill_min_age(std::time::Duration::from_secs(2))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Burn a sequence number (gap at N+1), then publish seq N+2.
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Well past the grace period but short of min_age: several fill
+    // attempts have fired, yet none may have written a placeholder.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1500), listener.next())
+            .await
+            .is_err(),
+        "no placeholder may be written before the sequence is provably min_age old"
+    );
+
+    // Once the sequence's age is provable, the placeholder arrives.
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive gap-filled placeholder after min_age")?;
+    assert!(
+        gap_event.payload.is_none(),
+        "gap-filled event should have None payload"
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive real event after gap")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Batch limit of 2 with 5 lost sequences: no single fill may insert
+    // more than 2 placeholders, and successive attempts must recover the
+    // remainder — capped, never skipped.
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_millis(100))
+            .gap_fill_min_age(std::time::Duration::from_millis(100))
+            .gap_fill_batch_limit(2)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Burn five sequence numbers (gaps at N+1..=N+5), then publish N+6.
+    for _ in 0..5 {
+        sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+            .fetch_one(&pool)
+            .await?;
+    }
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // All five placeholders arrive, in order, across at least three
+    // batch-capped fill attempts.
+    let first_gap = u64::from(event.sequence) + 1;
+    for expected_sequence in first_gap..first_gap + 5 {
+        let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("should receive gap-filled placeholder")?;
+        assert!(
+            gap_event.payload.is_none(),
+            "gap-filled event should have None payload"
+        );
+        assert_eq!(u64::from(gap_event.sequence), expected_sequence);
+    }
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive real event after gaps")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn fill_gaps_leaves_committed_rows_untouched() -> anyhow::Result<()> {
+    use obix::MailboxTables as _;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb), ($2::jsonb)")
+        .bind(r#"{"Ping": 1}"#)
+        .bind(r#"{"Ping": 2}"#)
+        .execute(&pool)
+        .await?;
+
+    let tuples_before: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT xmin::text, sequence FROM persistent_outbox_events ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    // Filling over already-committed sequences must insert nothing and —
+    // unlike the previous DO UPDATE upsert — rewrite nothing (no new row
+    // versions, no dead tuples).
+    let inserted = helpers::TestTables::fill_gaps::<TestEvent>(
+        &pool,
+        vec![EventSequence::from(1), EventSequence::from(2)],
+    )
+    .await?;
+    assert!(
+        inserted.is_empty(),
+        "fill over committed sequences must return no inserted rows"
+    );
+
+    let tuples_after: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT xmin::text, sequence FROM persistent_outbox_events ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        tuples_before, tuples_after,
+        "committed rows must keep their xmin — a rewrite would create dead tuples"
+    );
+
+    // And the payloads survive untouched.
+    let events =
+        helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
+    let payloads = events
+        .into_iter()
+        .map(|item| item.expect("decodable row").payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads,
+        vec![Some(TestEvent::Ping(1)), Some(TestEvent::Ping(2))]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn backfill_fills_historical_gap_for_replaying_listener() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // History written with NO cache loop running: seq 1 committed, seq 2
+    // burned (a rolled-back writer nobody observed as a frontier stall),
+    // seq 3 committed.
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 0}"#)
+        .execute(&pool)
+        .await?;
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 1}"#)
+        .execute(&pool)
+        .await?;
+
+    // Init AFTER the gap exists: the broadcast cursor starts at the head
+    // and never visits the historical gap — only backfill can serve a
+    // replaying listener, and it must placeholder-fill the lost sequence
+    // (age proof: allocated before init, uptime past min_age).
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_min_age(std::time::Duration::from_millis(200))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should replay first event")?;
+    assert!(matches!(first.payload, Some(TestEvent::Ping(0))));
+
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive placeholder for the historical gap")?;
+    assert!(
+        gap_event.payload.is_none(),
+        "historical gap must resolve as a placeholder"
+    );
+    assert_eq!(u64::from(gap_event.sequence), 2);
+
+    let third = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should replay the event after the gap")?;
+    assert!(matches!(third.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // History ends in burned sequences: seq 1 committed, seqs 2 and 3
+    // allocated but never committed, no process running at the time.
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 0}"#)
+        .execute(&pool)
+        .await?;
+    for _ in 0..2 {
+        sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+            .fetch_one(&pool)
+            .await?;
+    }
+
+    // The cursor initializes at the allocation head (3); a replaying
+    // listener must not stall forever on the burned tail — backfill
+    // placeholder-fills it once uptime proves the sequences' age.
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_min_age(std::time::Duration::from_millis(200))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should replay first event")?;
+    assert!(matches!(first.payload, Some(TestEvent::Ping(0))));
+
+    for expected_sequence in 2..=3u64 {
+        let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("should receive placeholder for the burned tail")?;
+        assert!(
+            gap_event.payload.is_none(),
+            "burned tail must resolve as placeholders"
+        );
+        assert_eq!(u64::from(gap_event.sequence), expected_sequence);
+    }
 
     Ok(())
 }

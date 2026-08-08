@@ -18,6 +18,21 @@ where
     local_cache: BTreeMap<EventSequence, PersistentDelivery<P>>,
     cache_handle: CacheHandle<P>,
     backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
+    /// Whether the current backfill round has contributed anything new to
+    /// the local cache. Folded into [`Self::backfill_barren`] when the
+    /// round completes.
+    backfill_progress: bool,
+    /// Set when a backfill round completes without contributing anything;
+    /// cleared by any live-broadcast signal (delivery or lag). While set,
+    /// no new backfill is requested: a listener parked at a frontier gap
+    /// would otherwise re-request in a tight loop — backfill reads
+    /// (deliberately, since the age-gated fill redesign) cannot resolve a
+    /// young gap, whose resolution always arrives through the live
+    /// broadcast once the writer commits or the grace-gated fill
+    /// placeholder lands. Everything below the broadcast cursor is
+    /// committed-or-placeholder in the table, so a barren round means
+    /// there is nothing more the database can currently add.
+    backfill_barren: bool,
 }
 
 impl<P> PersistentOutboxListener<P>
@@ -39,22 +54,31 @@ where
             buffer_size: buffer,
             cache_handle,
             backfill_receiver: None,
+            backfill_progress: false,
+            backfill_barren: false,
         }
     }
 
-    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
+    /// Returns whether the delivery contributed anything new (it was
+    /// neither behind the returned cursor nor already buffered).
+    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) -> bool {
         let sequence = delivery.sequence();
         self.latest_known = self.latest_known.max(sequence);
-        if sequence > self.last_returned_sequence
-            && self.local_cache.insert(sequence, delivery).is_none()
-            && self.local_cache.len() > self.buffer_size
-        {
+        if sequence <= self.last_returned_sequence {
+            return false;
+        }
+        if self.local_cache.insert(sequence, delivery).is_some() {
+            return false;
+        }
+        if self.local_cache.len() > self.buffer_size {
             self.local_cache.pop_last();
         }
+        true
     }
 
     fn request_backfill(&mut self) {
         if self.backfill_receiver.is_none() {
+            self.backfill_progress = false;
             self.backfill_receiver = Some(
                 self.cache_handle
                     .request_old_persistent_events(self.last_returned_sequence),
@@ -83,9 +107,14 @@ where
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(None) => break,
                 Poll::Ready(Some(Ok(event))) => {
+                    // Any live signal is new information: a barren backfill
+                    // round no longer proves the database has nothing to
+                    // add, so re-requesting is allowed again.
+                    this.backfill_barren = false;
                     this.maybe_add_to_cache(event);
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    this.backfill_barren = false;
                     record_lagged(
                         n,
                         u64::from(this.last_returned_sequence),
@@ -111,11 +140,14 @@ where
             }
         }
 
+        for event in backfill_events {
+            if this.maybe_add_to_cache(event) {
+                this.backfill_progress = true;
+            }
+        }
         if backfill_done {
             this.backfill_receiver = None;
-        }
-        for event in backfill_events {
-            this.maybe_add_to_cache(event);
+            this.backfill_barren = !this.backfill_progress;
         }
 
         while let Some((seq, event)) = this.local_cache.pop_first() {
@@ -130,7 +162,10 @@ where
             break;
         }
 
-        if this.last_returned_sequence < this.latest_known && this.backfill_receiver.is_none() {
+        if this.last_returned_sequence < this.latest_known
+            && this.backfill_receiver.is_none()
+            && !this.backfill_barren
+        {
             this.request_backfill();
             // need to register the cx with the backfill_receiver to get woken up
             return self.poll_next(cx);

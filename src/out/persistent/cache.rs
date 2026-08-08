@@ -65,6 +65,9 @@ struct NotifiedRange {
 struct GapFillState {
     /// Grace period before the first fill (`MailboxConfig::gap_fill_grace`).
     grace: std::time::Duration,
+    /// Minimum provable age before a sequence may be placeholder-filled
+    /// (`MailboxConfig::gap_fill_min_age`).
+    min_age: std::time::Duration,
     /// The sequence the broadcast cursor is stalled on. The state is
     /// discarded when the cursor advances past it.
     stalled_on: EventSequence,
@@ -72,19 +75,36 @@ struct GapFillState {
     /// `grace` has elapsed since this instant.
     first_seen: tokio::time::Instant,
     last_attempt: Option<tokio::time::Instant>,
+    /// Allocation-head observations `(observed_at, head)`: at `observed_at`
+    /// the sequence's `last_value` was already `head`, so every sequence
+    /// `<= head` was allocated at or before `observed_at` and is therefore
+    /// at least `now - observed_at` old. Sampled at state creation and at
+    /// each attempt; monotone in both fields.
+    head_samples: std::collections::VecDeque<(tokio::time::Instant, u64)>,
 }
 
 impl GapFillState {
     /// How long after a gap-fill attempt the same stalled sequence is
-    /// retried (the attempt itself may have raced a still-uncommitted row).
+    /// retried (the attempt itself may have raced a still-uncommitted row,
+    /// or been capped by `gap_fill_batch_limit`).
     const REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-    fn new(grace: std::time::Duration, stalled_on: EventSequence) -> Self {
+    fn new(
+        grace: std::time::Duration,
+        min_age: std::time::Duration,
+        stalled_on: EventSequence,
+        observed_head: u64,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        let mut head_samples = std::collections::VecDeque::new();
+        head_samples.push_back((now, observed_head));
         Self {
             grace,
+            min_age,
             stalled_on,
-            first_seen: tokio::time::Instant::now(),
+            first_seen: now,
             last_attempt: None,
+            head_samples,
         }
     }
 
@@ -107,8 +127,58 @@ impl GapFillState {
         self.next_fill_due() <= tokio::time::Instant::now()
     }
 
-    fn record_attempt(&mut self) {
-        self.last_attempt = Some(tokio::time::Instant::now());
+    fn record_attempt(&mut self, observed_head: u64) {
+        let now = tokio::time::Instant::now();
+        self.last_attempt = Some(now);
+        if self
+            .head_samples
+            .back()
+            .is_none_or(|(_, head)| observed_head > *head)
+        {
+            self.head_samples.push_back((now, observed_head));
+        }
+        // Keep only the newest sample already matured past `min_age`: any
+        // older matured sample is dominated (heads are monotone), so the
+        // deque stays bounded at ~min_age / REFILL_INTERVAL entries.
+        while self.head_samples.len() >= 2
+            && now.duration_since(self.head_samples[1].0) >= self.min_age
+        {
+            self.head_samples.pop_front();
+        }
+    }
+
+    /// Highest sequence that is provably at least `min_age` old — the
+    /// newest sampled head whose observation has matured past `min_age` —
+    /// or `None` while no observation is old enough (the attempt is then a
+    /// read-only page re-read; no placeholder may be written).
+    fn fillable_up_to(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        self.head_samples
+            .iter()
+            .rev()
+            .find(|(observed_at, _)| now.duration_since(*observed_at) >= self.min_age)
+            .map(|(_, head)| *head)
+    }
+}
+
+/// Age proof for historical gap fills during backfill: every sequence
+/// `<= head` was already allocated when the cache loop started
+/// (`observed_at`), so once `min_age` has elapsed since then those
+/// sequences are provably old enough to be lost and may be
+/// placeholder-filled. Backfill never fills younger (frontier) gaps —
+/// those belong exclusively to the grace-gated proactive fill.
+#[derive(Clone, Copy)]
+struct HistoricalFillBounds {
+    observed_at: tokio::time::Instant,
+    head: u64,
+    min_age: std::time::Duration,
+    batch_limit: usize,
+}
+
+impl HistoricalFillBounds {
+    /// Instant at which sequences `<= self.head` become fillable.
+    fn eligible_at(&self) -> tokio::time::Instant {
+        self.observed_at + self.min_age
     }
 }
 
@@ -235,19 +305,60 @@ where
         (cache, last_broadcast_sequence)
     }
 
+    /// One proactive gap-fill attempt for a stalled broadcast cursor.
+    ///
+    /// Phase 1 — read-only: re-read the page after `from_sequence` and feed
+    /// whatever has committed since into the cache. This alone resolves
+    /// stalls whose commit signal was missed (lost notification, dead
+    /// notifier) without writing anything.
+    ///
+    /// Phase 2 — placeholder insert, only when `fill_up_to` proves some
+    /// sequences are at least `gap_fill_min_age` old (see
+    /// [`GapFillState::fillable_up_to`]): `INSERT .. ON CONFLICT DO
+    /// NOTHING` for the missing sequences, capped at `batch_limit` per
+    /// call. Nothing is rewritten — sequences that committed between the
+    /// page read and the insert conflict harmlessly and reach the cache
+    /// through the post-commit broadcast or the next attempt's page read.
     async fn fill_gap(
         pool: sqlx::PgPool,
         from_sequence: EventSequence,
+        fill_up_to: Option<u64>,
+        batch_limit: usize,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         buffer_size: usize,
     ) {
-        if let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await {
-            for item in events {
+        let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await
+        else {
+            return;
+        };
+        let mut present = std::collections::HashSet::new();
+        for item in events {
+            let delivery = PersistentDelivery::from(item);
+            present.insert(u64::from(delivery.sequence()));
+            let _ = cache_fill_sender.send(delivery);
+        }
+
+        let Some(fill_up_to) = fill_up_to else {
+            return;
+        };
+        let from = u64::from(from_sequence);
+        let fill_up_to = fill_up_to.min(from + buffer_size as u64);
+        let missing = ((from + 1)..=fill_up_to)
+            .filter(|sequence| !present.contains(sequence))
+            .take(batch_limit)
+            .map(EventSequence::from)
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return;
+        }
+        if let Ok(placeholders) = Tables::fill_gaps::<P>(&pool, missing).await {
+            for item in placeholders {
                 let _ = cache_fill_sender.send(PersistentDelivery::from(item));
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
         start_after: EventSequence,
@@ -256,6 +367,7 @@ where
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
         buffer_size: usize,
+        fill_bounds: HistoricalFillBounds,
     ) {
         use std::ops::Bound;
 
@@ -268,10 +380,82 @@ where
             }
 
             match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
-                Ok(events) if events.is_empty() => break,
+                Ok(events) if events.is_empty() => {
+                    // No committed row follows `current_sequence`. Any
+                    // sequences left up to the init head are burned
+                    // pre-start allocations (e.g. rolled back with no
+                    // process observing the frontier at the time) — fill
+                    // them, or a replaying listener stalls on them forever.
+                    let from = u64::from(current_sequence);
+                    let fill_to = fill_bounds.head.min(from + buffer_size as u64);
+                    if from >= fill_to {
+                        break;
+                    }
+                    // Sequences <= the init head become provably old once
+                    // process uptime reaches `min_age`; waiting here can
+                    // add up to `min_age` of latency to a listener that
+                    // starts right at process init — the accepted cost of
+                    // never filling a young sequence.
+                    tokio::time::sleep_until(fill_bounds.eligible_at()).await;
+                    let missing = ((from + 1)..=fill_to)
+                        .take(fill_bounds.batch_limit)
+                        .map(EventSequence::from)
+                        .collect::<Vec<_>>();
+                    let requested = missing.len();
+                    let Ok(placeholders) = Tables::fill_gaps::<P>(&pool, missing).await else {
+                        break;
+                    };
+                    let all_inserted = placeholders.len() == requested;
+                    for item in placeholders {
+                        let delivery = PersistentDelivery::from(item);
+                        let _ = cache_fill_sender.send(delivery.clone());
+                        if sender.send(delivery).await.is_err() {
+                            return;
+                        }
+                    }
+                    if all_inserted {
+                        current_sequence = EventSequence::from(from + requested as u64);
+                    }
+                    // else: a concurrent filler owns part of the range; its
+                    // rows are committed by now (DO NOTHING waits out the
+                    // conflict), so the next page read delivers them — do
+                    // not advance past them.
+                }
                 Ok(events) => {
+                    let mut page = Vec::with_capacity(events.len());
+                    let mut present = std::collections::HashSet::new();
                     for item in events {
                         let delivery = PersistentDelivery::from(item);
+                        present.insert(u64::from(delivery.sequence()));
+                        page.push(delivery);
+                    }
+                    let page_last = page
+                        .last()
+                        .map(|delivery| u64::from(delivery.sequence()))
+                        .expect("page is non-empty");
+
+                    // Interior historical gaps: fill only sequences provably
+                    // allocated before the cache loop started (<= init
+                    // head). Younger gaps are skipped — they are either
+                    // in-flight writers about to commit or the grace-gated
+                    // fill's responsibility, and they reach the listener
+                    // through the live broadcast once resolved.
+                    let from = u64::from(current_sequence);
+                    let fill_to = fill_bounds.head.min(page_last);
+                    let missing = ((from + 1)..=fill_to)
+                        .filter(|sequence| !present.contains(sequence))
+                        .take(fill_bounds.batch_limit)
+                        .map(EventSequence::from)
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        tokio::time::sleep_until(fill_bounds.eligible_at()).await;
+                        if let Ok(placeholders) = Tables::fill_gaps::<P>(&pool, missing).await {
+                            page.extend(placeholders.into_iter().map(PersistentDelivery::from));
+                            page.sort_by_key(|delivery| delivery.sequence());
+                        }
+                    }
+
+                    for delivery in page {
                         let seq = delivery.sequence();
                         let _ = cache_fill_sender.send(delivery.clone());
                         if sender.send(delivery).await.is_err() {
@@ -380,6 +564,8 @@ where
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let gap_fill_grace = config.gap_fill_grace;
+        let gap_fill_min_age = config.gap_fill_min_age;
+        let gap_fill_batch_limit = config.gap_fill_batch_limit;
         let idle_resync_interval = config.idle_resync_interval;
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
@@ -389,6 +575,21 @@ where
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
             let mut gap_state: Option<GapFillState> = None;
+            // At most one fill task runs at a time: an attempt that blocks
+            // (e.g. on a still-uncommitted conflicting writer) must not be
+            // joined by the next 1s retry — previously up to ~8 concurrent
+            // multi-second fills stacked up, each holding a connection.
+            let mut fill_task: Option<tokio::task::JoinHandle<()>> = None;
+            // Age proof seeding historical fills: every sequence <= the
+            // head read at init was allocated before this loop started.
+            // (`observed_at` is taken slightly after the actual read, which
+            // only under-estimates ages — the safe direction.)
+            let fill_bounds = HistoricalFillBounds {
+                observed_at: tokio::time::Instant::now(),
+                head: u64::from(initial_sequence),
+                min_age: gap_fill_min_age,
+                batch_limit: gap_fill_batch_limit,
+            };
             let mut last_progress_at = tokio::time::Instant::now();
 
             loop {
@@ -416,6 +617,7 @@ where
                                     cache_fill_sender.clone(),
                                     highest,
                                     cache_size,
+                                    fill_bounds,
                                 ));
                             }
                             None => {
@@ -535,10 +737,14 @@ where
                                 // forged claim inside (committed_head, last_value]
                                 // still passes the clamp and can trigger a grace-period
                                 // gap-fill against in-flight sequences — but that work
-                                // is bounded by last_value and self-heals via the
-                                // ON CONFLICT speculative-insert block, so it never
-                                // stalls. On a transient head-read failure the fetch is
-                                // skipped (rather than fired unclamped); a subsequent
+                                // is bounded by last_value, read-only until the
+                                // sequences are provably `gap_fill_min_age` old, and
+                                // batch-capped once they are, so it never rewrites
+                                // committed rows and never stalls: in-flight writers
+                                // resolve the gap by committing (or their aborted
+                                // sequences age into a placeholder fill). On a
+                                // transient head-read failure the fetch is skipped
+                                // (rather than fired unclamped); a subsequent
                                 // notification or resync retries.
                                 let current_head =
                                     highest_known_sequence.load(Ordering::Relaxed);
@@ -603,14 +809,18 @@ where
                     }
                 }
 
-                // Proactive gap fill: if broadcasting is stuck waiting for a missing
-                // sequence, trigger load_next_page which will fill the gap via
-                // fill_gaps_query. The first fill is delayed by `gap_fill_grace`:
-                // most gaps are transactions that hold a sequence but have not
-                // committed yet, and the gap-fill upsert blocks on exactly those
-                // in-flight rows (ON CONFLICT speculative insertion) until they
-                // commit — filling immediately pays a blocked connection per gap
-                // for what a brief wait resolves without any DB work.
+                // Proactive gap fill: if broadcasting is stuck waiting for a
+                // missing sequence, attempt a fill. The first attempt is
+                // delayed by `gap_fill_grace` (most gaps are in-flight
+                // transactions that resolve on their own within ms), and
+                // every attempt starts read-only: a page re-read that
+                // delivers whatever committed since. Placeholder rows are
+                // only written for sequences provably older than
+                // `gap_fill_min_age` (per the state's allocation-head
+                // samples) and at most `gap_fill_batch_limit` per call —
+                // never for the young frontier, whose still-uncommitted
+                // writers would block the insert on their
+                // speculative-insertion locks.
                 let next_needed = last_broadcast_sequence.next();
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
                 if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
@@ -622,16 +832,29 @@ where
                         gap_state = None;
                     }
                     let state = gap_state.get_or_insert_with(|| {
-                        GapFillState::new(gap_fill_grace, last_broadcast_sequence)
+                        GapFillState::new(
+                            gap_fill_grace,
+                            gap_fill_min_age,
+                            last_broadcast_sequence,
+                            highest,
+                        )
                     });
                     if state.fill_is_due() {
-                        state.record_attempt();
-                        tokio::spawn(Self::fill_gap(
-                            pool.clone(),
-                            last_broadcast_sequence,
-                            cache_fill_sender.clone(),
-                            cache_size,
-                        ));
+                        state.record_attempt(highest);
+                        // A still-running fill (e.g. blocked on an
+                        // in-flight writer) is never joined by another:
+                        // the attempt is recorded (pushing the next retry
+                        // out) but not spawned.
+                        if fill_task.as_ref().is_none_or(|task| task.is_finished()) {
+                            fill_task = Some(tokio::spawn(Self::fill_gap(
+                                pool.clone(),
+                                last_broadcast_sequence,
+                                state.fillable_up_to(),
+                                gap_fill_batch_limit,
+                                cache_fill_sender.clone(),
+                                cache_size,
+                            )));
+                        }
                     }
                 } else {
                     gap_state = None;

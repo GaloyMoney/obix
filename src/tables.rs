@@ -135,14 +135,37 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// Each item is one sequence position: `Ok` for a decoded event or a
-    /// plain placeholder (`payload: None`), `Err` for a stored payload that
-    /// does not decode into `P` — delivered, not dropped, so the page stays
-    /// contiguous.
+    /// Load the committed rows in `(from_sequence, from_sequence +
+    /// buffer_size]` with a plain bounded SELECT. Each item is one committed
+    /// sequence position: `Ok` for a decoded event or a stored placeholder
+    /// (`payload: None`), `Err` for a stored payload that does not decode
+    /// into `P` — delivered, not dropped, so it still occupies its sequence
+    /// position. The page may contain sequence gaps (in-flight or lost
+    /// writers): this method never writes placeholder rows — that is
+    /// exclusively [`fill_gaps`](Self::fill_gaps), invoked age-gated and
+    /// batch-capped from `out::persistent::cache`.
     fn load_next_page<P>(
         pool: &sqlx::PgPool,
         from_sequence: EventSequence,
         buffer_size: usize,
+    ) -> impl Future<
+        Output = Result<Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>, sqlx::Error>,
+    > + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// Insert placeholder rows (`payload: NULL`) for the given sequences
+    /// with `ON CONFLICT (sequence) DO NOTHING`, returning only the rows
+    /// actually inserted. Sequences that already have a committed row —
+    /// a real event or an earlier placeholder — are left untouched: no
+    /// rewrite, no dead tuple. A sequence whose writer is still in flight
+    /// blocks the insert on that transaction's speculative-insertion lock
+    /// until it resolves, so callers must only pass sequences that are
+    /// provably old enough to be lost (`MailboxConfig::gap_fill_min_age`);
+    /// see the age-gated callers in `out::persistent::cache`.
+    fn fill_gaps<P>(
+        pool: &sqlx::PgPool,
+        sequences: Vec<EventSequence>,
     ) -> impl Future<
         Output = Result<Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>, sqlx::Error>,
     > + Send

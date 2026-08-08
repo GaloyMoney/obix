@@ -3,12 +3,36 @@ use es_entity::clock::{Clock, ClockHandle};
 
 pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 
-/// How long the persistent cache waits before gap-filling a missing
-/// sequence. Most gaps are in-flight transactions that committed out of
-/// sequence-allocation order and resolve on their own within a few ms;
-/// filling immediately makes the gap-fill upsert block on exactly those
-/// uncommitted rows (ON CONFLICT speculative insertion) until they commit.
-pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long the persistent cache waits before the first gap-fill attempt
+/// for a stalled broadcast sequence. Most gaps are in-flight transactions
+/// that committed out of sequence-allocation order and resolve on their own
+/// within a few ms; attempting immediately wastes a page re-read per gap.
+/// At high posting rates (hundreds of sequences/s) there is nearly always
+/// an in-flight frontier gap, so a sub-second grace is guaranteed-too-short
+/// and turns the fill into a permanent background load — hence seconds, not
+/// milliseconds. Attempts are read-only until a sequence is provably old
+/// enough to be lost (see [`DEFAULT_GAP_FILL_MIN_AGE`]).
+pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Minimum provable age of a sequence before a gap-fill may write a
+/// placeholder row for it. A sequence's age is bounded by allocation-head
+/// observations (a sequence is at least as old as the oldest observation of
+/// a head at or above it), so placeholders are only ever written for
+/// sequences whose writer has had at least this long to commit — younger
+/// gaps are almost always still-uncommitted transactions, and inserting
+/// into them blocks on the writer's speculative-insertion lock until it
+/// resolves. This is the invariant that keeps the fill off the hot
+/// concurrent-writer window: **no placeholder is ever written for a
+/// sequence younger than this**.
+pub const DEFAULT_GAP_FILL_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum number of placeholder rows a single gap-fill query may insert.
+/// Bounds the worst case (a mass rollback or long outage leaving thousands
+/// of lost sequences) to a small, predictable statement instead of one
+/// giant insert; the fixed 1s retry cadence picks up the remainder, so a
+/// cap delays recovery of a pathological backlog without ever losing
+/// sequences.
+pub const DEFAULT_GAP_FILL_BATCH_LIMIT: usize = 1000;
 
 /// How long the per-process notifier coalesces committed-batch reports
 /// before emitting one `pg_notify` wake-up hint. Notify-bearing commits
@@ -65,11 +89,23 @@ pub struct MailboxConfig {
     pub event_cache_trim_percent: u8,
     #[builder(default = "DEFAULT_PERSIST_EVENTS_BATCH_SIZE")]
     pub persist_events_batch_size: usize,
-    /// Grace period before the first proactive gap fill for a stalled
-    /// broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries after a
-    /// fill attempt are unaffected (fixed 1s interval).
+    /// Grace period before the first proactive gap-fill attempt for a
+    /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
+    /// after a fill attempt are unaffected (fixed 1s interval).
     #[builder(default = "DEFAULT_GAP_FILL_GRACE")]
     pub gap_fill_grace: std::time::Duration,
+    /// Minimum provable age a sequence must have before a gap fill may
+    /// write a placeholder row for it; see [`DEFAULT_GAP_FILL_MIN_AGE`].
+    /// Fill attempts due before any sequence is old enough are read-only
+    /// page re-reads.
+    #[builder(default = "DEFAULT_GAP_FILL_MIN_AGE")]
+    pub gap_fill_min_age: std::time::Duration,
+    /// Maximum placeholder rows a single gap-fill query may insert; see
+    /// [`DEFAULT_GAP_FILL_BATCH_LIMIT`]. The remainder is picked up by
+    /// subsequent attempts — sequences are never skipped, only filled
+    /// later.
+    #[builder(default = "DEFAULT_GAP_FILL_BATCH_LIMIT")]
+    pub gap_fill_batch_limit: usize,
     /// Coalescing window of the per-process debounced notifier; see
     /// [`DEFAULT_NOTIFY_DEBOUNCE`]. Deliberately no per-commit escape hatch.
     #[builder(default = "DEFAULT_NOTIFY_DEBOUNCE")]
