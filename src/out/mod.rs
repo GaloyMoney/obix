@@ -44,8 +44,7 @@ where
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
-    /// Per-process debounced NOTIFY emitter; persist statements on
-    /// hook-supporting operations no longer notify in-transaction.
+    /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
     clock: ClockHandle,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
@@ -179,9 +178,6 @@ where
         );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
-            // No commit hooks means no post_commit: obix never observes this
-            // operation's commit, so the debounced notifier cannot cover it —
-            // keep the legacy in-transaction NOTIFY for this rare path.
             hook.with_in_tx_notify()
                 .force_execute_pre_commit(op)
                 .await?;

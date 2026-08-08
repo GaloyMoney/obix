@@ -11,26 +11,16 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long the per-process notifier coalesces committed-batch reports
-/// before emitting one `pg_notify` wake-up hint.
-///
-/// Every notify-bearing commit serializes on a cluster-wide lock inside
-/// PostgreSQL's `PreCommit_Notify`, held across the commit's WAL flush —
-/// capping the whole instance at a few hundred notify-bearing commits/s.
-/// Application transactions therefore no longer notify at all; the
-/// out-of-band notifier emits at most one hint per debounce interval, adding
-/// at most this much cross-process wake-up latency (in-process delivery is
-/// unaffected). See `spaces/obix-dev/handoff-debounced-notifier.md` in the
-/// drua library for the full funnel analysis.
+/// before emitting one `pg_notify` wake-up hint. Notify-bearing commits
+/// serialize on a cluster-wide lock, so app transactions no longer notify;
+/// this bounds the added cross-process wake-up latency (in-process delivery
+/// is unaffected).
 pub const DEFAULT_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// How long the persistent cache tolerates notification silence before
-/// re-reading the sequence head (the O(1) `last_value` query).
-///
-/// Backstops lost wake-ups now that notifications are debounced and
-/// out-of-band: a writer crashing between commit and notify, a dead notifier
-/// task in a remote process, or rows written by external processes that
-/// never notify. In a busy system notifications stream constantly (each
-/// process also hears its own emissions), so the poll never fires.
+/// How long the persistent cache goes without a confirmed head read before
+/// polling the sequence head (the O(1) `last_value` query). Backstops lost
+/// wake-ups: a writer crashing between commit and notify, a dead remote
+/// notifier, or external writers that never notify.
 pub const DEFAULT_IDLE_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Width, in `sequence` units, of each `persistent_outbox_events` partition.
@@ -79,15 +69,12 @@ pub struct MailboxConfig {
     /// fill attempt are unaffected (fixed 1s interval).
     #[builder(default = "DEFAULT_GAP_FILL_GRACE")]
     pub gap_fill_grace: std::time::Duration,
-    /// Coalescing window of the per-process debounced notifier — the upper
-    /// bound it adds to cross-process wake-up latency; see
-    /// [`DEFAULT_NOTIFY_DEBOUNCE`]. There is deliberately no
-    /// "notify per commit" escape hatch: rollback is a version pin, and a
-    /// runtime flag would keep both code paths on the hot path.
+    /// Coalescing window of the per-process debounced notifier; see
+    /// [`DEFAULT_NOTIFY_DEBOUNCE`]. Deliberately no per-commit escape hatch.
     #[builder(default = "DEFAULT_NOTIFY_DEBOUNCE")]
     pub notify_debounce: std::time::Duration,
-    /// Notification-silence threshold after which the persistent cache
-    /// re-reads the sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
+    /// Head-read-silence threshold before the persistent cache polls the
+    /// sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
     #[builder(default = "DEFAULT_IDLE_RESYNC_INTERVAL")]
     pub idle_resync_interval: std::time::Duration,
     /// How many partitions ahead of the head the maintainer keeps created;

@@ -114,14 +114,9 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
-        // The default persist statement carries NO pg_notify: every
-        // notify-bearing commit serializes on a cluster-wide lock in
-        // `PreCommit_Notify` held across the commit's WAL flush, capping the
-        // whole instance at a few hundred notify-bearing commits/s. Since
-        // listeners treat notifications strictly as hints (they clamp claims
-        // and always fetch from the table), cross-process wake-up moved to
-        // the per-process debounced notifier (`src/out/notifier.rs`), fed by
-        // the commit hook's post_commit.
+        // No pg_notify here: notify-bearing commits serialize on a
+        // cluster-wide lock, so cross-process wake-up moved to the
+        // per-process debounced notifier (`src/out/notifier.rs`).
         let persist_events_query = format!(
             r#"WITH new_events AS (
                    INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
@@ -134,19 +129,14 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // Notifying variant, used ONLY for publishes onto operations without
-        // commit-hook support (a bare `sqlx::Transaction`): post_commit never
-        // runs there, so the debounced notifier cannot observe the commit —
-        // the insert statement itself must carry the {min_sequence,
-        // max_sequence} wake-up hint, exactly as every persist did pre-0.8.
+        // Kept only for publishes onto operations without commit-hook
+        // support (bare `sqlx::Transaction`): post_commit never runs there,
+        // so the insert statement itself must carry the {min, max} hint.
         //
         // INVARIANT: `notified` must remain referenced by the outer query
-        // (the LEFT JOIN below). Postgres never executes an unreferenced
-        // SELECT CTE — notifications would silently stop and cross-process
-        // delivery of bare-transaction publishes would degrade to the
-        // idle-resync path (events_via_pg_notify hangs if this regresses).
-        // HAVING COUNT(*) > 0 suppresses the aggregate's empty-input row so
-        // an empty insert notifies nothing.
+        // (the LEFT JOIN below) — Postgres never executes an unreferenced
+        // SELECT CTE (events_via_pg_notify hangs if this regresses).
+        // HAVING COUNT(*) > 0 keeps an empty insert from notifying.
         let persist_events_notifying_query = format!(
             r#"WITH new_events AS (
                    INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)

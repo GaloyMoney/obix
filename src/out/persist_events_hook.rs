@@ -15,8 +15,7 @@ where
     Tables: MailboxTables,
 {
     sender: broadcast::Sender<PersistentDelivery<P>>,
-    /// Reports the committed batch's `(min, max)` sequences to the
-    /// per-process debounced notifier from `post_commit`.
+    /// Reports the committed batch's `(min, max)` to the debounced notifier.
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     pre_commit_events: Vec<P>,
     post_commit_events: Vec<PersistentOutboxEvent<P>>,
@@ -25,10 +24,8 @@ where
     /// this commit hook is constructed (i.e. at the operation's first
     /// publish). Merged publishes keep the first snapshot.
     post_persist_hooks: PostPersistHooks<P>,
-    /// Set for publishes onto operations without commit-hook support (a bare
-    /// `sqlx::Transaction`, via `force_execute_pre_commit`): `post_commit`
-    /// never runs there, so the debounced notifier cannot observe the commit
-    /// — the persist statement itself must carry the in-tx NOTIFY.
+    /// Set on the force-execute path (no commit hooks): `post_commit` never
+    /// runs, so the persist statement must carry the in-tx NOTIFY.
     notify_in_tx: bool,
     _phantom: PhantomData<Tables>,
 }
@@ -57,9 +54,7 @@ where
         }
     }
 
-    /// Switch the persist statement to the in-transaction NOTIFY variant.
-    /// Only for the `force_execute_pre_commit` path — see
-    /// [`Self::notify_in_tx`].
+    /// Use the in-transaction NOTIFY persist variant (force-execute path).
     pub(crate) fn with_in_tx_notify(mut self) -> Self {
         self.notify_in_tx = true;
         self
@@ -111,8 +106,6 @@ where
             post_commit_events,
             ..
         } = self;
-        // The persist query orders by sequence and chunks append in order,
-        // so first/last bound the whole committed batch.
         let batch_range = match (post_commit_events.first(), post_commit_events.last()) {
             (Some(first), Some(last)) => Some((first.sequence, last.sequence)),
             _ => None,

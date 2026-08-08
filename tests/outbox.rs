@@ -955,12 +955,9 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
     Ok(())
 }
 
-// Since 0.8 an app transaction on a hook-supporting op carries NO pg_notify
-// (the cluster-wide NOTIFY commit lock is off the app commit path); the
-// per-process debounced notifier emits the {min,max} hint out-of-band after
-// commit. A second Outbox instance can only learn about the event through
-// that hint — receipt well under the 10s idle-resync default proves the
-// debounced path works.
+// A hook-supporting op carries no pg_notify; a second Outbox instance can
+// only learn about the event through the out-of-band debounced hint —
+// receipt well under the 10s idle-resync default proves that path works.
 #[tokio::test]
 #[file_serial]
 async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
@@ -993,10 +990,8 @@ async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
     Ok(())
 }
 
-// A burst of commits must coalesce into far fewer NOTIFYs than commits —
-// that is the whole point of the debounced notifier. A raw PgListener on
-// the channel counts actual emissions; the final hint's max_sequence must
-// still cover the last committed batch (nothing coalesced away).
+// A burst of commits must coalesce into fewer NOTIFYs, and the final
+// hint's max_sequence must still cover the last committed batch.
 #[tokio::test]
 #[file_serial]
 async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
@@ -1055,11 +1050,9 @@ async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Crash-window backstop: rows that never get ANY notification — a writer
-// dying between commit and notify, or an external process inserting via raw
-// SQL — must still be delivered. The cache's idle head-poll re-reads the
-// sequence head after `idle_resync_interval` of notification silence and
-// the gap-fill machinery fetches the rows.
+// Crash-window backstop: rows that never get any notification (writer died
+// between commit and notify, or external raw-SQL insert) must still be
+// delivered via the idle head-poll.
 #[tokio::test]
 #[file_serial]
 async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
@@ -1091,11 +1084,56 @@ async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
     Ok(())
 }
 
-// The bare-transaction path (no commit hooks -> post_commit never runs ->
-// the debounced notifier cannot observe the commit) keeps the legacy
-// in-transaction NOTIFY: cross-instance delivery must be prompt — well
-// under the 10s idle-resync default — proving the notifying query variant
-// is actually wired on the force-execute path.
+// SECURITY regression: garbage traffic on the notify channel must not
+// count as pipeline activity — the idle head-poll timer only resets on
+// confirmed head reads, so junk spam cannot suppress the backstop and
+// starve unnotified events.
+#[tokio::test]
+#[file_serial]
+async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .idle_resync_interval(std::time::Duration::from_millis(500))
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Unnotified row, as in unnotified_events_delivered_via_idle_resync…
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 42}"#)
+        .execute(&pool)
+        .await?;
+
+    // …but under continuous unparsable spam on the channel.
+    let spam_pool = pool.clone();
+    let spam = tokio::spawn(async move {
+        loop {
+            let _ = sqlx::query("SELECT pg_notify('persistent_outbox_events', 'junk')")
+                .execute(&spam_pool)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await;
+    spam.abort();
+    let event = result
+        .map_err(|_| anyhow::anyhow!("junk notifications suppressed the idle head-poll"))?
+        .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(42))));
+
+    Ok(())
+}
+
+// The bare-transaction path keeps the legacy in-tx NOTIFY: prompt
+// cross-instance delivery proves the notifying variant is wired on the
+// force-execute path.
 #[tokio::test]
 #[file_serial]
 async fn bare_transaction_publish_delivers_promptly_cross_instance() -> anyhow::Result<()> {
