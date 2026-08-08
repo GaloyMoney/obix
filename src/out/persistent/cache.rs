@@ -547,35 +547,35 @@ where
                                     highest_known_sequence.load(Ordering::Relaxed);
                                 let claim_advances = claimed_head
                                     .is_some_and(|claimed| u64::from(claimed) > current_head);
-                                if claim_advances || resync_needed || fetch_range.is_some() {
-                                    if let Some(head) = Self::read_confirmed_head(&pool).await {
-                                        let confirmed_head = claimed_head
-                                            .map(|claimed| {
-                                                EventSequence::from(
-                                                    u64::from(claimed)
-                                                        .min(u64::from(head)),
-                                                )
-                                            })
-                                            .unwrap_or(head);
-                                        highest_known_sequence.fetch_max(
-                                            u64::from(confirmed_head),
-                                            Ordering::AcqRel,
+                                if (claim_advances || resync_needed || fetch_range.is_some())
+                                    && let Some(head) = Self::read_confirmed_head(&pool).await
+                                {
+                                    let confirmed_head = claimed_head
+                                        .map(|claimed| {
+                                            EventSequence::from(
+                                                u64::from(claimed)
+                                                    .min(u64::from(head)),
+                                            )
+                                        })
+                                        .unwrap_or(head);
+                                    highest_known_sequence.fetch_max(
+                                        u64::from(confirmed_head),
+                                        Ordering::AcqRel,
+                                    );
+                                    if let Some((after, up_to)) = fetch_range {
+                                        let clamped_up_to = EventSequence::from(
+                                            u64::from(up_to)
+                                                .min(u64::from(confirmed_head)),
                                         );
-                                        if let Some((after, up_to)) = fetch_range {
-                                            let clamped_up_to = EventSequence::from(
-                                                u64::from(up_to)
-                                                    .min(u64::from(confirmed_head)),
-                                            );
-                                            if u64::from(after)
-                                                < u64::from(clamped_up_to)
-                                            {
-                                                tokio::spawn(Self::fetch_notified_range(
-                                                    pool.clone(),
-                                                    after,
-                                                    clamped_up_to,
-                                                    cache_fill_sender.clone(),
-                                                ));
-                                            }
+                                        if u64::from(after)
+                                            < u64::from(clamped_up_to)
+                                        {
+                                            tokio::spawn(Self::fetch_notified_range(
+                                                pool.clone(),
+                                                after,
+                                                clamped_up_to,
+                                                cache_fill_sender.clone(),
+                                            ));
                                         }
                                     }
                                 }
