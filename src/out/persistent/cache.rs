@@ -389,7 +389,7 @@ where
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
             let mut gap_state: Option<GapFillState> = None;
-            let mut last_head_confirmed_at = tokio::time::Instant::now();
+            let mut last_progress_at = tokio::time::Instant::now();
 
             loop {
                 // Wake up exactly when the next gap-fill action falls due,
@@ -429,6 +429,9 @@ where
                     result = cache_fill_receiver.recv() => {
                         match result {
                             Ok(event) => {
+                                let watermark_before =
+                                    highest_known_sequence.load(Ordering::Relaxed);
+
                                 (persistent_cache, last_broadcast_sequence) =
                                     Self::insert_into_cache_and_maybe_broadcast(
                                         persistent_cache,
@@ -449,6 +452,12 @@ where
                                             last_broadcast_sequence,
                                             cache_size,
                                         );
+                                }
+
+                                if highest_known_sequence.load(Ordering::Relaxed)
+                                    > watermark_before
+                                {
+                                    last_progress_at = tokio::time::Instant::now();
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -538,7 +547,7 @@ where
                                 if (claim_advances || resync_needed || fetch_range.is_some())
                                     && let Some(head) = Self::read_confirmed_head(&pool).await
                                 {
-                                    last_head_confirmed_at = tokio::time::Instant::now();
+                                    last_progress_at = tokio::time::Instant::now();
                                     let confirmed_head = claimed_head
                                         .map(|claimed| {
                                             EventSequence::from(
@@ -583,14 +592,14 @@ where
                         }
                     } => {}
 
-                    _ = tokio::time::sleep_until(last_head_confirmed_at + idle_resync_interval) => {
+                    _ = tokio::time::sleep_until(last_progress_at + idle_resync_interval) => {
                         if let Some(head) = Self::read_confirmed_head(&pool).await {
                             highest_known_sequence.fetch_max(
                                 u64::from(head),
                                 Ordering::AcqRel,
                             );
                         }
-                        last_head_confirmed_at = tokio::time::Instant::now();
+                        last_progress_at = tokio::time::Instant::now();
                     }
                 }
 

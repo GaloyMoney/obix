@@ -17,10 +17,11 @@ pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::fro
 /// is unaffected).
 pub const DEFAULT_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// How long the persistent cache goes without a confirmed head read before
-/// polling the sequence head (the O(1) `last_value` query). Backstops lost
-/// wake-ups: a writer crashing between commit and notify, a dead remote
-/// notifier, or external writers that never notify.
+/// How long the persistent cache goes without authoritative progress (a
+/// newly-seen committed row or a confirmed head read) before polling the
+/// sequence head (the O(1) `last_value` query). Backstops lost wake-ups: a
+/// writer crashing between commit and notify, a dead remote notifier, or
+/// external writers that never notify.
 pub const DEFAULT_IDLE_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Width, in `sequence` units, of each `persistent_outbox_events` partition.
@@ -73,7 +74,7 @@ pub struct MailboxConfig {
     /// [`DEFAULT_NOTIFY_DEBOUNCE`]. Deliberately no per-commit escape hatch.
     #[builder(default = "DEFAULT_NOTIFY_DEBOUNCE")]
     pub notify_debounce: std::time::Duration,
-    /// Head-read-silence threshold before the persistent cache polls the
+    /// Progress-silence threshold before the persistent cache polls the
     /// sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
     #[builder(default = "DEFAULT_IDLE_RESYNC_INTERVAL")]
     pub idle_resync_interval: std::time::Duration,

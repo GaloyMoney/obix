@@ -1086,8 +1086,8 @@ async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
 
 // SECURITY regression: garbage traffic on the notify channel must not
 // count as pipeline activity — the idle head-poll timer only resets on
-// confirmed head reads, so junk spam cannot suppress the backstop and
-// starve unnotified events.
+// authoritative progress (a new committed row or a confirmed head read),
+// so junk spam cannot suppress the backstop and starve unnotified events.
 #[tokio::test]
 #[file_serial]
 async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> {
