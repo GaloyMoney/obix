@@ -266,7 +266,7 @@ where
     ///    committing them — so the placeholder insert cannot collide with
     ///    a live writer. Insert under the cluster-wide fill lock, capped at
     ///    `batch_limit`; deliver the placeholders locally and report the
-    ///    range to the debounced notifier so other processes unstall
+    ///    range to the debounced notifier so other processes resume
     ///    reactively. If another node holds the lock, keep looping — its
     ///    rows surface in the next page re-read.
     async fn fill_gap(

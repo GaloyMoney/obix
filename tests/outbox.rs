@@ -660,7 +660,7 @@ async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
 /// The reactive tier: a transaction that fails *after* its outbox persist
 /// ran (here: a post-persist hook veto) reports its allocated sequences to
 /// the in-process compensator, which placeholder-fills them immediately —
-/// downstream listeners unstall in milliseconds, well before the
+/// downstream listeners resume in milliseconds, well before the
 /// grace-gated backstop (2s default here) would even take its first look.
 #[tokio::test]
 #[file_serial]

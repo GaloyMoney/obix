@@ -112,7 +112,7 @@ where
         .await?;
 
         // Spawned before the cache: backstop fills report the ranges they
-        // placeholder-fill through the notifier so other processes unstall
+        // placeholder-fill through the notifier so other processes resume
         // reactively instead of waiting out their own retry reads.
         let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
 
