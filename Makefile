@@ -1,6 +1,9 @@
 NIX_DEPS_DIR := .nix-deps
 
-.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code
+# Seconds the fuzz target runs in `make fuzz`.
+FUZZ_TIME := 60
+
+.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code fuzz
 
 start-deps:
 	@mkdir -p $(NIX_DEPS_DIR)
@@ -33,3 +36,10 @@ check-code:
 
 sqlx-prepare:
 	cargo sqlx prepare --workspace
+
+# Coverage-guided fuzzing via the shared vendored script
+# (ci/vendor/tasks/fuzz.sh, from galoy-concourse-shared), also used by
+# `nix run .#fuzz` and the Concourse `fuzz` job. Auto-discovers targets via
+# `cargo fuzz list`; runs them for $(FUZZ_TIME)s. Corpus in fuzz/corpus/ (gitignored).
+fuzz:
+	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh
