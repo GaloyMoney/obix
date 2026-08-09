@@ -3,6 +3,7 @@ mod ctx;
 mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
+mod gap_fill;
 mod job;
 mod notifier;
 mod op_cursor;
@@ -46,6 +47,10 @@ where
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
+    /// Per-process gap filler — the only component that writes
+    /// placeholder rows (rollback compensation, stall episodes,
+    /// historical fills).
+    gap_filler: gap_fill::GapFiller,
     clock: ClockHandle,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
@@ -81,6 +86,7 @@ where
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             notifier: self.notifier.clone(),
+            gap_filler: self.gap_filler.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
         }
@@ -106,12 +112,31 @@ where
         )
         .await?;
 
-        let persistent_cache =
-            PersistentOutboxEventCache::init(&pool, &config, persistent_notification_rx).await?;
+        let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
+
+        // The gap-fill channel exists before either side of it: the cache
+        // loop sends stall/historical requests, the GapFiller task (which
+        // needs the cache's fill sender) serves them.
+        let (gap_fill_tx, gap_fill_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let persistent_cache = PersistentOutboxEventCache::init(
+            &pool,
+            &config,
+            persistent_notification_rx,
+            gap_fill_tx.clone(),
+        )
+        .await?;
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
-        let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
+        let gap_filler = gap_fill::GapFiller::spawn::<P, Tables>(
+            &pool,
+            gap_fill_rx,
+            gap_fill_tx,
+            persistent_cache.cache_fill_sender(),
+            notifier.report_sender(),
+            &config,
+        );
 
         Ok(Self {
             pool,
@@ -123,6 +148,7 @@ where
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
+            gap_filler,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
         })
@@ -172,6 +198,7 @@ where
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
             self.notifier.report_sender(),
+            self.gap_filler.report_sender(),
             events,
             self.persist_events_batch_size,
             post_persist_hooks,

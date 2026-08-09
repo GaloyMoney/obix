@@ -17,6 +17,12 @@ where
     buffer_size: usize,
     local_cache: BTreeMap<EventSequence, PersistentDelivery<P>>,
     cache_handle: CacheHandle<P>,
+    /// At most one backfill request is ever outstanding, and one request
+    /// serves its whole range: the cache's backfill task delivers the
+    /// range in order and *parks* on any not-yet-servable gap (in-flight
+    /// writer, raced fill) until it resolves, rather than terminating.
+    /// The listener therefore never re-requests a range it already asked
+    /// for — gap semantics stay entirely inside the backfill task.
     backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
 }
 

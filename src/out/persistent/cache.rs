@@ -10,7 +10,7 @@ use std::sync::{
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
-    out::{event::*, pg_notify::NotifyMessage},
+    out::{event::*, gap_fill::GapFillRequest, pg_notify::NotifyMessage},
     sequence::EventSequence,
 };
 
@@ -61,57 +61,6 @@ struct NotifiedRange {
     missing: Option<(EventSequence, EventSequence)>,
 }
 
-/// Bookkeeping for the sequence the broadcast cursor is stalled on.
-struct GapFillState {
-    /// Grace period before the first fill (`MailboxConfig::gap_fill_grace`).
-    grace: std::time::Duration,
-    /// The sequence the broadcast cursor is stalled on. The state is
-    /// discarded when the cursor advances past it.
-    stalled_on: EventSequence,
-    /// When the stall was first observed. The first fill is withheld until
-    /// `grace` has elapsed since this instant.
-    first_seen: tokio::time::Instant,
-    last_attempt: Option<tokio::time::Instant>,
-}
-
-impl GapFillState {
-    /// How long after a gap-fill attempt the same stalled sequence is
-    /// retried (the attempt itself may have raced a still-uncommitted row).
-    const REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-    fn new(grace: std::time::Duration, stalled_on: EventSequence) -> Self {
-        Self {
-            grace,
-            stalled_on,
-            first_seen: tokio::time::Instant::now(),
-            last_attempt: None,
-        }
-    }
-
-    /// Whether this state tracks the sequence the broadcast cursor is
-    /// currently stalled on.
-    fn is_up_to_date(&self, stalled_on: EventSequence) -> bool {
-        self.stalled_on == stalled_on
-    }
-
-    /// When the next gap-fill action falls due: `grace` after the stall was
-    /// first observed, or [`Self::REFILL_INTERVAL`] after the last attempt.
-    fn next_fill_due(&self) -> tokio::time::Instant {
-        match self.last_attempt {
-            None => self.first_seen + self.grace,
-            Some(attempted) => attempted + Self::REFILL_INTERVAL,
-        }
-    }
-
-    fn fill_is_due(&self) -> bool {
-        self.next_fill_due() <= tokio::time::Instant::now()
-    }
-
-    fn record_attempt(&mut self) {
-        self.last_attempt = Some(tokio::time::Instant::now());
-    }
-}
-
 #[derive(Debug)]
 pub struct PersistentOutboxEventCache<P, Tables>
 where
@@ -149,6 +98,7 @@ where
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<NotifyMessage>,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -167,6 +117,7 @@ where
             cache_fill_recv,
             cache_fill_send.clone(),
             persistent_notification_rx,
+            gap_fill_tx,
         )
         .await?;
 
@@ -235,19 +186,65 @@ where
         (cache, last_broadcast_sequence)
     }
 
-    async fn fill_gap(
-        pool: sqlx::PgPool,
-        from_sequence: EventSequence,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
-        buffer_size: usize,
+    /// How long a parked backfill waits before re-reading regardless of
+    /// wake-up signals, and how long it backs off after a transient page
+    /// read error. The cache-fill wake-up makes typical resumption
+    /// immediate; this interval only bounds the lost-signal worst case.
+    const BACKFILL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Park a stalled backfill until its needed sequence plausibly
+    /// resolved: woken by that exact sequence arriving on the cache-fill
+    /// stream (every resolution path lands there — in-process post-commit
+    /// broadcast, notification fetch, the GapFiller's placeholders and
+    /// compensations), or by the retry interval elapsing as the
+    /// lost-signal backstop. The caller re-reads the page either way; the
+    /// wake-up is a hint, never trusted as data.
+    ///
+    /// Takes a receiver the caller subscribed **before** the page read
+    /// that discovered the gap (and thus before any fill request it sent):
+    /// a broadcast receiver only sees messages sent after `subscribe()`,
+    /// so a late subscription would let the resolving delivery slip into
+    /// the gap between request and park — anything resolved before the
+    /// subscription is instead visible to the page read itself.
+    async fn park_until_resolved(
+        mut wakeup: broadcast::Receiver<PersistentDelivery<P>>,
+        needed: EventSequence,
     ) {
-        if let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await {
-            for item in events {
-                let _ = cache_fill_sender.send(PersistentDelivery::from(item));
+        let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
+        loop {
+            match tokio::time::timeout_at(deadline, wakeup.recv()).await {
+                Ok(Ok(delivery)) if delivery.sequence() == needed => return,
+                Ok(Ok(_)) => {}
+                // Lagged or closed: no reliable signal left — re-read.
+                Ok(Err(_)) => return,
+                // Interval elapsed: re-read regardless.
+                Err(_) => return,
             }
         }
     }
 
+    /// Serve one backfill request: deliver `(start_after, highest]` to the
+    /// listener **in order, gap-free, in a single request**. The
+    /// listener-facing contract is deliberately simple — one request per
+    /// range, ever — so every gap condition is handled (or waited out)
+    /// here rather than leaking to the listener:
+    ///
+    /// - Historical gaps (allocated before the cache loop started) are
+    ///   reported to the [`GapFiller`](crate::out::gap_fill::GapFiller),
+    ///   which merges overlapping requests from concurrent backfills into
+    ///   one proof-gated, batch-capped, cluster-deduped fill; its
+    ///   placeholders land on the cache-fill stream, wake the park below,
+    ///   and the next page read delivers them in order.
+    /// - Young frontier gaps (an in-flight or just-failed writer) are
+    ///   **parked on**, never reported: the writer commits, the GapFiller
+    ///   compensates the rollback, or its grace-gated stall episode fills
+    ///   the gap once provably abandoned — all of which land on the
+    ///   cache-fill stream and wake the park. Liveness holds because the
+    ///   central broadcast cursor sweeps every sequence: any gap this task
+    ///   can park on is at or below a stall the cache loop reports.
+    /// - Transient read errors back off and retry. Nothing terminates the
+    ///   request short of range-complete or the listener going away.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
         start_after: EventSequence,
@@ -256,35 +253,97 @@ where
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
         buffer_size: usize,
+        init_head: u64,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) {
         use std::ops::Bound;
 
         let mut current_sequence = start_after;
 
         while current_sequence < highest {
-            let next_needed = current_sequence.next();
-            if cache_snapshot.contains_key(&next_needed) {
+            // Serve straight from the request-time cache snapshot while it
+            // holds the next contiguous run — no DB round trip.
+            if cache_snapshot.contains_key(&current_sequence.next()) {
+                for (_, event) in
+                    cache_snapshot.range((Bound::Excluded(current_sequence), Bound::Unbounded))
+                {
+                    if event.sequence() != current_sequence.next() {
+                        break;
+                    }
+                    if sender.send(event.clone()).await.is_err() {
+                        return;
+                    }
+                    current_sequence = event.sequence();
+                }
+                continue;
+            }
+
+            // Authoritative page read — with the park's wake-up receiver
+            // subscribed FIRST: any resolution landing after this point is
+            // buffered for the park below, and anything resolved before it
+            // is visible to the read itself. Subscribing later (inside the
+            // park) would let a resolving delivery — in particular the
+            // GapFiller's response to the Historical request sent below —
+            // slip into the unobserved window and cost the full retry
+            // interval.
+            let wakeup = cache_fill_sender.subscribe();
+            let select_from = current_sequence;
+            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size).await {
+                Ok(events) => events,
+                Err(e) => {
+                    record_backfill_failed(&e, u64::from(current_sequence));
+                    tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
+                    continue;
+                }
+            };
+            let returned = events.len();
+            let mut present = std::collections::HashSet::with_capacity(returned);
+            let mut page = Vec::with_capacity(returned);
+            for item in events {
+                let delivery = PersistentDelivery::from(item);
+                present.insert(u64::from(delivery.sequence()));
+                page.push(delivery);
+            }
+
+            // Deliver the contiguous prefix; anything above a gap is left
+            // for a later read so delivery stays ordered and gap-free.
+            let mut delivered = 0;
+            for delivery in &page {
+                if delivery.sequence() != current_sequence.next() {
+                    break;
+                }
+                let _ = cache_fill_sender.send(delivery.clone());
+                if sender.send(delivery.clone()).await.is_err() {
+                    return;
+                }
+                current_sequence = delivery.sequence();
+                delivered += 1;
+            }
+            if delivered == returned && returned == buffer_size {
+                // Full contiguous page — more may follow immediately.
+                continue;
+            }
+            if current_sequence >= highest {
                 break;
             }
 
-            match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
-                Ok(events) if events.is_empty() => break,
-                Ok(events) => {
-                    for item in events {
-                        let delivery = PersistentDelivery::from(item);
-                        let seq = delivery.sequence();
-                        let _ = cache_fill_sender.send(delivery.clone());
-                        if sender.send(delivery).await.is_err() {
-                            return;
-                        }
-                        current_sequence = seq;
-                    }
-                }
-                Err(e) => {
-                    record_backfill_failed(&e, u64::from(current_sequence));
-                    break;
-                }
+            // Stalled on a gap at `current_sequence.next()`. Historical
+            // gaps (allocated before the cache loop started — e.g. rolled
+            // back with no process observing the frontier at the time) are
+            // reported to the GapFiller; young frontier gaps are not (the
+            // cache loop reports the cursor's stall, and this task never
+            // decides fills). Either way, park until the resolution lands
+            // on the cache-fill stream, then re-read.
+            let next_needed = u64::from(current_sequence.next());
+            if next_needed <= init_head {
+                let fill_to = init_head.min(u64::from(select_from) + buffer_size as u64);
+                let missing = (next_needed..=fill_to)
+                    .filter(|sequence| !present.contains(sequence))
+                    .map(EventSequence::from)
+                    .collect::<Vec<_>>();
+                let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
             }
+            Self::park_until_resolved(wakeup, current_sequence.next()).await;
         }
 
         for (_, event) in
@@ -373,13 +432,13 @@ where
         mut cache_fill_receiver: broadcast::Receiver<PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
         let cache_size = config.event_cache_size;
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
-        let gap_fill_grace = config.gap_fill_grace;
         let idle_resync_interval = config.idle_resync_interval;
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
@@ -388,15 +447,18 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, PersistentDelivery<P>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
-            let mut gap_state: Option<GapFillState> = None;
+            // The stall position last reported to the GapFiller — the
+            // report is sent once per stall, re-armed on cache-fill lag
+            // and on idle resync so a lost delivery can never leave a
+            // stall unreported forever.
+            let mut reported_stall: Option<EventSequence> = None;
+            // Bound for backfill's historical classification: every
+            // sequence <= the head read at init was allocated before this
+            // loop started.
+            let init_head = u64::from(initial_sequence);
             let mut last_progress_at = tokio::time::Instant::now();
 
             loop {
-                // Wake up exactly when the next gap-fill action falls due,
-                // so a stalled broadcast is filled even when no further
-                // events or notifications arrive.
-                let gap_fill_at = gap_state.as_ref().map(GapFillState::next_fill_due);
-
                 tokio::select! {
                     biased;
 
@@ -416,6 +478,8 @@ where
                                     cache_fill_sender.clone(),
                                     highest,
                                     cache_size,
+                                    init_head,
+                                    gap_fill_tx.clone(),
                                 ));
                             }
                             None => {
@@ -466,6 +530,10 @@ where
                                     u64::from(last_broadcast_sequence),
                                     highest_known_sequence.load(Ordering::Relaxed),
                                 );
+                                // Dropped deliveries may include a fill that
+                                // would have resolved the reported stall —
+                                // re-arm so it is re-reported if it persists.
+                                reported_stall = None;
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -534,12 +602,16 @@ where
                                 // last_value advances at nextval (pre-commit), so a
                                 // forged claim inside (committed_head, last_value]
                                 // still passes the clamp and can trigger a grace-period
-                                // gap-fill against in-flight sequences — but that work
-                                // is bounded by last_value and self-heals via the
-                                // ON CONFLICT speculative-insert block, so it never
-                                // stalls. On a transient head-read failure the fetch is
-                                // skipped (rather than fired unclamped); a subsequent
-                                // notification or resync retries.
+                                // gap-fill episode against in-flight sequences — but
+                                // that work is bounded by last_value, read-only until
+                                // the sequences are provably abandoned (the xmin-
+                                // horizon proof), and batch-capped once they are, so
+                                // it never rewrites committed rows and never blocks on
+                                // a live writer: in-flight writers resolve the gap by
+                                // committing, aborted ones become provably lost the
+                                // moment they end. On a transient head-read failure
+                                // the fetch is skipped (rather than fired unclamped);
+                                // a subsequent notification or resync retries.
                                 let current_head =
                                     highest_known_sequence.load(Ordering::Relaxed);
                                 let claim_advances = claimed_head
@@ -585,13 +657,6 @@ where
                         }
                     }
 
-                    _ = async {
-                        match gap_fill_at {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => {}
-
                     _ = tokio::time::sleep_until(last_progress_at + idle_resync_interval) => {
                         if let Some(head) = Self::read_confirmed_head(&pool).await {
                             highest_known_sequence.fetch_max(
@@ -599,42 +664,34 @@ where
                                 Ordering::AcqRel,
                             );
                         }
+                        // Re-arm the stall report as a lost-signal backstop:
+                        // if the GapFiller's episode ended believing the
+                        // stall resolved but the resolving delivery was
+                        // lost, the re-report below restarts it.
+                        reported_stall = None;
                         last_progress_at = tokio::time::Instant::now();
                     }
                 }
 
-                // Proactive gap fill: if broadcasting is stuck waiting for a missing
-                // sequence, trigger load_next_page which will fill the gap via
-                // fill_gaps_query. The first fill is delayed by `gap_fill_grace`:
-                // most gaps are transactions that hold a sequence but have not
-                // committed yet, and the gap-fill upsert blocks on exactly those
-                // in-flight rows (ON CONFLICT speculative insertion) until they
-                // commit — filling immediately pays a blocked connection per gap
-                // for what a brief wait resolves without any DB work.
+                // Stall reporting: when broadcasting is stuck waiting for a
+                // missing sequence, tell the GapFiller — once per stall
+                // position, cleared when the cursor moves. All fill policy
+                // (grace, abandonment proof, batching, cluster dedup)
+                // lives in the GapFiller; this loop only observes its own
+                // cursor. This process's commit-failed allocations are
+                // compensated reactively without ever stalling here, and a
+                // stall that resolves within its grace period costs the
+                // GapFiller zero DB work.
                 let next_needed = last_broadcast_sequence.next();
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
                 if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
                 {
-                    if gap_state
-                        .as_ref()
-                        .is_some_and(|state| !state.is_up_to_date(last_broadcast_sequence))
-                    {
-                        gap_state = None;
+                    if reported_stall != Some(last_broadcast_sequence) {
+                        let _ = gap_fill_tx.send(GapFillRequest::Stalled(last_broadcast_sequence));
+                        reported_stall = Some(last_broadcast_sequence);
                     }
-                    let state = gap_state.get_or_insert_with(|| {
-                        GapFillState::new(gap_fill_grace, last_broadcast_sequence)
-                    });
-                    if state.fill_is_due() {
-                        state.record_attempt();
-                        tokio::spawn(Self::fill_gap(
-                            pool.clone(),
-                            last_broadcast_sequence,
-                            cache_fill_sender.clone(),
-                            cache_size,
-                        ));
-                    }
-                } else {
-                    gap_state = None;
+                } else if reported_stall.take().is_some() {
+                    let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
                 }
 
                 if persistent_cache.len() > high_water {

@@ -265,11 +265,34 @@ async fn hook_error_aborts_commit() -> anyhow::Result<()> {
         op.commit().await.is_err(),
         "a hook error must fail the commit"
     );
+    let payload_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM persistent_outbox_events WHERE payload IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(
-        outbox_row_count(&pool).await?,
-        0,
-        "the tx rolled back — including the events that triggered the hook"
+        payload_rows, 0,
+        "the tx rolled back — no event payload survives the hook error"
     );
+
+    // The burned sequence is compensated reactively: a NULL-payload
+    // placeholder appears without waiting for the gap-fill backstop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let placeholders: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM persistent_outbox_events WHERE payload IS NULL",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if placeholders == 1 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("compensation placeholder for the aborted sequence never appeared");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     Ok(())
 }
 

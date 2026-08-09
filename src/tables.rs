@@ -111,6 +111,11 @@ pub fn record_ephemeral_event_type_undecodable(error: &serde_json::Error, event_
 )]
 pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 
+/// One page/batch of decoded persistent rows: each item is one committed
+/// sequence position — `Ok` for a decoded event or a placeholder, `Err`
+/// for a stored payload that does not decode into `P`.
+pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>;
+
 pub trait MailboxTables: Send + Sync + 'static {
     fn highest_known_persistent_sequence<'a>(
         op: impl es_entity::IntoOneTimeExecutor<'a>,
@@ -135,19 +140,78 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// Each item is one sequence position: `Ok` for a decoded event or a
-    /// plain placeholder (`payload: None`), `Err` for a stored payload that
-    /// does not decode into `P` — delivered, not dropped, so the page stays
-    /// contiguous.
+    /// Load the committed rows in `(from_sequence, from_sequence +
+    /// buffer_size]` with a plain bounded SELECT. Each item is one committed
+    /// sequence position: `Ok` for a decoded event or a stored placeholder
+    /// (`payload: None`), `Err` for a stored payload that does not decode
+    /// into `P` — delivered, not dropped, so it still occupies its sequence
+    /// position. The page may contain sequence gaps (in-flight or lost
+    /// writers): this method never writes placeholder rows — that is
+    /// exclusively [`fill_gaps`](Self::fill_gaps) /
+    /// [`fill_gaps_deduped`](Self::fill_gaps_deduped), invoked proof-gated
+    /// and batch-capped from the per-process `out::gap_fill::GapFiller`.
     fn load_next_page<P>(
         pool: &sqlx::PgPool,
         from_sequence: EventSequence,
         buffer_size: usize,
-    ) -> impl Future<
-        Output = Result<Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>, sqlx::Error>,
-    > + Send
+    ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
+
+    /// Insert placeholder rows (`payload: NULL`) for the given sequences
+    /// with `ON CONFLICT (sequence) DO NOTHING`, returning only the rows
+    /// actually inserted. Sequences that already have a committed row —
+    /// a real event or an earlier placeholder — are left untouched: no
+    /// rewrite, no dead tuple. A sequence whose writer is still in flight
+    /// blocks the insert on that transaction's speculative-insertion lock
+    /// until it resolves, so callers must only pass sequences that are
+    /// provably abandoned: either their own rolled-back allocations (the
+    /// rollback-compensation path) or sequences proven lost via
+    /// [`abandonment_marker`](Self::abandonment_marker) /
+    /// [`abandonment_proof_passed`](Self::abandonment_proof_passed).
+    fn fill_gaps<P>(
+        pool: &sqlx::PgPool,
+        sequences: Vec<EventSequence>,
+    ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// [`fill_gaps`](Self::fill_gaps) behind a per-table
+    /// `pg_try_advisory_xact_lock`: the cluster-wide dedup for backstop
+    /// fills, where multiple nodes may attempt the same range. Returns
+    /// `None` without inserting anything when another connection holds the
+    /// fill lock — the winner's rows are committed by the time its lock
+    /// releases, so the caller's next page read delivers them.
+    fn fill_gaps_deduped<P>(
+        pool: &sqlx::PgPool,
+        sequences: Vec<EventSequence>,
+    ) -> impl Future<Output = Result<Option<PersistentEventRows<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// Assign an abandonment marker: a real xid on this connection (one
+    /// auto-commit statement), returned together with the sequence
+    /// allocation head read in the same statement. Every write transaction
+    /// that had begun before the marker holds a smaller xid, and every
+    /// sequence `<=` the returned head was allocated before it — the two
+    /// facts [`abandonment_proof_passed`](Self::abandonment_proof_passed)
+    /// combines into a proof.
+    fn abandonment_marker(
+        pool: &sqlx::PgPool,
+    ) -> impl Future<Output = Result<(String, EventSequence), sqlx::Error>> + Send;
+
+    /// Whether the xmin horizon has passed `marker`: every transaction
+    /// with an older xid has ended. A sequence allocated before the marker
+    /// (per [`abandonment_marker`](Self::abandonment_marker)'s head) that
+    /// is still absent from the table once this returns `true` is provably
+    /// abandoned — its writer ended without committing it — so a
+    /// placeholder insert cannot collide with a live writer. Latency is
+    /// the actual remaining lifetime of the concurrent write transactions,
+    /// not a fixed guess.
+    fn abandonment_proof_passed(
+        pool: &sqlx::PgPool,
+        marker: &str,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
 
     /// Load the committed events in `(after_sequence, up_to_sequence]` with
     /// a plain SELECT. Unlike [`load_next_page`](Self::load_next_page) this
@@ -159,9 +223,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         after_sequence: EventSequence,
         up_to_sequence: EventSequence,
-    ) -> impl Future<
-        Output = Result<Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>, sqlx::Error>,
-    > + Send
+    ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
 
