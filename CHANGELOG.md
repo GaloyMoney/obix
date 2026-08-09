@@ -1,3 +1,20 @@
+# [obix release v0.7.2](https://github.com/GaloyMoney/obix/releases/tag/0.7.2)
+
+
+
+### Bug Fixes
+
+- Set SQLX_OFFLINE in the dev shell (#119)
+
+### Miscellaneous Tasks
+
+- Bump vendir to galoy-concourse-shared 26b38b4 (#120)
+- Add coverage-guided fuzzing for decode_persistent_event (#115)
+
+### Performance
+
+- Age-gated, batch-capped gap fill with DO NOTHING placeholders (#116)
+
 # [obix release v0.7.1](https://github.com/GaloyMoney/obix/releases/tag/0.7.1)
 
 
