@@ -818,6 +818,85 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
     Ok(())
 }
 
+/// One backfill request serves its whole range, parking on gaps it cannot
+/// yet serve instead of terminating: a replaying listener that runs into a
+/// young frontier gap (in-flight writer) must receive the writer's REAL
+/// event once it commits — through the same request, with no placeholder
+/// and no listener-side re-request logic.
+#[tokio::test]
+#[file_serial]
+async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    // seq 1 committed; seq 2 allocated by a writer that stays in flight;
+    // seq 3 committed — all after outbox init, so seq 2 is a young gap the
+    // backfill task must never placeholder-fill.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 7}"#)
+        .execute(&mut *tx)
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Replay from the beginning: backfill serves seq 1, then parks at the
+    // in-flight seq 2.
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should replay first event")?;
+    assert!(matches!(first.payload, Some(TestEvent::Ping(0))));
+
+    // While the writer lives nothing may be delivered past the gap — and
+    // no placeholder may be written for it.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), listener.next())
+            .await
+            .is_err(),
+        "the parked backfill must not deliver past (or placeholder) an in-flight gap"
+    );
+
+    // The writer commits: the parked request resumes and delivers the real
+    // event, then the rest of the range — same request, no re-request
+    // needed.
+    tx.commit().await?;
+
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive the committed gap event")?;
+    assert!(
+        matches!(gap_event.payload, Some(TestEvent::Ping(7))),
+        "the gap must resolve with the real committed event, got {:?}",
+        gap_event.payload
+    );
+
+    let third = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive the event after the gap")?;
+    assert!(matches!(third.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
 /// The cluster-wide fill lock: a backstop fill skips entirely (inserting
 /// nothing) while another connection holds the lock, and proceeds once it
 /// is released.

@@ -392,6 +392,60 @@ where
             .flatten()
     }
 
+    /// How long a parked backfill waits before re-reading regardless of
+    /// wake-up signals, and how long it backs off after a transient page
+    /// read error. The cache-fill wake-up makes typical resumption
+    /// immediate; this interval only bounds the lost-signal worst case.
+    const BACKFILL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Park a stalled backfill until its needed sequence plausibly
+    /// resolved: woken by that exact sequence arriving on the cache-fill
+    /// stream (every resolution path lands there — in-process post-commit
+    /// broadcast, notification fetch, grace-gated fill placeholder,
+    /// rollback compensation), or by the retry interval elapsing as the
+    /// lost-signal backstop. The caller re-reads the page either way; the
+    /// wake-up is a hint, never trusted as data.
+    async fn park_until_resolved(
+        cache_fill_sender: &broadcast::Sender<PersistentDelivery<P>>,
+        needed: EventSequence,
+    ) {
+        let mut wakeup = cache_fill_sender.subscribe();
+        let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
+        loop {
+            match tokio::time::timeout_at(deadline, wakeup.recv()).await {
+                Ok(Ok(delivery)) if delivery.sequence() == needed => return,
+                Ok(Ok(_)) => {}
+                // Lagged or closed: no reliable signal left — re-read.
+                Ok(Err(_)) => return,
+                // Interval elapsed: re-read regardless.
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Serve one backfill request: deliver `(start_after, highest]` to the
+    /// listener **in order, gap-free, in a single request**. The
+    /// listener-facing contract is deliberately simple — one request per
+    /// range, ever — so every gap condition is handled (or waited out)
+    /// here rather than leaking to the listener:
+    ///
+    /// - Historical gaps (allocated before the cache loop started) are
+    ///   proof-gated placeholder fills, batch-capped and deduped
+    ///   cluster-wide; the next page read delivers the result in order.
+    /// - Young frontier gaps (an in-flight or just-failed writer) are
+    ///   **parked on**, never placeholder-filled here: the writer commits,
+    ///   the rollback compensator fills it, or the grace-gated fill
+    ///   episode placeholders it once provably abandoned — all of which
+    ///   land on the cache-fill stream and wake the park. Liveness holds
+    ///   because the central broadcast cursor sweeps every sequence: any
+    ///   gap this task can park on is at or below a stall the grace-gated
+    ///   episode will resolve.
+    /// - Transient read errors back off and retry; a raced fill lock
+    ///   re-reads (the winner's rows are committed by the time its lock
+    ///   releases). Neither terminates the request.
+    ///
+    /// The request ends only when the range is fully delivered or the
+    /// listener goes away.
     #[allow(clippy::too_many_arguments)]
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
@@ -408,107 +462,95 @@ where
         let mut current_sequence = start_after;
 
         while current_sequence < highest {
-            let next_needed = current_sequence.next();
-            if cache_snapshot.contains_key(&next_needed) {
+            // Serve straight from the request-time cache snapshot while it
+            // holds the next contiguous run — no DB round trip.
+            if cache_snapshot.contains_key(&current_sequence.next()) {
+                for (_, event) in
+                    cache_snapshot.range((Bound::Excluded(current_sequence), Bound::Unbounded))
+                {
+                    if event.sequence() != current_sequence.next() {
+                        break;
+                    }
+                    if sender.send(event.clone()).await.is_err() {
+                        return;
+                    }
+                    current_sequence = event.sequence();
+                }
+                continue;
+            }
+
+            // Authoritative page read.
+            let select_from = current_sequence;
+            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size).await {
+                Ok(events) => events,
+                Err(e) => {
+                    record_backfill_failed(&e, u64::from(current_sequence));
+                    tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
+                    continue;
+                }
+            };
+            let returned = events.len();
+            let mut present = std::collections::HashSet::with_capacity(returned);
+            let mut page = Vec::with_capacity(returned);
+            for item in events {
+                let delivery = PersistentDelivery::from(item);
+                present.insert(u64::from(delivery.sequence()));
+                page.push(delivery);
+            }
+
+            // Deliver the contiguous prefix; anything above a gap is left
+            // for a later read so delivery stays ordered and gap-free.
+            let mut delivered = 0;
+            for delivery in &page {
+                if delivery.sequence() != current_sequence.next() {
+                    break;
+                }
+                let _ = cache_fill_sender.send(delivery.clone());
+                if sender.send(delivery.clone()).await.is_err() {
+                    return;
+                }
+                current_sequence = delivery.sequence();
+                delivered += 1;
+            }
+            if delivered == returned && returned == buffer_size {
+                // Full contiguous page — more may follow immediately.
+                continue;
+            }
+            if current_sequence >= highest {
                 break;
             }
 
-            match Tables::load_next_page::<P>(&pool, current_sequence, buffer_size).await {
-                Ok(events) if events.is_empty() => {
-                    // No committed row follows `current_sequence`. Any
-                    // sequences left up to the init head are burned
-                    // pre-start allocations (e.g. rolled back with no
-                    // process observing the frontier at the time) — fill
-                    // them, or a replaying listener stalls on them forever.
-                    let from = u64::from(current_sequence);
-                    let fill_to = fill_bounds.head.min(from + buffer_size as u64);
-                    if from >= fill_to {
-                        break;
-                    }
-                    let missing = ((from + 1)..=fill_to)
-                        .take(fill_bounds.batch_limit)
-                        .map(EventSequence::from)
-                        .collect::<Vec<_>>();
-                    let requested = missing.len();
-                    let Some(placeholders) = Self::fill_provably_abandoned(&pool, missing).await
-                    else {
-                        // Fill lock raced or transient error: if another
-                        // node was filling, its rows are committed by the
-                        // time its lock releases — re-read the page rather
-                        // than advancing past them. Pause first: each
-                        // retry assigns a fresh marker xid, and contending
-                        // replayers would otherwise busy-loop until the
-                        // lock clears.
-                        tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await;
-                        continue;
-                    };
-                    let all_inserted = placeholders.len() == requested;
-                    for item in placeholders {
-                        let delivery = PersistentDelivery::from(item);
-                        let _ = cache_fill_sender.send(delivery.clone());
-                        if sender.send(delivery).await.is_err() {
-                            return;
-                        }
-                    }
-                    if all_inserted {
-                        current_sequence = EventSequence::from(from + requested as u64);
-                    }
-                    // else: a concurrent filler owns part of the range; its
-                    // rows are committed by now (DO NOTHING waits out the
-                    // conflict), so the next page read delivers them — do
-                    // not advance past them.
+            // Stalled on a gap at `current_sequence.next()`.
+            let next_needed = u64::from(current_sequence.next());
+            if next_needed <= fill_bounds.head {
+                // Historical gap (allocated before the cache loop started
+                // — e.g. rolled back with no process observing the
+                // frontier at the time): prove abandonment and insert
+                // placeholders, batch-capped; the next page read delivers
+                // them — and any row that committed meanwhile — in order.
+                let fill_to = fill_bounds
+                    .head
+                    .min(u64::from(select_from) + buffer_size as u64);
+                let missing = (next_needed..=fill_to)
+                    .filter(|sequence| !present.contains(sequence))
+                    .take(fill_bounds.batch_limit)
+                    .map(EventSequence::from)
+                    .collect::<Vec<_>>();
+                if Self::fill_provably_abandoned(&pool, missing)
+                    .await
+                    .is_none()
+                {
+                    // Raced fill lock or transient error: pause before the
+                    // re-read — each retry assigns a fresh marker xid, and
+                    // contending replayers would otherwise busy-loop until
+                    // the lock clears.
+                    tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await;
                 }
-                Ok(events) => {
-                    let mut page = Vec::with_capacity(events.len());
-                    let mut present = std::collections::HashSet::new();
-                    for item in events {
-                        let delivery = PersistentDelivery::from(item);
-                        present.insert(u64::from(delivery.sequence()));
-                        page.push(delivery);
-                    }
-                    let page_last = page
-                        .last()
-                        .map(|delivery| u64::from(delivery.sequence()))
-                        .expect("page is non-empty");
-
-                    // Interior historical gaps: fill only sequences
-                    // allocated before the cache loop started (<= init
-                    // head). Younger gaps are skipped — they are either
-                    // in-flight writers about to commit or the grace-gated
-                    // fill's responsibility, and they reach the listener
-                    // through the live broadcast once resolved.
-                    let from = u64::from(current_sequence);
-                    let fill_to = fill_bounds.head.min(page_last);
-                    let missing = ((from + 1)..=fill_to)
-                        .filter(|sequence| !present.contains(sequence))
-                        .take(fill_bounds.batch_limit)
-                        .map(EventSequence::from)
-                        .collect::<Vec<_>>();
-                    if !missing.is_empty()
-                        && let Some(placeholders) =
-                            Self::fill_provably_abandoned(&pool, missing).await
-                    {
-                        // A raced fill lock (None) is fine here: the winner's
-                        // rows are committed rows the listener's next
-                        // backfill round reads back; the contiguity gate
-                        // stalls it until then.
-                        page.extend(placeholders.into_iter().map(PersistentDelivery::from));
-                        page.sort_by_key(|delivery| delivery.sequence());
-                    }
-
-                    for delivery in page {
-                        let seq = delivery.sequence();
-                        let _ = cache_fill_sender.send(delivery.clone());
-                        if sender.send(delivery).await.is_err() {
-                            return;
-                        }
-                        current_sequence = seq;
-                    }
-                }
-                Err(e) => {
-                    record_backfill_failed(&e, u64::from(current_sequence));
-                    break;
-                }
+            } else {
+                // Young frontier gap: this task never placeholder-fills it
+                // (that is the grace-gated episode's and the compensator's
+                // exclusive job) — park until it resolves, then re-read.
+                Self::park_until_resolved(&cache_fill_sender, current_sequence.next()).await;
             }
         }
 
