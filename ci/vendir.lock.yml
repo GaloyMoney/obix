@@ -2,14 +2,14 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - git:
-      commitTitle: 'Merge pull request #22 from GaloyMoney/fix/fuzz-corpus-restore-portable...'
-      sha: 26b38b457e1e638fd168a0d4f4c5db49c1bcb47e
+      commitTitle: 'Merge pull request #24 from GaloyMoney/feat/fuzz-sqlx-offline...'
+      sha: 60ebf3df8afba503eec84ac3dce5464598dd581e
     path: .
   path: ../.github/workflows/vendor
 - contents:
   - git:
-      commitTitle: 'Merge pull request #22 from GaloyMoney/fix/fuzz-corpus-restore-portable...'
-      sha: 26b38b457e1e638fd168a0d4f4c5db49c1bcb47e
+      commitTitle: 'Merge pull request #24 from GaloyMoney/feat/fuzz-sqlx-offline...'
+      sha: 60ebf3df8afba503eec84ac3dce5464598dd581e
     path: .
   path: vendor
 kind: LockConfig
