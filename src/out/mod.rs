@@ -1,4 +1,5 @@
 mod all_listener;
+mod compensator;
 mod ctx;
 mod ephemeral;
 mod ephemeral_events_hook;
@@ -46,6 +47,9 @@ where
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
+    /// Per-process placeholder filler for this process's own abandoned
+    /// (allocated-but-not-committed) sequences.
+    compensator: compensator::AbandonedCompensator,
     clock: ClockHandle,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
@@ -81,6 +85,7 @@ where
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             notifier: self.notifier.clone(),
+            compensator: self.compensator.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
         }
@@ -106,12 +111,26 @@ where
         )
         .await?;
 
-        let persistent_cache =
-            PersistentOutboxEventCache::init(&pool, &config, persistent_notification_rx).await?;
+        // Spawned before the cache: backstop fills report the ranges they
+        // placeholder-fill through the notifier so other processes unstall
+        // reactively instead of waiting out their own retry reads.
+        let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
+
+        let persistent_cache = PersistentOutboxEventCache::init(
+            &pool,
+            &config,
+            persistent_notification_rx,
+            notifier.report_sender(),
+        )
+        .await?;
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
-        let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
+        let compensator = compensator::AbandonedCompensator::spawn::<P, Tables>(
+            &pool,
+            persistent_cache.cache_fill_sender(),
+            notifier.report_sender(),
+        );
 
         Ok(Self {
             pool,
@@ -123,6 +142,7 @@ where
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
+            compensator,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
         })
@@ -172,6 +192,7 @@ where
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
             self.notifier.report_sender(),
+            self.compensator.report_sender(),
             events,
             self.persist_events_batch_size,
             post_persist_hooks,

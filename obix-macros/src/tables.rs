@@ -232,6 +232,42 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // One statement, one round trip, auto-commit: assigns this
+        // connection a real xid (the abandonment marker — every write
+        // transaction that had begun before this statement holds a smaller
+        // xid) and reads the sequence's allocation head alongside it. The
+        // deliberate xid burn is negligible: markers are taken once per
+        // gap-fill episode, and episodes only exist while a stall persists.
+        let abandonment_marker_query = format!(
+            r#"
+            SELECT pg_current_xact_id()::text AS "marker!",
+                   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END
+                    FROM {}persistent_outbox_events_sequence_seq) AS "head!: i64""#,
+            table_prefix
+        );
+
+        // The xmin horizon has passed the marker once every transaction
+        // with an older xid has ended — at that point a sequence known to
+        // be allocated before the marker, and still absent from the table,
+        // is provably abandoned. (Deliberately NOT the snapshot-xmax
+        // variant: snapshot xmax is one past the highest *completed* xid,
+        // and a transaction active at marker time can hold an xid at or
+        // above it — that check can pass while the gap's writer still
+        // runs.)
+        let abandonment_proof_query =
+            r#"SELECT pg_snapshot_xmin(pg_current_snapshot()) > $1::text::xid8 AS "passed!""#
+                .to_string();
+
+        // Cluster-wide dedup of backstop fills: losers of the try-lock skip
+        // entirely (the winner's rows are committed by the time the lock
+        // releases, so a later page read delivers them). The key is derived
+        // from the (prefixed) table name so co-hosted outboxes never
+        // contend with each other.
+        let fill_gaps_lock_query = format!(
+            r#"SELECT pg_try_advisory_xact_lock(hashtextextended('{}persistent_outbox_events_gap_fill', 0)) AS "locked!""#,
+            table_prefix
+        );
+
         // === Inbox queries ===
         let insert_inbox_event_query = format!(
             r#"INSERT INTO {tbl}inbox_events (id, idempotency_key, payload, recorded_at)
@@ -530,6 +566,86 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
                         Ok(events)
+                    }
+                }
+
+                fn fill_gaps_deduped<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    sequences: Vec<#crate_name::EventSequence>,
+                ) -> impl std::future::Future<Output = Result<Option<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        if sequences.is_empty() {
+                            return Ok(Some(Vec::new()));
+                        }
+                        let sequences = sequences
+                            .into_iter()
+                            .map(|s| u64::from(s) as i64)
+                            .collect::<Vec<_>>();
+
+                        let mut tx = pool.begin().await?;
+                        let locked = sqlx::query!(#fill_gaps_lock_query)
+                            .fetch_one(&mut *tx)
+                            .await?
+                            .locked;
+                        if !locked {
+                            tx.rollback().await?;
+                            return Ok(None);
+                        }
+                        let rows = sqlx::query!(
+                            #fill_gaps_query,
+                            &sequences as _
+                        ).fetch_all(&mut *tx).await?;
+                        tx.commit().await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                #deserialize_context
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                )
+                            })
+                            .collect();
+                        Ok(Some(events))
+                    }
+                }
+
+                fn abandonment_marker(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                ) -> impl std::future::Future<Output = Result<(String, #crate_name::EventSequence), #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(#abandonment_marker_query)
+                            .fetch_one(&pool)
+                            .await?;
+                        Ok((row.marker, #crate_name::EventSequence::from(row.head as u64)))
+                    }
+                }
+
+                fn abandonment_proof_passed(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    marker: &str,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+                    let marker = marker.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#abandonment_proof_query, marker)
+                            .fetch_one(&pool)
+                            .await?;
+                        Ok(row.passed)
                     }
                 }
 
