@@ -18,3 +18,8 @@ target/
 .env
 .bacon-locations
 .claude/settings.local.json
+
+# cargo-fuzz: the evolving corpus is persisted to GCS in CI (not git); crash
+# outputs and the build dir (covered by global `target/`) are ignored.
+fuzz/artifacts/
+fuzz/corpus/
