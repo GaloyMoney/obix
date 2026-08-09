@@ -265,10 +265,15 @@ where
     ///    sequences are provably abandoned — their writers ended without
     ///    committing them — so the placeholder insert cannot collide with
     ///    a live writer. Insert under the cluster-wide fill lock, capped at
-    ///    `batch_limit`; deliver the placeholders locally and report the
-    ///    range to the debounced notifier so other processes resume
-    ///    reactively. If another node holds the lock, keep looping — its
-    ///    rows surface in the next page re-read.
+    ///    `batch_limit` per statement; deliver the placeholders locally and
+    ///    report the range to the debounced notifier so other processes
+    ///    resume reactively. A full batch keeps the episode going — the
+    ///    remainder of the window is filled at one batch per loop interval,
+    ///    NOT one batch per grace period (delivering a batch advances the
+    ///    broadcast cursor, which would discard the gap state and make a
+    ///    returning episode pay a fresh grace per batch). If another node
+    ///    holds the lock, keep looping — its rows surface in the next page
+    ///    re-read.
     async fn fill_gap(
         pool: sqlx::PgPool,
         from_sequence: EventSequence,
@@ -304,6 +309,7 @@ where
                 return;
             }
 
+            let requested = missing.len();
             match Tables::abandonment_proof_passed(&pool, &marker).await {
                 Ok(true) => {
                     match Tables::fill_gaps_deduped::<P>(&pool, missing).await {
@@ -321,7 +327,18 @@ where
                             if let Some(range) = range {
                                 let _ = notifier_tx.send(range);
                             }
-                            return;
+                            if requested < batch_limit {
+                                // The batch covered every missing sequence
+                                // in the window — nothing left for another
+                                // pass. (Sequences raced away by a
+                                // concurrent filler are committed rows the
+                                // next episode's page read delivers.)
+                                return;
+                            }
+                            // A full batch may leave more of the window
+                            // missing: keep the episode alive so the
+                            // remainder recovers at the loop cadence below
+                            // instead of a fresh grace period per batch.
                         }
                         // Another node holds the fill lock: loop — its rows
                         // are committed by the time the lock releases, so
@@ -342,6 +359,12 @@ where
         }
     }
 
+    /// Pacing for abandonment-proof polls, and for backfill retries after
+    /// a raced fill lock or a transient marker/proof error — each retry
+    /// assigns a fresh marker xid, so retrying without a pause would
+    /// busy-loop and burn xids while (e.g.) another node holds the lock.
+    const PROOF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Wait until the given (historically-allocated) sequences are provably
     /// abandoned, then insert their placeholders under the cluster-wide
     /// fill lock. A fresh abandonment marker post-dates the sequences'
@@ -355,12 +378,11 @@ where
         pool: &sqlx::PgPool,
         missing: Vec<EventSequence>,
     ) -> Option<crate::tables::PersistentEventRows<P>> {
-        const PROOF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let (marker, _) = Tables::abandonment_marker(pool).await.ok()?;
         loop {
             match Tables::abandonment_proof_passed(pool, &marker).await {
                 Ok(true) => break,
-                Ok(false) => tokio::time::sleep(PROOF_POLL_INTERVAL).await,
+                Ok(false) => tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await,
                 Err(_) => return None,
             }
         }
@@ -413,7 +435,11 @@ where
                         // Fill lock raced or transient error: if another
                         // node was filling, its rows are committed by the
                         // time its lock releases — re-read the page rather
-                        // than advancing past them.
+                        // than advancing past them. Pause first: each
+                        // retry assigns a fresh marker xid, and contending
+                        // replayers would otherwise busy-loop until the
+                        // lock clears.
+                        tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await;
                         continue;
                     };
                     let all_inserted = placeholders.len() == requested;

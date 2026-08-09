@@ -931,6 +931,79 @@ async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A batch-capped fill episode stays alive across batches: the remainder
+/// of the window recovers at the 1s loop cadence, not one full grace
+/// period per batch (delivering a batch advances the broadcast cursor,
+/// which discards the gap state — a returning episode would restart grace
+/// from scratch for every batch).
+#[tokio::test]
+#[file_serial]
+async fn batch_capped_fill_does_not_pay_grace_per_batch() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Grace (2.5s) far above the episode's 1s loop cadence: if each batch
+    // paid a fresh grace, consecutive placeholders would arrive ~2.5s
+    // apart; within one episode they arrive ~1s apart.
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_millis(2500))
+            .gap_fill_batch_limit(1)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Two burned sequences -> two single-placeholder batches.
+    for _ in 0..2 {
+        sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+            .fetch_one(&pool)
+            .await?;
+    }
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    let first_gap = tokio::time::timeout(std::time::Duration::from_secs(6), listener.next())
+        .await?
+        .expect("should receive first placeholder")?;
+    assert!(first_gap.payload.is_none());
+    let first_at = std::time::Instant::now();
+
+    let second_gap = tokio::time::timeout(std::time::Duration::from_secs(6), listener.next())
+        .await?
+        .expect("should receive second placeholder")?;
+    assert!(second_gap.payload.is_none());
+    assert!(
+        first_at.elapsed() < std::time::Duration::from_secs(2),
+        "second batch must follow at the episode's loop cadence (~1s), \
+         not after a fresh grace period (2.5s); took {:?}",
+        first_at.elapsed()
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive real event after gaps")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}
+
 #[tokio::test]
 #[file_serial]
 async fn fill_gaps_leaves_committed_rows_untouched() -> anyhow::Result<()> {
