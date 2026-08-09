@@ -44,6 +44,50 @@
         ];
       };
 
+      # Concourse `fly` CLI, fetched from the Galoy Concourse instance. On
+      # PATH in the dev shell (`nix develop`) so `repipe` / `fly` work without
+      # a manual install. Mirrors lana-bank's concourseFly derivation.
+      concourseFly = let
+        artifacts = {
+          x86_64-linux = {
+            arch = "amd64";
+            platform = "linux";
+            hash = "sha256-2K+9KcGyIXUxN/dbOsju6EKLcXDCMKEDwLXSZgIFnZc=";
+          };
+          aarch64-linux = {
+            arch = "arm64";
+            platform = "linux";
+            hash = "sha256-si+WUXm8B3ItRrUYER0SHAgIHlhjYdZTNLhO4JDNS34=";
+          };
+          x86_64-darwin = {
+            arch = "amd64";
+            platform = "darwin";
+            hash = "sha256-G9ZHUaAjdChzOhnQdnKuhXTpoO0RzVPY6PleuWOaktM=";
+          };
+          aarch64-darwin = {
+            arch = "arm64";
+            platform = "darwin";
+            hash = "sha256-j8AqvNbyCgl+AyOHwwlgfxss72Az10fxTlnqI/1lv5g=";
+          };
+        };
+        artifact = artifacts.${system} or (throw "Unsupported fly platform: ${system}");
+      in
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "fly";
+          version = "8.2.4";
+
+          src = pkgs.fetchurl {
+            url = "https://ci.galoy.io/api/v1/cli?arch=${artifact.arch}&platform=${artifact.platform}";
+            hash = artifact.hash;
+          };
+
+          dontUnpack = true;
+
+          installPhase = ''
+            install -D -m755 "$src" "$out/bin/fly"
+          '';
+        };
+
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
       rustSource = pkgs.lib.cleanSourceWith {
         src = craneLib.path ./.;
@@ -71,6 +115,7 @@
         process-compose
         ytt
         curl
+        concourseFly
       ];
 
       pgPort = 5432;
