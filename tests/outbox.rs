@@ -741,6 +741,83 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
     Ok(())
 }
 
+/// The `on_rollback` tier: a LATER commit hook on the same operation fails
+/// after `PersistEvents::pre_commit` already persisted its batch — the
+/// whole transaction rolls back, and es-entity fires `on_rollback` on the
+/// persist hook (after the rollback), which reports the burned sequences
+/// for immediate compensation. Regression test for the review question
+/// "does compensation survive a later hook's failure?": the placeholder
+/// must arrive reactively, well before the 2s grace period would let the
+/// backstop act.
+#[tokio::test]
+#[file_serial]
+async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Result<()> {
+    use es_entity::AtomicOperation as _;
+    use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
+
+    struct VetoHook;
+
+    impl CommitHook for VetoHook {
+        async fn pre_commit(
+            self,
+            _op: HookOperation<'_>,
+        ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
+            Err(sqlx::Error::Protocol("later hook veto".into()))
+        }
+    }
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Publish first (registers PersistEvents), then register the vetoing
+    // hook — hooks run in registration order, so the veto fires AFTER the
+    // outbox persist has allocated its sequence.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.add_commit_hook(VetoHook)
+        .unwrap_or_else(|_| panic!("DbOp supports commit hooks"));
+    assert!(
+        op.commit().await.is_err(),
+        "the later hook's veto must fail the commit"
+    );
+
+    // Reactive compensation via on_rollback: the placeholder must arrive
+    // well before the 2s grace period would allow a backstop fill.
+    let gap_event = tokio::time::timeout(std::time::Duration::from_millis(1500), listener.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("compensation placeholder did not arrive reactively"))?
+        .expect("stream open")?;
+    assert!(
+        gap_event.payload.is_none(),
+        "the compensated sequence must be a placeholder"
+    );
+
+    // The stream continues normally past the compensated sequence.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive the event after the compensated gap")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+    assert!(u64::from(real_event.sequence) > u64::from(gap_event.sequence));
+
+    Ok(())
+}
+
 /// The cluster-wide fill lock: a backstop fill skips entirely (inserting
 /// nothing) while another connection holds the lock, and proceeds once it
 /// is released.

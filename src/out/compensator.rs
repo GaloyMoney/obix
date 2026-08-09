@@ -17,21 +17,24 @@ use crate::{
 /// in-process allocation is only ever abandoned by a transaction failing
 /// *after* the persist ran: a later commit hook or post-persist hook
 /// erroring, or the COMMIT itself failing (serialization conflict,
-/// connection loss). `PersistEvents`' `Drop` detects exactly that state
-/// (persisted events never consumed by `post_commit`) and reports the
-/// sequences here; this task inserts their placeholders and delivers them —
-/// into the local cache-fill stream directly, and to other processes via a
-/// `(min, max)` report to the debounced notifier. Stalls behind such a
-/// rollback clear in milliseconds instead of waiting out the grace-gated
-/// backstop.
+/// connection loss). `PersistEvents` reports the sequences here from
+/// es-entity's `CommitHook::on_rollback` (later hook / COMMIT failures —
+/// the transaction is already rolled back when that fires) and from its
+/// own `pre_commit` error branches (own-chunk or post-persist-hook
+/// failures — the transaction is still open there, which is exactly why
+/// the report is a channel send and the insert happens on this task).
+/// This task inserts the placeholders and delivers them — into the local
+/// cache-fill stream directly, and to other processes via a `(min, max)`
+/// report to the debounced notifier. Stalls behind such a rollback clear
+/// in milliseconds instead of waiting out the grace-gated backstop.
 ///
 /// Only the owning process compensates its own sequences, so this path has
 /// no cross-node contention by construction and needs no fill lock. The
 /// insert is `ON CONFLICT DO NOTHING`: if the "failed" commit actually
 /// landed server-side (ambiguous commit), the placeholders no-op against
-/// the real rows. It may also briefly park on the aborting transaction's
-/// speculative-insertion lock — sqlx issues the ROLLBACK asynchronously —
-/// a wait bounded by the rollback itself.
+/// the real rows. On the own-failure path it may briefly park on the
+/// aborting transaction's speculative-insertion lock — a wait bounded by
+/// the rollback, which es-entity issues as soon as the error propagates.
 pub(crate) struct AbandonedCompensator {
     tx: mpsc::UnboundedSender<Vec<EventSequence>>,
     _handle: Arc<OwnedTaskHandle>,
