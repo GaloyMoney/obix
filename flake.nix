@@ -436,6 +436,11 @@
 
         devShells.default = mkShell {
           inherit nativeBuildInputs;
+          # obix uses compile-time sqlx::query! macros (via the MailboxTables
+          # derive) backed by the committed .sqlx/ cache. Without this, `cargo
+          # build` / `cargo fuzz build` in `nix develop` (incl. the CI fuzz task)
+          # tries to hit a live Postgres and fails — e.g. the fuzz job has no DB.
+          SQLX_OFFLINE = "true";
           shellHook = ''
             eval "$(${devEnv}/bin/obix-dev-env)"
           '';
