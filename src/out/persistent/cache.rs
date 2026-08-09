@@ -10,7 +10,7 @@ use std::sync::{
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
-    out::{event::*, pg_notify::NotifyMessage},
+    out::{event::*, gap_fill::GapFillRequest, pg_notify::NotifyMessage},
     sequence::EventSequence,
 };
 
@@ -61,70 +61,6 @@ struct NotifiedRange {
     missing: Option<(EventSequence, EventSequence)>,
 }
 
-/// Bookkeeping for the sequence the broadcast cursor is stalled on.
-struct GapFillState {
-    /// Grace period before the first fill (`MailboxConfig::gap_fill_grace`).
-    grace: std::time::Duration,
-    /// The sequence the broadcast cursor is stalled on. The state is
-    /// discarded when the cursor advances past it.
-    stalled_on: EventSequence,
-    /// When the stall was first observed. The first fill is withheld until
-    /// `grace` has elapsed since this instant.
-    first_seen: tokio::time::Instant,
-    last_attempt: Option<tokio::time::Instant>,
-}
-
-impl GapFillState {
-    /// How long after a gap-fill attempt the same stalled sequence is
-    /// retried, and the cadence of a running fill episode's re-read/proof
-    /// loop.
-    const REFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-    fn new(grace: std::time::Duration, stalled_on: EventSequence) -> Self {
-        Self {
-            grace,
-            stalled_on,
-            first_seen: tokio::time::Instant::now(),
-            last_attempt: None,
-        }
-    }
-
-    /// Whether this state tracks the sequence the broadcast cursor is
-    /// currently stalled on.
-    fn is_up_to_date(&self, stalled_on: EventSequence) -> bool {
-        self.stalled_on == stalled_on
-    }
-
-    /// When the next gap-fill action falls due: `grace` after the stall was
-    /// first observed, or [`Self::REFILL_INTERVAL`] after the last attempt.
-    fn next_fill_due(&self) -> tokio::time::Instant {
-        match self.last_attempt {
-            None => self.first_seen + self.grace,
-            Some(attempted) => attempted + Self::REFILL_INTERVAL,
-        }
-    }
-
-    fn fill_is_due(&self) -> bool {
-        self.next_fill_due() <= tokio::time::Instant::now()
-    }
-
-    fn record_attempt(&mut self) {
-        self.last_attempt = Some(tokio::time::Instant::now());
-    }
-}
-
-/// Bounds for historical gap fills during backfill: every sequence
-/// `<= head` was already allocated when the cache loop started, so a fresh
-/// abandonment marker trivially post-dates its allocation and the xmin
-/// horizon passing that marker proves it lost. Backfill never fills
-/// younger (frontier) gaps — those belong exclusively to the grace-gated
-/// proactive fill.
-#[derive(Clone, Copy)]
-struct HistoricalFillBounds {
-    head: u64,
-    batch_limit: usize,
-}
-
 #[derive(Debug)]
 pub struct PersistentOutboxEventCache<P, Tables>
 where
@@ -162,7 +98,7 @@ where
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<NotifyMessage>,
-        notifier_report_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
         let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
@@ -181,7 +117,7 @@ where
             cache_fill_recv,
             cache_fill_send.clone(),
             persistent_notification_rx,
-            notifier_report_tx,
+            gap_fill_tx,
         )
         .await?;
 
@@ -250,148 +186,6 @@ where
         (cache, last_broadcast_sequence)
     }
 
-    /// One gap-fill episode for a stalled broadcast cursor. Self-contained:
-    /// the episode resolves the stall or exits, and the loop's retry timer
-    /// spawns at most one episode at a time.
-    ///
-    /// Structure:
-    /// 1. Assign an abandonment marker (fresh xid + allocation head — every
-    ///    sequence `<=` head was allocated before the marker).
-    /// 2. Loop at [`GapFillState::REFILL_INTERVAL`]: re-read the page after
-    ///    `from_sequence`, feeding whatever committed since into the cache
-    ///    (this alone resolves stalls whose commit signal was missed). If
-    ///    nothing in the eligible window is missing, done — read-only.
-    /// 3. Once the xmin horizon passes the marker, the still-missing
-    ///    sequences are provably abandoned — their writers ended without
-    ///    committing them — so the placeholder insert cannot collide with
-    ///    a live writer. Insert under the cluster-wide fill lock, capped at
-    ///    `batch_limit` per statement; deliver the placeholders locally and
-    ///    report the range to the debounced notifier so other processes
-    ///    resume reactively. A full batch keeps the episode going — the
-    ///    remainder of the window is filled at one batch per loop interval,
-    ///    NOT one batch per grace period (delivering a batch advances the
-    ///    broadcast cursor, which would discard the gap state and make a
-    ///    returning episode pay a fresh grace per batch). If another node
-    ///    holds the lock, keep looping — its rows surface in the next page
-    ///    re-read.
-    async fn fill_gap(
-        pool: sqlx::PgPool,
-        from_sequence: EventSequence,
-        batch_limit: usize,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
-        notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
-        buffer_size: usize,
-    ) {
-        let Ok((marker, head)) = Tables::abandonment_marker(&pool).await else {
-            return;
-        };
-        let from = u64::from(from_sequence);
-        let fill_up_to = u64::from(head).min(from + buffer_size as u64);
-
-        loop {
-            let Ok(events) = Tables::load_next_page::<P>(&pool, from_sequence, buffer_size).await
-            else {
-                return;
-            };
-            let mut present = std::collections::HashSet::new();
-            for item in events {
-                let delivery = PersistentDelivery::from(item);
-                present.insert(u64::from(delivery.sequence()));
-                let _ = cache_fill_sender.send(delivery);
-            }
-
-            let missing = ((from + 1)..=fill_up_to)
-                .filter(|sequence| !present.contains(sequence))
-                .take(batch_limit)
-                .map(EventSequence::from)
-                .collect::<Vec<_>>();
-            if missing.is_empty() {
-                return;
-            }
-
-            let requested = missing.len();
-            match Tables::abandonment_proof_passed(&pool, &marker).await {
-                Ok(true) => {
-                    match Tables::fill_gaps_deduped::<P>(&pool, missing).await {
-                        Ok(Some(placeholders)) => {
-                            let mut range: Option<(EventSequence, EventSequence)> = None;
-                            for item in placeholders {
-                                let delivery = PersistentDelivery::from(item);
-                                let sequence = delivery.sequence();
-                                range = Some(match range {
-                                    Some((lo, hi)) => (lo.min(sequence), hi.max(sequence)),
-                                    None => (sequence, sequence),
-                                });
-                                let _ = cache_fill_sender.send(delivery);
-                            }
-                            if let Some(range) = range {
-                                let _ = notifier_tx.send(range);
-                            }
-                            if requested < batch_limit {
-                                // The batch covered every missing sequence
-                                // in the window — nothing left for another
-                                // pass. (Sequences raced away by a
-                                // concurrent filler are committed rows the
-                                // next episode's page read delivers.)
-                                return;
-                            }
-                            // A full batch may leave more of the window
-                            // missing: keep the episode alive so the
-                            // remainder recovers at the loop cadence below
-                            // instead of a fresh grace period per batch.
-                        }
-                        // Another node holds the fill lock: loop — its rows
-                        // are committed by the time the lock releases, so
-                        // the next page re-read delivers them.
-                        Ok(None) => {}
-                        Err(_) => return,
-                    }
-                }
-                // A transaction from before the marker still runs and may
-                // own a missing sequence: abandonment is unprovable, keep
-                // waiting (the periodic re-read above still delivers
-                // late-arriving commits meanwhile).
-                Ok(false) => {}
-                Err(_) => return,
-            }
-
-            tokio::time::sleep(GapFillState::REFILL_INTERVAL).await;
-        }
-    }
-
-    /// Pacing for abandonment-proof polls, and for backfill retries after
-    /// a raced fill lock or a transient marker/proof error — each retry
-    /// assigns a fresh marker xid, so retrying without a pause would
-    /// busy-loop and burn xids while (e.g.) another node holds the lock.
-    const PROOF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
-    /// Wait until the given (historically-allocated) sequences are provably
-    /// abandoned, then insert their placeholders under the cluster-wide
-    /// fill lock. A fresh abandonment marker post-dates the sequences'
-    /// allocation by construction (callers only pass sequences `<=` the
-    /// cache loop's init head), so the xmin horizon passing the marker
-    /// means every transaction that could have produced them has ended.
-    /// The wait is typically zero — pre-init writers are long gone —
-    /// and polls briefly otherwise. `None` = fill lock held elsewhere or
-    /// transient error; the caller re-reads instead of inserting.
-    async fn fill_provably_abandoned(
-        pool: &sqlx::PgPool,
-        missing: Vec<EventSequence>,
-    ) -> Option<crate::tables::PersistentEventRows<P>> {
-        let (marker, _) = Tables::abandonment_marker(pool).await.ok()?;
-        loop {
-            match Tables::abandonment_proof_passed(pool, &marker).await {
-                Ok(true) => break,
-                Ok(false) => tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await,
-                Err(_) => return None,
-            }
-        }
-        Tables::fill_gaps_deduped::<P>(pool, missing)
-            .await
-            .ok()
-            .flatten()
-    }
-
     /// How long a parked backfill waits before re-reading regardless of
     /// wake-up signals, and how long it backs off after a transient page
     /// read error. The cache-fill wake-up makes typical resumption
@@ -430,22 +224,20 @@ where
     /// here rather than leaking to the listener:
     ///
     /// - Historical gaps (allocated before the cache loop started) are
-    ///   proof-gated placeholder fills, batch-capped and deduped
-    ///   cluster-wide; the next page read delivers the result in order.
+    ///   reported to the [`GapFiller`](crate::out::gap_fill::GapFiller),
+    ///   which merges overlapping requests from concurrent backfills into
+    ///   one proof-gated, batch-capped, cluster-deduped fill; its
+    ///   placeholders land on the cache-fill stream, wake the park below,
+    ///   and the next page read delivers them in order.
     /// - Young frontier gaps (an in-flight or just-failed writer) are
-    ///   **parked on**, never placeholder-filled here: the writer commits,
-    ///   the rollback compensator fills it, or the grace-gated fill
-    ///   episode placeholders it once provably abandoned — all of which
-    ///   land on the cache-fill stream and wake the park. Liveness holds
-    ///   because the central broadcast cursor sweeps every sequence: any
-    ///   gap this task can park on is at or below a stall the grace-gated
-    ///   episode will resolve.
-    /// - Transient read errors back off and retry; a raced fill lock
-    ///   re-reads (the winner's rows are committed by the time its lock
-    ///   releases). Neither terminates the request.
-    ///
-    /// The request ends only when the range is fully delivered or the
-    /// listener goes away.
+    ///   **parked on**, never reported: the writer commits, the GapFiller
+    ///   compensates the rollback, or its grace-gated stall episode fills
+    ///   the gap once provably abandoned — all of which land on the
+    ///   cache-fill stream and wake the park. Liveness holds because the
+    ///   central broadcast cursor sweeps every sequence: any gap this task
+    ///   can park on is at or below a stall the cache loop reports.
+    /// - Transient read errors back off and retry. Nothing terminates the
+    ///   request short of range-complete or the listener going away.
     #[allow(clippy::too_many_arguments)]
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
@@ -455,7 +247,8 @@ where
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
         buffer_size: usize,
-        fill_bounds: HistoricalFillBounds,
+        init_head: u64,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) {
         use std::ops::Bound;
 
@@ -520,38 +313,23 @@ where
                 break;
             }
 
-            // Stalled on a gap at `current_sequence.next()`.
+            // Stalled on a gap at `current_sequence.next()`. Historical
+            // gaps (allocated before the cache loop started — e.g. rolled
+            // back with no process observing the frontier at the time) are
+            // reported to the GapFiller; young frontier gaps are not (the
+            // cache loop reports the cursor's stall, and this task never
+            // decides fills). Either way, park until the resolution lands
+            // on the cache-fill stream, then re-read.
             let next_needed = u64::from(current_sequence.next());
-            if next_needed <= fill_bounds.head {
-                // Historical gap (allocated before the cache loop started
-                // — e.g. rolled back with no process observing the
-                // frontier at the time): prove abandonment and insert
-                // placeholders, batch-capped; the next page read delivers
-                // them — and any row that committed meanwhile — in order.
-                let fill_to = fill_bounds
-                    .head
-                    .min(u64::from(select_from) + buffer_size as u64);
+            if next_needed <= init_head {
+                let fill_to = init_head.min(u64::from(select_from) + buffer_size as u64);
                 let missing = (next_needed..=fill_to)
                     .filter(|sequence| !present.contains(sequence))
-                    .take(fill_bounds.batch_limit)
                     .map(EventSequence::from)
                     .collect::<Vec<_>>();
-                if Self::fill_provably_abandoned(&pool, missing)
-                    .await
-                    .is_none()
-                {
-                    // Raced fill lock or transient error: pause before the
-                    // re-read — each retry assigns a fresh marker xid, and
-                    // contending replayers would otherwise busy-loop until
-                    // the lock clears.
-                    tokio::time::sleep(Self::PROOF_POLL_INTERVAL).await;
-                }
-            } else {
-                // Young frontier gap: this task never placeholder-fills it
-                // (that is the grace-gated episode's and the compensator's
-                // exclusive job) — park until it resolves, then re-read.
-                Self::park_until_resolved(&cache_fill_sender, current_sequence.next()).await;
+                let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
             }
+            Self::park_until_resolved(&cache_fill_sender, current_sequence.next()).await;
         }
 
         for (_, event) in
@@ -640,15 +418,13 @@ where
         mut cache_fill_receiver: broadcast::Receiver<PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
-        notifier_report_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
+        gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
         let cache_size = config.event_cache_size;
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
-        let gap_fill_grace = config.gap_fill_grace;
-        let gap_fill_batch_limit = config.gap_fill_batch_limit;
         let idle_resync_interval = config.idle_resync_interval;
 
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
@@ -657,26 +433,18 @@ where
             let mut persistent_cache: im::OrdMap<EventSequence, PersistentDelivery<P>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
-            let mut gap_state: Option<GapFillState> = None;
-            // At most one fill episode runs at a time: an episode that is
-            // waiting out a live pre-marker transaction must not be joined
-            // by the next 1s retry — previously up to ~8 concurrent
-            // multi-second fills stacked up, each holding a connection.
-            let mut fill_task: Option<tokio::task::JoinHandle<()>> = None;
-            // Bound for backfill's historical fills: every sequence <= the
-            // head read at init was allocated before this loop started.
-            let fill_bounds = HistoricalFillBounds {
-                head: u64::from(initial_sequence),
-                batch_limit: gap_fill_batch_limit,
-            };
+            // The stall position last reported to the GapFiller — the
+            // report is sent once per stall, re-armed on cache-fill lag
+            // and on idle resync so a lost delivery can never leave a
+            // stall unreported forever.
+            let mut reported_stall: Option<EventSequence> = None;
+            // Bound for backfill's historical classification: every
+            // sequence <= the head read at init was allocated before this
+            // loop started.
+            let init_head = u64::from(initial_sequence);
             let mut last_progress_at = tokio::time::Instant::now();
 
             loop {
-                // Wake up exactly when the next gap-fill action falls due,
-                // so a stalled broadcast is filled even when no further
-                // events or notifications arrive.
-                let gap_fill_at = gap_state.as_ref().map(GapFillState::next_fill_due);
-
                 tokio::select! {
                     biased;
 
@@ -696,7 +464,8 @@ where
                                     cache_fill_sender.clone(),
                                     highest,
                                     cache_size,
-                                    fill_bounds,
+                                    init_head,
+                                    gap_fill_tx.clone(),
                                 ));
                             }
                             None => {
@@ -747,6 +516,10 @@ where
                                     u64::from(last_broadcast_sequence),
                                     highest_known_sequence.load(Ordering::Relaxed),
                                 );
+                                // Dropped deliveries may include a fill that
+                                // would have resolved the reported stall —
+                                // re-arm so it is re-reported if it persists.
+                                reported_stall = None;
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -870,13 +643,6 @@ where
                         }
                     }
 
-                    _ = async {
-                        match gap_fill_at {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => {}
-
                     _ = tokio::time::sleep_until(last_progress_at + idle_resync_interval) => {
                         if let Some(head) = Self::read_confirmed_head(&pool).await {
                             highest_known_sequence.fetch_max(
@@ -884,53 +650,34 @@ where
                                 Ordering::AcqRel,
                             );
                         }
+                        // Re-arm the stall report as a lost-signal backstop:
+                        // if the GapFiller's episode ended believing the
+                        // stall resolved but the resolving delivery was
+                        // lost, the re-report below restarts it.
+                        reported_stall = None;
                         last_progress_at = tokio::time::Instant::now();
                     }
                 }
 
-                // Proactive gap fill: if broadcasting is stuck waiting for a
-                // missing sequence, spawn a fill episode. The first episode
-                // is delayed by `gap_fill_grace` — most gaps are in-flight
-                // transactions that resolve on their own within ms, and this
-                // process's own commit-failed allocations are compensated
-                // reactively without ever reaching here. An episode is
-                // read-only (page re-reads) until the missing sequences are
-                // provably abandoned via the abandonment marker, then
-                // inserts at most `gap_fill_batch_limit` placeholders under
-                // the cluster-wide fill lock — it can never collide with a
-                // live writer's speculative-insertion lock.
+                // Stall reporting: when broadcasting is stuck waiting for a
+                // missing sequence, tell the GapFiller — once per stall
+                // position, cleared when the cursor moves. All fill policy
+                // (grace, abandonment proof, batching, cluster dedup)
+                // lives in the GapFiller; this loop only observes its own
+                // cursor. This process's commit-failed allocations are
+                // compensated reactively without ever stalling here, and a
+                // stall that resolves within its grace period costs the
+                // GapFiller zero DB work.
                 let next_needed = last_broadcast_sequence.next();
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
                 if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
                 {
-                    if gap_state
-                        .as_ref()
-                        .is_some_and(|state| !state.is_up_to_date(last_broadcast_sequence))
-                    {
-                        gap_state = None;
+                    if reported_stall != Some(last_broadcast_sequence) {
+                        let _ = gap_fill_tx.send(GapFillRequest::Stalled(last_broadcast_sequence));
+                        reported_stall = Some(last_broadcast_sequence);
                     }
-                    let state = gap_state.get_or_insert_with(|| {
-                        GapFillState::new(gap_fill_grace, last_broadcast_sequence)
-                    });
-                    if state.fill_is_due() {
-                        state.record_attempt();
-                        // A still-running episode (e.g. waiting out a live
-                        // pre-marker transaction) is never joined by
-                        // another: the attempt is recorded (pushing the
-                        // next retry out) but not spawned.
-                        if fill_task.as_ref().is_none_or(|task| task.is_finished()) {
-                            fill_task = Some(tokio::spawn(Self::fill_gap(
-                                pool.clone(),
-                                last_broadcast_sequence,
-                                gap_fill_batch_limit,
-                                cache_fill_sender.clone(),
-                                notifier_report_tx.clone(),
-                                cache_size,
-                            )));
-                        }
-                    }
-                } else {
-                    gap_state = None;
+                } else if reported_stall.take().is_some() {
+                    let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
                 }
 
                 if persistent_cache.len() > high_water {

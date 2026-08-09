@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::out::event::{PersistentDelivery, PersistentOutboxEvent};
+use crate::out::gap_fill::GapFillRequest;
 use crate::out::post_persist_hook::PostPersistHooks;
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
@@ -18,10 +19,10 @@ where
     /// Reports the committed batch's `(min, max)` to the debounced notifier.
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     /// Reports sequences this operation allocated but failed to commit to
-    /// the [`AbandonedCompensator`](crate::out::compensator): see
+    /// the [`GapFiller`](crate::out::gap_fill::GapFiller): see
     /// [`CommitHook::on_rollback`] below and the own-failure branches in
     /// `pre_commit`.
-    abandoned_tx: mpsc::UnboundedSender<Vec<EventSequence>>,
+    abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
     pre_commit_events: Vec<P>,
     /// Persisted events, stashed chunk-by-chunk *as* `pre_commit` runs (not
     /// at its end): if a later chunk, a later hook, or the COMMIT itself
@@ -53,7 +54,7 @@ where
     pub fn new(
         sender: broadcast::Sender<PersistentDelivery<P>>,
         notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
-        abandoned_tx: mpsc::UnboundedSender<Vec<EventSequence>>,
+        abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
         events: impl IntoIterator<Item = impl Into<P>>,
         batch_size: usize,
         post_persist_hooks: PostPersistHooks<P>,
@@ -84,10 +85,10 @@ where
     }
 
     /// Own-failure compensation: report the sequences persisted so far to
-    /// the [`AbandonedCompensator`](crate::out::compensator) before
+    /// the [`GapFiller`](crate::out::gap_fill::GapFiller) before
     /// `pre_commit` returns its error. The transaction is still open here
     /// (its rollback follows once the error propagates), so the report
-    /// must stay a channel send — the compensator's insert parks briefly
+    /// must stay a channel send — the GapFiller's insert parks briefly
     /// on the dying transaction's speculative-insertion locks and resolves
     /// when the rollback lands; awaiting that insert inline would deadlock
     /// on our own transaction. Skipped on the force-execute path
@@ -103,7 +104,7 @@ where
             .map(|event| event.sequence)
             .collect();
         if !abandoned.is_empty() {
-            let _ = self.abandoned_tx.send(abandoned);
+            let _ = self.abandoned_tx.send(GapFillRequest::Abandoned(abandoned));
         }
     }
 }
@@ -180,17 +181,17 @@ where
     /// es-entity fires this when the commit failed after our `pre_commit`
     /// had completed — a later hook's `pre_commit` errored (the
     /// transaction is already rolled back when this runs, so the
-    /// compensator's insert contends with nothing) or the COMMIT itself
+    /// GapFiller's insert contends with nothing) or the COMMIT itself
     /// failed (the transaction is over server-side either way; the
-    /// compensator's `ON CONFLICT DO NOTHING` insert is idempotent against
+    /// GapFiller's `ON CONFLICT DO NOTHING` insert is idempotent against
     /// a commit that actually landed). The stashed sequences are this
     /// process's own abandoned allocations; reporting them to the
-    /// [`AbandonedCompensator`](crate::out::compensator) fills their
+    /// [`GapFiller`](crate::out::gap_fill::GapFiller) fills their
     /// placeholders in milliseconds instead of leaving downstream
     /// listeners stalled until the grace-gated backstop proves them lost.
     ///
     /// Signal-only per the trait contract: the DB work happens on the
-    /// compensator task. Failures *inside* our own `pre_commit` never
+    /// GapFiller task. Failures *inside* our own `pre_commit` never
     /// reach here (the failing hook is consumed by its own call) — those
     /// report from the error branches in `pre_commit` itself.
     fn on_rollback(mut self) {
@@ -200,7 +201,7 @@ where
             .map(|event| event.sequence)
             .collect();
         if !abandoned.is_empty() {
-            let _ = self.abandoned_tx.send(abandoned);
+            let _ = self.abandoned_tx.send(GapFillRequest::Abandoned(abandoned));
         }
     }
 

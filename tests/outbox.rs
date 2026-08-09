@@ -897,6 +897,65 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Concurrent replays over the same burned range: both listeners' backfills
+/// report the same historical gap; the GapFiller merges the overlapping
+/// requests into one proof + one locked fill, and both replays complete
+/// with the placeholder in position.
+#[tokio::test]
+#[file_serial]
+async fn overlapping_backfills_share_one_historical_fill() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // Pre-init history: seq 1 committed, seq 2 burned, seq 3 committed.
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 0}"#)
+        .execute(&pool)
+        .await?;
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 1}"#)
+        .execute(&pool)
+        .await?;
+
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listeners = [
+        outbox.listen_persisted(Some(EventSequence::from(0))),
+        outbox.listen_persisted(Some(EventSequence::from(0))),
+    ];
+
+    for listener in &mut listeners {
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("should replay first event")?;
+        assert!(matches!(first.payload, Some(TestEvent::Ping(0))));
+
+        let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("should receive placeholder for the burned sequence")?;
+        assert!(gap_event.payload.is_none());
+        assert_eq!(u64::from(gap_event.sequence), 2);
+
+        let third = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("should replay the event after the gap")?;
+        assert!(matches!(third.payload, Some(TestEvent::Ping(1))));
+    }
+
+    Ok(())
+}
+
 /// The cluster-wide fill lock: a backstop fill skips entirely (inserting
 /// nothing) while another connection holds the lock, and proceeds once it
 /// is released.

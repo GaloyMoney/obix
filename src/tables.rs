@@ -149,8 +149,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// writers): this method never writes placeholder rows — that is
     /// exclusively [`fill_gaps`](Self::fill_gaps) /
     /// [`fill_gaps_deduped`](Self::fill_gaps_deduped), invoked proof-gated
-    /// and batch-capped from `out::persistent::cache` and the rollback
-    /// compensator.
+    /// and batch-capped from the per-process `out::gap_fill::GapFiller`.
     fn load_next_page<P>(
         pool: &sqlx::PgPool,
         from_sequence: EventSequence,
