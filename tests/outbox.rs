@@ -1142,6 +1142,103 @@ async fn batch_capped_fill_does_not_pay_grace_per_batch() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A stall just past a running episode's window (a gap allocated AFTER the
+/// episode's marker was taken) must start a fresh episode rather than be
+/// swallowed by the episode-coverage dedup — the episode's stale marker
+/// head can never cover it, and the cache loop won't re-report the same
+/// stall position until its idle-resync re-arm (~10s).
+#[tokio::test]
+#[file_serial]
+async fn stall_past_episode_window_starts_fresh_episode() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // batch 1 keeps the first episode alive across ticks so the follow-on
+    // stall arrives while it still exists.
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .gap_fill_grace(std::time::Duration::from_millis(100))
+            .gap_fill_batch_limit(1)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("should receive first event")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Two burned sequences + one committed: the episode's window at marker
+    // time ends at the committed head, and batch 1 forces two fill ticks.
+    for _ in 0..2 {
+        sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+            .fetch_one(&pool)
+            .await?;
+    }
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // First placeholder = the episode's first tick ran, so its marker (and
+    // window end) is now fixed. Everything allocated from here on is past
+    // that window.
+    let first_gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive first placeholder")?;
+    assert!(first_gap.payload.is_none());
+
+    // Burn another sequence and commit one more — a NEW gap beyond the
+    // running episode's marker head. The cursor will stall on it while
+    // the episode is still alive; that report must not be swallowed.
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(2))
+        .await?;
+    op.commit().await?;
+
+    // Everything must flow, in order: second placeholder (old episode),
+    // Ping(1), the new gap's placeholder (fresh episode), Ping(2) — well
+    // inside the ~10s idle-resync that recovery would otherwise wait for.
+    let second_gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive second placeholder")?;
+    assert!(second_gap.payload.is_none());
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive Ping(1)")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    let third_gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("placeholder for the gap beyond the episode window")?;
+    assert!(
+        third_gap.payload.is_none(),
+        "the follow-on stall must get its own episode, got {:?}",
+        third_gap.payload
+    );
+
+    let final_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("should receive Ping(2)")?;
+    assert!(matches!(final_event.payload, Some(TestEvent::Ping(2))));
+
+    Ok(())
+}
+
 #[tokio::test]
 #[file_serial]
 async fn fill_gaps_leaves_committed_rows_untouched() -> anyhow::Result<()> {

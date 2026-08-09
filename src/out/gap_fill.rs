@@ -230,17 +230,31 @@ where
             }
             GapFillRequest::Stalled(stalled_on) => {
                 let from = u64::from(stalled_on);
-                // A stall inside the active episode's window is that
-                // episode's own progress — the cursor advancing over a
-                // just-filled batch onto the window's next missing
-                // sequence. The episode keeps its window, marker and
-                // original grace (no grace-per-batch). Only a stall
-                // beyond the window starts a new episode.
-                if self
-                    .stall
-                    .as_ref()
-                    .is_none_or(|stall| from > stall.from + self.page_size as u64)
-                {
+                // The active episode can resolve a stall at `from` only if
+                // the stall's needed sequence (`from + 1`) lies inside the
+                // episode's fill window `(from, min(marker head,
+                // from + page_size)]` — i.e. `from` < window end. Such
+                // stalls are the episode's own progress (the cursor
+                // advancing over just-filled batches); the episode keeps
+                // its window, marker and original grace (no
+                // grace-per-batch). Anything at or beyond the window end —
+                // in particular a gap allocated *after* the episode's
+                // marker was taken, which its stale head can never cover —
+                // must start a new episode with a fresh marker: swallowing
+                // it here would strand the cursor, because the cache loop
+                // dedups stall reports by position and would not re-send
+                // until its idle-resync re-arm.
+                let covered = self.stall.as_ref().is_some_and(|stall| {
+                    let window_end = match &stall.marker {
+                        Some((_, head)) => u64::from(*head).min(stall.from + self.page_size as u64),
+                        // Still in grace, no marker yet: the marker, once
+                        // assigned, will post-date this stall's allocation,
+                        // so the page bound alone is sound here.
+                        None => stall.from + self.page_size as u64,
+                    };
+                    from < window_end
+                });
+                if !covered {
                     self.stall = Some(StallEpisode {
                         from,
                         next_due: now + self.grace,
