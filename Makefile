@@ -37,8 +37,9 @@ check-code:
 sqlx-prepare:
 	cargo sqlx prepare --workspace
 
-# Coverage-guided fuzzing via the shared script (ci/fuzz.sh), also used by
-# `nix run .#fuzz` and the Concourse `fuzz` job. Runs the target for
-# $(FUZZ_TIME)s; the corpus lives in fuzz/corpus/ (gitignored).
+# Coverage-guided fuzzing via the shared vendored script
+# (ci/vendor/tasks/fuzz.sh, from galoy-concourse-shared), also used by
+# `nix run .#fuzz` and the Concourse `fuzz` job. Auto-discovers targets via
+# `cargo fuzz list`; runs them for $(FUZZ_TIME)s. Corpus in fuzz/corpus/ (gitignored).
 fuzz:
-	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/fuzz.sh
+	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh
