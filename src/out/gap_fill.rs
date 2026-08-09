@@ -48,17 +48,20 @@ pub(crate) enum GapFillRequest {
 ///   observation, backfill's historical gaps, the publish hook's rollback
 ///   reports) only describe *what* they saw, never decide *when or how*
 ///   to fill.
-/// - **At most one cluster-lock attempt in flight per process.** The task
-///   is sequential, so concurrent requesters can never race each other to
-///   the advisory lock from the same process.
+/// - **At most one cluster-lock attempt in flight per process** — and per
+///   pass, exactly one locked statement: the ready batches of both locked
+///   categories are combined into a single insert (one transaction, one
+///   advisory-lock acquisition) rather than locking once per category.
 /// - **Interim requests merge.** The run loop drains the channel between
-///   every step, so requests arriving while a fill pass waits on the
+///   every pass, so requests arriving while a pass waits on the
 ///   abandonment proof, retries a raced lock, or works through batches
 ///   join the pending set instead of paying their own proof/lock round
 ///   trips.
 ///
 /// Two write categories: **unlocked** for owner-reported rollback
-/// compensation (exact, contention-free by construction), **locked**
+/// compensation (exact, contention-free by construction — spawned onto
+/// its own task, since it may lawfully park on the aborting transaction's
+/// locks and must not block the pipeline), **locked**
 /// (`pg_try_advisory_xact_lock` inside [`MailboxTables::fill_gaps_deduped`])
 /// for everything inferred — stall episodes and historical fills — where
 /// other nodes may infer the same gap.
@@ -104,9 +107,6 @@ impl GapFiller {
             historical_marker: None,
             historical_proven: false,
             historical_due: None,
-            abandoned: Vec::new(),
-            abandoned_due: None,
-            abandoned_attempts: 0,
             _tables: std::marker::PhantomData,
         };
         let handle = spawn_supervised("obix::gap_filler", task.run(requests));
@@ -158,9 +158,6 @@ where
     historical_marker: Option<String>,
     historical_proven: bool,
     historical_due: Option<tokio::time::Instant>,
-    abandoned: Vec<EventSequence>,
-    abandoned_due: Option<tokio::time::Instant>,
-    abandoned_attempts: u32,
     _tables: std::marker::PhantomData<Tables>,
 }
 
@@ -210,7 +207,6 @@ where
 
     fn next_deadline(&self) -> Option<tokio::time::Instant> {
         [
-            self.abandoned_due,
             self.historical_due,
             self.stall.as_ref().map(|stall| stall.next_due),
         ]
@@ -223,10 +219,13 @@ where
         let now = tokio::time::Instant::now();
         match request {
             GapFillRequest::Abandoned(sequences) => {
-                self.abandoned.extend(sequences);
-                // A fresh report gets a fresh retry budget.
-                self.abandoned_attempts = 0;
-                self.abandoned_due.get_or_insert(now);
+                // Owner-only and unlocked — and possibly parked on the
+                // aborting transaction's speculative-insertion locks (the
+                // own-failure path reports before the rollback lands) —
+                // so compensation runs on its own task instead of
+                // head-of-line blocking the locked fill pipeline behind
+                // an in-flight rollback.
+                self.spawn_compensation(sequences);
             }
             GapFillRequest::Stalled(stalled_on) => {
                 let from = u64::from(stalled_on);
@@ -272,155 +271,70 @@ where
         }
     }
 
-    /// One bounded unit of work per due category, then back to the run
-    /// loop (which drains the request channel between steps).
+    /// One bounded pass: gather the *ready* (proof-passed) batches from
+    /// both locked categories, then insert them in a **single** locked
+    /// statement — one transaction, one advisory-lock acquisition —
+    /// before returning to the run loop (which drains the request channel
+    /// between passes).
     async fn step(&mut self) {
         let now = tokio::time::Instant::now();
-        if self.abandoned_due.is_some_and(|due| due <= now) {
-            self.compensate_abandoned().await;
-        }
-        if self.historical_due.is_some_and(|due| due <= now) {
-            self.fill_historical_step().await;
-        }
-        if self
+        let stall_batch = if self
             .stall
             .as_ref()
             .is_some_and(|stall| stall.next_due <= now)
         {
-            self.stall_episode_tick().await;
-        }
+            self.prepare_stall_batch().await
+        } else {
+            Vec::new()
+        };
+        let historical_batch = if self.historical_due.is_some_and(|due| due <= now) {
+            self.prepare_historical_batch(self.batch_limit.saturating_sub(stall_batch.len()))
+                .await
+        } else {
+            Vec::new()
+        };
+        self.locked_fill(stall_batch, historical_batch).await;
     }
 
-    /// Deliver filled rows into the local cache-fill stream (which also
-    /// wakes parked backfills); when `notify`, report the `(min, max)`
-    /// range to the debounced notifier so other processes resume
-    /// reactively. Historical fills do not notify — their ranges lie far
-    /// below other nodes' heads and would only trigger pointless fetches.
-    fn deliver(&self, rows: PersistentEventRows<P>, notify: bool) {
-        let mut range: Option<(EventSequence, EventSequence)> = None;
-        for item in rows {
-            let delivery = PersistentDelivery::from(item);
-            let sequence = delivery.sequence();
-            range = Some(match range {
-                Some((lo, hi)) => (lo.min(sequence), hi.max(sequence)),
-                None => (sequence, sequence),
-            });
-            let _ = self.cache_fill_sender.send(delivery);
-        }
-        if notify && let Some(range) = range {
-            let _ = self.notifier_tx.send(range);
-        }
-    }
-
-    /// Owner-reported sequences: insert immediately, no proof, no lock.
-    /// The insert may briefly park on the aborting transaction's
-    /// speculative-insertion lock (the own-failure path reports before
-    /// the rollback lands) — bounded by the rollback itself. `DO NOTHING`
-    /// makes it idempotent against a commit that actually landed.
-    async fn compensate_abandoned(&mut self) {
-        match Tables::fill_gaps::<P>(&self.pool, self.abandoned.clone()).await {
-            Ok(placeholders) => {
-                self.deliver(placeholders, true);
-                self.abandoned.clear();
-                self.abandoned_due = None;
-                self.abandoned_attempts = 0;
-            }
-            Err(error) => {
-                self.abandoned_attempts += 1;
-                record_compensation_failed(&error, self.abandoned_attempts);
-                if self.abandoned_attempts >= Self::COMPENSATION_MAX_ATTEMPTS {
-                    // The stall episode proves and fills them later.
-                    self.abandoned.clear();
-                    self.abandoned_due = None;
-                    self.abandoned_attempts = 0;
-                } else {
-                    self.abandoned_due =
-                        Some(tokio::time::Instant::now() + Self::COMPENSATION_RETRY_INTERVAL);
-                }
-            }
-        }
-    }
-
-    /// One historical step: establish the (process-lifetime) abandonment
-    /// proof if not yet proven, else fill one batch. Remaining work
-    /// reschedules immediately — the run loop drains the request channel
-    /// in between, merging any newly arrived sequences into the next
-    /// batch.
-    async fn fill_historical_step(&mut self) {
-        let now = tokio::time::Instant::now();
-        if self.historical.is_empty() {
-            self.historical_due = None;
-            return;
-        }
-
-        if !self.historical_proven {
-            let marker = match self.historical_marker.clone() {
-                Some(marker) => marker,
-                None => match Tables::abandonment_marker(&self.pool).await {
-                    Ok((marker, _)) => {
-                        self.historical_marker = Some(marker.clone());
-                        marker
-                    }
-                    Err(error) => {
-                        record_gap_fill_failed(&error);
-                        self.historical_due = Some(now + Self::REFILL_INTERVAL);
+    /// Owner-reported sequences: insert immediately, no proof, no lock —
+    /// on a task of their own. The insert may park on the aborting
+    /// transaction's speculative-insertion locks (the own-failure path
+    /// reports before the rollback lands), and that wait must not
+    /// head-of-line block the locked fill pipeline. Concurrent
+    /// compensations are safe: each failed operation reports its own
+    /// disjoint sequences, and `DO NOTHING` makes the insert idempotent
+    /// against a commit that actually landed.
+    fn spawn_compensation(&self, sequences: Vec<EventSequence>) {
+        let pool = self.pool.clone();
+        let cache_fill_sender = self.cache_fill_sender.clone();
+        let notifier_tx = self.notifier_tx.clone();
+        tokio::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                match Tables::fill_gaps::<P>(&pool, sequences.clone()).await {
+                    Ok(placeholders) => {
+                        deliver_and_notify(&cache_fill_sender, &notifier_tx, placeholders);
                         return;
                     }
-                },
-            };
-            match Tables::abandonment_proof_passed(&self.pool, &marker).await {
-                Ok(true) => self.historical_proven = true,
-                Ok(false) => {
-                    self.historical_due = Some(now + Self::PROOF_POLL_INTERVAL);
-                    return;
-                }
-                Err(error) => {
-                    record_gap_fill_failed(&error);
-                    self.historical_due = Some(now + Self::REFILL_INTERVAL);
-                    return;
+                    Err(error) => {
+                        attempts += 1;
+                        record_compensation_failed(&error, attempts);
+                        if attempts >= Self::COMPENSATION_MAX_ATTEMPTS {
+                            // The stall episode proves and fills them later.
+                            return;
+                        }
+                        tokio::time::sleep(Self::COMPENSATION_RETRY_INTERVAL).await;
+                    }
                 }
             }
-        }
-
-        let batch: Vec<EventSequence> = self
-            .historical
-            .iter()
-            .take(self.batch_limit)
-            .copied()
-            .map(EventSequence::from)
-            .collect();
-        match Tables::fill_gaps_deduped::<P>(&self.pool, batch.clone()).await {
-            Ok(Some(placeholders)) => {
-                // Everything attempted is settled: inserted by us
-                // (delivered below, waking any parked backfill) or already
-                // committed (the backfill's own re-read picks it up).
-                for sequence in &batch {
-                    self.historical.remove(&u64::from(*sequence));
-                }
-                self.deliver(placeholders, false);
-                self.historical_due = if self.historical.is_empty() {
-                    None
-                } else {
-                    Some(now)
-                };
-            }
-            Ok(None) => {
-                // Another node holds the fill lock — its rows are
-                // committed by the time it releases; retry shortly rather
-                // than spinning.
-                self.historical_due = Some(now + Self::PROOF_POLL_INTERVAL);
-            }
-            Err(error) => {
-                record_gap_fill_failed(&error);
-                self.historical_due = Some(now + Self::REFILL_INTERVAL);
-            }
-        }
+        });
     }
 
-    /// One tick of the stall episode: re-read the window (delivering
-    /// whatever committed since — this alone resolves stalls whose commit
-    /// signal was lost), then, once the abandonment proof passes, fill
-    /// one batch of the still-missing sequences under the cluster lock.
+    /// One tick of the stall episode, up to (not including) the insert:
+    /// re-read the window and deliver whatever committed since — this
+    /// alone resolves stalls whose commit signal was lost — then return
+    /// the still-missing batch if the episode's abandonment proof has
+    /// passed, or an empty batch while it hasn't (read-only tick).
     ///
     /// The episode terminates only when a re-read finds the window
     /// complete, or the cursor reports the stall cleared / moved beyond
@@ -429,11 +343,11 @@ where
     /// another tick, so a sequence that committed between re-read and
     /// insert (its conflict is silent, its signal possibly lost) is
     /// re-delivered by the next re-read rather than dropped.
-    async fn stall_episode_tick(&mut self) {
+    async fn prepare_stall_batch(&mut self) -> Vec<EventSequence> {
         let now = tokio::time::Instant::now();
         let pool = self.pool.clone();
         let Some(stall) = self.stall.as_mut() else {
-            return;
+            return Vec::new();
         };
         stall.next_due = now + Self::REFILL_INTERVAL;
 
@@ -446,7 +360,7 @@ where
                 }
                 Err(error) => {
                     record_gap_fill_failed(&error);
-                    return;
+                    return Vec::new();
                 }
             },
         };
@@ -460,7 +374,7 @@ where
                 Ok(events) => events,
                 Err(error) => {
                     record_gap_fill_failed(&error);
-                    return;
+                    return Vec::new();
                 }
             };
         let mut present = std::collections::HashSet::new();
@@ -480,24 +394,171 @@ where
             // the cursor was missing, so resolution is in hand. A stall
             // beyond this window reports as a new episode.
             self.stall = None;
-            return;
+            return Vec::new();
         }
 
         match Tables::abandonment_proof_passed(&pool, &marker).await {
-            Ok(true) => match Tables::fill_gaps_deduped::<P>(&pool, missing).await {
-                Ok(Some(placeholders)) => self.deliver(placeholders, true),
-                // Another node holds the fill lock: its rows surface in
-                // the next tick's re-read.
-                Ok(None) => {}
-                Err(error) => record_gap_fill_failed(&error),
-            },
+            Ok(true) => missing,
             // A transaction from before the marker still runs and may own
             // a missing sequence: abandonment is unprovable — the next
             // tick re-checks, its re-read delivering late commits
             // meanwhile.
-            Ok(false) => {}
-            Err(error) => record_gap_fill_failed(&error),
+            Ok(false) => Vec::new(),
+            Err(error) => {
+                record_gap_fill_failed(&error);
+                Vec::new()
+            }
         }
+    }
+
+    /// The ready historical batch, up to `capacity` sequences: establish
+    /// the (process-lifetime) abandonment proof if not yet proven, else
+    /// hand out the next slice of the pending set. With `capacity` 0 (the
+    /// stall batch filled the statement), the due time is left as-is so
+    /// the immediately following pass — after another channel drain —
+    /// picks the work up with full capacity.
+    async fn prepare_historical_batch(&mut self, capacity: usize) -> Vec<EventSequence> {
+        let now = tokio::time::Instant::now();
+        if self.historical.is_empty() {
+            self.historical_due = None;
+            return Vec::new();
+        }
+        if capacity == 0 {
+            return Vec::new();
+        }
+
+        if !self.historical_proven {
+            let marker = match self.historical_marker.clone() {
+                Some(marker) => marker,
+                None => match Tables::abandonment_marker(&self.pool).await {
+                    Ok((marker, _)) => {
+                        self.historical_marker = Some(marker.clone());
+                        marker
+                    }
+                    Err(error) => {
+                        record_gap_fill_failed(&error);
+                        self.historical_due = Some(now + Self::REFILL_INTERVAL);
+                        return Vec::new();
+                    }
+                },
+            };
+            match Tables::abandonment_proof_passed(&self.pool, &marker).await {
+                Ok(true) => self.historical_proven = true,
+                Ok(false) => {
+                    self.historical_due = Some(now + Self::PROOF_POLL_INTERVAL);
+                    return Vec::new();
+                }
+                Err(error) => {
+                    record_gap_fill_failed(&error);
+                    self.historical_due = Some(now + Self::REFILL_INTERVAL);
+                    return Vec::new();
+                }
+            }
+        }
+
+        self.historical
+            .iter()
+            .take(capacity)
+            .copied()
+            .map(EventSequence::from)
+            .collect()
+    }
+
+    /// Insert both ready batches in one locked statement. The batches are
+    /// disjoint by construction (historical sequences lie at or below the
+    /// init head, the stall window strictly above it) and together bounded
+    /// by `batch_limit`. Only the stall portion is notified cross-process:
+    /// historical ranges lie far below other nodes' heads and would only
+    /// trigger pointless fetches — their consumers (parked backfills) wake
+    /// via the cache-fill stream.
+    async fn locked_fill(
+        &mut self,
+        stall_batch: Vec<EventSequence>,
+        historical_batch: Vec<EventSequence>,
+    ) {
+        if stall_batch.is_empty() && historical_batch.is_empty() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+
+        let mut combined = stall_batch.clone();
+        combined.extend(historical_batch.iter().copied());
+        match Tables::fill_gaps_deduped::<P>(&self.pool, combined).await {
+            Ok(Some(placeholders)) => {
+                // Every attempted historical sequence is settled: inserted
+                // by us (delivered below, waking any parked backfill) or
+                // already committed (the backfill's own re-read picks it
+                // up). Stall-batch sequences settle via the episode's next
+                // re-read.
+                for sequence in &historical_batch {
+                    self.historical.remove(&u64::from(*sequence));
+                }
+                if !historical_batch.is_empty() {
+                    self.historical_due = if self.historical.is_empty() {
+                        None
+                    } else {
+                        Some(now)
+                    };
+                }
+
+                let stall_set: std::collections::HashSet<u64> =
+                    stall_batch.iter().map(|s| u64::from(*s)).collect();
+                let mut stall_range: Option<(EventSequence, EventSequence)> = None;
+                for item in placeholders {
+                    let delivery = PersistentDelivery::from(item);
+                    let sequence = delivery.sequence();
+                    if stall_set.contains(&u64::from(sequence)) {
+                        stall_range = Some(match stall_range {
+                            Some((lo, hi)) => (lo.min(sequence), hi.max(sequence)),
+                            None => (sequence, sequence),
+                        });
+                    }
+                    let _ = self.cache_fill_sender.send(delivery);
+                }
+                if let Some(range) = stall_range {
+                    let _ = self.notifier_tx.send(range);
+                }
+            }
+            Ok(None) => {
+                // Another node holds the fill lock — its rows are
+                // committed by the time it releases; retry shortly rather
+                // than spinning. The stall episode is already rescheduled.
+                if !historical_batch.is_empty() {
+                    self.historical_due = Some(now + Self::PROOF_POLL_INTERVAL);
+                }
+            }
+            Err(error) => {
+                record_gap_fill_failed(&error);
+                if !historical_batch.is_empty() {
+                    self.historical_due = Some(now + Self::REFILL_INTERVAL);
+                }
+            }
+        }
+    }
+}
+
+/// Deliver filled rows into the local cache-fill stream (which also wakes
+/// parked backfills) and report their `(min, max)` range to the debounced
+/// notifier so other processes resume reactively.
+fn deliver_and_notify<P>(
+    cache_fill_sender: &broadcast::Sender<PersistentDelivery<P>>,
+    notifier_tx: &mpsc::UnboundedSender<(EventSequence, EventSequence)>,
+    rows: PersistentEventRows<P>,
+) where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    let mut range: Option<(EventSequence, EventSequence)> = None;
+    for item in rows {
+        let delivery = PersistentDelivery::from(item);
+        let sequence = delivery.sequence();
+        range = Some(match range {
+            Some((lo, hi)) => (lo.min(sequence), hi.max(sequence)),
+            None => (sequence, sequence),
+        });
+        let _ = cache_fill_sender.send(delivery);
+    }
+    if let Some(range) = range {
+        let _ = notifier_tx.send(range);
     }
 }
 
