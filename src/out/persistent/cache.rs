@@ -195,15 +195,21 @@ where
     /// Park a stalled backfill until its needed sequence plausibly
     /// resolved: woken by that exact sequence arriving on the cache-fill
     /// stream (every resolution path lands there — in-process post-commit
-    /// broadcast, notification fetch, grace-gated fill placeholder,
-    /// rollback compensation), or by the retry interval elapsing as the
+    /// broadcast, notification fetch, the GapFiller's placeholders and
+    /// compensations), or by the retry interval elapsing as the
     /// lost-signal backstop. The caller re-reads the page either way; the
     /// wake-up is a hint, never trusted as data.
+    ///
+    /// Takes a receiver the caller subscribed **before** the page read
+    /// that discovered the gap (and thus before any fill request it sent):
+    /// a broadcast receiver only sees messages sent after `subscribe()`,
+    /// so a late subscription would let the resolving delivery slip into
+    /// the gap between request and park — anything resolved before the
+    /// subscription is instead visible to the page read itself.
     async fn park_until_resolved(
-        cache_fill_sender: &broadcast::Sender<PersistentDelivery<P>>,
+        mut wakeup: broadcast::Receiver<PersistentDelivery<P>>,
         needed: EventSequence,
     ) {
-        let mut wakeup = cache_fill_sender.subscribe();
         let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
         loop {
             match tokio::time::timeout_at(deadline, wakeup.recv()).await {
@@ -272,7 +278,15 @@ where
                 continue;
             }
 
-            // Authoritative page read.
+            // Authoritative page read — with the park's wake-up receiver
+            // subscribed FIRST: any resolution landing after this point is
+            // buffered for the park below, and anything resolved before it
+            // is visible to the read itself. Subscribing later (inside the
+            // park) would let a resolving delivery — in particular the
+            // GapFiller's response to the Historical request sent below —
+            // slip into the unobserved window and cost the full retry
+            // interval.
+            let wakeup = cache_fill_sender.subscribe();
             let select_from = current_sequence;
             let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size).await {
                 Ok(events) => events,
@@ -329,7 +343,7 @@ where
                     .collect::<Vec<_>>();
                 let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
             }
-            Self::park_until_resolved(&cache_fill_sender, current_sequence.next()).await;
+            Self::park_until_resolved(wakeup, current_sequence.next()).await;
         }
 
         for (_, event) in
