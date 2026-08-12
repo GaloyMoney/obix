@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM job_executions WHERE job_type = $1 RETURNING execution_state_json",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "execution_state_json",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c552a35fae8044fcb2edbc84ae98c8816ec16f07dc65b8fcd17c9366ced80667"
+}

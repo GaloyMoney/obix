@@ -8,6 +8,7 @@ use job::{
 };
 
 use super::ctx::*;
+use super::group::HandlerGroupName;
 use super::{EphemeralOutboxListener, Outbox, event::*};
 use crate::tables::MailboxTables;
 
@@ -167,9 +168,18 @@ where
 /// handler type erased.
 ///
 /// [`flush`]: OutboxEventHandler::flush
-struct HandlerFlusher<H, P> {
+pub(super) struct HandlerFlusher<H, P> {
     handler: Arc<H>,
     _payload: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<H, P> HandlerFlusher<H, P> {
+    pub(super) fn new(handler: Arc<H>) -> Self {
+        Self {
+            handler,
+            _payload: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<H, P> ItemFlush<H::Batch> for HandlerFlusher<H, P>
@@ -222,6 +232,7 @@ pub struct OutboxEventJobConfig {
     pub retry_settings: RetrySettings,
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
+    pub group: Option<HandlerGroupName>,
 }
 
 impl OutboxEventJobConfig {
@@ -231,7 +242,27 @@ impl OutboxEventJobConfig {
             retry_settings: RetrySettings::repeat_indefinitely(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            group: None,
         }
+    }
+
+    /// Host this handler on the named group's shared job instead of a job of
+    /// its own — see the [group module docs](super::group).
+    ///
+    /// The first handler registered into a group creates it; later ones join.
+    /// Members keep their own checkpoint, their own accumulator and their own
+    /// failure domain, but share one job slot, one outbox subscription and one
+    /// landing transaction. The handler itself is unchanged: `job_type` remains
+    /// its stable identity for checkpointing, adoption and tracing.
+    ///
+    /// Every member must be registered before the job poller starts, since the
+    /// group snapshots its membership when its job begins. `max_batch_size` and
+    /// `checkpoint_interval` govern the shared landing and so are taken from the
+    /// first registration; a later member setting them differently is a
+    /// registration error rather than a silent fold.
+    pub fn in_group(mut self, group: &HandlerGroupName) -> Self {
+        self.group = Some(group.clone());
+        self
     }
 
     pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
@@ -430,11 +461,14 @@ where
                 match persistent.next().now_or_never() {
                     Some(Some(item)) => item,
                     Some(None) => {
+                        let own_dirty = tracker.collected > 0;
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            checkpoint: &state,
                             tracker: &mut tracker,
+                            peers: &mut NoPeers,
+                            own_dirty,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
@@ -442,11 +476,14 @@ where
                         return Ok(JobCompletion::RescheduleNow);
                     }
                     None => {
+                        let own_dirty = tracker.collected > 0;
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            checkpoint: &state,
                             tracker: &mut tracker,
+                            peers: &mut NoPeers,
+                            own_dirty,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
                             .await
@@ -526,11 +563,14 @@ where
             let event = match item {
                 Ok(event) => event,
                 Err(undecodable) => {
+                    let own_dirty = tracker.collected > 0;
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        checkpoint: &state,
                         tracker: &mut tracker,
+                        peers: &mut NoPeers,
+                        own_dirty,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
                         .await
@@ -552,12 +592,15 @@ where
                 }
             };
 
+            let own_dirty = tracker.collected > 0;
             let ctx = EventCtx {
                 parts: CtxParts {
                     op_slot: &mut op_slot,
                     current_job: &mut current_job,
-                    state: &state,
+                    checkpoint: &state,
                     tracker: &mut tracker,
+                    peers: &mut NoPeers,
+                    own_dirty,
                 },
                 batch: &mut batch,
                 flusher: &flusher,
@@ -577,11 +620,14 @@ where
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {
+                    let own_dirty = tracker.collected > 0;
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        checkpoint: &state,
                         tracker: &mut tracker,
+                        peers: &mut NoPeers,
+                        own_dirty,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
                         .await
@@ -589,11 +635,14 @@ where
                 }
                 Outcome::Defer | Outcome::Collect => {
                     if tracker.events_in_op >= self.max_batch_size {
+                        let own_dirty = tracker.collected > 0;
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            checkpoint: &state,
                             tracker: &mut tracker,
+                            peers: &mut NoPeers,
+                            own_dirty,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
                             .await

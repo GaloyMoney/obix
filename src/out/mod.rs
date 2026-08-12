@@ -4,6 +4,7 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
+pub mod group;
 mod job;
 mod notifier;
 mod op_cursor;
@@ -19,6 +20,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
+pub use self::group::{HandlerGroupError, HandlerGroupName};
 pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -56,6 +58,11 @@ where
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
     /// single `Arc` clone.
     post_persist_hooks: Arc<std::sync::RwLock<post_persist_hook::PostPersistHooks<P>>>,
+    /// Handler groups declared via
+    /// [`OutboxEventJobConfig::in_group`](OutboxEventJobConfig::in_group),
+    /// shared across clones. Registration appends members; the group job's
+    /// initializer snapshots the membership when the job starts.
+    handler_groups: group::GroupRegistry<P>,
 }
 
 impl<P, Tables> std::fmt::Debug for Outbox<P, Tables>
@@ -89,6 +96,7 @@ where
             gap_filler: self.gap_filler.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
+            handler_groups: self.handler_groups.clone(),
         }
     }
 }
@@ -151,6 +159,7 @@ where
             gap_filler,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
+            handler_groups: Arc::new(std::sync::RwLock::new(Default::default())),
         })
     }
 
@@ -358,6 +367,13 @@ where
         )
     }
 
+    /// Register `handler` against this outbox.
+    ///
+    /// By default the handler gets a resident job of its own, keyed by
+    /// `config.job_type`. When the config names a group via
+    /// [`in_group`](OutboxEventJobConfig::in_group) the handler instead joins
+    /// that group's shared job — see the [group module docs](group) for what is
+    /// shared and what stays per-handler.
     pub async fn register_event_handler<H>(
         &self,
         jobs: &mut ::job::Jobs,
@@ -367,12 +383,103 @@ where
     where
         H: OutboxEventHandler<P>,
     {
+        if let Some(group) = config.group.clone() {
+            return self
+                .register_group_member(jobs, group, config, handler)
+                .await;
+        }
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
         let spawner = jobs.add_initializer(initializer);
         spawner
             .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())
             .await?;
+        Ok(())
+    }
+
+    /// Add `handler` to `group`, creating the group (and spawning its single
+    /// resident job) on the first member.
+    async fn register_group_member<H>(
+        &self,
+        jobs: &mut ::job::Jobs,
+        group: HandlerGroupName,
+        config: OutboxEventJobConfig,
+        handler: H,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        H: OutboxEventHandler<P>,
+    {
+        let spec = group::member_spec::<H, P>(config.job_type.clone(), handler);
+
+        let is_first = {
+            let mut registry = self
+                .handler_groups
+                .write()
+                .expect("handler group registry poisoned");
+            match registry.get_mut(&group) {
+                Some(entry) => {
+                    if entry.started {
+                        return Err(Box::new(HandlerGroupError::GroupAlreadyStarted {
+                            group,
+                            member: config.job_type,
+                        }));
+                    }
+                    if entry.members.iter().any(|m| m.key() == &config.job_type) {
+                        return Err(Box::new(HandlerGroupError::DuplicateMember {
+                            group,
+                            member: config.job_type,
+                        }));
+                    }
+                    // These govern the shared landing, so they belong to the
+                    // group as a whole — disagreement is an error, not a fold.
+                    if entry.max_batch_size != config.max_batch_size {
+                        return Err(Box::new(HandlerGroupError::ConflictingGroupSetting {
+                            group,
+                            member: config.job_type,
+                            setting: "max_batch_size",
+                            group_value: entry.max_batch_size.to_string(),
+                            member_value: config.max_batch_size.to_string(),
+                        }));
+                    }
+                    if entry.checkpoint_interval != config.checkpoint_interval {
+                        return Err(Box::new(HandlerGroupError::ConflictingGroupSetting {
+                            group,
+                            member: config.job_type,
+                            setting: "checkpoint_interval",
+                            group_value: format!("{:?}", entry.checkpoint_interval),
+                            member_value: format!("{:?}", config.checkpoint_interval),
+                        }));
+                    }
+                    entry.members.push(spec);
+                    false
+                }
+                None => {
+                    registry.insert(
+                        group.clone(),
+                        group::GroupEntry {
+                            members: vec![spec],
+                            max_batch_size: config.max_batch_size,
+                            checkpoint_interval: config.checkpoint_interval,
+                            started: false,
+                        },
+                    );
+                    true
+                }
+            }
+        };
+
+        if is_first {
+            let initializer = group::HandlerGroupJobInitializer::<P, Tables>::new(
+                self.clone(),
+                self.handler_groups.clone(),
+                group,
+                config.retry_settings,
+            );
+            let spawner = jobs.add_initializer(initializer);
+            spawner
+                .spawn_unique(::job::JobId::new(), group::HandlerGroupJobData::default())
+                .await?;
+        }
         Ok(())
     }
 

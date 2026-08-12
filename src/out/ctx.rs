@@ -57,6 +57,96 @@ pub(crate) struct OutboxEventJobState {
     pub(crate) sequence: EventSequence,
 }
 
+/// The checkpoint a landing commits, abstracted over the job's shape.
+///
+/// A solo handler job writes [`OutboxEventJobState`] — one sequence. A handler
+/// group writes one row carrying *every* member's sequence, so the landing
+/// transaction that applies N members' flushes also commits N checkpoints. The
+/// erasure keeps that difference out of [`EventCtx`], whose public signature
+/// must not gain a state type parameter.
+pub(crate) trait CheckpointState: Send + Sync {
+    /// The last fully handled sequence — the batch's upper bound, used for
+    /// tracing and [`FlushError`] attribution. For a group this is the
+    /// batch-end sequence, not any single member's checkpoint.
+    fn sequence(&self) -> EventSequence;
+
+    /// Write the checkpoint onto the landing op. Called inside the batch
+    /// transaction, after every flush, immediately before commit.
+    fn persist<'a>(
+        &'a self,
+        current_job: &'a mut CurrentJob,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>>;
+}
+
+impl CheckpointState for OutboxEventJobState {
+    fn sequence(&self) -> EventSequence {
+        self.sequence
+    }
+
+    fn persist<'a>(
+        &'a self,
+        current_job: &'a mut CurrentJob,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            current_job.update_execution_state_in_op(op, self).await?;
+            Ok(())
+        })
+    }
+}
+
+/// The *other* members sharing a group's landing.
+///
+/// A member's [`consume_isolated`](EventCtx::consume_isolated) fence must land
+/// the whole pending group batch — not just its own accumulator — or a sibling's
+/// collected items would outlive the transaction that was supposed to carry
+/// them. The dispatching member's own accumulator is already reachable through
+/// [`EventCtx`]'s `batch`/`flusher`, so this covers exactly the peers, split
+/// around it to preserve registration order: `flush_before` (registered earlier)
+/// → the dispatching member → `flush_after` (registered later).
+///
+/// A solo job passes [`NoPeers`].
+pub(crate) trait PeerFlush: Send {
+    /// Whether any peer holds collected items — a pending batch that must land
+    /// even when the dispatching member has nothing of its own.
+    fn any_dirty(&self) -> bool;
+
+    fn flush_before<'a>(
+        &'a mut self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>>;
+
+    fn flush_after<'a>(
+        &'a mut self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>>;
+}
+
+/// A solo handler job has no peers: every hook is a no-op, so the solo landing
+/// path is byte-for-byte the pre-group one.
+pub(crate) struct NoPeers;
+
+impl PeerFlush for NoPeers {
+    fn any_dirty(&self) -> bool {
+        false
+    }
+
+    fn flush_before<'a>(
+        &'a mut self,
+        _op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn flush_after<'a>(
+        &'a mut self,
+        _op: &'a mut es_entity::DbOp<'static>,
+    ) -> BoxFuture<'a, Result<(), HandlerError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 /// Book-keeping the runner shares with [`EventCtx`].
 pub(crate) struct BatchTracker {
     /// Number of events contributing to the pending batch (consumed into the
@@ -75,8 +165,18 @@ pub(crate) struct BatchTracker {
 pub(crate) struct CtxParts<'inv> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
-    pub(crate) state: &'inv OutboxEventJobState,
+    pub(crate) checkpoint: &'inv dyn CheckpointState,
     pub(crate) tracker: &'inv mut BatchTracker,
+    pub(crate) peers: &'inv mut dyn PeerFlush,
+    /// Whether the accumulator travelling alongside these parts holds collected
+    /// items.
+    ///
+    /// Solo: identical to `tracker.collected > 0`, which counts this handler's
+    /// collects and nothing else. Grouped: the *dispatching member's* own dirty
+    /// flag — the shared counter only says that some member collected, and
+    /// flushing on that would hand a sibling's trigger to this member's
+    /// [`flush`](super::OutboxEventHandler::flush) as an empty accumulator.
+    pub(crate) own_dirty: bool,
 }
 
 /// Proof that a persistent event was resolved in one of the legal ways.
@@ -518,6 +618,11 @@ impl std::error::Error for FlushError {
 /// flush (inside the batch transaction, opening one if only items are
 /// pending) → checkpoint at the last fully handled sequence → commit. No-op
 /// when nothing is pending.
+///
+/// In a handler group the same call also flushes every peer holding collected
+/// items, in registration order around the dispatching member, so one landing
+/// is one transaction carrying every member's work *and* every member's
+/// checkpoint.
 #[tracing::instrument(
     name = "outbox.flush_batch",
     skip_all,
@@ -525,7 +630,7 @@ impl std::error::Error for FlushError {
         reason = reason,
         batch_size = parts.tracker.events_in_op,
         collected = parts.tracker.collected,
-        checkpoint_seq = u64::from(parts.state.sequence),
+        checkpoint_seq = u64::from(parts.checkpoint.sequence()),
     ),
     err
 )]
@@ -535,44 +640,55 @@ pub(crate) async fn flush_batch<B: Default>(
     flusher: &dyn ItemFlush<B>,
     reason: &'static str,
 ) -> Result<(), HandlerError> {
-    if parts.op_slot.is_none() && parts.tracker.collected == 0 {
+    let own_items = parts.own_dirty;
+    if parts.op_slot.is_none() && parts.tracker.collected == 0 && !parts.peers.any_dirty() {
         return Ok(());
     }
-    if parts.tracker.collected > 0 {
-        if parts.op_slot.is_none() {
-            *parts.op_slot = Some(
-                es_entity::DbOp::init_with_clock(
-                    parts.current_job.pool(),
-                    parts.current_job.clock(),
-                )
-                .await?,
-            );
+    // Take the op out for the whole landing: on any error below it is dropped
+    // here and rolls back, and the slot is already empty — a failed landing can
+    // never leave a half-applied op behind for the next event to join.
+    let mut op = match parts.op_slot.take() {
+        Some(op) => op,
+        None => {
+            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
+                .await?
         }
+    };
+    // Hoisted so failure attribution does not borrow `parts` while the flush
+    // hooks below need it mutably. Neither value moves during a landing.
+    let (after, through) = (parts.tracker.persisted_seq, parts.checkpoint.sequence());
+    let attribute = |source| {
+        Box::new(FlushError {
+            reason,
+            after,
+            through,
+            source,
+        })
+    };
+
+    // Every accumulator in scope is drained by this landing, so the shared
+    // counter clears unconditionally — including when only peers were dirty.
+    parts.tracker.collected = 0;
+
+    if let Err(source) = parts.peers.flush_before(&mut op).await {
+        return Err(attribute(source));
+    }
+    if own_items {
         // Drain before the call: on error the items are dropped with the op,
         // and the replayed events re-collect them — the accumulator never
         // leaks stale state into a retry.
         let items = std::mem::take(batch);
-        parts.tracker.collected = 0;
-        let op = parts.op_slot.as_mut().expect("op was materialized above");
-        if let Err(source) = flusher.flush_items(op, items).await {
-            return Err(Box::new(FlushError {
-                reason,
-                after: parts.tracker.persisted_seq,
-                through: parts.state.sequence,
-                source,
-            }));
+        if let Err(source) = flusher.flush_items(&mut op, items).await {
+            return Err(attribute(source));
         }
     }
-    let mut op = parts
-        .op_slot
-        .take()
-        .expect("a pending batch always has an op by now");
-    parts
-        .current_job
-        .update_execution_state_in_op(&mut op, parts.state)
-        .await?;
+    if let Err(source) = parts.peers.flush_after(&mut op).await {
+        return Err(attribute(source));
+    }
+
+    parts.checkpoint.persist(parts.current_job, &mut op).await?;
     op.commit().await?;
-    parts.tracker.persisted_seq = parts.state.sequence;
+    parts.tracker.persisted_seq = parts.checkpoint.sequence();
     parts.tracker.last_persist = tokio::time::Instant::now();
     parts.tracker.events_in_op = 0;
     Ok(())
@@ -583,17 +699,15 @@ pub(crate) async fn flush_batch<B: Default>(
 #[tracing::instrument(
     name = "outbox.persist_checkpoint",
     skip_all,
-    fields(checkpoint_seq = u64::from(state.sequence)),
+    fields(checkpoint_seq = u64::from(checkpoint.sequence())),
     err
 )]
 pub(crate) async fn persist_checkpoint(
     current_job: &mut CurrentJob,
-    state: &OutboxEventJobState,
+    checkpoint: &dyn CheckpointState,
 ) -> Result<(), HandlerError> {
     let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
-    current_job
-        .update_execution_state_in_op(&mut op, state)
-        .await?;
+    checkpoint.persist(current_job, &mut op).await?;
     op.commit().await?;
     Ok(())
 }
