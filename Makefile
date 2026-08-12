@@ -34,8 +34,11 @@ reset-deps: clean-deps start-deps
 check-code:
 	nix flake check
 
+# `--all-targets` is required: without it, prepare only sees lib/bin queries and
+# silently DELETES the .sqlx entries for queries that live in tests/, breaking
+# the offline build of the test suite.
 sqlx-prepare:
-	cargo sqlx prepare --workspace
+	cargo sqlx prepare --workspace -- --all-targets
 
 # Coverage-guided fuzzing via the shared vendored script
 # (ci/vendor/tasks/fuzz.sh, from galoy-concourse-shared), also used by
