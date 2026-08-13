@@ -64,7 +64,9 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
-job = "0.7.2"
+# Pinned to job PR #153 (JobHandle + JobSnapshot, stage 1) pending the 0.9.0
+# release. Revert to a crates.io version once #153 merges and publishes.
+job = { git = "https://github.com/GaloyMoney/job.git", branch = "task/job-handle-impl-019fe306" }
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
