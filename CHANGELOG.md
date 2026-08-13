@@ -1,3 +1,15 @@
+# [obix release v0.8.0](https://github.com/GaloyMoney/obix/releases/tag/0.8.0)
+
+
+
+### Features
+
+- [**breaking**] HandlerHandle — checkpoint read-back and caught-up barrier (#126)
+
+### Miscellaneous Tasks
+
+- Bump job to 0.9.1
+
 # [obix release v0.7.2](https://github.com/GaloyMoney/obix/releases/tag/0.7.2)
 
 
