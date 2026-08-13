@@ -417,6 +417,54 @@ async fn await_caught_up_fences_a_backlog() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Contract 9 — `await_sequence` fences on a caller-chosen target, and
+/// `await_caught_up` is its special case over the call-time frontier.
+#[tokio::test]
+#[file_serial]
+async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let handle = register(
+        &outbox,
+        &mut jobs,
+        SkippingObserver {
+            received: Arc::new(Mutex::new(Vec::new())),
+        },
+    )
+    .await?;
+
+    publish_pings(&outbox, 1..=5).await?;
+    jobs.start_poll().await?;
+
+    let target = EventSequence::from(3u64);
+    handle
+        .await_sequence(target, Duration::from_secs(60))
+        .await?;
+    assert!(handle.load().await?.checkpoint() >= target);
+
+    // A target the stream has not reached is not an error — it is simply a
+    // wait the handler cannot satisfy yet, and it times out honestly.
+    let beyond = EventSequence::from(999u64);
+    match handle.await_sequence(beyond, Duration::ZERO).await {
+        Err(HandlerCheckpointError::CaughtUpTimeout {
+            checkpoint, target, ..
+        }) => {
+            assert_eq!(target, beyond);
+            assert!(checkpoint < beyond);
+        }
+        other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
+    }
+
+    // Already-satisfied targets return without waiting.
+    handle
+        .await_sequence(EventSequence::BEGIN, Duration::ZERO)
+        .await?;
+
+    Ok(())
+}
+
 /// Contract 7 — the timeout is honest: a handler that never runs produces an
 /// alertable error carrying the real lag, not a silent hang.
 #[tokio::test]
@@ -440,12 +488,11 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
 
     match handle.await_caught_up(Duration::ZERO).await {
         Err(HandlerCheckpointError::CaughtUpTimeout {
-            checkpoint,
-            frontier,
-            ..
+            checkpoint, target, ..
         }) => {
             assert_eq!(checkpoint, EventSequence::BEGIN);
-            assert_eq!(frontier, EventSequence::from(3u64));
+            // `await_caught_up`'s target is the call-time frontier.
+            assert_eq!(target, EventSequence::from(3u64));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }

@@ -38,15 +38,20 @@ pub enum HandlerCheckpointError {
     /// state type — the checkpoint is unreadable rather than absent.
     #[error("HandlerCheckpointError - StateDecode: {0}")]
     StateDecode(#[from] serde_json::Error),
-    /// [`RegisteredEventHandler::await_caught_up`] hit its deadline. Carries the
-    /// observed lag so the caller can alert with real numbers instead of
-    /// reporting a bare timeout.
+    /// [`RegisteredEventHandler::await_sequence`] — or
+    /// [`await_caught_up`](RegisteredEventHandler::await_caught_up), which
+    /// delegates to it — hit its deadline. Carries the observed lag so the
+    /// caller can alert with real numbers instead of reporting a bare
+    /// timeout.
+    ///
+    /// `target` is the sequence being awaited: the caller's own for
+    /// `await_sequence`, the call-time frontier for `await_caught_up`.
     #[error(
-        "HandlerCheckpointError - CaughtUpTimeout: checkpoint {checkpoint} behind frontier {frontier} after {waited:?}"
+        "HandlerCheckpointError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
     )]
     CaughtUpTimeout {
         checkpoint: EventSequence,
-        frontier: EventSequence,
+        target: EventSequence,
         waited: Duration,
     },
 }
@@ -261,18 +266,21 @@ where
         })
     }
 
-    /// Block until the handler's checkpoint reaches the frontier **sampled at
-    /// call time** — the fence for "everything published before this call has
-    /// been applied".
+    /// Block until the handler's checkpoint reaches `target` — everything up
+    /// to that sequence is handled and its effects committed (semantics 1).
     ///
-    /// The frontier is sampled once, up front; the checkpoint is then polled
-    /// starting at 100ms and doubling to a 250ms ceiling, bounded by the
-    /// deadline. Events published *after* the call are not waited for
-    /// (semantics 5).
+    /// The checkpoint is polled starting at 100ms and doubling to a 250ms
+    /// ceiling, bounded by the deadline. Each poll reads only the checkpoint,
+    /// so it costs one round-trip rather than a full [`load`](Self::load).
     ///
-    /// Each poll reads only the checkpoint — it does not re-read the
-    /// frontier, so a poll costs one round-trip rather than a full
-    /// [`load`](Self::load).
+    /// Use this when the caller already knows the sequence it cares about —
+    /// e.g. one captured from an earlier publish. To fence on "everything
+    /// published so far", use [`await_caught_up`](Self::await_caught_up),
+    /// which is this method over the call-time frontier.
+    ///
+    /// A `target` beyond the frontier is not an error, just a wait the
+    /// handler cannot satisfy until the stream reaches it; it times out
+    /// honestly like any other unmet target.
     ///
     /// The timeout is REQUIRED: the wait is structurally bounded, so a
     /// stopped handler surfaces as an alertable error rather than a silent
@@ -281,26 +289,28 @@ where
     /// # Errors
     ///
     /// Returns [`HandlerCheckpointError::CaughtUpTimeout`] — carrying the
-    /// observed checkpoint, the sampled frontier and the elapsed wait — if
-    /// the deadline passes first.
+    /// observed checkpoint, the target and the elapsed wait — if the deadline
+    /// passes first.
     #[tracing::instrument(
-        name = "obix.registered_handler.await_caught_up",
+        name = "obix.registered_handler.await_sequence",
         skip_all,
-        fields(timeout_ms = timeout.as_millis()),
+        // Not `target`: that name collides with `instrument`'s own span-target
+        // argument.
+        fields(target_seq = %target, timeout_ms = timeout.as_millis()),
         err
     )]
-    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), HandlerCheckpointError> {
+    pub async fn await_sequence(
+        &self,
+        target: EventSequence,
+        timeout: Duration,
+    ) -> Result<(), HandlerCheckpointError> {
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
-        // Sampled ONCE: the fence is anchored to the stream position at call
-        // time, so a handler that publishes as it drains cannot extend its
-        // own barrier indefinitely (semantics 5).
-        let frontier = self.frontier().await?;
 
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
             let checkpoint = self.checkpoint().await?;
-            if checkpoint >= frontier {
+            if checkpoint >= target {
                 return Ok(());
             }
 
@@ -308,7 +318,7 @@ where
             if now >= deadline {
                 return Err(HandlerCheckpointError::CaughtUpTimeout {
                     checkpoint,
-                    frontier,
+                    target,
                     waited: now.duration_since(start),
                 });
             }
@@ -318,6 +328,37 @@ where
             tokio::time::sleep(interval.min(deadline - now)).await;
             interval = (interval * 2).min(MAX_POLL_INTERVAL);
         }
+    }
+
+    /// Block until the handler's checkpoint reaches the frontier **sampled at
+    /// call time** — the fence for "everything published before this call has
+    /// been applied".
+    ///
+    /// A strict special case of [`await_sequence`](Self::await_sequence) over
+    /// the call-time frontier, and inherits its polling and timeout
+    /// behaviour. Events published *after* the call are not waited for
+    /// (semantics 5).
+    ///
+    /// The frontier read happens before the deadline starts, so the reported
+    /// `waited` measures the polling, and total call time is that read plus
+    /// at most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerCheckpointError::CaughtUpTimeout`] — where `target`
+    /// is the sampled frontier — if the deadline passes first.
+    #[tracing::instrument(
+        name = "obix.registered_handler.await_caught_up",
+        skip_all,
+        fields(timeout_ms = timeout.as_millis()),
+        err
+    )]
+    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), HandlerCheckpointError> {
+        // Sampled ONCE: the fence is anchored to the stream position at call
+        // time, so a handler that publishes as it drains cannot extend its
+        // own barrier indefinitely (semantics 5).
+        let frontier = self.frontier().await?;
+        self.await_sequence(frontier, timeout).await
     }
 
     /// The committed checkpoint alone — one round-trip, no frontier read.
