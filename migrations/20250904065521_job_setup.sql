@@ -2,11 +2,10 @@ CREATE TABLE jobs (
   id UUID PRIMARY KEY,
   unique_per_type BOOLEAN NOT NULL,
   job_type VARCHAR NOT NULL,
-  parent_job_id UUID REFERENCES jobs(id),
+  queue_id VARCHAR,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = TRUE;
-CREATE INDEX idx_jobs_parent_job_id ON jobs (parent_job_id);
 
 CREATE TABLE job_events (
   id UUID NOT NULL REFERENCES jobs(id),
@@ -37,10 +36,6 @@ CREATE INDEX idx_job_executions_poller_instance
   ON job_executions(poller_instance_id)
   WHERE state = 'running';
 
-CREATE INDEX idx_job_executions_running_alive_at
-  ON job_executions(alive_at)
-  WHERE state = 'running';
-
 CREATE INDEX idx_job_executions_pending_execute_at
   ON job_executions(execute_at)
   WHERE state = 'pending';
@@ -53,33 +48,26 @@ CREATE INDEX idx_job_executions_running_queue_id
   ON job_executions(queue_id)
   WHERE state = 'running' AND queue_id IS NOT NULL;
 
-CREATE OR REPLACE FUNCTION notify_job_event() RETURNS TRIGGER AS $$
-BEGIN
-  IF TG_OP = 'INSERT' THEN
-    PERFORM pg_notify('job_events', json_build_object('type', 'execution_ready', 'job_type', NEW.job_type)::text);
-    RETURN NULL;
-  END IF;
+-- job_executions is a small, extremely update-heavy table (state flips,
+-- heartbeat bumps, per-attempt reschedules). A lowered fillfactor leaves
+-- room in each page so non-indexed-column updates (execution_state_json,
+-- alive_at, poller_instance_id) can go HOT instead of appending a new
+-- row version elsewhere, and aggressive autovacuum settings keep dead
+-- tuples near zero — cheap at this table size, and it stops the poll
+-- query's cost from growing between default-schedule vacuums.
+-- cost_delay = 0 removes the vacuum throttle: at this table's churn
+-- rate the default 2ms delay reclaims dead tuples slower than they
+-- accumulate, and the poll query's cost grows with the backlog.
+-- log_autovacuum_min_duration = 0 logs every autovacuum pass on this table
+-- (the residual stress-load bloat is naptime/worker/xmin-bound, not tunable
+-- by the triggers above, which already sit at their floor).
+ALTER TABLE job_executions SET (
+  fillfactor = 70,
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold = 50,
+  autovacuum_analyze_scale_factor = 0.02,
+  autovacuum_vacuum_cost_delay = 0,
+  log_autovacuum_min_duration = 0
+);
 
-  IF TG_OP = 'UPDATE' THEN
-    IF NEW.execute_at IS DISTINCT FROM OLD.execute_at THEN
-      PERFORM pg_notify('job_events', json_build_object('type', 'execution_ready', 'job_type', NEW.job_type)::text);
-    END IF;
-    RETURN NULL;
-  END IF;
-
-  IF TG_OP = 'DELETE' THEN
-    PERFORM pg_notify('job_events', json_build_object('type', 'job_terminal', 'job_id', OLD.id::text)::text);
-    IF OLD.queue_id IS NOT NULL THEN
-      PERFORM pg_notify('job_events', json_build_object('type', 'execution_ready', 'job_type', OLD.job_type)::text);
-    END IF;
-    RETURN NULL;
-  END IF;
-
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER job_executions_notify_event_trigger
-AFTER INSERT OR UPDATE OR DELETE ON job_executions
-FOR EACH ROW
-EXECUTE FUNCTION notify_job_event();
+-- `job_executions` deliberately has NO notification trigger.
