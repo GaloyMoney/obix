@@ -480,9 +480,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "es-entity"
-version = "0.12.4"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29b51b7a4eb0746ab8f89ebfab855cc24249b0efeb410b1c49c4e3026e73de29"
+checksum = "8f9f94a1c1d074fbe3ea443d6c6a476a80af6f16ea794fcb6be4bb1bdeddd7f3"
 dependencies = [
  "async-stream",
  "chrono",
@@ -507,9 +507,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.12.4"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d090ec1cf62cf6b515a5fb0151df13a6bc7dc4e1c1c9b17cc38de50ab11411b"
+checksum = "0f846f97468b73de4d70059c6c89adf5606dfdd3b08f7d98f2093e9b534d699c"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -992,8 +992,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "job"
-version = "0.8.1-dev"
-source = "git+https://github.com/GaloyMoney/job.git?branch=task%2Fjob-handle-impl-019fe306#4a02bde9ed62af0212ff11a65aa0d4100694db6e"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f8f1bd5040c23cbcc01a4bfd7f5d42478120295429499e548b00593ed64551b"
 dependencies = [
  "async-trait",
  "chrono",
