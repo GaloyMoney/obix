@@ -28,12 +28,11 @@ pub enum HandlerCheckpointError {
     /// Reading the stream frontier failed.
     #[error("HandlerCheckpointError - Sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    /// Loading the handler job's snapshot failed (including the job never
-    /// having existed).
-    // `job` does not re-export `JobError` at its crate root (only
-    // `job::error`), though its public signatures return it.
+    /// Reading the handler job failed — a snapshot load (including the job
+    /// never having existed), or a checkpoint point-read whose stored state
+    /// did not decode.
     #[error("HandlerCheckpointError - Job: {0}")]
-    Job(#[from] ::job::error::JobError),
+    Job(#[from] ::job::JobError),
     /// The committed execution state did not decode as the handler job's
     /// state type — the checkpoint is unreadable rather than absent.
     #[error("HandlerCheckpointError - StateDecode: {0}")]
@@ -142,8 +141,32 @@ impl HandlerSnapshot {
         self.job.state()
     }
 
+    /// The handler's most recent failure, if it has ever failed an attempt.
+    ///
+    /// **This is the wedged-vs-slow signal.** obix registers handlers to
+    /// retry indefinitely, so a handler crash-looping on a poison event never
+    /// reaches a terminal state: [`job_status`](Self::job_status) keeps
+    /// reporting `Pending`/`Running` while the checkpoint sits frozen. A
+    /// lagging handler with `Some` here — especially with
+    /// [`attempt`](Self::attempt) climbing across successive loads — is stuck
+    /// on this error, not merely backlogged.
+    ///
+    /// `None` means no attempt has ever failed. A stale `Some` from an
+    /// earlier, since-recovered failure is possible, which is why the pair
+    /// with a frozen checkpoint (or a rising attempt) is what diagnoses.
+    pub fn last_error(&self) -> Option<&str> {
+        self.job.last_error()
+    }
+
+    /// The current attempt number — `Some` only while the job has a live
+    /// execution row. Rising across loads means the handler is retrying; see
+    /// [`last_error`](Self::last_error).
+    pub fn attempt(&self) -> Option<u32> {
+        self.job.attempt()
+    }
+
     /// The underlying job snapshot, for callers that want the job's own
-    /// accessors (attempt, next run, config, return value).
+    /// accessors (next run, queue id, config, return value).
     pub fn job(&self) -> &::job::JobSnapshot {
         &self.job
     }
@@ -361,11 +384,29 @@ where
         self.await_sequence(frontier, timeout).await
     }
 
-    /// The committed checkpoint alone — one round-trip, no frontier read.
-    /// Backs the [`await_caught_up`](Self::await_caught_up) poll loop, which
-    /// already holds the frontier it anchored to.
+    /// The committed checkpoint alone, via job's point-read: a single-row
+    /// `SELECT` on the execution row, with no entity hydration and no
+    /// snapshot reconciliation. Backs the
+    /// [`await_sequence`](Self::await_sequence) poll loop, which already
+    /// holds the target it anchored to and needs nothing else per tick.
+    ///
+    /// Staying off [`load`](Self::load) here matters because the entity
+    /// hydration it skips grows with the job's event log — that is, with
+    /// retries — so a full-snapshot poll would get more expensive exactly
+    /// when a handler is wedged and someone is watching a fence time out.
+    ///
+    /// Safe because this does not serve
+    /// [`job_status`](HandlerSnapshot::job_status): a missing or
+    /// mid-transition row reads `None` ⇒ [`EventSequence::BEGIN`], which can
+    /// only under-report progress, and under-reporting preserves the
+    /// barrier's never-return-early invariant.
     async fn checkpoint(&self) -> Result<EventSequence, HandlerCheckpointError> {
-        decode_checkpoint(&self.job.load().await?)
+        Ok(self
+            .job
+            .execution_state::<OutboxEventJobState>()
+            .await?
+            .unwrap_or_default()
+            .sequence)
     }
 
     async fn frontier(&self) -> Result<EventSequence, sqlx::Error> {

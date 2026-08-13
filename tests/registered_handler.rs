@@ -52,6 +52,24 @@ impl OutboxEventHandler<TestEvent> for SkippingObserver {
     }
 }
 
+/// Always fails, so its job crash-loops on the first event forever — the
+/// shape of a handler parked on a poison event.
+struct PoisonHandler;
+
+const POISON_ERROR: &str = "poison-handler-always-fails";
+
+impl OutboxEventHandler<TestEvent> for PoisonHandler {
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        _ctx: EventCtx<'inv>,
+        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(POISON_ERROR.into())
+    }
+}
+
 /// Collects every `Ping` and, on flush, publishes a matching `Echo` back onto
 /// the SAME outbox — inside the batch transaction that commits the
 /// checkpoint. `Echo`s are skipped rather than collected, so the cascade
@@ -119,13 +137,32 @@ fn test_config() -> OutboxEventJobConfig {
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
 }
 
+/// Retry fast enough that a crash-looping job cycles several times inside a
+/// test, instead of at the production backoff.
+fn fast_retry_settings() -> job::RetrySettings {
+    let mut settings = job::RetrySettings::repeat_indefinitely();
+    settings.min_backoff = Duration::from_millis(50);
+    settings.max_backoff = Duration::from_millis(100);
+    settings.backoff_jitter_pct = 0;
+    settings
+}
+
 async fn register<H: OutboxEventHandler<TestEvent>>(
     outbox: &Outbox<TestEvent, TestTables>,
     jobs: &mut job::Jobs,
     handler: H,
 ) -> anyhow::Result<RegisteredEventHandler<TestEvent, TestTables>> {
+    register_with(outbox, jobs, test_config(), handler).await
+}
+
+async fn register_with<H: OutboxEventHandler<TestEvent>>(
+    outbox: &Outbox<TestEvent, TestTables>,
+    jobs: &mut job::Jobs,
+    config: OutboxEventJobConfig,
+    handler: H,
+) -> anyhow::Result<RegisteredEventHandler<TestEvent, TestTables>> {
     outbox
-        .register_event_handler(jobs, test_config(), handler)
+        .register_event_handler(jobs, config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -413,6 +450,64 @@ async fn await_caught_up_fences_a_backlog() -> anyhow::Result<()> {
         snapshot.job_status()
     );
     assert_eq!(received.lock().await.len(), 25);
+
+    Ok(())
+}
+
+/// Contract 10 — a wedged handler is diagnosable. Handler jobs retry
+/// indefinitely, so one crash-looping on a poison event never goes terminal:
+/// `job_status` keeps saying "alive" while the checkpoint is frozen, and a
+/// barrier over it times out looking exactly like a slow handler.
+/// `last_error` is what separates the two.
+#[tokio::test]
+#[file_serial]
+async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let handle = register_with(
+        &outbox,
+        &mut jobs,
+        test_config().with_retry_settings(fast_retry_settings()),
+        PoisonHandler,
+    )
+    .await?;
+
+    publish_pings(&outbox, 1..=3).await?;
+    jobs.start_poll().await?;
+
+    // The failure is recorded while the job is still retrying — under a
+    // terminal-only error surface this stays `None` forever.
+    eventually(Duration::from_secs(10), || {
+        let handle = handle.clone();
+        async move { Ok(handle.load().await?.last_error().is_some()) }
+    })
+    .await?;
+
+    let snapshot = handle.load().await?;
+    assert!(
+        snapshot
+            .last_error()
+            .is_some_and(|e| e.contains(POISON_ERROR)),
+        "expected the handler's own error, got {:?}",
+        snapshot.last_error()
+    );
+    // Alive by every other measure: never terminal, checkpoint parked before
+    // the poison event. That pair is the wedge.
+    assert!(!snapshot.job_status().is_terminal());
+    assert_eq!(snapshot.checkpoint(), EventSequence::BEGIN);
+    assert!(!snapshot.is_caught_up());
+
+    // The barrier reports a plain timeout — identical in shape to a merely
+    // backlogged handler — so the diagnosis has to come from the snapshot.
+    match handle.await_caught_up(Duration::from_millis(200)).await {
+        Err(HandlerCheckpointError::CaughtUpTimeout { checkpoint, .. }) => {
+            assert_eq!(checkpoint, EventSequence::BEGIN);
+        }
+        other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
+    }
+    assert!(handle.load().await?.last_error().is_some());
 
     Ok(())
 }

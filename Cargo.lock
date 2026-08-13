@@ -993,7 +993,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "job"
 version = "0.8.1-dev"
-source = "git+https://github.com/GaloyMoney/job.git?branch=task%2Fjob-handle-impl-019fe306#d2c7aa0771ce2bf8ff14b7471388accffd1849b7"
+source = "git+https://github.com/GaloyMoney/job.git?branch=task%2Fjob-handle-impl-019fe306#4a02bde9ed62af0212ff11a65aa0d4100694db6e"
 dependencies = [
  "async-trait",
  "chrono",
