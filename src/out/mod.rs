@@ -20,7 +20,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
-pub use self::handler_handle::{HandlerCheckpointError, HandlerHandle, HandlerStreamStatus};
+pub use self::handler_handle::{
+    HandlerCheckpointError, HandlerHandle, HandlerSnapshot, HandlerStreamStatus,
+};
 pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -394,10 +396,10 @@ where
     /// Read from the sequence generator's `last_value`, so it includes
     /// sequences already assigned to transactions that have not committed
     /// yet, and needs no table scan. This is the same value
-    /// [`HandlerHandle::stream_status`] compares a handler's checkpoint
+    /// [`HandlerSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
     pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        Tables::highest_known_persistent_sequence(&self.pool).await
+        handler_handle::read_frontier::<Tables>(&self.pool).await
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a

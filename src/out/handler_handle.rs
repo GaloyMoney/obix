@@ -52,7 +52,7 @@ pub enum HandlerCheckpointError {
 }
 
 /// A `{ checkpoint, frontier }` pair sampled by
-/// [`HandlerHandle::stream_status`].
+/// [`HandlerSnapshot::stream_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandlerStreamStatus {
     /// Highest sequence the handler has durably applied.
@@ -73,6 +73,74 @@ impl HandlerStreamStatus {
     /// Whether the checkpoint has reached the frontier sampled alongside it.
     pub fn is_caught_up(&self) -> bool {
         self.checkpoint >= self.frontier
+    }
+}
+
+/// A point-in-time view of a registered handler, produced by
+/// [`HandlerHandle::load`].
+///
+/// One `load()` pairs the handler's committed checkpoint with the stream
+/// frontier, so every accessor below is synchronous and infallible — a
+/// consumer reading several of them pays one round-trip, not one per
+/// question. Nothing is cached on the handle: a fresh `load()` always
+/// reflects the latest committed state.
+///
+/// The checkpoint is decoded eagerly during `load()` (obix knows the handler
+/// job's state type, so there is no reason to defer it to the caller), which
+/// is why these accessors cannot fail.
+pub struct HandlerSnapshot {
+    job: ::job::JobSnapshot,
+    checkpoint: EventSequence,
+    frontier: EventSequence,
+}
+
+impl HandlerSnapshot {
+    /// The handler's committed checkpoint: every persistent event with a
+    /// sequence at or below this has been handled and its effects committed
+    /// (semantics 1). A handler that has never checkpointed reads as
+    /// [`EventSequence::BEGIN`] (semantics 4).
+    pub fn checkpoint(&self) -> EventSequence {
+        self.checkpoint
+    }
+
+    /// The stream frontier as of this load — the highest sequence the outbox
+    /// had handed out (semantics 2).
+    pub fn frontier(&self) -> EventSequence {
+        self.frontier
+    }
+
+    /// The `{ checkpoint, frontier }` pair.
+    pub fn stream_status(&self) -> HandlerStreamStatus {
+        HandlerStreamStatus {
+            checkpoint: self.checkpoint,
+            frontier: self.frontier,
+        }
+    }
+
+    /// How far the handler trails the frontier, saturating at zero.
+    pub fn lag(&self) -> u64 {
+        self.stream_status().lag()
+    }
+
+    /// Whether the checkpoint has reached the frontier.
+    pub fn is_caught_up(&self) -> bool {
+        self.stream_status().is_caught_up()
+    }
+
+    /// Runtime status of the job hosting this handler.
+    ///
+    /// A resident handler job stays `Running`; a terminal status means the
+    /// handler is no longer consuming, which is the case
+    /// [`HandlerHandle::await_caught_up`] reports as a timeout rather than a
+    /// hang.
+    pub fn job_status(&self) -> ::job::JobStatus {
+        self.job.state()
+    }
+
+    /// The underlying job snapshot, for callers that want the job's own
+    /// accessors (attempt, next run, config, return value).
+    pub fn job(&self) -> &::job::JobSnapshot {
+        &self.job
     }
 }
 
@@ -113,7 +181,7 @@ impl HandlerStreamStatus {
 ///    publishes back onto the *same* outbox leaves a tail behind the frontier
 ///    that [`await_caught_up`](Self::await_caught_up) sampled, so a
 ///    successful barrier does **not** imply a subsequent
-///    [`stream_status`](Self::stream_status) reports caught up. Each call
+///    [`load`](Self::load) reports caught up. Each call
 ///    anchors to its own call-time frontier, and sequential barriers still
 ///    compose: the first commits its emissions before returning, so the
 ///    second's snapshot includes them.
@@ -171,47 +239,25 @@ where
         self.job.id()
     }
 
-    /// The handler's committed checkpoint: every persistent event with a
-    /// sequence at or below this has been handled and its effects committed
-    /// (semantics 1). A handler that has never checkpointed reads as
-    /// [`EventSequence::BEGIN`] (semantics 4).
-    ///
-    /// One round-trip: the underlying job snapshot pairs the execution row
-    /// with the durable entity in a single committed read.
-    #[tracing::instrument(name = "obix.handler_handle.checkpoint", skip_all, err)]
-    pub async fn checkpoint(&self) -> Result<EventSequence, HandlerCheckpointError> {
-        let snapshot = self.job.load().await?;
-        Ok(snapshot
-            .execution_state::<OutboxEventJobState>()?
-            .unwrap_or_default()
-            .sequence)
-    }
-
-    /// The handler's `{ checkpoint, frontier }` position.
+    /// Load a point-in-time [`HandlerSnapshot`]: the committed checkpoint,
+    /// the stream frontier, and the hosting job's runtime status, in one
+    /// round-trip pair. Every accessor on the result is synchronous.
     ///
     /// The checkpoint is read **first**, then the frontier, so a concurrent
-    /// advance between the two reads can only overstate the lag — never
-    /// understate it. A caller acting on `is_caught_up` therefore never acts
+    /// advance between the two can only overstate the snapshot's lag — never
+    /// understate it. A caller acting on
+    /// [`is_caught_up`](HandlerSnapshot::is_caught_up) therefore never acts
     /// on an optimistic reading.
-    #[tracing::instrument(name = "obix.handler_handle.stream_status", skip_all, err)]
-    pub async fn stream_status(&self) -> Result<HandlerStreamStatus, HandlerCheckpointError> {
-        let checkpoint = self.checkpoint().await?;
+    #[tracing::instrument(name = "obix.handler_handle.load", skip_all, err)]
+    pub async fn load(&self) -> Result<HandlerSnapshot, HandlerCheckpointError> {
+        let job = self.job.load().await?;
+        let checkpoint = decode_checkpoint(&job)?;
         let frontier = self.frontier().await?;
-        Ok(HandlerStreamStatus {
+        Ok(HandlerSnapshot {
+            job,
             checkpoint,
             frontier,
         })
-    }
-
-    /// Runtime status of the job hosting this handler.
-    ///
-    /// A resident handler job stays `Running`; a terminal status means the
-    /// handler is no longer consuming, which is the case
-    /// [`await_caught_up`](Self::await_caught_up) reports as a timeout rather
-    /// than a hang.
-    #[tracing::instrument(name = "obix.handler_handle.job_status", skip_all, err)]
-    pub async fn job_status(&self) -> Result<::job::JobStatus, HandlerCheckpointError> {
-        Ok(self.job.load().await?.state())
     }
 
     /// Block until the handler's checkpoint reaches the frontier **sampled at
@@ -222,6 +268,10 @@ where
     /// starting at 100ms and doubling to a 250ms ceiling, bounded by the
     /// deadline. Events published *after* the call are not waited for
     /// (semantics 5).
+    ///
+    /// Each poll reads only the checkpoint — it does not re-read the
+    /// frontier, so a poll costs one round-trip rather than a full
+    /// [`load`](Self::load).
     ///
     /// The timeout is REQUIRED: the wait is structurally bounded, so a
     /// stopped handler surfaces as an alertable error rather than a silent
@@ -269,7 +319,46 @@ where
         }
     }
 
-    async fn frontier(&self) -> Result<EventSequence, sqlx::Error> {
-        Tables::highest_known_persistent_sequence(&self.pool).await
+    /// The committed checkpoint alone — one round-trip, no frontier read.
+    /// Backs the [`await_caught_up`](Self::await_caught_up) poll loop, which
+    /// already holds the frontier it anchored to.
+    async fn checkpoint(&self) -> Result<EventSequence, HandlerCheckpointError> {
+        decode_checkpoint(&self.job.load().await?)
     }
+
+    async fn frontier(&self) -> Result<EventSequence, sqlx::Error> {
+        read_frontier::<Tables>(&self.pool).await
+    }
+}
+
+/// Read the stream frontier.
+///
+/// The inner future is boxed deliberately, and removing the box will compile
+/// here but break callers.
+/// [`MailboxTables::highest_known_persistent_sequence`] returns an opaque
+/// `impl Future` that captures the lifetime of its executor argument.
+/// Awaiting that opaque type inside a method taking `&self` makes the
+/// enclosing future's `Send`-ness higher-ranked over that lifetime, which
+/// defeats inference at `tokio::spawn` — "implementation of `Send` is not
+/// general enough" (rust-lang/rust#100013). Boxing erases the opaque type and
+/// grounds the lifetime, for one allocation per call — nothing next to the
+/// round-trip it wraps.
+pub(super) async fn read_frontier<Tables: MailboxTables>(
+    pool: &sqlx::PgPool,
+) -> Result<EventSequence, sqlx::Error> {
+    let pool = pool.clone();
+    let fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<EventSequence, sqlx::Error>> + Send>,
+    > = Box::pin(async move { Tables::highest_known_persistent_sequence(&pool).await });
+    fut.await
+}
+
+/// Decode a handler job's committed checkpoint. Absent state — no execution
+/// row, or a job that has not checkpointed yet — reads as
+/// [`EventSequence::BEGIN`] (semantics 4).
+fn decode_checkpoint(job: &::job::JobSnapshot) -> Result<EventSequence, HandlerCheckpointError> {
+    Ok(job
+        .execution_state::<OutboxEventJobState>()?
+        .unwrap_or_default()
+        .sequence)
 }

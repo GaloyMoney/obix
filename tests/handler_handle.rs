@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use obix::{
     EventCtx, EventSequence, FlushOp, Handled, HandlerCheckpointError, HandlerHandle,
-    MailboxConfig, OutboxEventHandler, OutboxEventJobConfig, out::Outbox,
+    HandlerSnapshot, HandlerStreamStatus, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -143,6 +144,15 @@ async fn publish_pings(
     Ok(())
 }
 
+/// Load through an owned handle. Taking the handle by value keeps the future
+/// free of borrows, which is what lets it cross a `tokio::spawn` boundary
+/// (an inline `async move` block hits rust-lang/rust#100013 here).
+async fn load_owned(
+    handle: HandlerHandle<TestEvent, TestTables>,
+) -> Result<HandlerSnapshot, HandlerCheckpointError> {
+    handle.load().await
+}
+
 /// Poll `f` until it holds or `timeout` elapses.
 async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<()>
 where
@@ -181,15 +191,22 @@ async fn checkpoint_reads_begin_before_the_handler_runs() -> anyhow::Result<()> 
     .await?;
 
     // Deliberately no `jobs.start_poll()`.
-    assert_eq!(handle.checkpoint().await?, EventSequence::BEGIN);
+    assert_eq!(handle.load().await?.checkpoint(), EventSequence::BEGIN);
 
     publish_pings(&outbox, 1..=3).await?;
 
-    let status = handle.stream_status().await?;
-    assert_eq!(status.checkpoint, EventSequence::BEGIN);
-    assert_eq!(status.frontier, EventSequence::from(3u64));
-    assert_eq!(status.lag(), 3);
-    assert!(!status.is_caught_up());
+    let snapshot = handle.load().await?;
+    assert_eq!(snapshot.checkpoint(), EventSequence::BEGIN);
+    assert_eq!(snapshot.frontier(), EventSequence::from(3u64));
+    assert_eq!(snapshot.lag(), 3);
+    assert!(!snapshot.is_caught_up());
+    assert_eq!(
+        snapshot.stream_status(),
+        HandlerStreamStatus {
+            checkpoint: EventSequence::BEGIN,
+            frontier: EventSequence::from(3u64),
+        }
+    );
 
     Ok(())
 }
@@ -221,14 +238,16 @@ async fn checkpoint_trails_applied_state_and_converges() -> anyhow::Result<()> {
 
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.checkpoint().await? >= frontier) }
+        async move { Ok(handle.load().await?.checkpoint() >= frontier) }
     })
     .await?;
 
     assert_eq!(*received.lock().await, vec![1, 2, 3]);
     // Nothing published since, so the checkpoint must sit exactly on the
     // frontier — never past it.
-    assert_eq!(handle.checkpoint().await?, frontier);
+    let snapshot = handle.load().await?;
+    assert_eq!(snapshot.checkpoint(), frontier);
+    assert!(snapshot.is_caught_up());
 
     Ok(())
 }
@@ -289,20 +308,20 @@ async fn stream_status_never_understates_lag() -> anyhow::Result<()> {
     // Sampled while a publisher races the reader: whatever pair comes back,
     // the checkpoint may never exceed the frontier read after it.
     for _ in 0..20 {
-        let status = handle.stream_status().await?;
+        let snapshot = handle.load().await?;
         assert!(
-            status.checkpoint <= status.frontier,
+            snapshot.checkpoint() <= snapshot.frontier(),
             "checkpoint {} led frontier {}",
-            status.checkpoint,
-            status.frontier
+            snapshot.checkpoint(),
+            snapshot.frontier()
         );
-        assert_eq!(status.is_caught_up(), status.lag() == 0);
+        assert_eq!(snapshot.is_caught_up(), snapshot.lag() == 0);
         publish_pings(&outbox, 6..=6).await?;
     }
 
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.stream_status().await?.is_caught_up()) }
+        async move { Ok(handle.load().await?.is_caught_up()) }
     })
     .await?;
 
@@ -336,16 +355,24 @@ async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     let frontier = outbox.highest_known_persistent_sequence().await?;
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.checkpoint().await? >= frontier) }
+        async move { Ok(handle.load().await?.checkpoint() >= frontier) }
     })
     .await?;
 
     // The poller stops here; the handle keeps reading committed state.
     drop(jobs);
 
-    let moved = handle.clone();
-    let checkpoint = tokio::spawn(async move { moved.checkpoint().await }).await??;
-    assert_eq!(checkpoint, frontier);
+    // Spawning is the regression guard for the boxed frontier read: awaiting
+    // `highest_known_persistent_sequence`'s opaque future directly makes
+    // these `Send` bounds higher-ranked and fails to compile here.
+    let snapshot = tokio::spawn(load_owned(handle.clone())).await??;
+    assert_eq!(snapshot.checkpoint(), frontier);
+
+    let spawned_outbox = outbox.clone();
+    let spawned_frontier =
+        tokio::spawn(async move { spawned_outbox.highest_known_persistent_sequence().await })
+            .await??;
+    assert_eq!(spawned_frontier, frontier);
 
     Ok(())
 }
@@ -376,8 +403,15 @@ async fn await_caught_up_fences_a_backlog() -> anyhow::Result<()> {
     jobs.start_poll().await?;
     handle.await_caught_up(Duration::from_secs(60)).await?;
 
-    // The barrier's guarantee: applied, not merely delivered.
-    assert!(handle.checkpoint().await? >= frontier_at_call);
+    // The barrier's guarantee: applied, not merely delivered — and one load
+    // answers every question about the handler.
+    let snapshot = handle.load().await?;
+    assert!(snapshot.checkpoint() >= frontier_at_call);
+    assert!(
+        !snapshot.job_status().is_terminal(),
+        "a resident handler job should still be live, got {:?}",
+        snapshot.job_status()
+    );
     assert_eq!(received.lock().await.len(), 25);
 
     Ok(())
@@ -460,7 +494,7 @@ async fn await_caught_up_anchors_to_the_call_time_frontier() -> anyhow::Result<(
     // Terminates despite the handler extending the stream as it drains — the
     // frontier is sampled once, at call time.
     handle.await_caught_up(Duration::from_secs(60)).await?;
-    assert!(handle.checkpoint().await? >= pings_frontier);
+    assert!(handle.load().await?.checkpoint() >= pings_frontier);
 
     // The self-publishing tail really happened: the stream grew past the
     // frontier this fence anchored to.
@@ -474,7 +508,7 @@ async fn await_caught_up_anchors_to_the_call_time_frontier() -> anyhow::Result<(
     handle.await_caught_up(Duration::from_secs(60)).await?;
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.stream_status().await?.is_caught_up()) }
+        async move { Ok(handle.load().await?.is_caught_up()) }
     })
     .await?;
 
