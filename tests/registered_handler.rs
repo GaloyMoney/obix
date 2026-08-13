@@ -1,4 +1,4 @@
-//! Contracts for [`obix::HandlerHandle`] — the checkpoint read-back returned
+//! Contracts for [`obix::RegisteredEventHandler`] — the checkpoint read-back returned
 //! by `Outbox::register_event_handler` and the caught-up barrier built on it.
 
 mod helpers;
@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obix::{
-    EventCtx, EventSequence, FlushOp, Handled, HandlerCheckpointError, HandlerHandle,
-    HandlerSnapshot, HandlerStreamStatus, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
-    out::Outbox,
+    EventCtx, EventSequence, FlushOp, Handled, HandlerCheckpointError, HandlerSnapshot,
+    HandlerStreamStatus, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    RegisteredEventHandler, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
 
-const JOB_TYPE: &str = "test-handler-handle";
+const JOB_TYPE: &str = "test-registered-handler";
 
 /// Short enough that a skip-only handler's lazy checkpoint lands inside a
 /// test's patience, rather than at the 5s production default.
@@ -123,7 +123,7 @@ async fn register<H: OutboxEventHandler<TestEvent>>(
     outbox: &Outbox<TestEvent, TestTables>,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<HandlerHandle<TestEvent, TestTables>> {
+) -> anyhow::Result<RegisteredEventHandler<TestEvent, TestTables>> {
     outbox
         .register_event_handler(jobs, test_config(), handler)
         .await
@@ -148,7 +148,7 @@ async fn publish_pings(
 /// free of borrows, which is what lets it cross a `tokio::spawn` boundary
 /// (an inline `async move` block hits rust-lang/rust#100013 here).
 async fn load_owned(
-    handle: HandlerHandle<TestEvent, TestTables>,
+    handle: RegisteredEventHandler<TestEvent, TestTables>,
 ) -> Result<HandlerSnapshot, HandlerCheckpointError> {
     handle.load().await
 }
@@ -334,7 +334,7 @@ async fn stream_status_never_understates_lag() -> anyhow::Result<()> {
 #[file_serial]
 async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     fn assert_portable<T: Send + Sync + Clone + 'static>() {}
-    assert_portable::<HandlerHandle<TestEvent, TestTables>>();
+    assert_portable::<RegisteredEventHandler<TestEvent, TestTables>>();
 
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;

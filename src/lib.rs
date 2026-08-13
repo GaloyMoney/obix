@@ -31,9 +31,9 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
-    HandlerCheckpointError, HandlerHandle, HandlerSnapshot, HandlerStreamStatus, IsolatedOp,
-    OpCursor, Outbox, OutboxEventHandler, OutboxEventJobConfig, PartitionMaintainerConfig,
-    Partitions, PostPersistHook, UndecodableEventError,
+    HandlerCheckpointError, HandlerSnapshot, HandlerStreamStatus, IsolatedOp, OpCursor, Outbox,
+    OutboxEventHandler, OutboxEventJobConfig, PartitionMaintainerConfig, Partitions,
+    PostPersistHook, RegisteredEventHandler, UndecodableEventError,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

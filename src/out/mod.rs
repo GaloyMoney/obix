@@ -4,7 +4,6 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
-mod handler_handle;
 mod job;
 mod notifier;
 mod op_cursor;
@@ -13,6 +12,7 @@ mod persist_events_hook;
 mod persistent;
 mod pg_notify;
 mod post_persist_hook;
+mod registered_handler;
 
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
@@ -20,10 +20,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
-pub use self::handler_handle::{
-    HandlerCheckpointError, HandlerHandle, HandlerSnapshot, HandlerStreamStatus,
-};
 pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
+pub use self::registered_handler::{
+    HandlerCheckpointError, HandlerSnapshot, HandlerStreamStatus, RegisteredEventHandler,
+};
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
@@ -364,20 +364,20 @@ where
 
     /// Register `handler` as a resident job consuming this outbox.
     ///
-    /// Returns a [`HandlerHandle`]: the handler's committed checkpoint, its
+    /// Returns a [`RegisteredEventHandler`]: the handler's committed checkpoint, its
     /// position against the stream frontier, and the
-    /// [`await_caught_up`](HandlerHandle::await_caught_up) barrier. Callers
+    /// [`await_caught_up`](RegisteredEventHandler::await_caught_up) barrier. Callers
     /// that only want the handler running can discard it with `.await?;`.
     ///
     /// Registration is idempotent per job type: registering the same job type
     /// twice resolves to the already-persisted job, so both calls hand back
-    /// handles with the same [`job_id`](HandlerHandle::job_id).
+    /// handles with the same [`job_id`](RegisteredEventHandler::job_id).
     pub async fn register_event_handler<H>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<HandlerHandle<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<RegisteredEventHandler<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
     where
         H: OutboxEventHandler<P>,
     {
@@ -387,7 +387,7 @@ where
         let handle = spawner
             .spawn_unique(::job::JobId::new(), job::OutboxEventJobData::default())
             .await?;
-        Ok(HandlerHandle::new(handle, self.pool.clone()))
+        Ok(RegisteredEventHandler::new(handle, self.pool.clone()))
     }
 
     /// The highest sequence the persistent outbox has handed out — the
@@ -399,7 +399,7 @@ where
     /// [`HandlerSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
     pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        handler_handle::read_frontier::<Tables>(&self.pool).await
+        registered_handler::read_frontier::<Tables>(&self.pool).await
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a

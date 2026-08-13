@@ -1,10 +1,10 @@
-//! [`HandlerHandle`] — public read-back of a registered outbox event
+//! [`RegisteredEventHandler`] — public read-back of a registered outbox event
 //! handler's committed checkpoint, plus the caught-up barrier built on it.
 //!
 //! Returned by
 //! [`Outbox::register_event_handler`](super::Outbox::register_event_handler).
-//! The handle is a capability, not a value: it caches nothing, and every
-//! accessor is a fresh committed read.
+//! It is a capability, not a value: it caches nothing, and every read goes
+//! to committed state.
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -16,10 +16,10 @@ use crate::{
     tables::{DefaultMailboxTables, MailboxTables},
 };
 
-/// First poll interval used by [`HandlerHandle::await_caught_up`], doubling
+/// First poll interval used by [`RegisteredEventHandler::await_caught_up`], doubling
 /// up to [`MAX_POLL_INTERVAL`].
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Ceiling for the [`HandlerHandle::await_caught_up`] poll interval.
+/// Ceiling for the [`RegisteredEventHandler::await_caught_up`] poll interval.
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Failure modes of the checkpoint read-back and the caught-up barrier.
@@ -38,7 +38,7 @@ pub enum HandlerCheckpointError {
     /// state type — the checkpoint is unreadable rather than absent.
     #[error("HandlerCheckpointError - StateDecode: {0}")]
     StateDecode(#[from] serde_json::Error),
-    /// [`HandlerHandle::await_caught_up`] hit its deadline. Carries the
+    /// [`RegisteredEventHandler::await_caught_up`] hit its deadline. Carries the
     /// observed lag so the caller can alert with real numbers instead of
     /// reporting a bare timeout.
     #[error(
@@ -77,13 +77,13 @@ impl HandlerStreamStatus {
 }
 
 /// A point-in-time view of a registered handler, produced by
-/// [`HandlerHandle::load`].
+/// [`RegisteredEventHandler::load`].
 ///
 /// One `load()` pairs the handler's committed checkpoint with the stream
 /// frontier, so every accessor below is synchronous and infallible — a
 /// consumer reading several of them pays one round-trip, not one per
-/// question. Nothing is cached on the handle: a fresh `load()` always
-/// reflects the latest committed state.
+/// question. Nothing is cached: a fresh `load()` always reflects the latest
+/// committed state.
 ///
 /// The checkpoint is decoded eagerly during `load()` (obix knows the handler
 /// job's state type, so there is no reason to defer it to the caller), which
@@ -131,7 +131,7 @@ impl HandlerSnapshot {
     ///
     /// A resident handler job stays `Running`; a terminal status means the
     /// handler is no longer consuming, which is the case
-    /// [`HandlerHandle::await_caught_up`] reports as a timeout rather than a
+    /// [`RegisteredEventHandler::await_caught_up`] reports as a timeout rather than a
     /// hang.
     pub fn job_status(&self) -> ::job::JobStatus {
         self.job.state()
@@ -144,14 +144,15 @@ impl HandlerSnapshot {
     }
 }
 
-/// A handle to a registered outbox event handler: its committed checkpoint,
-/// its position relative to the stream frontier, the underlying job's runtime
-/// status, and the caught-up barrier.
+/// An outbox event handler that has been registered and is running: its
+/// committed checkpoint, its position relative to the stream frontier, the
+/// runtime status of the job hosting it, and the caught-up barrier.
 ///
-/// Obtained from
+/// Returned by
 /// [`Outbox::register_event_handler`](super::Outbox::register_event_handler).
-/// Cloneable and cheap to hold; it caches nothing, so every accessor reflects
-/// the latest committed state.
+/// This does not own the handler — it is a cloneable, cheap-to-hold capability
+/// for observing and fencing one, and it caches nothing, so every read
+/// reflects the latest committed state.
 ///
 /// # Semantics
 ///
@@ -185,7 +186,7 @@ impl HandlerSnapshot {
 ///    anchors to its own call-time frontier, and sequential barriers still
 ///    compose: the first commits its emissions before returning, so the
 ///    second's snapshot includes them.
-pub struct HandlerHandle<P, Tables = DefaultMailboxTables>
+pub struct RegisteredEventHandler<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -194,10 +195,10 @@ where
     _phantom: PhantomData<(P, Tables)>,
 }
 
-// Manual `Clone`: the handle is cloneable regardless of whether `P` is, so
+// Manual `Clone`: this is cloneable regardless of whether `P` is, so
 // deriving (which would bound `P: Clone` through `PhantomData`) is wrong.
 // Mirrors `Outbox`'s manual impl.
-impl<P, Tables> Clone for HandlerHandle<P, Tables>
+impl<P, Tables> Clone for RegisteredEventHandler<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -210,18 +211,18 @@ where
     }
 }
 
-impl<P, Tables> std::fmt::Debug for HandlerHandle<P, Tables>
+impl<P, Tables> std::fmt::Debug for RegisteredEventHandler<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HandlerHandle")
+        f.debug_struct("RegisteredEventHandler")
             .field("job_id", &self.job.id())
             .finish_non_exhaustive()
     }
 }
 
-impl<P, Tables> HandlerHandle<P, Tables>
+impl<P, Tables> RegisteredEventHandler<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -248,7 +249,7 @@ where
     /// understate it. A caller acting on
     /// [`is_caught_up`](HandlerSnapshot::is_caught_up) therefore never acts
     /// on an optimistic reading.
-    #[tracing::instrument(name = "obix.handler_handle.load", skip_all, err)]
+    #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
     pub async fn load(&self) -> Result<HandlerSnapshot, HandlerCheckpointError> {
         let job = self.job.load().await?;
         let checkpoint = decode_checkpoint(&job)?;
@@ -283,7 +284,7 @@ where
     /// observed checkpoint, the sampled frontier and the elapsed wait — if
     /// the deadline passes first.
     #[tracing::instrument(
-        name = "obix.handler_handle.await_caught_up",
+        name = "obix.registered_handler.await_caught_up",
         skip_all,
         fields(timeout_ms = timeout.as_millis()),
         err
