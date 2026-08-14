@@ -1,3 +1,11 @@
+# [obix release v0.8.1](https://github.com/GaloyMoney/obix/releases/tag/0.8.1)
+
+
+
+### Features
+
+- Bump es-entity to 0.12.9 for re-entrant hook registration (#127)
+
 # [obix release v0.8.0](https://github.com/GaloyMoney/obix/releases/tag/0.8.0)
 
 
