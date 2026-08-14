@@ -36,12 +36,22 @@ where
     /// this commit hook is constructed (i.e. at the operation's first
     /// publish). Merged publishes keep the first snapshot.
     post_persist_hooks: PostPersistHooks<P>,
-    /// Set on the force-execute path (no commit hooks): `post_commit` never
-    /// runs, so the persist statement must carry the in-tx NOTIFY. Also
-    /// suppresses own-failure compensation — on that path the caller's
-    /// bare transaction is still open when `pre_commit` returns and its
-    /// fate is unknowable (it may savepoint-recover and commit), so those
-    /// sequences are the proof-gated backstop's responsibility.
+    /// Set on the force-execute path: `post_commit` never runs, so the
+    /// persist statement must carry the in-tx NOTIFY. Also suppresses
+    /// own-failure compensation — on that path the caller's bare transaction
+    /// is still open when `pre_commit` returns and its fate is unknowable
+    /// (it may savepoint-recover and commit), so those sequences are the
+    /// proof-gated backstop's responsibility.
+    ///
+    /// Narrower scope than the name once implied: with es-entity's
+    /// re-entrant hook registration, this only fires for an operation that
+    /// genuinely has no commit pass to join (a bare `sqlx::Transaction`).
+    /// A repost from inside another outbox's [`PostPersistHook`] no longer
+    /// takes this path — `add_commit_hook` now succeeds there, so the
+    /// repost joins the enclosing commit pass and gets the full
+    /// `post_commit`/`on_rollback` lifecycle instead.
+    ///
+    /// [`PostPersistHook`]: crate::out::PostPersistHook
     notify_in_tx: bool,
     _phantom: PhantomData<Tables>,
 }
@@ -72,7 +82,9 @@ where
         }
     }
 
-    /// Use the in-transaction NOTIFY persist variant (force-execute path).
+    /// Use the in-transaction NOTIFY persist variant — for the force-execute
+    /// path only (see the `notify_in_tx` field doc above for its narrowed
+    /// scope: genuinely hookless operations, not reposts).
     pub(crate) fn with_in_tx_notify(mut self) -> Self {
         self.notify_in_tx = true;
         self
