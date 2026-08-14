@@ -147,7 +147,12 @@ impl PostPersistHook<SourceEvent> for FailingHook {
 
 /// The repost consumer from the design doc: map source events into the
 /// destination outbox's payload type and publish them from inside the hook —
-/// same transaction, immediate-insert path.
+/// same transaction. `dest`'s own commit hook joins the tail of the *same*
+/// commit pass (es-entity's re-entrant hook registration) rather than
+/// inserting inline here: its persist and its own post-persist hooks run
+/// later, when the enclosing `execute_pre` loop reaches it — still before
+/// the single `COMMIT`, and still ordered ahead of anything registered
+/// after `source`'s hook.
 struct RepostHook {
     dest: Outbox<DestEvent, TestTables>,
 }
@@ -395,8 +400,11 @@ async fn repost_rolls_back_atomically() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A hook publishing into outbox B runs B's own post-persist hooks (force
-/// path) — chains compose.
+/// A hook publishing into outbox B runs B's own post-persist hooks — B's
+/// repost into C joins the tail of the same pass in turn, so a linear chain
+/// (A→B→C) still lands its hops in causal insertion order even though the
+/// enclosing `execute_pre` loop processes them breadth-first (by
+/// generation), not by recursing inline through each `on_persisted` call.
 #[tokio::test]
 #[file_serial]
 async fn chained_reposts_compose() -> anyhow::Result<()> {
@@ -423,6 +431,106 @@ async fn chained_reposts_compose() -> anyhow::Result<()> {
         ],
         "A→B→C: each hop persisted in the same tx, in causal order"
     );
+    Ok(())
+}
+
+/// The `on_rollback` tier reaches a repost that already joined the pass.
+/// `hop` — three hops deep — vetoes from its own post-persist hook, *after*
+/// `hop`'s own persist has already allocated its sequence: the whole
+/// transaction rolls back, including `source`'s and `dest`'s already-
+/// succeeded hooks earlier in the pass.
+///
+/// Before es-entity's re-entrant commit-hook registration
+/// (GaloyMoney/es-entity#200), `dest`'s repost always force-executed — a
+/// repost's `HookOperation` could never register further hooks, so
+/// `dest`'s hook never entered the `CommitHooks` bookkeeping at all.
+/// Neither `post_commit` nor `on_rollback` ever ran for it, and its burned
+/// sequence depended entirely on the slow, grace-gated backstop (2s
+/// default). Now that the repost joins the same commit pass as `source`,
+/// `dest`'s `PersistEvents` hook is tracked exactly like a directly-
+/// registered hook: its `on_rollback` fires once the deeper failure
+/// surfaces, and `dest`'s abandoned sequence is placeholder-filled
+/// reactively — in milliseconds, not seconds.
+#[tokio::test]
+#[file_serial]
+async fn repost_on_rollback_reaches_destination_reactively() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let source = init_outbox::<SourceEvent>(&pool, default_config()).await?;
+    let dest = Outbox::<DestEvent, TestTables>::init(&pool, default_config()).await?;
+    let hop = Outbox::<HopEvent, TestTables>::init(&pool, default_config()).await?;
+
+    source.add_post_persist_hook(RepostHook { dest: dest.clone() });
+    dest.add_post_persist_hook(HopHook { next: hop.clone() });
+
+    /// Vetoes after `hop`'s own persist already ran — the failure that must
+    /// unwind the whole chain, including the hops that already succeeded
+    /// earlier in the same pass.
+    struct VetoHopHook;
+
+    impl PostPersistHook<HopEvent> for VetoHopHook {
+        fn on_persisted<'a>(
+            &'a self,
+            _op: &'a mut HookOperation<'_>,
+            _events: &'a [PersistentOutboxEvent<HopEvent>],
+        ) -> BoxFuture<'a, Result<(), sqlx::Error>> {
+            Box::pin(async { Err(sqlx::Error::Protocol("hop veto".into())) })
+        }
+    }
+    hop.add_post_persist_hook(VetoHopHook);
+
+    let mut dest_listener = dest.listen_persisted(None);
+
+    let mut op = source.begin_op().await?;
+    source
+        .publish_persisted_in_op(&mut op, SourceEvent::Source(11))
+        .await?;
+    assert!(
+        op.commit().await.is_err(),
+        "hop's veto, three hops deep, must fail the whole commit"
+    );
+
+    // Reactive compensation must reach `dest` specifically: its
+    // `PersistEvents` hook's `pre_commit` had already succeeded (staged
+    // earlier in the same pass, its own persist done) by the time hop's
+    // veto surfaced deeper in the queue — so es-entity fires its
+    // `on_rollback`, not its own-failure branch.
+    //
+    // `dest_listener` sees every row on the shared physical table (comment
+    // at the top of this file), including source's and hop's own
+    // compensation — and each of source/dest/hop has its *own* `GapFiller`
+    // task (one per `Outbox::init`), so the three placeholders can land in
+    // any order. We must therefore identify dest's placeholder by its
+    // sequence, not just take the first payload-less event we see.
+    //
+    // Sequences are deterministic here: this test's fresh table (truncated
+    // + identity-restarted by the `init_outbox::<SourceEvent>` call above)
+    // sees exactly one publish, so source's own persist is sequence 1 and
+    // dest's repost — persisted next in the same pass, before hop's — is
+    // sequence 2, regardless of which GapFiller physically writes first.
+    const DEST_SEQUENCE: u64 = 2;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let dest_gap_event = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("dest's compensation placeholder did not arrive reactively");
+        }
+        let event = tokio::time::timeout(remaining, dest_listener.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("dest's compensation placeholder did not arrive reactively")
+            })?
+            .expect("stream open")?;
+        if u64::from(event.sequence) == DEST_SEQUENCE {
+            break event;
+        }
+        // Not dest's row (source's or hop's own compensation, arrived
+        // first from their own independent GapFiller) — keep waiting.
+    };
+    assert!(
+        dest_gap_event.payload.is_none(),
+        "dest's abandoned sequence must resolve as a placeholder, not a real Mapped event"
+    );
+
     Ok(())
 }
 
@@ -523,10 +631,21 @@ async fn late_registration_affects_only_subsequent_ops() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// With es-entity ≥ 0.11.7 commit hooks run in registration order, so the
-/// relative order of destination-native vs reposted events follows the order
-/// of each outbox's first publish in the op — deterministically, in both
-/// directions.
+/// Commit hooks run in registration order (es-entity ≥ 0.11.7) — but a
+/// repost's destination hook shares its `TypeId` with any hook the
+/// destination's own direct publishes already registered on the same op,
+/// so es-entity's ordinary same-op merge rule applies: the merge keeps the
+/// **earliest still-pending** registration's queue position and appends
+/// later contributions to its event list in the order they fold in. When
+/// `dest` published nothing of its own before the repost lands, the
+/// repost's hook is fresh — it runs at its own (later) position, after
+/// `source`. But when `dest` already published directly on the same op
+/// *before* `source`'s hook ran, the repost merges INTO that still-pending
+/// hook (es-entity's re-entrant registration folds into the tail of the
+/// pass — see [`PostPersistHook`]'s contract docs) — so the merged hook
+/// still runs at `dest`'s earlier position, and physically inserts `dest`'s
+/// own events before the freshly-appended reposted ones, regardless of
+/// which outbox's `publish_*_in_op` call came first in program order.
 #[tokio::test]
 #[file_serial]
 async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {
@@ -536,7 +655,9 @@ async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {
 
     source.add_post_persist_hook(RepostHook { dest: dest.clone() });
 
-    // Dest-native publish first → its commit hook registers (and runs) first.
+    // Dest-native publish first → dest's hook is already-executed by the
+    // time the repost is staged, so the repost gets a fresh (later)
+    // instance instead of merging — its position follows program order.
     let mut op = source.begin_op().await?;
     dest.publish_persisted_in_op(&mut op, DestEvent::Native(1))
         .await?;
@@ -555,7 +676,11 @@ async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {
         "dest-native published first ⇒ dest-native sequences < reposted"
     );
 
-    // Inverted: source publish first → reposted events precede dest-native.
+    // Inverted: source publish first → `dest`'s direct publish is still
+    // PENDING (not yet executed) when `source`'s hook stages the repost, so
+    // the repost merges into it and inherits dest's earlier queue position.
+    // The merged batch still inserts dest's own event before the appended
+    // repost — Native precedes Mapped despite `source` publishing first.
     let mut op = source.begin_op().await?;
     source
         .publish_persisted_in_op(&mut op, SourceEvent::Source(4))
@@ -568,17 +693,18 @@ async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {
         payloads_by_sequence(&pool).await?[3..],
         [
             serde_json::json!({"Source": 4}),
-            serde_json::json!({"Mapped": 4}),
             serde_json::json!({"Native": 5}),
+            serde_json::json!({"Mapped": 4}),
         ],
-        "source published first ⇒ reposted sequences < dest-native"
+        "source published first, but dest's still-pending direct publish \
+         absorbs the repost at dest's own queue position"
     );
     Ok(())
 }
 
-/// The immediate-insert path drops the destination's in-process broadcast
-/// hook, so delivery to destination listeners is healed by pg NOTIFY (fires
-/// at commit) and the poller/gap-fill — reposted events must still arrive.
+/// A repost's destination hook now joins the same commit pass as the
+/// source, so its own `post_commit` runs — feeding the in-process broadcast
+/// directly, not just healing via pg NOTIFY and the poller/gap-fill.
 #[tokio::test]
 #[file_serial]
 async fn reposted_events_reach_destination_listener() -> anyhow::Result<()> {
@@ -596,7 +722,14 @@ async fn reposted_events_reach_destination_listener() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    let deadline = std::time::Duration::from_secs(5);
+    // `dest`'s repost joins the same commit pass as `source` (the op
+    // supports commit hooks), so `dest`'s own `PersistEvents::post_commit`
+    // now runs — feeding its in-process broadcast directly, not just the
+    // debounced NOTIFY fallback. A tight bound (well under the crate's 2s
+    // gap-fill grace) is a meaningful regression signal: before es-entity's
+    // re-entrant hook registration, `dest`'s hook always force-executed and
+    // never fed the broadcast at all.
+    let deadline = std::time::Duration::from_secs(2);
     let received = tokio::time::timeout(deadline, async {
         while let Some(Ok(event)) = listener.next().await {
             if event.payload == Some(DestEvent::Mapped(9)) {
@@ -609,8 +742,7 @@ async fn reposted_events_reach_destination_listener() -> anyhow::Result<()> {
     .unwrap_or(false);
     assert!(
         received,
-        "reposted event must reach a destination listener via NOTIFY/gap-fill \
-         despite the dropped in-process broadcast"
+        "reposted event must reach a destination listener via in-process forwarding"
     );
     Ok(())
 }
