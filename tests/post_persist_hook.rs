@@ -493,19 +493,41 @@ async fn repost_on_rollback_reaches_destination_reactively() -> anyhow::Result<(
     // `PersistEvents` hook's `pre_commit` had already succeeded (staged
     // earlier in the same pass, its own persist done) by the time hop's
     // veto surfaced deeper in the queue — so es-entity fires its
-    // `on_rollback`, not its own-failure branch. Bound well under the 2s
-    // gap-fill grace so a regression back to the pre-#200 force-execute
-    // path (no `on_rollback` at all) fails this test rather than just
-    // running slow.
-    let gap_event =
-        tokio::time::timeout(std::time::Duration::from_millis(1500), dest_listener.next())
+    // `on_rollback`, not its own-failure branch.
+    //
+    // `dest_listener` sees every row on the shared physical table (comment
+    // at the top of this file), including source's and hop's own
+    // compensation — and each of source/dest/hop has its *own* `GapFiller`
+    // task (one per `Outbox::init`), so the three placeholders can land in
+    // any order. We must therefore identify dest's placeholder by its
+    // sequence, not just take the first payload-less event we see.
+    //
+    // Sequences are deterministic here: this test's fresh table (truncated
+    // + identity-restarted by the `init_outbox::<SourceEvent>` call above)
+    // sees exactly one publish, so source's own persist is sequence 1 and
+    // dest's repost — persisted next in the same pass, before hop's — is
+    // sequence 2, regardless of which GapFiller physically writes first.
+    const DEST_SEQUENCE: u64 = 2;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let dest_gap_event = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("dest's compensation placeholder did not arrive reactively");
+        }
+        let event = tokio::time::timeout(remaining, dest_listener.next())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("dest's compensation placeholder did not arrive reactively")
             })?
             .expect("stream open")?;
+        if u64::from(event.sequence) == DEST_SEQUENCE {
+            break event;
+        }
+        // Not dest's row (source's or hop's own compensation, arrived
+        // first from their own independent GapFiller) — keep waiting.
+    };
     assert!(
-        gap_event.payload.is_none(),
+        dest_gap_event.payload.is_none(),
         "dest's abandoned sequence must resolve as a placeholder, not a real Mapped event"
     );
 
