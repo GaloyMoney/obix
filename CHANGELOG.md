@@ -1,3 +1,11 @@
+# [obix release v0.8.3](https://github.com/GaloyMoney/obix/releases/tag/0.8.3)
+
+
+
+### Features
+
+- Persist_after cross-outbox persist ordering (#129)
+
 # [obix release v0.8.2](https://github.com/GaloyMoney/obix/releases/tag/0.8.2)
 
 
