@@ -1,3 +1,11 @@
+# [obix release v0.8.2](https://github.com/GaloyMoney/obix/releases/tag/0.8.2)
+
+
+
+### Performance
+
+- Stop the catch-up read fetching past the gap it is blocked on (#128)
+
 # [obix release v0.8.1](https://github.com/GaloyMoney/obix/releases/tag/0.8.1)
 
 
