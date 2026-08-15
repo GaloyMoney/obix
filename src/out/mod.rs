@@ -17,6 +17,7 @@ mod registered_handler;
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
@@ -60,6 +61,11 @@ where
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
     /// single `Arc` clone.
     post_persist_hooks: Arc<std::sync::RwLock<post_persist_hook::PostPersistHooks<P>>>,
+    /// TypeIds of upstream outboxes' `PersistEvents` hooks that this
+    /// outbox's persist hook must run after within a shared commit pass.
+    /// Copy-on-write; snapshotted into each constructed hook at publish,
+    /// like `post_persist_hooks`.
+    persist_after: Arc<std::sync::RwLock<Arc<[TypeId]>>>,
 }
 
 impl<P, Tables> std::fmt::Debug for Outbox<P, Tables>
@@ -93,6 +99,7 @@ where
             gap_filler: self.gap_filler.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
+            persist_after: self.persist_after.clone(),
         }
     }
 }
@@ -155,6 +162,7 @@ where
             gap_filler,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
+            persist_after: Arc::new(std::sync::RwLock::new(Vec::new().into())),
         })
     }
 
@@ -175,6 +183,43 @@ where
         let mut rebuilt: Vec<Arc<dyn PostPersistHook<P>>> = hooks.iter().cloned().collect();
         rebuilt.push(Arc::new(hook));
         *hooks = rebuilt.into();
+    }
+
+    /// Declare that this outbox's persist commit hook must run after
+    /// `upstream`'s whenever both are registered on the same operation.
+    ///
+    /// Use when a [`PostPersistHook`] on `upstream` republishes into this
+    /// outbox: with the ordering declared, the repost merges into this
+    /// outbox's still-pending commit hook — one INSERT batch, one notify —
+    /// instead of appending a fresh re-entrant generation whenever this
+    /// outbox happened to publish earlier in the operation. Without a
+    /// shared operation, or when `upstream` never publishes in it, this
+    /// declaration has no effect.
+    ///
+    /// `upstream` is used only to name its concrete hook type; nothing is
+    /// stored from it. Call at startup next to the hook registration —
+    /// snapshot-at-publish semantics, same as
+    /// [`add_post_persist_hook`](Self::add_post_persist_hook). Idempotent.
+    ///
+    /// Declaring a cycle (A after B and B after A, directly or
+    /// transitively) is an error caught at commit time: a pass containing
+    /// the cycle fails loudly with a protocol error and rolls back.
+    pub fn persist_after<P2, Tables2>(&self, _upstream: &Outbox<P2, Tables2>)
+    where
+        P2: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables2: MailboxTables,
+    {
+        let dep = TypeId::of::<persist_events_hook::PersistEvents<P2, Tables2>>();
+        let mut deps = self
+            .persist_after
+            .write()
+            .expect("persist_after lock poisoned");
+        if deps.contains(&dep) {
+            return;
+        }
+        let mut rebuilt: Vec<TypeId> = deps.iter().copied().collect();
+        rebuilt.push(dep);
+        *deps = rebuilt.into();
     }
 
     pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
@@ -199,6 +244,11 @@ where
             .read()
             .expect("post_persist_hooks lock poisoned")
             .clone();
+        let persist_after = self
+            .persist_after
+            .read()
+            .expect("persist_after lock poisoned")
+            .clone();
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
             self.notifier.report_sender(),
@@ -206,6 +256,7 @@ where
             events,
             self.persist_events_batch_size,
             post_persist_hooks,
+            persist_after,
         );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
