@@ -1,5 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
+use tracing::Instrument;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -101,7 +102,10 @@ impl GapFiller {
             notifier_tx,
             grace: config.gap_fill_grace,
             batch_limit: config.gap_fill_batch_limit,
-            page_size: config.event_cache_size,
+            // An episode's window is one page read's reach. Not the batch
+            // limit: a window wider than that cap is what lets a multi-batch
+            // fill run at the loop cadence on one grace period.
+            page_size: config.backfill_page_size.max(1),
             stall: None,
             historical: BTreeSet::new(),
             historical_marker: None,
@@ -367,8 +371,19 @@ where
         let from = stall.from;
         let fill_up_to = u64::from(head).min(from + self.page_size as u64);
 
+        // One span per episode tick; `rows` against `missing` says whether
+        // the tick closed the window or is still waiting on a sequence.
+        let page_span = tracing::info_span!(
+            "obix.gap_filler.stall_page",
+            from = from,
+            limit = self.page_size,
+            fill_up_to = fill_up_to,
+            rows = tracing::field::Empty,
+            missing = tracing::field::Empty,
+        );
         let events =
             match Tables::load_next_page::<P>(&pool, EventSequence::from(from), self.page_size)
+                .instrument(page_span.clone())
                 .await
             {
                 Ok(events) => events,
@@ -377,6 +392,7 @@ where
                     return Vec::new();
                 }
             };
+        page_span.record("rows", events.len());
         let mut present = std::collections::HashSet::new();
         for item in events {
             let delivery = PersistentDelivery::from(item);
@@ -389,6 +405,7 @@ where
             .take(self.batch_limit)
             .map(EventSequence::from)
             .collect();
+        page_span.record("missing", missing.len());
         if missing.is_empty() {
             // The window is complete: the re-read just delivered whatever
             // the cursor was missing, so resolution is in hand. A stall

@@ -189,6 +189,66 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // The contiguous run above `$1`, cut at the first gap. `win` finds the
+        // cut index-only: in a contiguous run `sequence = $1 + rn` exactly, so
+        // the first row failing that is the first gap.
+        //
+        // The cut MUST stay a scalar subquery. As an InitPlan it is evaluated
+        // once and usable as an index bound, so the payload scan stops at the
+        // gap; written as a joined CTE (`FROM t e, stop WHERE ...`) the planner
+        // demotes it to a Join Filter and walks the whole tail of the table —
+        // 5,327 buffers / 24.6 ms against 43 / 0.3 ms here. The redundant
+        // `sequence <= $1 + $2` bounds the scan and prunes partitions
+        // independently of the InitPlan. Re-check the plan (including the
+        // generic one) if you touch this.
+        let load_next_contiguous_page_query = format!(
+            r#"
+            WITH win AS (
+                SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence) AS rn
+                FROM {tbl}persistent_outbox_events
+                WHERE sequence > $1
+                  AND sequence <= $1 + $2
+            )
+            SELECT e.sequence AS "sequence!: i64", e.id AS "id!", e.payload,
+                   e.tracing_context, e.recorded_at AS "recorded_at!"
+            FROM {tbl}persistent_outbox_events e
+            WHERE e.sequence > $1
+              AND e.sequence <= $1 + $2
+              AND e.sequence < (
+                  SELECT COALESCE(MIN(sequence), $1 + $2 + 1)
+                  FROM win
+                  WHERE sequence <> $1 + rn
+              )
+            ORDER BY e.sequence ASC"#,
+            tbl = table_prefix,
+        );
+
+        // Single index probe for a parked reader: has the sequence it is
+        // blocked on landed yet?
+        let sequence_present_query = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM {tbl}persistent_outbox_events WHERE sequence = $1
+            ) AS "present!""#,
+            tbl = table_prefix,
+        );
+
+        // The holes in `(after, up_to]`, without fetching payloads.
+        //
+        // Must stay `EXCEPT`, not `WHERE NOT EXISTS (...)`: the anti-join form
+        // plans as a Nested Loop Anti Join paying an index probe per generated
+        // sequence — 4,501 buffers on a 1,500-wide range against 8 here.
+        let missing_sequences_query = format!(
+            r#"
+            SELECT g AS "sequence!: i64"
+            FROM generate_series($1::bigint + 1, $2::bigint) g
+            EXCEPT
+            SELECT sequence FROM {tbl}persistent_outbox_events
+            WHERE sequence > $1 AND sequence <= $2
+            ORDER BY 1"#,
+            tbl = table_prefix,
+        );
+
         let load_events_in_range_query = format!(
             r#"
             SELECT id, sequence, payload, tracing_context, recorded_at
@@ -527,6 +587,78 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
                         Ok(events)
+                    }
+                }
+
+                fn load_next_contiguous_page<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    from_sequence: #crate_name::EventSequence,
+                    buffer_size: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_next_contiguous_page_query,
+                            from_sequence as #crate_name::EventSequence,
+                            buffer_size as i64,
+                        ).fetch_all(&pool).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                #deserialize_context
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                )
+                            })
+                            .collect();
+                        Ok(events)
+                    }
+                }
+
+                fn sequence_present(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(
+                            #sequence_present_query,
+                            sequence as #crate_name::EventSequence,
+                        ).fetch_one(&pool).await?;
+                        Ok(row.present)
+                    }
+                }
+
+                fn missing_sequences(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after_sequence: #crate_name::EventSequence,
+                    up_to_sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #missing_sequences_query,
+                            after_sequence as #crate_name::EventSequence,
+                            up_to_sequence as #crate_name::EventSequence,
+                        ).fetch_all(&pool).await?;
+
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::EventSequence::from(row.sequence as u64))
+                            .collect())
                     }
                 }
 

@@ -28,24 +28,15 @@ pub(crate) type PostPersistHooks<P> = Arc<[Arc<dyn PostPersistHook<P>>]>;
 ///   see [`MailboxConfig::persist_events_batch_size`](crate::MailboxConfig)).
 ///   Implementations must not assume they see an operation's events in one
 ///   call.
-/// - A hook CAN publish to another outbox — `on_persisted` runs from inside
-///   a real commit pass, so the [`HookOperation`] it is handed supports
-///   registering further commit hooks: the repost's own `PersistEvents` hook
-///   joins the **tail of this same pass** rather than executing immediately.
-///   The destination outbox therefore gets its full lifecycle — its own
-///   `pre_commit`, `post_commit` (in-process broadcast, debounced `NOTIFY`)
-///   and `on_rollback` (reactive gap-fill) — atomically, in the same
-///   transaction. `Outbox::publish_all_persisted` needs no special-casing
-///   for this: it always tries to register a commit hook first, only
-///   falling back to an immediate in-transaction write (which skips
-///   `post_commit`/`on_rollback`) when the underlying operation genuinely
-///   has no commit pass to join (e.g. a bare `sqlx::Transaction` at the root
-///   of the chain). Chains (A→B→C) compose; a cycle (A→B→A) is bounded by
+/// - A hook CAN publish to another outbox. `on_persisted` runs from inside a
+///   real commit pass, so the [`HookOperation`] it is handed can register
+///   further commit hooks: the repost's own `PersistEvents` joins the **tail
+///   of this same pass**, giving the destination outbox its full lifecycle
+///   (`pre_commit`, `post_commit`, `on_rollback`) atomically in the same
+///   transaction. Chains (A→B→C) compose; a cycle (A→B→A) is bounded by
 ///   es-entity's [`MAX_HOOK_GENERATIONS`](es_entity::hooks::MAX_HOOK_GENERATIONS)
-///   (8) and fails the commit loudly instead of recursing unboundedly —
-///   still the implementor's responsibility to avoid, just a safely-caught
-///   mistake now rather than a stack overflow. See [`es_entity::hooks`] for
-///   the full re-entrant registration contract.
+///   (8) and fails the commit loudly — still the implementor's job to avoid.
+///   See [`es_entity::hooks`] for the re-entrant registration contract.
 /// - Fires on every persist path, including publishes on operations without
 ///   commit-hook support at all (e.g. a bare `sqlx::Transaction`), where
 ///   events are inserted immediately — the hook then fires during the

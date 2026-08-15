@@ -1,6 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
+use tracing::Instrument;
 
 use std::sync::{
     Arc,
@@ -125,7 +126,7 @@ where
             highest_known_sequence,
             backfill_request_send: backfill_send,
             persistent_event_sender,
-            backfill_buffer_size: config.event_buffer_size,
+            backfill_buffer_size: config.backfill_page_size.max(1),
             cache_fill_sender: cache_fill_send,
             _cache_loop_handle: cache_loop_handle,
             _phantom: std::marker::PhantomData,
@@ -196,9 +197,12 @@ where
     /// resolved: woken by that exact sequence arriving on the cache-fill
     /// stream (every resolution path lands there — in-process post-commit
     /// broadcast, notification fetch, the GapFiller's placeholders and
-    /// compensations), or by the retry interval elapsing as the
-    /// lost-signal backstop. The caller re-reads the page either way; the
-    /// wake-up is a hint, never trusted as data.
+    /// compensations), or, once the retry interval elapses, by an
+    /// authoritative index probe as the lost-signal backstop. The wake-up
+    /// is a hint, never trusted as data; the probe is the one that decides,
+    /// which keeps a park behind a slow or abandoned sequence costing one
+    /// index lookup per interval. A failed probe returns rather than
+    /// retries — the caller's re-read has its own backoff.
     ///
     /// Takes a receiver the caller subscribed **before** the page read
     /// that discovered the gap (and thus before any fill request it sent):
@@ -207,18 +211,32 @@ where
     /// the gap between request and park — anything resolved before the
     /// subscription is instead visible to the page read itself.
     async fn park_until_resolved(
+        pool: &sqlx::PgPool,
         mut wakeup: broadcast::Receiver<PersistentDelivery<P>>,
         needed: EventSequence,
     ) {
-        let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
         loop {
-            match tokio::time::timeout_at(deadline, wakeup.recv()).await {
-                Ok(Ok(delivery)) if delivery.sequence() == needed => return,
-                Ok(Ok(_)) => {}
-                // Lagged or closed: no reliable signal left — re-read.
-                Ok(Err(_)) => return,
-                // Interval elapsed: re-read regardless.
-                Err(_) => return,
+            let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
+            loop {
+                match tokio::time::timeout_at(deadline, wakeup.recv()).await {
+                    Ok(Ok(delivery)) if delivery.sequence() == needed => return,
+                    Ok(Ok(_)) => {}
+                    // Dropped wake-ups are still only hints: re-subscribe at
+                    // the tail, then let the probe decide. A resolution
+                    // inside the lost window is visible to the probe, one
+                    // after it to the fresh receiver.
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        wakeup = wakeup.resubscribe();
+                        break;
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                    Err(_) => break,
+                }
+            }
+            match Tables::sequence_present(pool, needed).await {
+                Ok(false) => continue,
+                // Landed, or the probe failed — the caller re-reads and decides.
+                Ok(true) | Err(_) => return,
             }
         }
     }
@@ -252,7 +270,7 @@ where
         cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
-        buffer_size: usize,
+        page_size: usize,
         init_head: u64,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) {
@@ -278,17 +296,36 @@ where
                 continue;
             }
 
-            // Authoritative page read — with the park's wake-up receiver
-            // subscribed FIRST: any resolution landing after this point is
-            // buffered for the park below, and anything resolved before it
-            // is visible to the read itself. Subscribing later (inside the
-            // park) would let a resolving delivery — in particular the
-            // GapFiller's response to the Historical request sent below —
-            // slip into the unobserved window and cost the full retry
-            // interval.
+            // Don't spend a query without demand: a listener that has stopped
+            // polling parks the reader here rather than materialising a page
+            // nobody will take. A gate only, never a size (see
+            // `backfill_page_size`); dropping the permit returns the slot.
+            match sender.reserve().await {
+                Ok(permit) => drop(permit),
+                Err(_) => return,
+            }
+
+            // Subscribe before the page read (and the Historical request
+            // below) so no resolution falls between them, but after the
+            // demand gate — `reserve` blocks as long as the consumer takes,
+            // and a receiver held across that wait enters the park lagged.
             let wakeup = cache_fill_sender.subscribe();
+
             let select_from = current_sequence;
-            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size).await {
+            // One span per page read — the only place this path's cost is
+            // observable. `rows` against `delivered` separates genuine
+            // catch-up from a read that advanced almost nothing.
+            let page_span = tracing::info_span!(
+                "obix.persistent_cache.backfill_page",
+                from_sequence = u64::from(select_from),
+                limit = page_size,
+                rows = tracing::field::Empty,
+                delivered = tracing::field::Empty,
+            );
+            let events = match Tables::load_next_contiguous_page::<P>(&pool, select_from, page_size)
+                .instrument(page_span.clone())
+                .await
+            {
                 Ok(events) => events,
                 Err(e) => {
                     record_backfill_failed(&e, u64::from(current_sequence));
@@ -297,29 +334,26 @@ where
                 }
             };
             let returned = events.len();
-            let mut present = std::collections::HashSet::with_capacity(returned);
-            let mut page = Vec::with_capacity(returned);
+            page_span.record("rows", returned);
+
+            // The read is cut at the first gap, so every returned row is
+            // deliverable. The ordering check enforces that contract against
+            // whatever a `MailboxTables` implementation hands back.
+            let mut delivered = 0;
             for item in events {
                 let delivery = PersistentDelivery::from(item);
-                present.insert(u64::from(delivery.sequence()));
-                page.push(delivery);
-            }
-
-            // Deliver the contiguous prefix; anything above a gap is left
-            // for a later read so delivery stays ordered and gap-free.
-            let mut delivered = 0;
-            for delivery in &page {
                 if delivery.sequence() != current_sequence.next() {
                     break;
                 }
                 let _ = cache_fill_sender.send(delivery.clone());
-                if sender.send(delivery.clone()).await.is_err() {
+                if sender.send(delivery).await.is_err() {
                     return;
                 }
-                current_sequence = delivery.sequence();
+                current_sequence = current_sequence.next();
                 delivered += 1;
             }
-            if delivered == returned && returned == buffer_size {
+            page_span.record("delivered", delivered);
+            if delivered == returned && returned == page_size {
                 // Full contiguous page — more may follow immediately.
                 continue;
             }
@@ -336,14 +370,24 @@ where
             // on the cache-fill stream, then re-read.
             let next_needed = u64::from(current_sequence.next());
             if next_needed <= init_head {
-                let fill_to = init_head.min(u64::from(select_from) + buffer_size as u64);
-                let missing = (next_needed..=fill_to)
-                    .filter(|sequence| !present.contains(sequence))
-                    .map(EventSequence::from)
-                    .collect::<Vec<_>>();
-                let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
+                let fill_to = init_head.min(u64::from(select_from) + page_size as u64);
+                if next_needed <= fill_to {
+                    match Tables::missing_sequences(
+                        &pool,
+                        current_sequence,
+                        EventSequence::from(fill_to),
+                    )
+                    .await
+                    {
+                        Ok(missing) if !missing.is_empty() => {
+                            let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
+                        }
+                        Ok(_) => {}
+                        Err(e) => record_backfill_failed(&e, next_needed),
+                    }
+                }
             }
-            Self::park_until_resolved(wakeup, current_sequence.next()).await;
+            Self::park_until_resolved(&pool, wakeup, current_sequence.next()).await;
         }
 
         for (_, event) in
@@ -437,6 +481,7 @@ where
         let pool = pool.clone();
 
         let cache_size = config.event_cache_size;
+        let backfill_page_size = config.backfill_page_size.max(1);
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let idle_resync_interval = config.idle_resync_interval;
@@ -477,7 +522,7 @@ where
                                     cache_snapshot,
                                     cache_fill_sender.clone(),
                                     highest,
-                                    cache_size,
+                                    backfill_page_size,
                                     init_head,
                                     gap_fill_tx.clone(),
                                 ));

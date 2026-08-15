@@ -18,12 +18,35 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 /// can never collide with a live writer regardless of this setting.
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Ceiling on the rows a single backfill page read may return, and the width
+/// of a gap-fill stall episode's window (an episode's re-read is a page read,
+/// so one episode covers what one page read can see).
+///
+/// A query-shape knob, distinct from `event_cache_size` (how far behind a
+/// listener may fall and still be served from memory) and `event_buffer_size`
+/// (how much may be in flight): this bounds how long a catch-up read holds a
+/// pooled connection and how large a result set it materialises. Keep it well
+/// under `event_cache_size`, so a listener that consumes a page lands back
+/// inside the memory window instead of paging forever.
+///
+/// It is also the depth of the channel a backfill delivers through, so it
+/// bounds how far the reader may run ahead of its consumer — one page in
+/// flight while the next is fetched. Sizing that channel by `event_buffer_size`
+/// instead would let the reader outrun a slow consumer by a whole second
+/// buffer's worth of events, all of it read from the database and then evicted.
+pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
+
 /// Maximum number of placeholder rows a single gap-fill query may insert.
 /// Bounds the worst case (a mass rollback or long outage leaving thousands
 /// of lost sequences) to a small, predictable statement instead of one
 /// giant insert; the fixed 1s retry cadence picks up the remainder, so a
 /// cap delays recovery of a pathological backlog without ever losing
 /// sequences.
+///
+/// This caps one *insert*, not an episode: the episode window is the
+/// [`backfill page`](DEFAULT_BACKFILL_PAGE_SIZE), so a gap wider than this cap
+/// fills across several passes of one episode — one grace period, one marker,
+/// batches at the loop cadence.
 pub const DEFAULT_GAP_FILL_BATCH_LIMIT: usize = 1000;
 
 /// How long the per-process notifier coalesces committed-batch reports
@@ -81,6 +104,11 @@ pub struct MailboxConfig {
     pub event_cache_trim_percent: u8,
     #[builder(default = "DEFAULT_PERSIST_EVENTS_BATCH_SIZE")]
     pub persist_events_batch_size: usize,
+    /// Rows a single backfill page read may return; see
+    /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. The reader waits for the consumer to
+    /// have room before issuing a read, but the read itself is this size.
+    #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
+    pub backfill_page_size: usize,
     /// Grace period before the first proactive gap-fill attempt for a
     /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
     /// after a fill attempt are unaffected (fixed 1s interval).

@@ -158,6 +158,42 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// Load the **contiguous** committed run in `(from_sequence,
+    /// from_sequence + buffer_size]` — the same window as
+    /// [`load_next_page`](Self::load_next_page), cut at the first gap. The cut
+    /// is found index-only, so a window blocked at its first sequence returns
+    /// an empty page without touching the heap.
+    ///
+    /// For callers delivering in sequence order, where everything past the
+    /// first hole is unusable anyway. This deliberately cannot distinguish
+    /// "the window has a hole" from "the window ended" — the caller resolves
+    /// that against its own frontier, or asks
+    /// [`missing_sequences`](Self::missing_sequences).
+    fn load_next_contiguous_page<P>(
+        pool: &sqlx::PgPool,
+        from_sequence: EventSequence,
+        buffer_size: usize,
+    ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// Whether `sequence` has a committed row — a real event or a
+    /// placeholder. One index probe, no payload: the per-interval re-check
+    /// for a reader parked on a gap.
+    fn sequence_present(
+        pool: &sqlx::PgPool,
+        sequence: EventSequence,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
+
+    /// The sequences in `(after_sequence, up_to_sequence]` with no committed
+    /// row, as an index-only anti-join — no payloads fetched. For callers
+    /// that must report holes rather than consume events.
+    fn missing_sequences(
+        pool: &sqlx::PgPool,
+        after_sequence: EventSequence,
+        up_to_sequence: EventSequence,
+    ) -> impl Future<Output = Result<Vec<EventSequence>, sqlx::Error>> + Send;
+
     /// Insert placeholder rows (`payload: NULL`) for the given sequences
     /// with `ON CONFLICT (sequence) DO NOTHING`, returning only the rows
     /// actually inserted. Sequences that already have a committed row —
