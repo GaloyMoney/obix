@@ -37,6 +37,14 @@ pub(crate) type PostPersistHooks<P> = Arc<[Arc<dyn PostPersistHook<P>>]>;
 ///   es-entity's [`MAX_HOOK_GENERATIONS`](es_entity::hooks::MAX_HOOK_GENERATIONS)
 ///   (8) and fails the commit loudly — still the implementor's job to avoid.
 ///   See [`es_entity::hooks`] for the re-entrant registration contract.
+///   Whether the repost merges into the destination's still-pending commit
+///   hook or appends a fresh generation depends on registration order,
+///   which is otherwise an accident of application call order — declare
+///   [`Outbox::persist_after`](super::Outbox::persist_after) on the
+///   destination to pin it: the destination's persist hook then always
+///   defers behind the source's while the source is still pending, so the
+///   repost merges into one INSERT batch, one notify, one broadcast,
+///   regardless of which outbox published first in program order.
 /// - Fires on every persist path, including publishes on operations without
 ///   commit-hook support at all (e.g. a bare `sqlx::Transaction`), where
 ///   events are inserted immediately — the hook then fires during the

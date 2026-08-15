@@ -1,4 +1,6 @@
+use std::any::TypeId;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
@@ -51,6 +53,11 @@ where
     ///
     /// [`PostPersistHook`]: crate::out::PostPersistHook
     notify_in_tx: bool,
+    /// Snapshot of the outbox's declared upstream hook types
+    /// (`Outbox::persist_after`) at construction. Merged publishes keep the
+    /// first snapshot — identical by construction, since all instances of
+    /// this concrete type come from the same outbox.
+    runs_after: Arc<[TypeId]>,
     _phantom: PhantomData<Tables>,
 }
 
@@ -66,6 +73,7 @@ where
         events: impl IntoIterator<Item = impl Into<P>>,
         batch_size: usize,
         post_persist_hooks: PostPersistHooks<P>,
+        runs_after: Arc<[TypeId]>,
     ) -> Self {
         Self {
             sender,
@@ -76,6 +84,7 @@ where
             batch_size,
             post_persist_hooks,
             notify_in_tx: false,
+            runs_after,
             _phantom: PhantomData,
         }
     }
@@ -217,5 +226,9 @@ where
     fn merge(&mut self, other: &mut Self) -> bool {
         self.pre_commit_events.append(&mut other.pre_commit_events);
         true
+    }
+
+    fn runs_after(&self) -> &[TypeId] {
+        &self.runs_after
     }
 }

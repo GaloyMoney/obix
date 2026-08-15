@@ -690,6 +690,166 @@ async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Records each invocation's persisted payloads for `DestEvent` — used to
+/// prove `Outbox::persist_after` merges a deferred repost into a single
+/// dest batch instead of the two-invocation behavior
+/// `ordering_follows_first_publish_order` documents without the ordering
+/// declared.
+struct DestRecordingHook {
+    invocations: Arc<Mutex<Vec<Vec<DestEvent>>>>,
+}
+
+impl PostPersistHook<DestEvent> for DestRecordingHook {
+    fn on_persisted<'a>(
+        &'a self,
+        _op: &'a mut HookOperation<'_>,
+        events: &'a [PersistentOutboxEvent<DestEvent>],
+    ) -> BoxFuture<'a, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            self.invocations.lock().unwrap().push(
+                events
+                    .iter()
+                    .map(|e| e.payload.clone().expect("payload present"))
+                    .collect(),
+            );
+            Ok(())
+        })
+    }
+}
+
+/// `Outbox::persist_after` fixes the *cost* (not the correctness) of the
+/// unlucky registration order `ordering_follows_first_publish_order`
+/// documents: with `dest.persist_after(&source)` declared, `dest`'s persist
+/// hook defers behind `source`'s while `source` is still pending, so it is
+/// never already-executed by the time the repost stages — the repost always
+/// merges into `dest`'s single still-pending hook, regardless of which
+/// outbox published first in program order.
+#[tokio::test]
+#[file_serial]
+async fn persist_after_merges_repost_into_single_dest_batch() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let source = init_outbox::<SourceEvent>(&pool, default_config()).await?;
+    let dest = Outbox::<DestEvent, TestTables>::init(&pool, default_config()).await?;
+
+    dest.persist_after(&source);
+    source.add_post_persist_hook(RepostHook { dest: dest.clone() });
+
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    dest.add_post_persist_hook(DestRecordingHook {
+        invocations: invocations.clone(),
+    });
+
+    let mut listener = dest.listen_persisted(None);
+
+    // Dest-native publish FIRST — the unlucky order that, without
+    // `persist_after`, leaves dest's hook already-executed by the time the
+    // repost stages (see `ordering_follows_first_publish_order`).
+    let mut op = source.begin_op().await?;
+    dest.publish_persisted_in_op(&mut op, DestEvent::Native(1))
+        .await?;
+    source
+        .publish_persisted_in_op(&mut op, SourceEvent::Source(7))
+        .await?;
+    op.commit().await?;
+
+    {
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(
+            invocations.len(),
+            1,
+            "dest's hook deferred behind source, so the repost merges into \
+             the same still-pending instance instead of appending a fresh \
+             generation"
+        );
+        assert_eq!(
+            invocations[0],
+            [DestEvent::Native(1), DestEvent::Mapped(7)],
+            "dest's own event precedes the merged repost"
+        );
+    }
+
+    // Still joins the same commit pass — reaches a destination listener via
+    // in-process forwarding, not just the debounced NOTIFY fallback.
+    let deadline = std::time::Duration::from_secs(2);
+    let received = tokio::time::timeout(deadline, async {
+        while let Some(Ok(event)) = listener.next().await {
+            if event.payload == Some(DestEvent::Mapped(7)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        received,
+        "merged repost still reaches a destination listener"
+    );
+
+    Ok(())
+}
+
+/// Declaring `persist_after` an upstream that never publishes on the op is
+/// vacuous — `dest` commits normally, single invocation, event delivered.
+#[tokio::test]
+#[file_serial]
+async fn persist_after_vacuous_when_upstream_never_publishes() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let source = init_outbox::<SourceEvent>(&pool, default_config()).await?;
+    let dest = Outbox::<DestEvent, TestTables>::init(&pool, default_config()).await?;
+
+    dest.persist_after(&source);
+
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    dest.add_post_persist_hook(DestRecordingHook {
+        invocations: invocations.clone(),
+    });
+
+    let mut op = dest.begin_op().await?;
+    dest.publish_persisted_in_op(&mut op, DestEvent::Native(1))
+        .await?;
+    op.commit().await?;
+
+    let invocations = invocations.lock().unwrap();
+    assert_eq!(invocations.len(), 1, "no upstream publish ⇒ no deferral");
+    assert_eq!(invocations[0], [DestEvent::Native(1)]);
+    assert_eq!(outbox_row_count(&pool).await?, 1);
+    Ok(())
+}
+
+/// A declared cycle (A after B and B after A) can never make progress —
+/// es-entity fails the commit loudly with a protocol error instead of
+/// hanging inside an open transaction, and the whole operation rolls back.
+#[tokio::test]
+#[file_serial]
+async fn persist_after_cycle_fails_commit_loudly() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let source = init_outbox::<SourceEvent>(&pool, default_config()).await?;
+    let dest = Outbox::<DestEvent, TestTables>::init(&pool, default_config()).await?;
+
+    source.persist_after(&dest);
+    dest.persist_after(&source);
+
+    let mut op = source.begin_op().await?;
+    source
+        .publish_persisted_in_op(&mut op, SourceEvent::Source(1))
+        .await?;
+    dest.publish_persisted_in_op(&mut op, DestEvent::Native(2))
+        .await?;
+
+    let result = op.commit().await;
+    assert!(
+        matches!(result, Err(sqlx::Error::Protocol(_))),
+        "a runs_after cycle must fail the commit with a protocol error, got {result:?}"
+    );
+    assert_eq!(
+        outbox_row_count(&pool).await?,
+        0,
+        "the cycle is caught before any hook's pre_commit runs — nothing persists"
+    );
+    Ok(())
+}
+
 /// A repost's destination hook now joins the same commit pass as the
 /// source, so its own `post_commit` runs — feeding the in-process broadcast
 /// directly, not just healing via pg NOTIFY and the poller/gap-fill.
