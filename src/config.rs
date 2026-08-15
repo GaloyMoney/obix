@@ -30,7 +30,19 @@ pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::fro
 ///
 /// This is only a ceiling: each read is sized to the room the consumer
 /// actually has, so a fast reader still gets full pages and few round trips
-/// while a slow one stops fetching ahead of what it can take.
+/// while a slow one stops fetching ahead of what it can take. Concretely,
+///
+/// ```text
+/// page = min(available capacity (at most event_buffer_size), backfill_page_size)
+/// ```
+///
+/// Note which number bounds the self-sizing: the delivery channel is
+/// `event_buffer_size` deep, so that — not `event_cache_size` — is what a
+/// reader with an empty channel would otherwise ask for. The two knobs
+/// compose: `event_buffer_size` decides how much a reader may have in
+/// flight, and therefore the page it naturally wants; this ceiling decides
+/// how much of that is allowed to arrive as a *single statement*. Raising
+/// the buffer for in-flight slack does not, on its own, enlarge the query.
 pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 
 /// Width of the window a gap-fill episode re-reads and may fill per tick.
