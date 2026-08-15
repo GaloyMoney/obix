@@ -53,10 +53,11 @@ where
 
     /// Take an event into the local view.
     ///
-    /// Eviction is a backstop: only the unguarded backfill drain can exceed
-    /// `buffer_size`, and its events must always be accepted. Dropping the
-    /// *highest* is what makes that safe — the least urgent event held, never
-    /// the one blocking the cursor.
+    /// Eviction is a backstop: both drains in `poll_next` stop at capacity,
+    /// so the only way past `buffer_size` is the one backfill event that must
+    /// always be accepted to keep the cursor moving. Dropping the *highest* is
+    /// what makes that safe — the least urgent event held, never the one
+    /// blocking the cursor.
     fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
         let sequence = delivery.sequence();
         self.latest_known = self.latest_known.max(sequence);
@@ -94,15 +95,33 @@ where
     ) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
 
-        // Backfill first and without a capacity guard: it carries the lowest
-        // outstanding sequences, so a cache full of newer broadcast events
-        // must never starve it. This also registers its waker before the
-        // guarded loop below can return without registering one.
+        // Backfill first: it carries the lowest outstanding sequences, so a
+        // cache full of newer broadcast events must never starve it.
         let mut backfill_events = Vec::new();
         let mut backfill_done = false;
+        let needed = this.last_returned_sequence.next();
+        let mut can_deliver = this.local_cache.contains_key(&needed);
         while let Some(backfill_receiver) = this.backfill_receiver.as_mut() {
+            // Stop pulling at capacity — but only once this poll is certain
+            // to yield an event. Draining the channel dry every poll lets the
+            // reader run arbitrarily far ahead of the consumer, and
+            // everything past `buffer_size` is then evicted by
+            // `maybe_add_to_cache` and re-read later. Leaving it in the
+            // channel instead blocks the reader in `send`, which is the
+            // backpressure the demand gate cannot supply on its own.
+            //
+            // The `can_deliver` half is what keeps that safe: breaking early
+            // skips the poll that would register a waker, so it is only
+            // sound when the delivery loop below returns `Ready` and the
+            // consumer therefore polls again. Otherwise keep draining to
+            // `Pending` — which registers the waker — so the backfill can
+            // never be starved by a cache full of newer broadcast events.
+            if can_deliver && this.local_cache.len() + backfill_events.len() >= this.buffer_size {
+                break;
+            }
             match Pin::new(backfill_receiver).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
+                    can_deliver |= event.sequence() == needed;
                     backfill_events.push(event);
                 }
                 Poll::Ready(None) => {

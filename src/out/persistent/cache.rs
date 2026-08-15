@@ -126,7 +126,7 @@ where
             highest_known_sequence,
             backfill_request_send: backfill_send,
             persistent_event_sender,
-            backfill_buffer_size: config.event_buffer_size,
+            backfill_buffer_size: config.backfill_page_size.max(1),
             cache_fill_sender: cache_fill_send,
             _cache_loop_handle: cache_loop_handle,
             _phantom: std::marker::PhantomData,

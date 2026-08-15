@@ -29,9 +29,11 @@ pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::fro
 /// under `event_cache_size`, so a listener that consumes a page lands back
 /// inside the memory window instead of paging forever.
 ///
-/// It is a flat size, not the delivery channel's free capacity — that would
-/// cap pages at `event_buffer_size` rows and split one statement into many,
-/// for no memory saving (the reader blocks in `send` regardless).
+/// It is also the depth of the channel a backfill delivers through, so it
+/// bounds how far the reader may run ahead of its consumer — one page in
+/// flight while the next is fetched. Sizing that channel by `event_buffer_size`
+/// instead would let the reader outrun a slow consumer by a whole second
+/// buffer's worth of events, all of it read from the database and then evicted.
 pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 
 /// Maximum number of placeholder rows a single gap-fill query may insert.

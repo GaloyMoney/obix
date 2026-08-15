@@ -2313,3 +2313,83 @@ async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// A slow consumer must not make the catch-up reader read the same rows over
+/// and over. The reader is only bounded by what the listener takes from the
+/// backfill channel, so a listener that empties it on every poll lets the
+/// reader run arbitrarily far ahead — and everything past `event_buffer_size`
+/// is then evicted and re-read.
+///
+/// Measured against `idx_tup_fetch`, which counts rows actually fetched via
+/// index. The bound is deliberately loose: the gap-cut read scans its window
+/// twice, so ~2x is the floor, while an unbounded drain on this shape reads
+/// well over 30x.
+#[tokio::test]
+#[file_serial]
+async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    const HISTORY: u64 = 2000;
+
+    async fn rows_read_by_index(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
+        // Stats land at transaction end and are read through a per-snapshot
+        // cache; give the collector a moment before sampling.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT sum(idx_tup_fetch)::bigint FROM pg_stat_user_tables
+             WHERE relname LIKE 'persistent_outbox_events%'",
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(n.unwrap_or(0))
+    }
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // History far past the buffer, written before any cache loop runs so only
+    // the backfill path can serve it.
+    for n in 0..HISTORY {
+        sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+            .bind(format!(r#"{{"Ping": {n}}}"#))
+            .execute(&pool)
+            .await?;
+    }
+    let before = rows_read_by_index(&pool).await?;
+
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(32)
+            .backfill_page_size(500)
+            .event_cache_size(10)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    for n in 0..HISTORY {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), listener.next())
+            .await?
+            .expect("stream closed early")?;
+        assert_eq!(
+            u64::from(event.sequence),
+            n + 1,
+            "delivery must stay ordered"
+        );
+        // Consume slowly, giving the reader every chance to run ahead.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let read = rows_read_by_index(&pool).await? - before;
+    assert!(
+        read < (HISTORY * 4) as i64,
+        "backfill read {read} rows to deliver {HISTORY} events — the reader is \
+         running ahead of the consumer and its pages are being evicted"
+    );
+
+    Ok(())
+}
