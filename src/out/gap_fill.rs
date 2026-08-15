@@ -1,5 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
+use tracing::Instrument;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -367,8 +368,21 @@ where
         let from = stall.from;
         let fill_up_to = u64::from(head).min(from + self.page_size as u64);
 
+        // One span per episode tick: the re-read is the episode's whole
+        // recurring cost, and `rows` against `missing` says whether the
+        // tick was productive (the window closed) or another read of a
+        // window still waiting on an unresolved sequence.
+        let page_span = tracing::info_span!(
+            "obix.gap_filler.stall_page",
+            from = from,
+            limit = self.page_size,
+            fill_up_to = fill_up_to,
+            rows = tracing::field::Empty,
+            missing = tracing::field::Empty,
+        );
         let events =
             match Tables::load_next_page::<P>(&pool, EventSequence::from(from), self.page_size)
+                .instrument(page_span.clone())
                 .await
             {
                 Ok(events) => events,
@@ -377,6 +391,7 @@ where
                     return Vec::new();
                 }
             };
+        page_span.record("rows", events.len());
         let mut present = std::collections::HashSet::new();
         for item in events {
             let delivery = PersistentDelivery::from(item);
@@ -389,6 +404,7 @@ where
             .take(self.batch_limit)
             .map(EventSequence::from)
             .collect();
+        page_span.record("missing", missing.len());
         if missing.is_empty() {
             // The window is complete: the re-read just delivered whatever
             // the cursor was missing, so resolution is in hand. A stall

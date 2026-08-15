@@ -1,6 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
+use tracing::Instrument;
 
 use std::sync::{
     Arc,
@@ -288,7 +289,23 @@ where
             // interval.
             let wakeup = cache_fill_sender.subscribe();
             let select_from = current_sequence;
-            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size).await {
+            // One span per page read — the only place the cost of the
+            // catch-up path is observable. `rows` against `delivered` is
+            // the signal that matters: a page whose contiguous prefix is
+            // short paid for the whole read and advanced almost nothing,
+            // and the pair separates genuine catch-up from a park
+            // re-reading the same window behind an unresolved gap.
+            let page_span = tracing::info_span!(
+                "obix.persistent_cache.backfill_page",
+                from_sequence = u64::from(select_from),
+                limit = buffer_size,
+                rows = tracing::field::Empty,
+                delivered = tracing::field::Empty,
+            );
+            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size)
+                .instrument(page_span.clone())
+                .await
+            {
                 Ok(events) => events,
                 Err(e) => {
                     record_backfill_failed(&e, u64::from(current_sequence));
@@ -297,6 +314,7 @@ where
                 }
             };
             let returned = events.len();
+            page_span.record("rows", returned);
             let mut present = std::collections::HashSet::with_capacity(returned);
             let mut page = Vec::with_capacity(returned);
             for item in events {
@@ -319,6 +337,7 @@ where
                 current_sequence = delivery.sequence();
                 delivered += 1;
             }
+            page_span.record("delivered", delivered);
             if delivered == returned && returned == buffer_size {
                 // Full contiguous page — more may follow immediately.
                 continue;
