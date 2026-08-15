@@ -227,8 +227,23 @@ where
                 match tokio::time::timeout_at(deadline, wakeup.recv()).await {
                     Ok(Ok(delivery)) if delivery.sequence() == needed => return,
                     Ok(Ok(_)) => {}
-                    // Lagged or closed: no reliable signal left — re-read.
-                    Ok(Err(_)) => return,
+                    // Lagged: wake-ups were dropped and the resolution may
+                    // have been among them — but a dropped hint is still
+                    // only a hint. Re-subscribe at the stream's tail FIRST,
+                    // then fall through to the probe: a resolution inside
+                    // the lost window is visible to the probe, one after it
+                    // to the fresh receiver. Returning here instead (the
+                    // old behavior) sent the caller back to a page re-read
+                    // once per lag episode — under heavy write traffic with
+                    // a slow consumer, a loop paced by nothing but the
+                    // write rate.
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        wakeup = wakeup.resubscribe();
+                        break;
+                    }
+                    // Closed: the cache loop is gone — no signal will ever
+                    // come; the caller's re-read owns error handling.
+                    Ok(Err(broadcast::error::RecvError::Closed)) => return,
                     // Interval elapsed: fall through to the probe.
                     Err(_) => break,
                 }
@@ -298,16 +313,6 @@ where
                 continue;
             }
 
-            // Authoritative page read — with the park's wake-up receiver
-            // subscribed FIRST: any resolution landing after this point is
-            // buffered for the park below, and anything resolved before it
-            // is visible to the read itself. Subscribing later (inside the
-            // park) would let a resolving delivery — in particular the
-            // GapFiller's response to the Historical request sent below —
-            // slip into the unobserved window and cost the full retry
-            // interval.
-            let wakeup = cache_fill_sender.subscribe();
-
             // Don't spend a query without demand: block until the listener
             // has room for at least one more event. A listener that has
             // stopped polling entirely parks the reader here instead of
@@ -330,6 +335,17 @@ where
                 // Listener gone.
                 Err(_) => return,
             }
+
+            // The park's wake-up receiver, subscribed before the page read
+            // (and thus before the Historical request below): any
+            // resolution landing after this point is buffered for the
+            // park, anything before it is visible to the read itself.
+            // Subscribed AFTER the demand gate, equally deliberately —
+            // `reserve` blocks for as long as the consumer takes, and a
+            // receiver subscribed across that wait would only accumulate
+            // lag for deliveries the park will discard anyway, entering
+            // the park pre-lagged under load.
+            let wakeup = cache_fill_sender.subscribe();
 
             let select_from = current_sequence;
             // One span per page read — the only place the cost of the
