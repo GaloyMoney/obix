@@ -199,16 +199,10 @@ where
     /// broadcast, notification fetch, the GapFiller's placeholders and
     /// compensations), or, once the retry interval elapses, by an
     /// authoritative index probe as the lost-signal backstop. The wake-up
-    /// is a hint, never trusted as data; the probe is the one that decides.
-    ///
-    /// The probe is why the interval no longer ends the park by itself. A
-    /// timeout used to return so the caller could re-read the page purely
-    /// to discover whether the gap had closed — a full window of rows, per
-    /// interval, for as long as the writer took. Asking the table directly
-    /// answers the same question for one index lookup, so a park behind a
-    /// slow or abandoned sequence costs effectively nothing while it waits.
-    /// A failed probe returns rather than retries: the caller's re-read
-    /// handles transient errors with its own backoff.
+    /// is a hint, never trusted as data; the probe is the one that decides,
+    /// which keeps a park behind a slow or abandoned sequence costing one
+    /// index lookup per interval. A failed probe returns rather than
+    /// retries — the caller's re-read has its own backoff.
     ///
     /// Takes a receiver the caller subscribed **before** the page read
     /// that discovered the gap (and thus before any fill request it sent):
@@ -227,32 +221,21 @@ where
                 match tokio::time::timeout_at(deadline, wakeup.recv()).await {
                     Ok(Ok(delivery)) if delivery.sequence() == needed => return,
                     Ok(Ok(_)) => {}
-                    // Lagged: wake-ups were dropped and the resolution may
-                    // have been among them — but a dropped hint is still
-                    // only a hint. Re-subscribe at the stream's tail FIRST,
-                    // then fall through to the probe: a resolution inside
-                    // the lost window is visible to the probe, one after it
-                    // to the fresh receiver. Returning here instead (the
-                    // old behavior) sent the caller back to a page re-read
-                    // once per lag episode — under heavy write traffic with
-                    // a slow consumer, a loop paced by nothing but the
-                    // write rate.
+                    // Dropped wake-ups are still only hints: re-subscribe at
+                    // the tail, then let the probe decide. A resolution
+                    // inside the lost window is visible to the probe, one
+                    // after it to the fresh receiver.
                     Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
                         wakeup = wakeup.resubscribe();
                         break;
                     }
-                    // Closed: the cache loop is gone — no signal will ever
-                    // come; the caller's re-read owns error handling.
                     Ok(Err(broadcast::error::RecvError::Closed)) => return,
-                    // Interval elapsed: fall through to the probe.
                     Err(_) => break,
                 }
             }
             match Tables::sequence_present(pool, needed).await {
-                // Still missing: keep parking, at one probe per interval.
                 Ok(false) => continue,
-                // Landed, or the probe itself failed — either way the
-                // caller re-reads and decides.
+                // Landed, or the probe failed — the caller re-reads and decides.
                 Ok(true) | Err(_) => return,
             }
         }
@@ -313,47 +296,25 @@ where
                 continue;
             }
 
-            // Don't spend a query without demand: block until the listener
-            // has room for at least one more event. A listener that has
-            // stopped polling entirely parks the reader here instead of
-            // materialising a page nobody will take.
-            //
-            // Deliberately only a gate, not a size. Sizing the page to the
-            // channel's free capacity sounds better than it measures: the
-            // channel is `event_buffer_size` deep, so on the default config
-            // it would cap pages at 100 rows and turn one statement into
-            // ten. Fetching 10,000 rows as 100-row pages costs ~2x the
-            // server time of 1,000-row pages *before* counting a round trip
-            // each, against the 6-8x round-trip inflation this path already
-            // suffers under load. In-flight memory is bounded by the
-            // channel depth regardless of page size — the reader simply
-            // blocks in `send` — so the smaller pages bought nothing.
+            // Don't spend a query without demand: a listener that has stopped
+            // polling parks the reader here rather than materialising a page
+            // nobody will take. A gate only, never a size (see
+            // `backfill_page_size`); dropping the permit returns the slot.
             match sender.reserve().await {
-                // The permit is only the demand signal; dropping it returns
-                // the slot for the delivery loop below.
                 Ok(permit) => drop(permit),
-                // Listener gone.
                 Err(_) => return,
             }
 
-            // The park's wake-up receiver, subscribed before the page read
-            // (and thus before the Historical request below): any
-            // resolution landing after this point is buffered for the
-            // park, anything before it is visible to the read itself.
-            // Subscribed AFTER the demand gate, equally deliberately —
-            // `reserve` blocks for as long as the consumer takes, and a
-            // receiver subscribed across that wait would only accumulate
-            // lag for deliveries the park will discard anyway, entering
-            // the park pre-lagged under load.
+            // Subscribe before the page read (and the Historical request
+            // below) so no resolution falls between them, but after the
+            // demand gate — `reserve` blocks as long as the consumer takes,
+            // and a receiver held across that wait enters the park lagged.
             let wakeup = cache_fill_sender.subscribe();
 
             let select_from = current_sequence;
-            // One span per page read — the only place the cost of the
-            // catch-up path is observable. `rows` against `delivered` is
-            // the signal that matters: a page whose contiguous prefix is
-            // short paid for the whole read and advanced almost nothing,
-            // and the pair separates genuine catch-up from a park
-            // re-reading the same window behind an unresolved gap.
+            // One span per page read — the only place this path's cost is
+            // observable. `rows` against `delivered` separates genuine
+            // catch-up from a read that advanced almost nothing.
             let page_span = tracing::info_span!(
                 "obix.persistent_cache.backfill_page",
                 from_sequence = u64::from(select_from),
@@ -375,11 +336,9 @@ where
             let returned = events.len();
             page_span.record("rows", returned);
 
-            // Every returned row is deliverable: the read is cut at the
-            // first gap, so the page *is* the contiguous prefix. The
-            // ordering check stays as the enforcement point of that
-            // contract — delivery must be ordered and gap-free whatever a
-            // `MailboxTables` implementation hands back.
+            // The read is cut at the first gap, so every returned row is
+            // deliverable. The ordering check enforces that contract against
+            // whatever a `MailboxTables` implementation hands back.
             let mut delivered = 0;
             for item in events {
                 let delivery = PersistentDelivery::from(item);
@@ -411,9 +370,6 @@ where
             // on the cache-fill stream, then re-read.
             let next_needed = u64::from(current_sequence.next());
             if next_needed <= init_head {
-                // Enumerating the hole is an index-only anti-join, not a
-                // by-product of a payload page: reporting a historical gap
-                // no longer costs a window of rows that get discarded.
                 let fill_to = init_head.min(u64::from(select_from) + page_size as u64);
                 if next_needed <= fill_to {
                     match Tables::missing_sequences(

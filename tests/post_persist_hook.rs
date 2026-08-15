@@ -147,12 +147,10 @@ impl PostPersistHook<SourceEvent> for FailingHook {
 
 /// The repost consumer from the design doc: map source events into the
 /// destination outbox's payload type and publish them from inside the hook —
-/// same transaction. `dest`'s own commit hook joins the tail of the *same*
-/// commit pass (es-entity's re-entrant hook registration) rather than
-/// inserting inline here: its persist and its own post-persist hooks run
-/// later, when the enclosing `execute_pre` loop reaches it — still before
-/// the single `COMMIT`, and still ordered ahead of anything registered
-/// after `source`'s hook.
+/// same transaction. `dest`'s commit hook joins the tail of the *same* pass
+/// rather than inserting inline here, so its persist and its own hooks run
+/// when the enclosing `execute_pre` loop reaches it — still before the single
+/// `COMMIT`.
 struct RepostHook {
     dest: Outbox<DestEvent, TestTables>,
 }
@@ -440,17 +438,11 @@ async fn chained_reposts_compose() -> anyhow::Result<()> {
 /// transaction rolls back, including `source`'s and `dest`'s already-
 /// succeeded hooks earlier in the pass.
 ///
-/// Before es-entity's re-entrant commit-hook registration
-/// (GaloyMoney/es-entity#200), `dest`'s repost always force-executed — a
-/// repost's `HookOperation` could never register further hooks, so
-/// `dest`'s hook never entered the `CommitHooks` bookkeeping at all.
-/// Neither `post_commit` nor `on_rollback` ever ran for it, and its burned
-/// sequence depended entirely on the slow, grace-gated backstop (2s
-/// default). Now that the repost joins the same commit pass as `source`,
-/// `dest`'s `PersistEvents` hook is tracked exactly like a directly-
-/// registered hook: its `on_rollback` fires once the deeper failure
-/// surfaces, and `dest`'s abandoned sequence is placeholder-filled
-/// reactively — in milliseconds, not seconds.
+/// Because the repost joins `source`'s commit pass (GaloyMoney/es-entity#200),
+/// `dest`'s `PersistEvents` hook is tracked like a directly-registered one:
+/// its `on_rollback` fires once the deeper failure surfaces, and `dest`'s
+/// abandoned sequence is placeholder-filled reactively in milliseconds rather
+/// than waiting on the grace-gated backstop.
 #[tokio::test]
 #[file_serial]
 async fn repost_on_rollback_reaches_destination_reactively() -> anyhow::Result<()> {
@@ -631,21 +623,17 @@ async fn late_registration_affects_only_subsequent_ops() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Commit hooks run in registration order (es-entity ≥ 0.11.7) — but a
-/// repost's destination hook shares its `TypeId` with any hook the
-/// destination's own direct publishes already registered on the same op,
-/// so es-entity's ordinary same-op merge rule applies: the merge keeps the
-/// **earliest still-pending** registration's queue position and appends
-/// later contributions to its event list in the order they fold in. When
-/// `dest` published nothing of its own before the repost lands, the
-/// repost's hook is fresh — it runs at its own (later) position, after
-/// `source`. But when `dest` already published directly on the same op
-/// *before* `source`'s hook ran, the repost merges INTO that still-pending
-/// hook (es-entity's re-entrant registration folds into the tail of the
-/// pass — see [`PostPersistHook`]'s contract docs) — so the merged hook
-/// still runs at `dest`'s earlier position, and physically inserts `dest`'s
-/// own events before the freshly-appended reposted ones, regardless of
-/// which outbox's `publish_*_in_op` call came first in program order.
+/// Commit hooks run in registration order, but a repost's destination hook
+/// shares its `TypeId` with any hook `dest`'s own direct publishes already
+/// registered on the same op, so es-entity's same-op merge rule applies: the
+/// merge keeps the **earliest still-pending** registration's queue position
+/// and appends later contributions to its event list.
+///
+/// So if `dest` published nothing first, the repost's hook is fresh and runs
+/// at its own later position. If `dest` already published directly on the op,
+/// the repost merges into that pending hook — which runs at `dest`'s earlier
+/// position and inserts `dest`'s own events first, whichever
+/// `publish_*_in_op` call came first in program order.
 #[tokio::test]
 #[file_serial]
 async fn ordering_follows_first_publish_order() -> anyhow::Result<()> {

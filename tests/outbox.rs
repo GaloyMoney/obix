@@ -2121,8 +2121,7 @@ async fn contiguous_page_read_stops_at_the_first_gap() -> anyhow::Result<()> {
         helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
     assert_eq!(window.len(), 6, "window read returns rows past both gaps");
 
-    // The delivery read stops at the first gap: three rows, never the six
-    // it would have had to fetch, decode and then discard.
+    // The delivery read stops at the first gap: three rows, not six.
     let prefix = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
         &pool,
         EventSequence::from(0),
@@ -2147,8 +2146,7 @@ async fn contiguous_page_read_stops_at_the_first_gap() -> anyhow::Result<()> {
     .await?;
     assert_eq!(next.len(), 2, "run between the two gaps");
 
-    // Parked directly behind a gap the read returns nothing at all — the
-    // case that used to fetch a full window every retry interval.
+    // Parked directly behind a gap, the read returns nothing at all.
     let blocked = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
         &pool,
         EventSequence::from(3),
@@ -2282,9 +2280,7 @@ async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
 
     // Buffers far smaller than the burst: the listener cannot hold what is
     // published, so the drain has to apply backpressure rather than pull
-    // events in and evict them. Nothing may be lost or reordered — an
-    // event dropped locally after being counted as known is the case that
-    // used to cost a database round trip to fetch back.
+    // events in and evict them. Nothing may be lost or reordered.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
         MailboxConfig::builder()

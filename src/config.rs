@@ -18,30 +18,20 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 /// can never collide with a live writer regardless of this setting.
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Ceiling on the rows a single backfill page read may return.
+/// Ceiling on the rows a single backfill page read may return, and the width
+/// of a gap-fill stall episode's window (an episode's re-read is a page read,
+/// so one episode covers what one page read can see).
 ///
-/// Deliberately **not** `event_cache_size`. The cache size is a memory-window
-/// decision — how far behind a listener can fall and still be served without
-/// touching the database — while this is a query-shape decision: how much a
-/// catch-up read holds a pooled connection for, how large a result set it
-/// materialises, and how long the consumer waits for the first event of a
-/// page. Sharing one number meant that widening the memory window (a good
-/// thing) silently turned every catch-up read into a multi-megabyte statement.
+/// A query-shape knob, distinct from `event_cache_size` (how far behind a
+/// listener may fall and still be served from memory) and `event_buffer_size`
+/// (how much may be in flight): this bounds how long a catch-up read holds a
+/// pooled connection and how large a result set it materialises. Keep it well
+/// under `event_cache_size`, so a listener that consumes a page lands back
+/// inside the memory window instead of paging forever.
 ///
-/// It is a flat size, deliberately not derived from the delivery channel's
-/// free capacity. Tracking capacity self-tunes in the wrong direction: the
-/// channel is `event_buffer_size` deep, so on the default config it would cap
-/// pages at 100 rows and turn one statement into ten. Reading 10,000 rows as
-/// 100-row pages costs about twice the server time of 1,000-row pages before
-/// counting one round trip each — and the catch-up path is exactly where
-/// round trips are most heavily taxed. In-flight memory is bounded by the
-/// channel depth either way, since the reader blocks in `send`, so the
-/// smaller pages bought nothing. The reader still waits for demand before
-/// issuing a query; it just does not shrink the query to match.
-///
-/// The same number is the width of a gap-fill stall episode's window — the
-/// episode's re-read is a page read, so one episode covers what one page
-/// read can see.
+/// It is a flat size, not the delivery channel's free capacity — that would
+/// cap pages at `event_buffer_size` rows and split one statement into many,
+/// for no memory saving (the reader blocks in `send` regardless).
 pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 
 /// Maximum number of placeholder rows a single gap-fill query may insert.
@@ -51,10 +41,10 @@ pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 /// cap delays recovery of a pathological backlog without ever losing
 /// sequences.
 ///
-/// This caps one *insert*, not an episode: a stall episode's window is the
-/// [`backfill page`](DEFAULT_BACKFILL_PAGE_SIZE), and a gap wider than this
-/// cap fills across multiple passes of the same episode — one grace period,
-/// one marker, batches at the loop cadence.
+/// This caps one *insert*, not an episode: the episode window is the
+/// [`backfill page`](DEFAULT_BACKFILL_PAGE_SIZE), so a gap wider than this cap
+/// fills across several passes of one episode — one grace period, one marker,
+/// batches at the loop cadence.
 pub const DEFAULT_GAP_FILL_BATCH_LIMIT: usize = 1000;
 
 /// How long the per-process notifier coalesces committed-batch reports
@@ -114,11 +104,7 @@ pub struct MailboxConfig {
     pub persist_events_batch_size: usize,
     /// Rows a single backfill page read may return; see
     /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. The reader waits for the consumer to
-    /// have room before issuing a read, but the read itself is this size —
-    /// how much a catch-up statement costs is a query-shape decision, kept
-    /// separate from how far behind a listener may fall
-    /// (`event_cache_size`) and from how much may be in flight
-    /// (`event_buffer_size`).
+    /// have room before issuing a read, but the read itself is this size.
     #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
     pub backfill_page_size: usize,
     /// Grace period before the first proactive gap-fill attempt for a

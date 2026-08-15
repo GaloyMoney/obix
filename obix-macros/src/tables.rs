@@ -189,49 +189,18 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
-        // The delivery-path read: the contiguous run above `$1` and nothing
-        // past the first gap. `load_next_page` returns every committed row in
-        // the window, but a caller delivering in order can only use the
-        // contiguous prefix — so on a window whose gap sits early, the rest
-        // was fetched from the heap, detoasted, transmitted and decoded only
-        // to be dropped, once per park interval for as long as the gap
-        // persisted.
+        // The contiguous run above `$1`, cut at the first gap. `win` finds the
+        // cut index-only: in a contiguous run `sequence = $1 + rn` exactly, so
+        // the first row failing that is the first gap.
         //
-        // `win` finds the cut index-only (the PK is `sequence`): in a
-        // contiguous run `sequence = $1 + rn` exactly, so the first row where
-        // that fails is the first gap. Only rows below the cut reach the
-        // heap, so a page blocked at the very first sequence costs an index
-        // scan of the window and returns nothing.
-        // The cut MUST be a scalar subquery, not a joined CTE. As an InitPlan
-        // it is evaluated once and its result is usable as an index bound —
-        // `Index Cond: (sequence > $1 AND sequence <= $1 + $2 AND sequence <
-        // (InitPlan 1).col1)` — so the payload scan stops at the gap in the
-        // index. Written as `FROM t e, stop WHERE e.sequence < stop.s` the
-        // planner instead produces a Nested Loop whose `stop` value is only a
-        // Join Filter: with no upper bound left on the index it walks the
-        // entire tail of the table and discards it — 5,327 buffers / 24.6 ms
-        // where this form takes 43 / 0.3 ms. Verified to survive the generic
-        // plan, which is what a prepared statement gets after five executions.
-        //
-        // The redundant `sequence <= $1 + $2` is kept deliberately: it bounds
-        // the scan (and prunes partitions) independently of the InitPlan.
-        //
-        // Measured against `load_next_page`, 200k rows, page 1000, generic
-        // plans, `VACUUM ANALYZE`d (buffers, rows handed back):
-        //
-        //   no gap in window     69 buf / 1000 rows  ->   76 buf / 1000 rows
-        //   parked on the gap    69 buf /  999 rows  ->   10 buf /    0 rows
-        //
-        // ~10% more work on a clean page buys not fetching, decoding and
-        // discarding a window of payloads on a blocked one. The cut is only
-        // genuinely index-only once the visibility map is set, so on the
-        // never-yet-vacuumed tail it costs a second heap pass (~2x buffers on
-        // a clean page); catch-up reads are mostly far behind the tail, where
-        // the map is set and `Heap Fetches` is 0.
-        //
-        // NOTE for anyone editing this: re-check the plan. A gap-cut query is
-        // unusually easy to write in a form that silently degrades into a
-        // whole-table scan.
+        // The cut MUST stay a scalar subquery. As an InitPlan it is evaluated
+        // once and usable as an index bound, so the payload scan stops at the
+        // gap; written as a joined CTE (`FROM t e, stop WHERE ...`) the planner
+        // demotes it to a Join Filter and walks the whole tail of the table —
+        // 5,327 buffers / 24.6 ms against 43 / 0.3 ms here. The redundant
+        // `sequence <= $1 + $2` bounds the scan and prunes partitions
+        // independently of the InitPlan. Re-check the plan (including the
+        // generic one) if you touch this.
         let load_next_contiguous_page_query = format!(
             r#"
             WITH win AS (
@@ -254,9 +223,8 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // Single index probe for a parked reader: "has the sequence I am
-        // blocked on landed yet?". Replaces re-reading the whole page each
-        // retry interval purely to discover the answer.
+        // Single index probe for a parked reader: has the sequence it is
+        // blocked on landed yet?
         let sequence_present_query = format!(
             r#"
             SELECT EXISTS (
@@ -265,16 +233,11 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // Enumerate the holes in `(after, up_to]` without fetching payloads,
-        // for callers that must *report* which sequences are missing rather
-        // than deliver the ones present.
+        // The holes in `(after, up_to]`, without fetching payloads.
         //
-        // `EXCEPT` against a bounded scan, NOT `WHERE NOT EXISTS (...)`: the
-        // anti-join form plans as a Nested Loop Anti Join that pays a separate
-        // index probe per generated sequence — measured at 4,501 buffers for a
-        // 1,500-wide range, worse than reading the payload page it replaces.
-        // The set-operation form reads the window once, index-only: 8 buffers
-        // for the same range, 31 for a 10,000-wide one.
+        // Must stay `EXCEPT`, not `WHERE NOT EXISTS (...)`: the anti-join form
+        // plans as a Nested Loop Anti Join paying an index probe per generated
+        // sequence — 4,501 buffers on a 1,500-wide range against 8 here.
         let missing_sequences_query = format!(
             r#"
             SELECT g AS "sequence!: i64"

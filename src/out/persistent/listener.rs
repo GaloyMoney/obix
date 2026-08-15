@@ -42,9 +42,9 @@ where
             latest_known,
             event_receiver: cache_handle.persistent_event_stream(),
             local_cache: BTreeMap::new(),
-            // At least one: the drain loop is guarded on remaining
-            // capacity, and a zero-capacity cache would never poll the
-            // broadcast at all — never registering a waker, never waking.
+            // At least one: the drain loop is guarded on remaining capacity,
+            // so a zero-capacity cache would never poll the broadcast at all
+            // — never registering a waker, never waking.
             buffer_size: buffer.max(1),
             cache_handle,
             backfill_receiver: None,
@@ -53,12 +53,10 @@ where
 
     /// Take an event into the local view.
     ///
-    /// The eviction is now a backstop rather than the steady state: the
-    /// broadcast drain in `poll_next` stops at capacity, so the only way
-    /// past `buffer_size` is the unguarded backfill drain, whose events
-    /// are the ones the cursor needs next and so must always be accepted.
-    /// Dropping the *highest* is what makes that safe — it is the least
-    /// urgent event held, and never the one blocking the cursor.
+    /// Eviction is a backstop: only the unguarded backfill drain can exceed
+    /// `buffer_size`, and its events must always be accepted. Dropping the
+    /// *highest* is what makes that safe — the least urgent event held, never
+    /// the one blocking the cursor.
     fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
         let sequence = delivery.sequence();
         self.latest_known = self.latest_known.max(sequence);
@@ -96,12 +94,10 @@ where
     ) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
 
-        // Backfill first, and deliberately without a capacity guard: it
-        // carries the *lowest* outstanding sequences — precisely the ones
-        // the cursor needs next — so it must never be starved by a cache
-        // already full of newer broadcast events. Draining it here also
-        // registers its waker before the guarded loop below can return
-        // without registering one of its own.
+        // Backfill first and without a capacity guard: it carries the lowest
+        // outstanding sequences, so a cache full of newer broadcast events
+        // must never starve it. This also registers its waker before the
+        // guarded loop below can return without registering one.
         let mut backfill_events = Vec::new();
         let mut backfill_done = false;
         while let Some(backfill_receiver) = this.backfill_receiver.as_mut() {
@@ -124,20 +120,14 @@ where
             this.maybe_add_to_cache(event);
         }
 
-        // Then take from the broadcast only while there is room for it.
-        // Draining it unconditionally used to pull events in just to have
-        // `maybe_add_to_cache` evict the highest of them — discarding an
-        // event that had already been delivered in-process, and
-        // guaranteeing a later database round trip to fetch it back.
-        // Leaving them in the channel costs nothing (they are shared
-        // there already) and turns an overflow into a `Lagged` that is
-        // visible, instead of a silent local drop.
+        // Then take from the broadcast only while there is room, so an
+        // overflow surfaces as a visible `Lagged` rather than a silent drop.
         //
-        // Breaking out on a full cache without registering a waker is
-        // safe: a full cache holds sequences above the cursor, so either
-        // the next one is contiguous and this poll returns an event (the
-        // consumer polls again), or it is not and the backfill request
-        // below registers a waker for the range that unblocks it.
+        // Breaking out on a full cache without registering a waker is safe: a
+        // full cache holds sequences above the cursor, so either the next one
+        // is contiguous and this poll returns an event (the consumer polls
+        // again), or it is not and the backfill request below registers a
+        // waker for the range that unblocks it.
         while this.local_cache.len() < this.buffer_size {
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
                 Poll::Ready(None) => break,

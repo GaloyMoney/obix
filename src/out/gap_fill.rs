@@ -102,13 +102,9 @@ impl GapFiller {
             notifier_tx,
             grace: config.gap_fill_grace,
             batch_limit: config.gap_fill_batch_limit,
-            // The episode window is the backfill page size: the episode's
-            // re-read is a page read, so one episode covers exactly what
-            // one page read can see. Deliberately NOT the batch limit —
-            // the window bounds an episode's *scope* (one grace period,
-            // one marker), the batch limit bounds one *insert*: a window
-            // wider than the cap is what lets a multi-batch gap fill at
-            // the loop cadence instead of paying grace per batch.
+            // An episode's window is one page read's reach. Not the batch
+            // limit: a window wider than that cap is what lets a multi-batch
+            // fill run at the loop cadence on one grace period.
             page_size: config.backfill_page_size.max(1),
             stall: None,
             historical: BTreeSet::new(),
@@ -375,10 +371,8 @@ where
         let from = stall.from;
         let fill_up_to = u64::from(head).min(from + self.page_size as u64);
 
-        // One span per episode tick: the re-read is the episode's whole
-        // recurring cost, and `rows` against `missing` says whether the
-        // tick was productive (the window closed) or another read of a
-        // window still waiting on an unresolved sequence.
+        // One span per episode tick; `rows` against `missing` says whether
+        // the tick closed the window or is still waiting on a sequence.
         let page_span = tracing::info_span!(
             "obix.gap_filler.stall_page",
             from = from,
