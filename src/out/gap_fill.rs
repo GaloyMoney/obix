@@ -102,7 +102,14 @@ impl GapFiller {
             notifier_tx,
             grace: config.gap_fill_grace,
             batch_limit: config.gap_fill_batch_limit,
-            page_size: config.gap_fill_page_size.max(1),
+            // The episode window is the backfill page size: the episode's
+            // re-read is a page read, so one episode covers exactly what
+            // one page read can see. Deliberately NOT the batch limit —
+            // the window bounds an episode's *scope* (one grace period,
+            // one marker), the batch limit bounds one *insert*: a window
+            // wider than the cap is what lets a multi-batch gap fill at
+            // the loop cadence instead of paying grace per batch.
+            page_size: config.backfill_page_size.max(1),
             stall: None,
             historical: BTreeSet::new(),
             historical_marker: None,

@@ -38,14 +38,11 @@ pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::fro
 /// channel depth either way, since the reader blocks in `send`, so the
 /// smaller pages bought nothing. The reader still waits for demand before
 /// issuing a query; it just does not shrink the query to match.
-pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
-
-/// Width of the window a gap-fill episode re-reads and may fill per tick.
 ///
-/// Separate from both the cache size and the backfill page: this window is a
-/// *fill* bound (how far above a stalled cursor one episode reaches), not a
-/// delivery bound, and it has no consumer to pace itself against.
-pub const DEFAULT_GAP_FILL_PAGE_SIZE: usize = 1000;
+/// The same number is the width of a gap-fill stall episode's window — the
+/// episode's re-read is a page read, so one episode covers what one page
+/// read can see.
+pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 
 /// Maximum number of placeholder rows a single gap-fill query may insert.
 /// Bounds the worst case (a mass rollback or long outage leaving thousands
@@ -53,6 +50,11 @@ pub const DEFAULT_GAP_FILL_PAGE_SIZE: usize = 1000;
 /// giant insert; the fixed 1s retry cadence picks up the remainder, so a
 /// cap delays recovery of a pathological backlog without ever losing
 /// sequences.
+///
+/// This caps one *insert*, not an episode: a stall episode's window is the
+/// [`backfill page`](DEFAULT_BACKFILL_PAGE_SIZE), and a gap wider than this
+/// cap fills across multiple passes of the same episode — one grace period,
+/// one marker, batches at the loop cadence.
 pub const DEFAULT_GAP_FILL_BATCH_LIMIT: usize = 1000;
 
 /// How long the per-process notifier coalesces committed-batch reports
@@ -119,10 +121,6 @@ pub struct MailboxConfig {
     /// (`event_buffer_size`).
     #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
     pub backfill_page_size: usize,
-    /// Window a gap-fill episode re-reads and may fill per tick; see
-    /// [`DEFAULT_GAP_FILL_PAGE_SIZE`].
-    #[builder(default = "DEFAULT_GAP_FILL_PAGE_SIZE")]
-    pub gap_fill_page_size: usize,
     /// Grace period before the first proactive gap-fill attempt for a
     /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
     /// after a fill attempt are unaffected (fixed 1s interval).
