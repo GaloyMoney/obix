@@ -272,7 +272,7 @@ where
         cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
-        max_page_size: usize,
+        page_size: usize,
         init_head: u64,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) {
@@ -308,20 +308,28 @@ where
             // interval.
             let wakeup = cache_fill_sender.subscribe();
 
-            // Size the read to demand rather than to a constant: wait until
-            // the listener has room, then take as much as it can actually
-            // hold, under the configured ceiling. A reader keeping up gets
-            // full pages and few round trips; one that has stalled stops
-            // fetching — and materialising — pages it cannot take, instead
-            // of running the buffer's whole depth ahead of itself.
+            // Don't spend a query without demand: block until the listener
+            // has room for at least one more event. A listener that has
+            // stopped polling entirely parks the reader here instead of
+            // materialising a page nobody will take.
+            //
+            // Deliberately only a gate, not a size. Sizing the page to the
+            // channel's free capacity sounds better than it measures: the
+            // channel is `event_buffer_size` deep, so on the default config
+            // it would cap pages at 100 rows and turn one statement into
+            // ten. Fetching 10,000 rows as 100-row pages costs ~2x the
+            // server time of 1,000-row pages *before* counting a round trip
+            // each, against the 6-8x round-trip inflation this path already
+            // suffers under load. In-flight memory is bounded by the
+            // channel depth regardless of page size — the reader simply
+            // blocks in `send` — so the smaller pages bought nothing.
             match sender.reserve().await {
-                // The permit is only a demand signal; dropping it returns
-                // the slot, so the size below sees it as free capacity.
+                // The permit is only the demand signal; dropping it returns
+                // the slot for the delivery loop below.
                 Ok(permit) => drop(permit),
                 // Listener gone.
                 Err(_) => return,
             }
-            let page_size = sender.capacity().clamp(1, max_page_size);
 
             let select_from = current_sequence;
             // One span per page read — the only place the cost of the

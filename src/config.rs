@@ -28,21 +28,16 @@ pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::fro
 /// page. Sharing one number meant that widening the memory window (a good
 /// thing) silently turned every catch-up read into a multi-megabyte statement.
 ///
-/// This is only a ceiling: each read is sized to the room the consumer
-/// actually has, so a fast reader still gets full pages and few round trips
-/// while a slow one stops fetching ahead of what it can take. Concretely,
-///
-/// ```text
-/// page = min(available capacity (at most event_buffer_size), backfill_page_size)
-/// ```
-///
-/// Note which number bounds the self-sizing: the delivery channel is
-/// `event_buffer_size` deep, so that — not `event_cache_size` — is what a
-/// reader with an empty channel would otherwise ask for. The two knobs
-/// compose: `event_buffer_size` decides how much a reader may have in
-/// flight, and therefore the page it naturally wants; this ceiling decides
-/// how much of that is allowed to arrive as a *single statement*. Raising
-/// the buffer for in-flight slack does not, on its own, enlarge the query.
+/// It is a flat size, deliberately not derived from the delivery channel's
+/// free capacity. Tracking capacity self-tunes in the wrong direction: the
+/// channel is `event_buffer_size` deep, so on the default config it would cap
+/// pages at 100 rows and turn one statement into ten. Reading 10,000 rows as
+/// 100-row pages costs about twice the server time of 1,000-row pages before
+/// counting one round trip each — and the catch-up path is exactly where
+/// round trips are most heavily taxed. In-flight memory is bounded by the
+/// channel depth either way, since the reader blocks in `send`, so the
+/// smaller pages bought nothing. The reader still waits for demand before
+/// issuing a query; it just does not shrink the query to match.
 pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
 
 /// Width of the window a gap-fill episode re-reads and may fill per tick.
@@ -115,10 +110,13 @@ pub struct MailboxConfig {
     pub event_cache_trim_percent: u8,
     #[builder(default = "DEFAULT_PERSIST_EVENTS_BATCH_SIZE")]
     pub persist_events_batch_size: usize,
-    /// Ceiling on a single backfill page read; see
-    /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. Reads are sized to the consumer's
-    /// available buffer and clamped here, so this bounds the worst case
-    /// rather than fixing every read.
+    /// Rows a single backfill page read may return; see
+    /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. The reader waits for the consumer to
+    /// have room before issuing a read, but the read itself is this size —
+    /// how much a catch-up statement costs is a query-shape decision, kept
+    /// separate from how far behind a listener may fall
+    /// (`event_cache_size`) and from how much may be in flight
+    /// (`event_buffer_size`).
     #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
     pub backfill_page_size: usize,
     /// Window a gap-fill episode re-reads and may fill per tick; see
