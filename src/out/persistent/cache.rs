@@ -197,9 +197,18 @@ where
     /// resolved: woken by that exact sequence arriving on the cache-fill
     /// stream (every resolution path lands there — in-process post-commit
     /// broadcast, notification fetch, the GapFiller's placeholders and
-    /// compensations), or by the retry interval elapsing as the
-    /// lost-signal backstop. The caller re-reads the page either way; the
-    /// wake-up is a hint, never trusted as data.
+    /// compensations), or, once the retry interval elapses, by an
+    /// authoritative index probe as the lost-signal backstop. The wake-up
+    /// is a hint, never trusted as data; the probe is the one that decides.
+    ///
+    /// The probe is why the interval no longer ends the park by itself. A
+    /// timeout used to return so the caller could re-read the page purely
+    /// to discover whether the gap had closed — a full window of rows, per
+    /// interval, for as long as the writer took. Asking the table directly
+    /// answers the same question for one index lookup, so a park behind a
+    /// slow or abandoned sequence costs effectively nothing while it waits.
+    /// A failed probe returns rather than retries: the caller's re-read
+    /// handles transient errors with its own backoff.
     ///
     /// Takes a receiver the caller subscribed **before** the page read
     /// that discovered the gap (and thus before any fill request it sent):
@@ -208,18 +217,28 @@ where
     /// the gap between request and park — anything resolved before the
     /// subscription is instead visible to the page read itself.
     async fn park_until_resolved(
+        pool: &sqlx::PgPool,
         mut wakeup: broadcast::Receiver<PersistentDelivery<P>>,
         needed: EventSequence,
     ) {
-        let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
         loop {
-            match tokio::time::timeout_at(deadline, wakeup.recv()).await {
-                Ok(Ok(delivery)) if delivery.sequence() == needed => return,
-                Ok(Ok(_)) => {}
-                // Lagged or closed: no reliable signal left — re-read.
-                Ok(Err(_)) => return,
-                // Interval elapsed: re-read regardless.
-                Err(_) => return,
+            let deadline = tokio::time::Instant::now() + Self::BACKFILL_RETRY_INTERVAL;
+            loop {
+                match tokio::time::timeout_at(deadline, wakeup.recv()).await {
+                    Ok(Ok(delivery)) if delivery.sequence() == needed => return,
+                    Ok(Ok(_)) => {}
+                    // Lagged or closed: no reliable signal left — re-read.
+                    Ok(Err(_)) => return,
+                    // Interval elapsed: fall through to the probe.
+                    Err(_) => break,
+                }
+            }
+            match Tables::sequence_present(pool, needed).await {
+                // Still missing: keep parking, at one probe per interval.
+                Ok(false) => continue,
+                // Landed, or the probe itself failed — either way the
+                // caller re-reads and decides.
+                Ok(true) | Err(_) => return,
             }
         }
     }
@@ -253,7 +272,7 @@ where
         cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         highest: EventSequence,
-        buffer_size: usize,
+        max_page_size: usize,
         init_head: u64,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) {
@@ -288,6 +307,22 @@ where
             // slip into the unobserved window and cost the full retry
             // interval.
             let wakeup = cache_fill_sender.subscribe();
+
+            // Size the read to demand rather than to a constant: wait until
+            // the listener has room, then take as much as it can actually
+            // hold, under the configured ceiling. A reader keeping up gets
+            // full pages and few round trips; one that has stalled stops
+            // fetching — and materialising — pages it cannot take, instead
+            // of running the buffer's whole depth ahead of itself.
+            match sender.reserve().await {
+                // The permit is only a demand signal; dropping it returns
+                // the slot, so the size below sees it as free capacity.
+                Ok(permit) => drop(permit),
+                // Listener gone.
+                Err(_) => return,
+            }
+            let page_size = sender.capacity().clamp(1, max_page_size);
+
             let select_from = current_sequence;
             // One span per page read — the only place the cost of the
             // catch-up path is observable. `rows` against `delivered` is
@@ -298,11 +333,11 @@ where
             let page_span = tracing::info_span!(
                 "obix.persistent_cache.backfill_page",
                 from_sequence = u64::from(select_from),
-                limit = buffer_size,
+                limit = page_size,
                 rows = tracing::field::Empty,
                 delivered = tracing::field::Empty,
             );
-            let events = match Tables::load_next_page::<P>(&pool, select_from, buffer_size)
+            let events = match Tables::load_next_contiguous_page::<P>(&pool, select_from, page_size)
                 .instrument(page_span.clone())
                 .await
             {
@@ -315,30 +350,27 @@ where
             };
             let returned = events.len();
             page_span.record("rows", returned);
-            let mut present = std::collections::HashSet::with_capacity(returned);
-            let mut page = Vec::with_capacity(returned);
+
+            // Every returned row is deliverable: the read is cut at the
+            // first gap, so the page *is* the contiguous prefix. The
+            // ordering check stays as the enforcement point of that
+            // contract — delivery must be ordered and gap-free whatever a
+            // `MailboxTables` implementation hands back.
+            let mut delivered = 0;
             for item in events {
                 let delivery = PersistentDelivery::from(item);
-                present.insert(u64::from(delivery.sequence()));
-                page.push(delivery);
-            }
-
-            // Deliver the contiguous prefix; anything above a gap is left
-            // for a later read so delivery stays ordered and gap-free.
-            let mut delivered = 0;
-            for delivery in &page {
                 if delivery.sequence() != current_sequence.next() {
                     break;
                 }
                 let _ = cache_fill_sender.send(delivery.clone());
-                if sender.send(delivery.clone()).await.is_err() {
+                if sender.send(delivery).await.is_err() {
                     return;
                 }
-                current_sequence = delivery.sequence();
+                current_sequence = current_sequence.next();
                 delivered += 1;
             }
             page_span.record("delivered", delivered);
-            if delivered == returned && returned == buffer_size {
+            if delivered == returned && returned == page_size {
                 // Full contiguous page — more may follow immediately.
                 continue;
             }
@@ -355,14 +387,27 @@ where
             // on the cache-fill stream, then re-read.
             let next_needed = u64::from(current_sequence.next());
             if next_needed <= init_head {
-                let fill_to = init_head.min(u64::from(select_from) + buffer_size as u64);
-                let missing = (next_needed..=fill_to)
-                    .filter(|sequence| !present.contains(sequence))
-                    .map(EventSequence::from)
-                    .collect::<Vec<_>>();
-                let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
+                // Enumerating the hole is an index-only anti-join, not a
+                // by-product of a payload page: reporting a historical gap
+                // no longer costs a window of rows that get discarded.
+                let fill_to = init_head.min(u64::from(select_from) + page_size as u64);
+                if next_needed <= fill_to {
+                    match Tables::missing_sequences(
+                        &pool,
+                        current_sequence,
+                        EventSequence::from(fill_to),
+                    )
+                    .await
+                    {
+                        Ok(missing) if !missing.is_empty() => {
+                            let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
+                        }
+                        Ok(_) => {}
+                        Err(e) => record_backfill_failed(&e, next_needed),
+                    }
+                }
             }
-            Self::park_until_resolved(wakeup, current_sequence.next()).await;
+            Self::park_until_resolved(&pool, wakeup, current_sequence.next()).await;
         }
 
         for (_, event) in
@@ -456,6 +501,7 @@ where
         let pool = pool.clone();
 
         let cache_size = config.event_cache_size;
+        let backfill_page_size = config.backfill_page_size.max(1);
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let idle_resync_interval = config.idle_resync_interval;
@@ -496,7 +542,7 @@ where
                                     cache_snapshot,
                                     cache_fill_sender.clone(),
                                     highest,
-                                    cache_size,
+                                    backfill_page_size,
                                     init_head,
                                     gap_fill_tx.clone(),
                                 ));

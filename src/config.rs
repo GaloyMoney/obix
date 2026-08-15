@@ -18,6 +18,28 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 /// can never collide with a live writer regardless of this setting.
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Ceiling on the rows a single backfill page read may return.
+///
+/// Deliberately **not** `event_cache_size`. The cache size is a memory-window
+/// decision — how far behind a listener can fall and still be served without
+/// touching the database — while this is a query-shape decision: how much a
+/// catch-up read holds a pooled connection for, how large a result set it
+/// materialises, and how long the consumer waits for the first event of a
+/// page. Sharing one number meant that widening the memory window (a good
+/// thing) silently turned every catch-up read into a multi-megabyte statement.
+///
+/// This is only a ceiling: each read is sized to the room the consumer
+/// actually has, so a fast reader still gets full pages and few round trips
+/// while a slow one stops fetching ahead of what it can take.
+pub const DEFAULT_BACKFILL_PAGE_SIZE: usize = 1000;
+
+/// Width of the window a gap-fill episode re-reads and may fill per tick.
+///
+/// Separate from both the cache size and the backfill page: this window is a
+/// *fill* bound (how far above a stalled cursor one episode reaches), not a
+/// delivery bound, and it has no consumer to pace itself against.
+pub const DEFAULT_GAP_FILL_PAGE_SIZE: usize = 1000;
+
 /// Maximum number of placeholder rows a single gap-fill query may insert.
 /// Bounds the worst case (a mass rollback or long outage leaving thousands
 /// of lost sequences) to a small, predictable statement instead of one
@@ -81,6 +103,16 @@ pub struct MailboxConfig {
     pub event_cache_trim_percent: u8,
     #[builder(default = "DEFAULT_PERSIST_EVENTS_BATCH_SIZE")]
     pub persist_events_batch_size: usize,
+    /// Ceiling on a single backfill page read; see
+    /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. Reads are sized to the consumer's
+    /// available buffer and clamped here, so this bounds the worst case
+    /// rather than fixing every read.
+    #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
+    pub backfill_page_size: usize,
+    /// Window a gap-fill episode re-reads and may fill per tick; see
+    /// [`DEFAULT_GAP_FILL_PAGE_SIZE`].
+    #[builder(default = "DEFAULT_GAP_FILL_PAGE_SIZE")]
+    pub gap_fill_page_size: usize,
     /// Grace period before the first proactive gap-fill attempt for a
     /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
     /// after a fill attempt are unaffected (fixed 1s interval).

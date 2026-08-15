@@ -2076,3 +2076,244 @@ async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Build `1,2,3, <gap 4>, 5,6, <gap 7>, 8` directly in the table, with no
+/// cache loop running — the shape the read-path queries are cut against.
+async fn write_history_with_gaps(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    for n in [0u64, 1, 2] {
+        sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+            .bind(format!(r#"{{"Ping": {n}}}"#))
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(pool)
+        .await?;
+    for n in [4u64, 5] {
+        sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+            .bind(format!(r#"{{"Ping": {n}}}"#))
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(pool)
+        .await?;
+    sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+        .bind(r#"{"Ping": 7}"#)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn contiguous_page_read_stops_at_the_first_gap() -> anyhow::Result<()> {
+    use obix::MailboxTables;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+    write_history_with_gaps(&pool).await?;
+
+    // The window read sees every committed row past the gaps — which is
+    // what the gap filler needs, and exactly what a reader delivering in
+    // order cannot use.
+    let window =
+        helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
+    assert_eq!(window.len(), 6, "window read returns rows past both gaps");
+
+    // The delivery read stops at the first gap: three rows, never the six
+    // it would have had to fetch, decode and then discard.
+    let prefix = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
+        &pool,
+        EventSequence::from(0),
+        10,
+    )
+    .await?;
+    let sequences: Vec<u64> = prefix
+        .iter()
+        .map(|item| match item {
+            Ok(event) => u64::from(event.sequence),
+            Err(e) => u64::from(e.sequence),
+        })
+        .collect();
+    assert_eq!(sequences, vec![1, 2, 3]);
+
+    // Resuming above the gap picks up the next run, and stops at the next one.
+    let next = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
+        &pool,
+        EventSequence::from(4),
+        10,
+    )
+    .await?;
+    assert_eq!(next.len(), 2, "run between the two gaps");
+
+    // Parked directly behind a gap the read returns nothing at all — the
+    // case that used to fetch a full window every retry interval.
+    let blocked = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
+        &pool,
+        EventSequence::from(3),
+        10,
+    )
+    .await?;
+    assert!(
+        blocked.is_empty(),
+        "a read starting on a gap delivers nothing"
+    );
+
+    // And the ceiling still bounds the page.
+    let capped = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
+        &pool,
+        EventSequence::from(0),
+        2,
+    )
+    .await?;
+    assert_eq!(capped.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn sequence_present_probes_without_reading_a_page() -> anyhow::Result<()> {
+    use obix::MailboxTables;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+    write_history_with_gaps(&pool).await?;
+
+    assert!(helpers::TestTables::sequence_present(&pool, EventSequence::from(3)).await?);
+    assert!(!helpers::TestTables::sequence_present(&pool, EventSequence::from(4)).await?);
+    assert!(!helpers::TestTables::sequence_present(&pool, EventSequence::from(7)).await?);
+    assert!(helpers::TestTables::sequence_present(&pool, EventSequence::from(8)).await?);
+    // Never allocated at all.
+    assert!(!helpers::TestTables::sequence_present(&pool, EventSequence::from(99)).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn missing_sequences_enumerates_holes() -> anyhow::Result<()> {
+    use obix::MailboxTables;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+    write_history_with_gaps(&pool).await?;
+
+    let missing = helpers::TestTables::missing_sequences(
+        &pool,
+        EventSequence::from(0),
+        EventSequence::from(8),
+    )
+    .await?;
+    let missing: Vec<u64> = missing.into_iter().map(u64::from).collect();
+    assert_eq!(missing, vec![4, 7]);
+
+    // A run with no holes reports none.
+    let none = helpers::TestTables::missing_sequences(
+        &pool,
+        EventSequence::from(0),
+        EventSequence::from(3),
+    )
+    .await?;
+    assert!(none.is_empty());
+
+    // Sequences above the allocation head count as missing — the caller
+    // bounds the range, not this query.
+    let beyond = helpers::TestTables::missing_sequences(
+        &pool,
+        EventSequence::from(8),
+        EventSequence::from(10),
+    )
+    .await?;
+    let beyond: Vec<u64> = beyond.into_iter().map(u64::from).collect();
+    assert_eq!(beyond, vec![9, 10]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn backfill_replays_across_many_small_pages() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // History well past a single page, written before any cache loop runs
+    // so only the backfill path can serve it.
+    for n in 0..25u64 {
+        sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+            .bind(format!(r#"{{"Ping": {n}}}"#))
+            .execute(&pool)
+            .await?;
+    }
+
+    // A deliberately tiny ceiling: replay must page across it, in order,
+    // losing nothing at the boundaries.
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .backfill_page_size(3)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
+
+    for n in 0..25u64 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("stream closed early")?;
+        assert_eq!(u64::from(event.sequence), n + 1);
+        assert!(matches!(event.payload, Some(TestEvent::Ping(p)) if p == n));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
+    use obix::out::Outbox;
+
+    let pool = init_pool().await?;
+    helpers::wipeout_outbox_tables(&pool).await?;
+
+    // Buffers far smaller than the burst: the listener cannot hold what is
+    // published, so the drain has to apply backpressure rather than pull
+    // events in and evict them. Nothing may be lost or reordered — an
+    // event dropped locally after being counted as known is the case that
+    // used to cost a database round trip to fetch back.
+    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(16)
+            .backfill_page_size(3)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    for n in 0..30u64 {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
+            .await?;
+    }
+    op.commit().await?;
+
+    for n in 0..30u64 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+            .await?
+            .expect("stream closed early")?;
+        assert!(
+            matches!(event.payload, Some(TestEvent::Ping(p)) if p == n),
+            "expected Ping({n}) at sequence {:?}",
+            event.sequence
+        );
+    }
+
+    Ok(())
+}

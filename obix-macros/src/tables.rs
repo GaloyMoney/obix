@@ -189,6 +189,103 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
+        // The delivery-path read: the contiguous run above `$1` and nothing
+        // past the first gap. `load_next_page` returns every committed row in
+        // the window, but a caller delivering in order can only use the
+        // contiguous prefix — so on a window whose gap sits early, the rest
+        // was fetched from the heap, detoasted, transmitted and decoded only
+        // to be dropped, once per park interval for as long as the gap
+        // persisted.
+        //
+        // `win` finds the cut index-only (the PK is `sequence`): in a
+        // contiguous run `sequence = $1 + rn` exactly, so the first row where
+        // that fails is the first gap. Only rows below the cut reach the
+        // heap, so a page blocked at the very first sequence costs an index
+        // scan of the window and returns nothing.
+        // The cut MUST be a scalar subquery, not a joined CTE. As an InitPlan
+        // it is evaluated once and its result is usable as an index bound —
+        // `Index Cond: (sequence > $1 AND sequence <= $1 + $2 AND sequence <
+        // (InitPlan 1).col1)` — so the payload scan stops at the gap in the
+        // index. Written as `FROM t e, stop WHERE e.sequence < stop.s` the
+        // planner instead produces a Nested Loop whose `stop` value is only a
+        // Join Filter: with no upper bound left on the index it walks the
+        // entire tail of the table and discards it — 5,327 buffers / 24.6 ms
+        // where this form takes 43 / 0.3 ms. Verified to survive the generic
+        // plan, which is what a prepared statement gets after five executions.
+        //
+        // The redundant `sequence <= $1 + $2` is kept deliberately: it bounds
+        // the scan (and prunes partitions) independently of the InitPlan.
+        //
+        // Measured against `load_next_page`, 200k rows, page 1000, generic
+        // plans, `VACUUM ANALYZE`d (buffers, rows handed back):
+        //
+        //   no gap in window     69 buf / 1000 rows  ->   76 buf / 1000 rows
+        //   parked on the gap    69 buf /  999 rows  ->   10 buf /    0 rows
+        //
+        // ~10% more work on a clean page buys not fetching, decoding and
+        // discarding a window of payloads on a blocked one. The cut is only
+        // genuinely index-only once the visibility map is set, so on the
+        // never-yet-vacuumed tail it costs a second heap pass (~2x buffers on
+        // a clean page); catch-up reads are mostly far behind the tail, where
+        // the map is set and `Heap Fetches` is 0.
+        //
+        // NOTE for anyone editing this: re-check the plan. A gap-cut query is
+        // unusually easy to write in a form that silently degrades into a
+        // whole-table scan.
+        let load_next_contiguous_page_query = format!(
+            r#"
+            WITH win AS (
+                SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence) AS rn
+                FROM {tbl}persistent_outbox_events
+                WHERE sequence > $1
+                  AND sequence <= $1 + $2
+            )
+            SELECT e.sequence AS "sequence!: i64", e.id AS "id!", e.payload,
+                   e.tracing_context, e.recorded_at AS "recorded_at!"
+            FROM {tbl}persistent_outbox_events e
+            WHERE e.sequence > $1
+              AND e.sequence <= $1 + $2
+              AND e.sequence < (
+                  SELECT COALESCE(MIN(sequence), $1 + $2 + 1)
+                  FROM win
+                  WHERE sequence <> $1 + rn
+              )
+            ORDER BY e.sequence ASC"#,
+            tbl = table_prefix,
+        );
+
+        // Single index probe for a parked reader: "has the sequence I am
+        // blocked on landed yet?". Replaces re-reading the whole page each
+        // retry interval purely to discover the answer.
+        let sequence_present_query = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM {tbl}persistent_outbox_events WHERE sequence = $1
+            ) AS "present!""#,
+            tbl = table_prefix,
+        );
+
+        // Enumerate the holes in `(after, up_to]` without fetching payloads,
+        // for callers that must *report* which sequences are missing rather
+        // than deliver the ones present.
+        //
+        // `EXCEPT` against a bounded scan, NOT `WHERE NOT EXISTS (...)`: the
+        // anti-join form plans as a Nested Loop Anti Join that pays a separate
+        // index probe per generated sequence — measured at 4,501 buffers for a
+        // 1,500-wide range, worse than reading the payload page it replaces.
+        // The set-operation form reads the window once, index-only: 8 buffers
+        // for the same range, 31 for a 10,000-wide one.
+        let missing_sequences_query = format!(
+            r#"
+            SELECT g AS "sequence!: i64"
+            FROM generate_series($1::bigint + 1, $2::bigint) g
+            EXCEPT
+            SELECT sequence FROM {tbl}persistent_outbox_events
+            WHERE sequence > $1 AND sequence <= $2
+            ORDER BY 1"#,
+            tbl = table_prefix,
+        );
+
         let load_events_in_range_query = format!(
             r#"
             SELECT id, sequence, payload, tracing_context, recorded_at
@@ -527,6 +624,78 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
                         Ok(events)
+                    }
+                }
+
+                fn load_next_contiguous_page<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    from_sequence: #crate_name::EventSequence,
+                    buffer_size: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_next_contiguous_page_query,
+                            from_sequence as #crate_name::EventSequence,
+                            buffer_size as i64,
+                        ).fetch_all(&pool).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                #deserialize_context
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                )
+                            })
+                            .collect();
+                        Ok(events)
+                    }
+                }
+
+                fn sequence_present(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(
+                            #sequence_present_query,
+                            sequence as #crate_name::EventSequence,
+                        ).fetch_one(&pool).await?;
+                        Ok(row.present)
+                    }
+                }
+
+                fn missing_sequences(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after_sequence: #crate_name::EventSequence,
+                    up_to_sequence: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #missing_sequences_query,
+                            after_sequence as #crate_name::EventSequence,
+                            up_to_sequence as #crate_name::EventSequence,
+                        ).fetch_all(&pool).await?;
+
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::EventSequence::from(row.sequence as u64))
+                            .collect())
                     }
                 }
 

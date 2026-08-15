@@ -102,7 +102,7 @@ impl GapFiller {
             notifier_tx,
             grace: config.gap_fill_grace,
             batch_limit: config.gap_fill_batch_limit,
-            page_size: config.event_cache_size,
+            page_size: config.gap_fill_page_size.max(1),
             stall: None,
             historical: BTreeSet::new(),
             historical_marker: None,
