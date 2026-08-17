@@ -630,31 +630,40 @@ async fn wait_for_n_deliveries(
     }
 }
 
-async fn checkpoint_sequence(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
-    let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
-        "SELECT s.execution_state_json FROM job_executions je \
-         JOIN jobs j ON j.id = je.id \
-         LEFT JOIN job_execution_states s ON s.id = je.id \
-         WHERE j.job_type = $1",
-    )
-    .bind(JOB_TYPE)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row
-        .and_then(|(json,)| json)
-        .and_then(|json| json.get("sequence").and_then(|s| s.as_i64())))
+/// Mirrors the shape of obix's own (crate-private) `OutboxEventJobState` —
+/// just the field this test cares about. `execution_state` deserializes
+/// straight off whatever JSON the job crate hands back, so this doesn't need
+/// to match anything beyond that one key.
+#[derive(Deserialize)]
+struct CheckpointState {
+    sequence: i64,
 }
 
-async fn wait_for_checkpoint(pool: &sqlx::PgPool, expected: i64) -> anyhow::Result<()> {
+/// Reads the job's checkpoint entirely through the `job` crate's public API
+/// — `handle_unique` + `execution_state` — never touching `job_executions` /
+/// `job_execution_states` directly. Those tables are the job crate's own
+/// storage detail; obix (and its tests) have no business knowing their
+/// shape.
+async fn checkpoint_sequence(jobs: &job::Jobs) -> anyhow::Result<Option<i64>> {
+    let Some(handle) = jobs.handle_unique(job::JobType::new(JOB_TYPE)).await? else {
+        return Ok(None);
+    };
+    Ok(handle
+        .execution_state::<CheckpointState>()
+        .await?
+        .map(|s| s.sequence))
+}
+
+async fn wait_for_checkpoint(jobs: &job::Jobs, expected: i64) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     loop {
-        if checkpoint_sequence(pool).await? == Some(expected) {
+        if checkpoint_sequence(jobs).await? == Some(expected) {
             return Ok(());
         }
         if start.elapsed() > std::time::Duration::from_secs(5) {
             anyhow::bail!(
                 "Timeout waiting for checkpoint to reach {expected}, at {:?}",
-                checkpoint_sequence(pool).await?
+                checkpoint_sequence(jobs).await?
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1106,7 +1115,7 @@ async fn skipped_events_advance_checkpoint_lazily() -> anyhow::Result<()> {
     // No transaction ever ran for these events, yet the checkpoint catches
     // up within ~checkpoint_interval via the standalone pointer write.
     // (Sequences are deterministic: the wipeout restarts identity at 1.)
-    wait_for_checkpoint(&pool, 3).await?;
+    wait_for_checkpoint(&jobs, 3).await?;
 
     Ok(())
 }
@@ -1215,7 +1224,7 @@ async fn single_deferred_event_commits_promptly_at_low_traffic() -> anyhow::Resu
     // moment the backlog is drained the batch (of one) lands — work AND
     // checkpoint — with no configured wait.
     wait_for_effect_rows(&pool, 1).await?;
-    wait_for_checkpoint(&pool, 1).await?;
+    wait_for_checkpoint(&jobs, 1).await?;
     let latency = published_at.elapsed();
     assert!(
         latency < std::time::Duration::from_secs(2),
@@ -1261,7 +1270,7 @@ async fn collected_events_flush_once_per_batch() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     wait_for_effect_rows(&pool, N as usize).await?;
-    wait_for_checkpoint(&pool, N as i64).await?;
+    wait_for_checkpoint(&jobs, N as i64).await?;
 
     // One flush applied the whole burst: N per-event statements became a
     // single batched flush call inside the checkpoint's transaction.
@@ -1356,7 +1365,7 @@ async fn failed_flush_replays_and_recollects() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     wait_for_effect_rows(&pool, N as usize).await?;
-    wait_for_checkpoint(&pool, N as i64).await?;
+    wait_for_checkpoint(&jobs, N as i64).await?;
 
     // The failed flush dropped its drained items with the op; the retry
     // re-delivered the events and re-collected from scratch. The primary
@@ -1402,7 +1411,7 @@ async fn mixed_collect_and_defer_land_in_one_batch() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     wait_for_effect_rows(&pool, N as usize).await?;
-    wait_for_checkpoint(&pool, N as i64).await?;
+    wait_for_checkpoint(&jobs, N as i64).await?;
 
     // Odd events were collected (applied at flush), even events wrote into
     // the shared op at handle time — one batch, one transaction, one
@@ -1515,7 +1524,7 @@ async fn hashmap_collect_coalesces_by_key() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     wait_for_effect_rows(&pool, 2).await?;
-    wait_for_checkpoint(&pool, N as i64).await?;
+    wait_for_checkpoint(&jobs, N as i64).await?;
 
     // N updates per key coalesced in the accumulator: only the newest value
     // per key reached the flush.
@@ -1565,7 +1574,7 @@ async fn single_collected_event_flushes_promptly_at_low_traffic() -> anyhow::Res
     // checkpoint — with no configured wait, and no transaction existed
     // before the flush instant.
     wait_for_effect_rows(&pool, 1).await?;
-    wait_for_checkpoint(&pool, 1).await?;
+    wait_for_checkpoint(&jobs, 1).await?;
     let latency = published_at.elapsed();
     assert!(
         latency < std::time::Duration::from_secs(2),
@@ -1737,7 +1746,7 @@ async fn ephemeral_only_handler_skips_checkpoint_machinery() -> anyhow::Result<(
         "EphemeralOnly handler must never receive persistent events"
     );
     assert_eq!(
-        checkpoint_sequence(&pool).await?,
+        checkpoint_sequence(&jobs).await?,
         None,
         "EphemeralOnly job must never write execution state"
     );
@@ -1794,10 +1803,10 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
         // The checkpoint is persisted at seq 1 before the job errors, then
         // every retry re-reads the poison event and fails again: the
         // checkpoint stays parked and Ping(2) stays undelivered.
-        wait_for_checkpoint(&pool, 1).await?;
+        wait_for_checkpoint(&jobs, 1).await?;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(*received.lock().await, vec![1]);
-        assert_eq!(checkpoint_sequence(&pool).await?, Some(1));
+        assert_eq!(checkpoint_sequence(&jobs).await?, Some(1));
 
         jobs.shutdown().await?;
     }
@@ -1843,7 +1852,7 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
 
         wait_for_n_deliveries(&received_after, 1, std::time::Duration::from_secs(5)).await?;
         assert_eq!(*received_after.lock().await, vec![2]);
-        wait_for_checkpoint(&pool, 3).await?;
+        wait_for_checkpoint(&jobs, 3).await?;
 
         jobs.shutdown().await?;
     }
@@ -1898,7 +1907,7 @@ async fn handle_undecodable_ok_moves_past_poison_event() -> anyhow::Result<()> {
     wait_for_n_deliveries(&received, 2, std::time::Duration::from_secs(5)).await?;
     assert_eq!(*received.lock().await, vec![1, 2]);
     assert_eq!(*acked.lock().await, vec![2]);
-    wait_for_checkpoint(&pool, 3).await?;
+    wait_for_checkpoint(&jobs, 3).await?;
 
     jobs.shutdown().await?;
 
