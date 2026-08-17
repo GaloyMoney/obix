@@ -632,8 +632,10 @@ async fn wait_for_n_deliveries(
 
 async fn checkpoint_sequence(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
     let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
-        "SELECT je.execution_state_json FROM job_executions je \
-         JOIN jobs j ON j.id = je.id WHERE j.job_type = $1",
+        "SELECT s.execution_state_json FROM job_executions je \
+         JOIN jobs j ON j.id = je.id \
+         LEFT JOIN job_execution_states s ON s.id = je.id \
+         WHERE j.job_type = $1",
     )
     .bind(JOB_TYPE)
     .fetch_optional(pool)

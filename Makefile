@@ -35,7 +35,7 @@ check-code:
 	nix flake check
 
 sqlx-prepare:
-	cargo sqlx prepare --workspace
+	cargo sqlx prepare --workspace -- --all-targets
 
 # Coverage-guided fuzzing via the shared vendored script
 # (ci/vendor/tasks/fuzz.sh, from galoy-concourse-shared), also used by
