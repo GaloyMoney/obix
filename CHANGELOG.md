@@ -1,3 +1,19 @@
+# [obix release v0.8.5](https://github.com/GaloyMoney/obix/releases/tag/0.8.5)
+
+
+
+### Bug Fixes
+
+- Restore missing sqlx query cache + stale execution_state_json test query
+
+### Miscellaneous Tasks
+
+- Bump job
+
+### Testing
+
+- Read job checkpoint via the job crate's public API
+
 # [obix release v0.8.4](https://github.com/GaloyMoney/obix/releases/tag/0.8.4)
 
 
