@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use job::{
-    CurrentJob, Job, JobCompletion, JobInitializer, JobRunner, JobSpawner, JobType, RetrySettings,
+    CurrentJob, Job, JobType, ResidentJobCompletion, ResidentJobInitializer, ResidentJobRunner,
+    RetrySettings,
 };
 
 use super::Partitions;
@@ -76,7 +77,7 @@ where
     }
 }
 
-impl<Tables> JobInitializer for PartitionMaintainerJobInitializer<Tables>
+impl<Tables> ResidentJobInitializer for PartitionMaintainerJobInitializer<Tables>
 where
     Tables: MailboxTables,
 {
@@ -90,11 +91,7 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(
-        &self,
-        _job: &Job,
-        _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(PartitionMaintainerJobRunner::<Tables> {
             partitions: self.partitions.clone(),
             interval: self.interval,
@@ -111,14 +108,14 @@ where
 }
 
 #[async_trait]
-impl<Tables> JobRunner for PartitionMaintainerJobRunner<Tables>
+impl<Tables> ResidentJobRunner for PartitionMaintainerJobRunner<Tables>
 where
     Tables: MailboxTables,
 {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         // Re-run on an internal timer rather than round-tripping through the job
         // scheduler each tick: the job stays resident and only falls out of the
         // loop on shutdown (reschedule to resume after restart) or on an
@@ -133,7 +130,7 @@ where
             tokio::select! {
                 biased;
                 _ = current_job.shutdown_requested() => {
-                    return Ok(JobCompletion::RescheduleNow);
+                    return Ok(ResidentJobCompletion::RescheduleNow);
                 }
                 _ = tokio::time::sleep(self.interval) => {}
             }
