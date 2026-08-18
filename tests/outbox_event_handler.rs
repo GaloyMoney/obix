@@ -640,12 +640,12 @@ struct CheckpointState {
 }
 
 /// Reads the job's checkpoint entirely through the `job` crate's public API
-/// — `handle_unique` + `execution_state` — never touching `job_executions` /
-/// `job_execution_states` directly. Those tables are the job crate's own
+/// — `resident_handle` + `execution_state` — never touching `job_executions`
+/// / `job_execution_states` directly. Those tables are the job crate's own
 /// storage detail; obix (and its tests) have no business knowing their
 /// shape.
 async fn checkpoint_sequence(jobs: &job::Jobs) -> anyhow::Result<Option<i64>> {
-    let Some(handle) = jobs.handle_unique(job::JobType::new(JOB_TYPE)).await? else {
+    let Some(handle) = jobs.resident_handle(job::JobType::new(JOB_TYPE)).await? else {
         return Ok(None);
     };
     Ok(handle

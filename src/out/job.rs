@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 use job::{
-    CurrentJob, Job, JobCompletion, JobInitializer, JobRunner, JobSpawner, JobType, RetrySettings,
+    CurrentJob, Job, JobType, ResidentJobCompletion, ResidentJobInitializer, ResidentJobRunner,
+    RetrySettings,
 };
 
 use super::ctx::*;
@@ -296,7 +297,7 @@ where
     }
 }
 
-impl<H, P, Tables> JobInitializer for OutboxEventJobInitializer<H, P, Tables>
+impl<H, P, Tables> ResidentJobInitializer for OutboxEventJobInitializer<H, P, Tables>
 where
     H: OutboxEventHandler<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -312,11 +313,7 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(
-        &self,
-        _job: &Job,
-        _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(OutboxEventJobRunner::<H, P, Tables> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
@@ -339,7 +336,7 @@ where
 }
 
 #[async_trait]
-impl<H, P, Tables> JobRunner for OutboxEventJobRunner<H, P, Tables>
+impl<H, P, Tables> ResidentJobRunner for OutboxEventJobRunner<H, P, Tables>
 where
     H: OutboxEventHandler<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -348,7 +345,7 @@ where
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         match H::SUBSCRIPTION {
             EventSubscription::EphemeralOnly => self.run_ephemeral_only(current_job).await,
             EventSubscription::All | EventSubscription::PersistentOnly => {
@@ -370,13 +367,13 @@ where
     async fn run_ephemeral_only(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         let mut ephemeral = self.outbox.listen_ephemeral();
         loop {
             tokio::select! {
                 biased;
                 _ = current_job.shutdown_requested() => {
-                    return Ok(JobCompletion::RescheduleNow);
+                    return Ok(ResidentJobCompletion::RescheduleNow);
                 }
                 event = ephemeral.next() => match event {
                     Some(event) => {
@@ -385,7 +382,7 @@ where
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                     }
-                    None => return Ok(JobCompletion::RescheduleNow),
+                    None => return Ok(ResidentJobCompletion::RescheduleNow),
                 },
             }
         }
@@ -394,7 +391,7 @@ where
     async fn run_with_persistent(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()?
             .unwrap_or_default();
@@ -439,7 +436,7 @@ where
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
-                        return Ok(JobCompletion::RescheduleNow);
+                        return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     None => {
                         let mut parts = CtxParts {
@@ -463,7 +460,7 @@ where
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
-                        return Ok(JobCompletion::RescheduleNow);
+                        return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted_seq < state.sequence => {
@@ -508,7 +505,7 @@ where
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
-                        return Ok(JobCompletion::RescheduleNow);
+                        return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                 }
             };

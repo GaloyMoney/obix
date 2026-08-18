@@ -434,10 +434,8 @@ where
     {
         let initializer =
             job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
-        let spawner = jobs.add_initializer(initializer);
-        let handle = spawner
-            .spawn_unique(job::OutboxEventJobData::default())
-            .await?;
+        let spawner = jobs.add_resident_initializer(initializer);
+        let handle = spawner.spawn(job::OutboxEventJobData::default()).await?;
         Ok(RegisteredEventHandler::new(handle, self.pool.clone()))
     }
 
@@ -486,9 +484,9 @@ where
             &config,
             self.partition_maintainer_interval,
         );
-        let spawner = jobs.add_initializer(initializer);
+        let spawner = jobs.add_resident_initializer(initializer);
         spawner
-            .spawn_unique(partition::PartitionMaintainerJobData::default())
+            .spawn(partition::PartitionMaintainerJobData::default())
             .await?;
         Ok(())
     }
