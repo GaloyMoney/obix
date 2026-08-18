@@ -1,3 +1,11 @@
+# [obix release v0.8.6](https://github.com/GaloyMoney/obix/releases/tag/0.8.6)
+
+
+
+### Miscellaneous Tasks
+
+- Bump job to 0.12.0 (#130)
+
 # [obix release v0.8.5](https://github.com/GaloyMoney/obix/releases/tag/0.8.5)
 
 
