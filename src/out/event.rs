@@ -20,6 +20,109 @@ where
     }
 }
 
+/// Wire-level classification of an outbox event enum's variants into
+/// *ephemeral* (at-most-once runtime broadcasts) and *persistent*
+/// (checkpointed, replayable) events.
+///
+/// Derive it and mark the ephemeral variants with `#[obix(ephemeral)]`:
+///
+/// ```
+/// use obix::OutboxEventKind;
+/// use obix::out::OutboxEventKind as Kind;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Debug, Serialize, Deserialize, OutboxEventKind)]
+/// #[serde(tag = "type")]
+/// enum PriceEvent {
+///     /// Ephemeral: live spot tick, never persisted.
+///     #[obix(ephemeral)]
+///     PriceUpdated { usd: f64 },
+///     /// Persistent: the official EOD closing rate.
+///     ClosingRateCaptured { usd: f64 },
+/// }
+///
+/// assert_eq!(PriceEvent::EPHEMERAL_VARIANTS, &["PriceUpdated"]);
+/// assert!(Kind::is_ephemeral(&PriceEvent::PriceUpdated { usd: 1.0 }));
+/// assert!(!Kind::is_ephemeral(&PriceEvent::ClosingRateCaptured { usd: 1.0 }));
+/// ```
+///
+/// Aggregates — enums whose variants wrap other event enums — delegate: an
+/// unmarked single-field variant forwards [`is_ephemeral`](Self::is_ephemeral)
+/// to the inner event, which therefore must implement `OutboxEventKind` too.
+/// A variant marked `#[obix(ephemeral)]` is ephemeral as a whole, regardless
+/// of its inner value (so its inner type needs no impl of its own):
+///
+/// ```
+/// # use obix::OutboxEventKind;
+/// # use obix::out::OutboxEventKind as Kind;
+/// # use serde::{Deserialize, Serialize};
+/// # #[derive(Debug, Serialize, Deserialize, OutboxEventKind)]
+/// # #[serde(tag = "type")]
+/// # enum PriceEvent {
+/// #     #[obix(ephemeral)]
+/// #     PriceUpdated { usd: f64 },
+/// #     ClosingRateCaptured { usd: f64 },
+/// # }
+/// #[derive(Debug, Serialize, Deserialize, OutboxEventKind)]
+/// #[serde(tag = "module")]
+/// enum BankEvent {
+///     Price(PriceEvent),
+///     /// Ephemeral module: cache-invalidation pokes, never persisted.
+///     #[obix(ephemeral)]
+///     DomainConfig(DomainConfigEvent),
+/// }
+///
+/// # #[derive(Debug, Serialize, Deserialize)]
+/// # struct DomainConfigEvent;
+/// assert!(Kind::is_ephemeral(&BankEvent::Price(PriceEvent::PriceUpdated { usd: 1.0 })));
+/// assert!(Kind::is_ephemeral(&BankEvent::DomainConfig(DomainConfigEvent)));
+/// assert_eq!(BankEvent::EPHEMERAL_VARIANTS, &["DomainConfig"]);
+/// assert_eq!(
+///     <BankEvent as Kind>::ephemeral_event_types(),
+///     vec![("Price", "PriceUpdated"), ("DomainConfig", "*")],
+/// );
+/// ```
+///
+/// ## Tags
+///
+/// The tags in [`EPHEMERAL_VARIANTS`](Self::EPHEMERAL_VARIANTS) and
+/// [`ephemeral_event_types`](Self::ephemeral_event_types) are the values
+/// serde writes for the enum's internal tag — the variant name, or its
+/// `#[serde(rename)]` / `rename_all` spelling — so they match the `oneOf`
+/// discriminants of a generated JSON Schema directly.
+///
+/// ## Why
+///
+/// Ephemeral events are not replayable: consumers that persist them
+/// silently lose rows whenever they were not listening. Classifying the
+/// variants on the enum itself keeps exactly one machine-readable source of
+/// truth for which events may be replicated downstream.
+pub trait OutboxEventKind {
+    /// The serde internal-tag values of this enum's variants that are marked
+    /// `#[obix(ephemeral)]` — empty when every variant is persistent.
+    const EPHEMERAL_VARIANTS: &'static [&'static str];
+
+    /// Whether this value is an ephemeral event: a variant marked
+    /// `#[obix(ephemeral)]` on this enum, or — for an unmarked single-field
+    /// variant wrapping another event enum — an inner value that is itself
+    /// ephemeral.
+    fn is_ephemeral(&self) -> bool;
+
+    /// The full ephemeral classification reachable from this enum, as
+    /// `(tag, inner_tag)` pairs: `(tag, "*")` for variants marked ephemeral
+    /// on this enum, and `(tag, inner_tag)` for each ephemeral variant of a
+    /// single-field inner enum. Only one level of nesting is unfolded.
+    ///
+    /// Intended for consumers that classify by wire tag — e.g. filtering a
+    /// generated JSON Schema down to its persistent variants.
+    fn ephemeral_event_types() -> Vec<(&'static str, &'static str)> {
+        Self::EPHEMERAL_VARIANTS
+            .iter()
+            .map(|tag| (*tag, "*"))
+            .collect()
+    }
+}
+
 pub enum OutboxEvent<P>
 where
     P: Serialize + DeserializeOwned + Send,
