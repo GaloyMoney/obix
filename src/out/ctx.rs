@@ -12,12 +12,13 @@
 //! | [`EventCtx::consume_in_batch`] | do work joined to the pending batch op | shares one transaction (and one checkpoint) with neighboring events |
 //! | [`EventCtx::consume_isolated`] | land the pending batch first, then do my work in a fresh op | my event is its own atomic unit, fenced from history |
 //!
-//! and — when an op was taken — one of two exit verbs:
+//! and — when an op was taken — one of three exit verbs:
 //!
 //! | verb | meaning |
 //! |------|---------|
 //! | [`BatchOp::commit`] / [`IsolatedOp::commit`] | land the op (work + checkpoint, atomically) when the invocation returns |
 //! | [`BatchOp::defer`] | leave the op open so subsequent events can coalesce into it |
+//! | [`BatchOp::collect_with`] (and the [`collect`](BatchOp::collect) sugar) | [`defer`](BatchOp::defer), plus contribute an item to the pending batch's accumulator |
 //!
 //! A pending batch — an open op, collected items, or both — only ever exists
 //! while there is ready persistent backlog: the runner never awaits the
@@ -83,7 +84,9 @@ pub(crate) struct CtxParts<'inv> {
 ///
 /// Only obtainable from [`EventCtx::skip`], [`EventCtx::collect_with`] (or
 /// its [`collect`](EventCtx::collect) sugar), [`BatchOp::commit`],
-/// [`BatchOp::defer`] or [`IsolatedOp::commit`] — the type system forces
+/// [`BatchOp::defer`], [`BatchOp::collect_with`] (or its
+/// [`collect`](BatchOp::collect) sugar) or [`IsolatedOp::commit`] — the
+/// type system forces
 /// every [`handle_persistent`](super::OutboxEventHandler::handle_persistent)
 /// invocation to decide the transactional fate of its event.
 ///
@@ -176,8 +179,8 @@ impl<'inv, B> EventCtx<'inv, B> {
     /// committed checkpoint. Only choose this when the handler's work is
     /// idempotent under such replay (pure in-op DB writes and in-op job
     /// spawns are — they roll back with the op).
-    pub async fn consume_in_batch(self) -> Result<BatchOp<'inv>, HandlerError> {
-        let parts = self.parts;
+    pub async fn consume_in_batch(self) -> Result<BatchOp<'inv, B>, HandlerError> {
+        let EventCtx { parts, batch, .. } = self;
         if parts.op_slot.is_none() {
             *parts.op_slot = Some(
                 es_entity::DbOp::init_with_clock(
@@ -188,7 +191,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             );
         }
         parts.tracker.events_in_op += 1;
-        Ok(BatchOp { parts })
+        Ok(BatchOp { parts, batch })
     }
 
     /// Land the pending batch first (its collected items, its work and its
@@ -245,19 +248,26 @@ where
 
 /// An op joined to the pending batch. Implements
 /// [`AtomicOperation`](es_entity::AtomicOperation) — use it exactly like any
-/// atomic operation, then exit with [`commit`](Self::commit) or
-/// [`defer`](Self::defer).
+/// atomic operation, then exit with [`commit`](Self::commit),
+/// [`defer`](Self::defer) or [`collect_with`](Self::collect_with) (and its
+/// [`collect`](Self::collect) sugar).
+///
+/// Generic over the handler's
+/// [`Batch`](super::OutboxEventHandler::Batch) accumulator `B` (defaulting
+/// to `()` for handlers that never collect), so the collect exit can
+/// contribute to the same accumulator as [`EventCtx::collect_with`].
 ///
 /// There is no mutable access to the raw [`es_entity::DbOp`] (only a shared
 /// [`Deref`](std::ops::Deref) view): committing, rolling back, or swapping
 /// out the underlying op is unrepresentable, so work and checkpoint can only
 /// land together, through the runner.
-#[must_use = "exit with .commit() or .defer() to produce the Handled token"]
-pub struct BatchOp<'inv> {
+#[must_use = "exit with .commit(), .defer() or .collect_with() to produce the Handled token"]
+pub struct BatchOp<'inv, B = ()> {
     parts: CtxParts<'inv>,
+    batch: &'inv mut B,
 }
 
-impl<'inv> BatchOp<'inv> {
+impl<'inv, B> BatchOp<'inv, B> {
     fn op_mut(&mut self) -> &mut es_entity::DbOp<'static> {
         self.parts
             .op_slot
@@ -284,9 +294,59 @@ impl<'inv> BatchOp<'inv> {
             _invocation: PhantomData,
         }
     }
+
+    /// [`defer`](Self::defer), plus contribute to the pending batch's
+    /// accumulator — for events that need both direct op work now and a
+    /// coalesced contribution at flush time. The op stays open for
+    /// subsequent events, and the item is applied by the handler's
+    /// [`flush`](super::OutboxEventHandler::flush) inside this same batch
+    /// transaction when the batch lands.
+    ///
+    /// Unlike [`EventCtx::collect_with`] (a pure memory write) this exit
+    /// rides the op the handler already opened via
+    /// [`consume_in_batch`](EventCtx::consume_in_batch). The replay
+    /// contract is unchanged: on a failed batch the op work rolls back and
+    /// the replayed events re-collect their items.
+    ///
+    /// For `Vec` and `HashMap` accumulators the [`collect`](Self::collect)
+    /// sugar is usually more convenient.
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        // No `events_in_op += 1` here: `consume_in_batch` already counted
+        // this event — bumping again would double-count it against
+        // `max_batch_size`.
+        self.parts.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
+            _invocation: PhantomData,
+        }
+    }
 }
 
-impl std::ops::Deref for BatchOp<'_> {
+impl<'inv, T> BatchOp<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators:
+    /// append one item to the pending batch.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> BatchOp<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap`
+    /// accumulators: keyed last-write-wins insert — the coalescing fold
+    /// (see [`EventCtx::collect`](EventCtx::collect)).
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
+    }
+}
+
+impl<B> std::ops::Deref for BatchOp<'_, B> {
     type Target = es_entity::DbOp<'static>;
 
     fn deref(&self) -> &Self::Target {
@@ -309,7 +369,7 @@ impl std::ops::Deref for BatchOp<'_> {
 /// mutable surface: with no `DerefMut`, a `&mut es_entity::DbOp` can never be
 /// obtained from the guard (which would allow `std::mem::swap`-ing in a decoy
 /// op and committing the real one without its checkpoint).
-impl es_entity::AtomicOperation for BatchOp<'_> {
+impl<B: Send> es_entity::AtomicOperation for BatchOp<'_, B> {
     fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         (**self).maybe_now()
     }
