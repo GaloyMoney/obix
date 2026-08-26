@@ -117,12 +117,12 @@ pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>;
 
 #[doc(hidden)]
-pub async fn execute_complete_and_scrub_inbox_event(
+pub async fn execute_complete_and_scrub_inbox_event_in_op(
     op: &mut impl AtomicOperation,
-    now: Option<chrono::DateTime<chrono::Utc>>,
     query: &'static str,
     id: InboxEventId,
 ) -> Result<(), sqlx::Error> {
+    let now = op.maybe_now();
     sqlx::query::<sqlx::Postgres>(query)
         .bind(id)
         .bind(now)
@@ -341,9 +341,8 @@ pub trait MailboxTables: Send + Sync + 'static {
         error: Option<&str>,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    fn complete_and_scrub_inbox_event(
+    fn complete_and_scrub_inbox_event_in_op(
         op: &mut impl es_entity::AtomicOperation,
-        now: Option<chrono::DateTime<chrono::Utc>>,
         id: InboxEventId,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
