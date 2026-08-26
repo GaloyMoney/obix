@@ -160,10 +160,13 @@ where
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::CompleteAndScrub) => {
-                Tables::complete_and_scrub_inbox_event(&self.pool, now, self.inbox_event_id)
+                let mut op = es_entity::DbOp::init_with_clock(&self.pool, &self.clock)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-                Ok(JobCompletion::Complete)
+                Tables::complete_and_scrub_inbox_event(&mut op, self.inbox_event_id)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                Ok(JobCompletion::CompleteWithOp(op))
             }
             Ok(InboxResult::ReprocessNow) => {
                 Tables::update_inbox_event_status(
