@@ -163,7 +163,7 @@ where
                 let mut op = es_entity::DbOp::init_with_clock(&self.pool, &self.clock)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-                Tables::complete_and_scrub_inbox_event(&mut op, self.inbox_event_id)
+                Tables::complete_and_scrub_inbox_event(&mut op, now, self.inbox_event_id)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
                 Ok(JobCompletion::CompleteWithOp(op))

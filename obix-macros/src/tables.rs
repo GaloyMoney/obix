@@ -1055,11 +1055,13 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn complete_and_scrub_inbox_event(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    now: Option<chrono::DateTime<chrono::Utc>>,
                     id: #crate_name::inbox::InboxEventId,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
                 {
                     #crate_name::execute_complete_and_scrub_inbox_event(
                         op,
+                        now,
                         #complete_and_scrub_inbox_event_query,
                         id,
                     )

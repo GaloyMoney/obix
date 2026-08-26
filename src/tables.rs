@@ -119,10 +119,10 @@ pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, Undecodab
 #[doc(hidden)]
 pub async fn execute_complete_and_scrub_inbox_event(
     op: &mut impl AtomicOperation,
+    now: Option<chrono::DateTime<chrono::Utc>>,
     query: &'static str,
     id: InboxEventId,
 ) -> Result<(), sqlx::Error> {
-    let now = op.maybe_now();
     sqlx::query::<sqlx::Postgres>(query)
         .bind(id)
         .bind(now)
@@ -343,6 +343,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     fn complete_and_scrub_inbox_event(
         op: &mut impl es_entity::AtomicOperation,
+        now: Option<chrono::DateTime<chrono::Utc>>,
         id: InboxEventId,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
