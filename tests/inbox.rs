@@ -193,6 +193,78 @@ async fn inbox_scrubs_payload_after_processing() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn scrub_and_job_completion_roll_back_together_before_recovery() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    remove_terminal_failure_trigger(&pool).await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .poller_config(job::JobPollerConfig {
+            job_lost_interval: std::time::Duration::from_secs(2),
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let inbox = init_inbox(
+        &pool,
+        &mut jobs,
+        ScrubbingHandler {
+            received: received.clone(),
+        },
+    )
+    .await?;
+
+    let original_payload = TestInboxEvent::DoWork(42);
+    let event_id = inbox
+        .persist_and_queue_job("scrub-recovery-event", original_payload.clone())
+        .await?
+        .expect("Event should be created");
+    install_terminal_failure_trigger(&pool, event_id).await?;
+    jobs.start_poll().await?;
+
+    wait_for_terminal_failure(&pool, std::time::Duration::from_secs(3)).await?;
+
+    let event = inbox.find_event_by_id(event_id).await?;
+    assert_eq!(event.status, InboxEventStatus::Processing);
+    assert_eq!(event.payload, serde_json::to_value(&original_payload)?);
+    assert_eq!(event.processed_at, None);
+
+    let job_id = job::JobId::from(event_id);
+    let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(state, "running");
+
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(8),
+    )
+    .await?;
+
+    assert_eq!(
+        received.lock().await.as_slice(),
+        &[original_payload.clone(), original_payload]
+    );
+    let event = inbox.find_event_by_id(event_id).await?;
+    assert_eq!(event.payload, serde_json::Value::Null);
+    let execution_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM job_executions WHERE id = $1)")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(!execution_exists);
+
+    remove_terminal_failure_trigger(&pool).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn inbox_retains_payload_after_processing_error() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
@@ -238,6 +310,77 @@ async fn inbox_retains_payload_after_processing_error() -> anyhow::Result<()> {
     assert_eq!(event.error.as_deref(), Some("expected failure"));
     assert_eq!(event.processed_at, None);
 
+    Ok(())
+}
+
+async fn install_terminal_failure_trigger(
+    pool: &sqlx::PgPool,
+    event_id: obix::inbox::InboxEventId,
+) -> anyhow::Result<()> {
+    sqlx::query("CREATE SEQUENCE obix_test_terminal_failure_seq")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE FUNCTION obix_test_fail_first_terminal_transition()
+        RETURNS trigger AS $$
+        BEGIN
+            IF nextval('obix_test_terminal_failure_seq') = 1 THEN
+                RAISE EXCEPTION 'expected terminal transition failure';
+            END IF;
+            RETURN OLD;
+        END;
+        $$ LANGUAGE plpgsql
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        r#"
+        CREATE TRIGGER obix_test_fail_first_terminal_transition
+        BEFORE DELETE ON job_executions
+        FOR EACH ROW WHEN (OLD.id = '{}')
+        EXECUTE FUNCTION obix_test_fail_first_terminal_transition()
+        "#,
+        job::JobId::from(event_id)
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn wait_for_terminal_failure(
+    pool: &sqlx::PgPool,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let started_at = std::time::Instant::now();
+    loop {
+        let failure_attempted: bool =
+            sqlx::query_scalar("SELECT is_called FROM obix_test_terminal_failure_seq")
+                .fetch_one(pool)
+                .await?;
+        if failure_attempted {
+            return Ok(());
+        }
+        if started_at.elapsed() >= timeout {
+            anyhow::bail!("timed out waiting for the forced terminal transition failure");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn remove_terminal_failure_trigger(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS obix_test_fail_first_terminal_transition ON job_executions",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("DROP FUNCTION IF EXISTS obix_test_fail_first_terminal_transition()")
+        .execute(pool)
+        .await?;
+    sqlx::query("DROP SEQUENCE IF EXISTS obix_test_terminal_failure_seq")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

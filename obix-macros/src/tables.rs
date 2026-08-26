@@ -1054,18 +1054,15 @@ FROM {}persistent_outbox_events_sequence_seq",
                 }
 
                 fn complete_and_scrub_inbox_event(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    now: Option<chrono::DateTime<chrono::Utc>>,
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     id: #crate_name::inbox::InboxEventId,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
                 {
-                    async move {
-                        let query = #crate_name::prelude::sqlx::query(#complete_and_scrub_inbox_event_query)
-                            .bind(id as #crate_name::inbox::InboxEventId)
-                            .bind(now);
-                        query.execute(pool).await?;
-                        Ok(())
-                    }
+                    #crate_name::execute_complete_and_scrub_inbox_event(
+                        op,
+                        #complete_and_scrub_inbox_event_query,
+                        id,
+                    )
                 }
             }
         });
