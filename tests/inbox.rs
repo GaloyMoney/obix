@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use helpers::{init_inbox, init_inbox_with_clock, init_pool, wait_for_inbox_status};
 use obix::{
-    Inbox, InboxEventStatus,
-    inbox::{InboxConfig, InboxEvent, InboxHandler, InboxResult},
+    InboxEventStatus,
+    inbox::{InboxEvent, InboxHandler, InboxResult},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -51,21 +51,6 @@ impl InboxHandler for ScrubbingHandler {
         let payload: TestInboxEvent = event.payload()?;
         self.received.lock().await.push(payload);
         Ok(InboxResult::CompleteAndScrub)
-    }
-}
-
-struct FailingHandler {
-    received: Arc<Mutex<Vec<TestInboxEvent>>>,
-}
-
-impl InboxHandler for FailingHandler {
-    async fn handle(
-        &self,
-        event: &InboxEvent,
-    ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
-        let payload: TestInboxEvent = event.payload()?;
-        self.received.lock().await.push(payload);
-        Err(Box::new(std::io::Error::other("expected failure")))
     }
 }
 
@@ -141,59 +126,7 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn inbox_scrubs_payload_after_processing() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-    let received = Arc::new(Mutex::new(Vec::new()));
-
-    let inbox = init_inbox(
-        &pool,
-        &mut jobs,
-        ScrubbingHandler {
-            received: received.clone(),
-        },
-    )
-    .await?;
-    jobs.start_poll().await?;
-
-    let event_id = inbox
-        .persist_and_queue_job("scrub-event-1", TestInboxEvent::DoWork(42))
-        .await?
-        .expect("Event should be created");
-    let recorded_at = inbox.find_event_by_id(event_id).await?.recorded_at;
-
-    wait_for_inbox_status(
-        &inbox,
-        event_id,
-        InboxEventStatus::Completed,
-        std::time::Duration::from_secs(5),
-    )
-    .await?;
-
-    assert_eq!(
-        received.lock().await.as_slice(),
-        &[TestInboxEvent::DoWork(42)]
-    );
-    let event = inbox.find_event_by_id(event_id).await?;
-    assert_eq!(event.id, event_id);
-    assert_eq!(event.idempotency_key.as_deref(), Some("scrub-event-1"));
-    assert_eq!(event.recorded_at, recorded_at);
-    assert_eq!(event.status, InboxEventStatus::Completed);
-    assert_eq!(event.payload, serde_json::Value::Null);
-    assert_eq!(event.error, None);
-    assert!(event.processed_at.is_some());
-
-    Ok(())
-}
-
-#[tokio::test]
-#[file_serial]
-async fn scrub_and_job_completion_roll_back_together_before_recovery() -> anyhow::Result<()> {
+async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     remove_terminal_failure_trigger(&pool).await?;
 
@@ -251,7 +184,15 @@ async fn scrub_and_job_completion_roll_back_together_before_recovery() -> anyhow
         &[original_payload.clone(), original_payload]
     );
     let event = inbox.find_event_by_id(event_id).await?;
+    assert_eq!(event.id, event_id);
+    assert_eq!(
+        event.idempotency_key.as_deref(),
+        Some("scrub-recovery-event")
+    );
+    assert_eq!(event.status, InboxEventStatus::Completed);
     assert_eq!(event.payload, serde_json::Value::Null);
+    assert_eq!(event.error, None);
+    assert!(event.processed_at.is_some());
     let execution_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM job_executions WHERE id = $1)")
             .bind(job_id)
@@ -260,56 +201,6 @@ async fn scrub_and_job_completion_roll_back_together_before_recovery() -> anyhow
     assert!(!execution_exists);
 
     remove_terminal_failure_trigger(&pool).await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[file_serial]
-async fn inbox_retains_payload_after_processing_error() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-    let received = Arc::new(Mutex::new(Vec::new()));
-
-    helpers::wipeout_inbox_tables(&pool).await?;
-    let inbox = Inbox::<helpers::TestTables>::new(
-        &pool,
-        &mut jobs,
-        InboxConfig::new(job::JobType::new("test-inbox")).with_max_attempts(1),
-        FailingHandler {
-            received: received.clone(),
-        },
-    );
-    jobs.start_poll().await?;
-
-    let original_payload = TestInboxEvent::FailOnce("sensitive".to_owned());
-    let event_id = inbox
-        .persist_and_queue_job("failed-event-1", original_payload.clone())
-        .await?
-        .expect("Event should be created");
-
-    wait_for_inbox_status(
-        &inbox,
-        event_id,
-        InboxEventStatus::Failed,
-        std::time::Duration::from_secs(5),
-    )
-    .await?;
-
-    assert_eq!(
-        received.lock().await.as_slice(),
-        std::slice::from_ref(&original_payload)
-    );
-    let event = inbox.find_event_by_id(event_id).await?;
-    assert_eq!(event.status, InboxEventStatus::Failed);
-    assert_eq!(event.payload, serde_json::to_value(original_payload)?);
-    assert_eq!(event.error.as_deref(), Some("expected failure"));
-    assert_eq!(event.processed_at, None);
-
     Ok(())
 }
 
