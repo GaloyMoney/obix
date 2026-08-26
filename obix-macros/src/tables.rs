@@ -1058,11 +1058,20 @@ FROM {}persistent_outbox_events_sequence_seq",
                     id: #crate_name::inbox::InboxEventId,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
                 {
-                    #crate_name::execute_complete_and_scrub_inbox_event_in_op(
-                        op,
-                        #complete_and_scrub_inbox_event_query,
-                        id,
-                    )
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let now = op.maybe_now();
+
+                    async move {
+                        #crate_name::prelude::sqlx::query::<#crate_name::prelude::sqlx::Postgres>(
+                            #complete_and_scrub_inbox_event_query,
+                        )
+                        .bind(id)
+                        .bind(now)
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
                 }
             }
         });
