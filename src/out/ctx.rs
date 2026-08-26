@@ -246,25 +246,15 @@ where
 /// An op joined to the pending batch. Implements
 /// [`AtomicOperation`](es_entity::AtomicOperation) — use it exactly like any
 /// atomic operation, then exit with [`commit`](Self::commit) or
-/// [`defer`](Self::defer).
-///
-/// There is no mutable access to the raw [`es_entity::DbOp`] (only a shared
-/// [`Deref`](std::ops::Deref) view): committing, rolling back, or swapping
-/// out the underlying op is unrepresentable, so work and checkpoint can only
-/// land together, through the runner.
+/// [`defer`](Self::defer). Committing or rolling back the underlying op
+/// directly is unrepresentable — work and checkpoint can only land together,
+/// through the runner.
 #[must_use = "exit with .commit() or .defer() to produce the Handled token"]
 pub struct BatchOp<'inv> {
     parts: CtxParts<'inv>,
 }
 
 impl<'inv> BatchOp<'inv> {
-    fn op_mut(&mut self) -> &mut es_entity::DbOp<'static> {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("BatchOp always holds a materialized op")
-    }
-
     /// Land the whole batch (my work included) when the invocation returns:
     /// checkpoint at my sequence → commit.
     pub fn commit(self) -> Handled<'inv> {
@@ -297,80 +287,47 @@ impl std::ops::Deref for BatchOp<'_> {
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — including the provided
-/// methods, which [`es_entity::DbOp`] overrides (`supports_hooks` is `true`,
-/// `commit_hook` returns registered hooks, `maybe_now`/`clock` carry the op's
-/// cached time and clock, `savepoint_parts` forwards the op's real hook
-/// buffer). Inheriting the trait defaults instead would silently report
-/// `supports_hooks() == false`, lose the op time, or — since `supports_hooks`
-/// would then disagree with an un-forwarded `savepoint_parts` — fail any
-/// savepoint opened through this type with a protocol error.
+/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) —
+/// time, clock, executor, commit hooks, `supports_hooks`, and
+/// `savepoint_parts` — to the wrapped [`es_entity::DbOp`] via
+/// [`es_entity::WrapsOperation`], each reporting the op's real capability
+/// rather than a trait default (`supports_hooks() == true`, the op's cached
+/// time/clock, and — through `savepoint_parts` — the op's real hook buffer,
+/// so savepoints opened through this type work exactly as they would on the
+/// op directly).
 ///
 /// This lets handlers pass `&mut op` directly to any
 /// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
-/// `spawn_in_op`, `publish_persisted_in_op`, …) — and it is the *only*
-/// mutable surface: with no `DerefMut`, a `&mut es_entity::DbOp` can never be
-/// obtained from the guard (which would allow `std::mem::swap`-ing in a decoy
-/// op and committing the real one without its checkpoint).
-///
-/// Deliberately hand-written rather than [`es_entity::WrapsOperation`]:
-/// `WrapsOperation::op_mut` is a public, required accessor that hands back
-/// `&mut Self::Inner` (here `&mut es_entity::DbOp`) to anyone holding a
-/// `BatchOp` who imports the trait — exactly the sealed-off mutable surface
-/// the paragraph above depends on not existing. See the enumeration report
-/// sent alongside this change for the full reasoning.
-impl es_entity::AtomicOperation for BatchOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        (**self).maybe_now()
+/// `spawn_in_op`, `publish_persisted_in_op`, …).
+impl es_entity::WrapsOperation for BatchOp<'_> {
+    type Inner = es_entity::DbOp<'static>;
+
+    fn op(&self) -> &Self::Inner {
+        self.parts
+            .op_slot
+            .as_ref()
+            .expect("BatchOp always holds a materialized op")
     }
 
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(&**self)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.op_mut().connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.op_mut().as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.op_mut().add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        (**self).commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        (**self).supports_hooks()
-    }
-
-    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
-        self.op_mut().savepoint_parts()
+    fn op_mut(&mut self) -> &mut Self::Inner {
+        self.parts
+            .op_slot
+            .as_mut()
+            .expect("BatchOp always holds a materialized op")
     }
 }
 
 /// An op holding exactly this event's work, fenced from the batch history.
 /// Implements [`AtomicOperation`](es_entity::AtomicOperation). The only exit
 /// is [`commit`](Self::commit) — isolation from future events is guaranteed
-/// by construction, and (as with [`BatchOp`]) no mutable access to the raw
-/// [`es_entity::DbOp`] exists, so the op can only land through the runner.
+/// by construction, and (as with [`BatchOp`]) the op can only land through
+/// the runner.
 #[must_use = "exit with .commit() to produce the Handled token"]
 pub struct IsolatedOp<'inv> {
     parts: CtxParts<'inv>,
 }
 
 impl<'inv> IsolatedOp<'inv> {
-    fn op_mut(&mut self) -> &mut es_entity::DbOp<'static> {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("IsolatedOp always holds a materialized op")
-    }
-
     /// Land my work and my checkpoint, atomically, when the invocation
     /// returns.
     pub fn commit(self) -> Handled<'inv> {
@@ -392,42 +349,24 @@ impl std::ops::Deref for IsolatedOp<'_> {
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method (including
-/// `savepoint_parts`) is delegated by hand rather than via
-/// [`es_entity::WrapsOperation`], and why this is deliberately the only
-/// mutable surface (no `DerefMut`).
-impl es_entity::AtomicOperation for IsolatedOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        (**self).maybe_now()
+/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) to
+/// the wrapped [`es_entity::DbOp`] via [`es_entity::WrapsOperation`] — see the
+/// notes on [`BatchOp`]'s impl.
+impl es_entity::WrapsOperation for IsolatedOp<'_> {
+    type Inner = es_entity::DbOp<'static>;
+
+    fn op(&self) -> &Self::Inner {
+        self.parts
+            .op_slot
+            .as_ref()
+            .expect("IsolatedOp always holds a materialized op")
     }
 
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(&**self)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.op_mut().connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.op_mut().as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.op_mut().add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        (**self).commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        (**self).supports_hooks()
-    }
-
-    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
-        self.op_mut().savepoint_parts()
+    fn op_mut(&mut self) -> &mut Self::Inner {
+        self.parts
+            .op_slot
+            .as_mut()
+            .expect("IsolatedOp always holds a materialized op")
     }
 }
 
@@ -452,8 +391,7 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the
 /// checkpoint is written and the transaction commits — items, work and
-/// pointer land atomically. There is no access to the raw
-/// [`es_entity::DbOp`], mirroring [`BatchOp`]/[`IsolatedOp`]'s sealing.
+/// pointer land atomically.
 pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
 
 impl<'a> FlushOp<'a> {
@@ -462,43 +400,20 @@ impl<'a> FlushOp<'a> {
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method (including
-/// `savepoint_parts`) is delegated by hand rather than via
-/// [`es_entity::WrapsOperation`]. `add_commit_hook` delegation is what lets a
+/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) to
+/// the inner [`es_entity::DbOp`] via [`es_entity::WrapsOperation`] — see the
+/// notes on [`BatchOp`]'s impl. `add_commit_hook` delegation is what lets a
 /// flush body publish onto the batch op (e.g. `publish_all_persisted`) with
 /// the events buffered on the runner's commit.
-impl es_entity::AtomicOperation for FlushOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.0.maybe_now()
+impl<'a> es_entity::WrapsOperation for FlushOp<'a> {
+    type Inner = es_entity::DbOp<'static>;
+
+    fn op(&self) -> &Self::Inner {
+        self.0
     }
 
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(self.0)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.0.connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.0.as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.0.add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        self.0.commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        self.0.supports_hooks()
-    }
-
-    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
-        self.0.savepoint_parts()
+    fn op_mut(&mut self) -> &mut Self::Inner {
+        self.0
     }
 }
 
