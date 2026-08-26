@@ -1,3 +1,15 @@
+# [obix release v0.9.1](https://github.com/GaloyMoney/obix/releases/tag/0.9.1)
+
+
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group across 1 directory with 2 updates (#132)
+
+### Refactor
+
+- Bump es-entity to 0.12.14, use delegate_atomic_operation! macro (#136)
+
 # [obix release v0.9.0](https://github.com/GaloyMoney/obix/releases/tag/0.9.0)
 
 
