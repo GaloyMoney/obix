@@ -289,19 +289,6 @@ impl std::ops::Deref for BatchOp<'_> {
     }
 }
 
-// Delegates the whole of AtomicOperation — time, clock, executor, commit
-// hooks, supports_hooks, and savepoint_parts — to the wrapped DbOp via
-// es_entity::delegate_atomic_operation!, each reporting the op's real
-// capability rather than a trait default (supports_hooks() == true, the
-// op's cached time/clock, and — through savepoint_parts — the op's real
-// hook buffer, so savepoints opened through this type work exactly as
-// they would on the op directly). The macro generates the impl in place
-// and adds no accessor, so the sealing above holds — there is still no
-// way to reach a &mut DbOp through a BatchOp.
-//
-// This lets handlers pass `&mut op` directly to any
-// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
-// `spawn_in_op`, `publish_persisted_in_op`, …).
 es_entity::delegate_atomic_operation!(BatchOp<'_>, { s => s.op });
 
 /// An op holding exactly this event's work, fenced from the batch history.
@@ -333,8 +320,6 @@ impl std::ops::Deref for IsolatedOp<'_> {
     }
 }
 
-// Delegates the whole of AtomicOperation to the wrapped DbOp via
-// es_entity::delegate_atomic_operation! — see the notes on BatchOp's impl.
 es_entity::delegate_atomic_operation!(IsolatedOp<'_>, { s => s.op });
 
 pub(crate) type BoxFuture<'a, T> =
@@ -368,11 +353,6 @@ impl<'a> FlushOp<'a> {
     }
 }
 
-// Delegates the whole of AtomicOperation to the inner DbOp via
-// es_entity::delegate_atomic_operation! — see the notes on BatchOp's impl.
-// add_commit_hook delegation is what lets a flush body publish onto the
-// batch op (e.g. publish_all_persisted) with the events buffered on the
-// runner's commit.
 es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
