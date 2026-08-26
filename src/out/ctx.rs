@@ -188,7 +188,8 @@ impl<'inv, B> EventCtx<'inv, B> {
             );
         }
         parts.tracker.events_in_op += 1;
-        Ok(BatchOp { parts })
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(BatchOp { op })
     }
 
     /// Land the pending batch first (its collected items, its work and its
@@ -215,7 +216,8 @@ impl<'inv, B> EventCtx<'inv, B> {
                 .await?,
         );
         parts.tracker.events_in_op = 1;
-        Ok(IsolatedOp { parts })
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(IsolatedOp { op })
     }
 }
 
@@ -254,17 +256,10 @@ where
 /// land together, through the runner.
 #[must_use = "exit with .commit() or .defer() to produce the Handled token"]
 pub struct BatchOp<'inv> {
-    parts: CtxParts<'inv>,
+    op: &'inv mut es_entity::DbOp<'static>,
 }
 
 impl<'inv> BatchOp<'inv> {
-    fn op_mut(&mut self) -> &mut es_entity::DbOp<'static> {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("BatchOp always holds a materialized op")
-    }
-
     /// Land the whole batch (my work included) when the invocation returns:
     /// checkpoint at my sequence → commit.
     pub fn commit(self) -> Handled<'inv> {
@@ -290,54 +285,11 @@ impl std::ops::Deref for BatchOp<'_> {
     type Target = es_entity::DbOp<'static>;
 
     fn deref(&self) -> &Self::Target {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("BatchOp always holds a materialized op")
+        self.op
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — including the provided
-/// methods, which [`es_entity::DbOp`] overrides (`supports_hooks` is `true`,
-/// `commit_hook` returns registered hooks, `maybe_now`/`clock` carry the op's
-/// cached time and clock). Inheriting the trait defaults instead would
-/// silently report `supports_hooks() == false` and lose the op time.
-///
-/// This lets handlers pass `&mut op` directly to any
-/// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
-/// `spawn_in_op`, `publish_persisted_in_op`, …) — and it is the *only*
-/// mutable surface: with no `DerefMut`, a `&mut es_entity::DbOp` can never be
-/// obtained from the guard (which would allow `std::mem::swap`-ing in a decoy
-/// op and committing the real one without its checkpoint).
-impl es_entity::AtomicOperation for BatchOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        (**self).maybe_now()
-    }
-
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(&**self)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.op_mut().connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.op_mut().as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.op_mut().add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        (**self).commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        (**self).supports_hooks()
-    }
-}
+es_entity::delegate_atomic_operation!(BatchOp<'_>, { s => s.op });
 
 /// An op holding exactly this event's work, fenced from the batch history.
 /// Implements [`AtomicOperation`](es_entity::AtomicOperation). The only exit
@@ -346,17 +298,10 @@ impl es_entity::AtomicOperation for BatchOp<'_> {
 /// [`es_entity::DbOp`] exists, so the op can only land through the runner.
 #[must_use = "exit with .commit() to produce the Handled token"]
 pub struct IsolatedOp<'inv> {
-    parts: CtxParts<'inv>,
+    op: &'inv mut es_entity::DbOp<'static>,
 }
 
 impl<'inv> IsolatedOp<'inv> {
-    fn op_mut(&mut self) -> &mut es_entity::DbOp<'static> {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("IsolatedOp always holds a materialized op")
-    }
-
     /// Land my work and my checkpoint, atomically, when the invocation
     /// returns.
     pub fn commit(self) -> Handled<'inv> {
@@ -371,45 +316,11 @@ impl std::ops::Deref for IsolatedOp<'_> {
     type Target = es_entity::DbOp<'static>;
 
     fn deref(&self) -> &Self::Target {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("IsolatedOp always holds a materialized op")
+        self.op
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method is delegated too, and why
-/// this is deliberately the only mutable surface (no `DerefMut`).
-impl es_entity::AtomicOperation for IsolatedOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        (**self).maybe_now()
-    }
-
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(&**self)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.op_mut().connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.op_mut().as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.op_mut().add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        (**self).commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        (**self).supports_hooks()
-    }
-}
+es_entity::delegate_atomic_operation!(IsolatedOp<'_>, { s => s.op });
 
 pub(crate) type BoxFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -442,40 +353,7 @@ impl<'a> FlushOp<'a> {
     }
 }
 
-/// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method is delegated too.
-/// `add_commit_hook` delegation is what lets a flush body publish onto the
-/// batch op (e.g. `publish_all_persisted`) with the events buffered on the
-/// runner's commit.
-impl es_entity::AtomicOperation for FlushOp<'_> {
-    fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.0.maybe_now()
-    }
-
-    fn clock(&self) -> &es_entity::clock::ClockHandle {
-        es_entity::AtomicOperation::clock(self.0)
-    }
-
-    fn connection(&mut self) -> &mut es_entity::db::Connection {
-        self.0.connection()
-    }
-
-    fn as_executor(&mut self) -> es_entity::OneTimeExecutor<'_, &mut es_entity::db::Connection> {
-        self.0.as_executor()
-    }
-
-    fn add_commit_hook<H: es_entity::hooks::CommitHook>(&mut self, hook: H) -> Result<(), H> {
-        self.0.add_commit_hook(hook)
-    }
-
-    fn commit_hook<H: es_entity::hooks::CommitHook>(&self) -> Option<&H> {
-        self.0.commit_hook::<H>()
-    }
-
-    fn supports_hooks(&self) -> bool {
-        self.0.supports_hooks()
-    }
-}
+es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
