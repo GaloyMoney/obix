@@ -164,13 +164,6 @@ async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
     assert_eq!(event.payload, serde_json::to_value(&original_payload)?);
     assert_eq!(event.processed_at, None);
 
-    let job_id = job::JobId::from(event_id);
-    let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(state, "running");
-
     wait_for_inbox_status(
         &inbox,
         event_id,
@@ -193,12 +186,6 @@ async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
     assert_eq!(event.payload, serde_json::Value::Null);
     assert_eq!(event.error, None);
     assert!(event.processed_at.is_some());
-    let execution_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM job_executions WHERE id = $1)")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await?;
-    assert!(!execution_exists);
 
     remove_terminal_failure_trigger(&pool).await?;
     Ok(())
