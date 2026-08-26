@@ -1060,13 +1060,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
                 {
                     async move {
-                        sqlx::query!(
-                            #complete_and_scrub_inbox_event_query,
-                            id as #crate_name::inbox::InboxEventId,
-                            now
-                        )
-                        .execute(pool)
-                        .await?;
+                        let query = #crate_name::prelude::sqlx::query(#complete_and_scrub_inbox_event_query)
+                            .bind(id as #crate_name::inbox::InboxEventId)
+                            .bind(now);
+                        query.execute(pool).await?;
                         Ok(())
                     }
                 }
