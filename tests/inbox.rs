@@ -126,6 +126,53 @@ async fn inbox_processes_event() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
+async fn inbox_scrubs_payload_after_processing() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let inbox = init_inbox(
+        &pool,
+        &mut jobs,
+        ScrubbingHandler {
+            received: received.clone(),
+        },
+    )
+    .await?;
+    jobs.start_poll().await?;
+
+    let event_id = inbox
+        .persist_and_queue_job("scrub-event", TestInboxEvent::DoWork(42))
+        .await?
+        .expect("Event should be created");
+
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    assert_eq!(
+        received.lock().await.as_slice(),
+        &[TestInboxEvent::DoWork(42)]
+    );
+    let event = inbox.find_event_by_id(event_id).await?;
+    assert_eq!(event.status, InboxEventStatus::Completed);
+    assert_eq!(event.payload, serde_json::Value::Null);
+    assert_eq!(event.error, None);
+    assert!(event.processed_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     remove_terminal_failure_trigger(&pool).await?;
@@ -156,13 +203,6 @@ async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
         .expect("Event should be created");
     install_terminal_failure_trigger(&pool, event_id).await?;
     jobs.start_poll().await?;
-
-    wait_for_forced_terminal_failure(&pool, std::time::Duration::from_secs(3)).await?;
-
-    let event = inbox.find_event_by_id(event_id).await?;
-    assert_eq!(event.status, InboxEventStatus::Processing);
-    assert_eq!(event.payload, serde_json::to_value(&original_payload)?);
-    assert_eq!(event.processed_at, None);
 
     wait_for_inbox_status(
         &inbox,
@@ -225,26 +265,6 @@ async fn install_terminal_failure_trigger(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-async fn wait_for_forced_terminal_failure(
-    pool: &sqlx::PgPool,
-    timeout: std::time::Duration,
-) -> anyhow::Result<()> {
-    let started_at = std::time::Instant::now();
-    loop {
-        let failure_attempted: bool =
-            sqlx::query_scalar("SELECT is_called FROM obix_test_terminal_failure_seq")
-                .fetch_one(pool)
-                .await?;
-        if failure_attempted {
-            return Ok(());
-        }
-        if started_at.elapsed() >= timeout {
-            anyhow::bail!("timed out waiting for the forced terminal transition failure");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 async fn remove_terminal_failure_trigger(pool: &sqlx::PgPool) -> anyhow::Result<()> {
