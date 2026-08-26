@@ -1063,11 +1063,11 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let now = op.maybe_now();
 
                     async move {
-                        #crate_name::prelude::sqlx::query::<#crate_name::prelude::sqlx::Postgres>(
+                        sqlx::query!(
                             #complete_and_scrub_inbox_event_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            now
                         )
-                        .bind(id)
-                        .bind(now)
                         .execute(op.as_executor())
                         .await?;
                         Ok(())

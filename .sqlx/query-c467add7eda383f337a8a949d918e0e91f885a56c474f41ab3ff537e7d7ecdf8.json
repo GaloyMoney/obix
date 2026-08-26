@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE inbox_events\n            SET status = 'completed'::InboxEventStatus,\n                payload = 'null'::jsonb,\n                error = NULL,\n                processed_at = COALESCE($2::timestamptz, NOW())\n            WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c467add7eda383f337a8a949d918e0e91f885a56c474f41ab3ff537e7d7ecdf8"
+}
