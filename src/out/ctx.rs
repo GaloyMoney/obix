@@ -300,8 +300,11 @@ impl std::ops::Deref for BatchOp<'_> {
 /// Full delegation to the inner [`es_entity::DbOp`] — including the provided
 /// methods, which [`es_entity::DbOp`] overrides (`supports_hooks` is `true`,
 /// `commit_hook` returns registered hooks, `maybe_now`/`clock` carry the op's
-/// cached time and clock). Inheriting the trait defaults instead would
-/// silently report `supports_hooks() == false` and lose the op time.
+/// cached time and clock, `savepoint_parts` forwards the op's real hook
+/// buffer). Inheriting the trait defaults instead would silently report
+/// `supports_hooks() == false`, lose the op time, or — since `supports_hooks`
+/// would then disagree with an un-forwarded `savepoint_parts` — fail any
+/// savepoint opened through this type with a protocol error.
 ///
 /// This lets handlers pass `&mut op` directly to any
 /// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
@@ -309,6 +312,13 @@ impl std::ops::Deref for BatchOp<'_> {
 /// mutable surface: with no `DerefMut`, a `&mut es_entity::DbOp` can never be
 /// obtained from the guard (which would allow `std::mem::swap`-ing in a decoy
 /// op and committing the real one without its checkpoint).
+///
+/// Deliberately hand-written rather than [`es_entity::WrapsOperation`]:
+/// `WrapsOperation::op_mut` is a public, required accessor that hands back
+/// `&mut Self::Inner` (here `&mut es_entity::DbOp`) to anyone holding a
+/// `BatchOp` who imports the trait — exactly the sealed-off mutable surface
+/// the paragraph above depends on not existing. See the enumeration report
+/// sent alongside this change for the full reasoning.
 impl es_entity::AtomicOperation for BatchOp<'_> {
     fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         (**self).maybe_now()
@@ -336,6 +346,10 @@ impl es_entity::AtomicOperation for BatchOp<'_> {
 
     fn supports_hooks(&self) -> bool {
         (**self).supports_hooks()
+    }
+
+    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
+        self.op_mut().savepoint_parts()
     }
 }
 
@@ -379,8 +393,10 @@ impl std::ops::Deref for IsolatedOp<'_> {
 }
 
 /// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method is delegated too, and why
-/// this is deliberately the only mutable surface (no `DerefMut`).
+/// [`BatchOp`]'s impl for why every provided method (including
+/// `savepoint_parts`) is delegated by hand rather than via
+/// [`es_entity::WrapsOperation`], and why this is deliberately the only
+/// mutable surface (no `DerefMut`).
 impl es_entity::AtomicOperation for IsolatedOp<'_> {
     fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         (**self).maybe_now()
@@ -408,6 +424,10 @@ impl es_entity::AtomicOperation for IsolatedOp<'_> {
 
     fn supports_hooks(&self) -> bool {
         (**self).supports_hooks()
+    }
+
+    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
+        self.op_mut().savepoint_parts()
     }
 }
 
@@ -443,10 +463,11 @@ impl<'a> FlushOp<'a> {
 }
 
 /// Full delegation to the inner [`es_entity::DbOp`] — see the notes on
-/// [`BatchOp`]'s impl for why every provided method is delegated too.
-/// `add_commit_hook` delegation is what lets a flush body publish onto the
-/// batch op (e.g. `publish_all_persisted`) with the events buffered on the
-/// runner's commit.
+/// [`BatchOp`]'s impl for why every provided method (including
+/// `savepoint_parts`) is delegated by hand rather than via
+/// [`es_entity::WrapsOperation`]. `add_commit_hook` delegation is what lets a
+/// flush body publish onto the batch op (e.g. `publish_all_persisted`) with
+/// the events buffered on the runner's commit.
 impl es_entity::AtomicOperation for FlushOp<'_> {
     fn maybe_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.0.maybe_now()
@@ -474,6 +495,10 @@ impl es_entity::AtomicOperation for FlushOp<'_> {
 
     fn supports_hooks(&self) -> bool {
         self.0.supports_hooks()
+    }
+
+    fn savepoint_parts(&mut self) -> (&mut es_entity::db::Connection, es_entity::HookSlot<'_>) {
+        self.0.savepoint_parts()
     }
 }
 
