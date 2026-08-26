@@ -13,6 +13,7 @@ use crate::tables::MailboxTables;
 
 pub enum InboxResult {
     Complete,
+    CompleteAndScrub,
     ReprocessNow,
     ReprocessIn(std::time::Duration),
 }
@@ -156,6 +157,12 @@ where
                 )
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                Ok(JobCompletion::Complete)
+            }
+            Ok(InboxResult::CompleteAndScrub) => {
+                Tables::complete_and_scrub_inbox_event(&self.pool, now, self.inbox_event_id)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {

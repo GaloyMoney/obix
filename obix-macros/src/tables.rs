@@ -353,6 +353,16 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        let complete_and_scrub_inbox_event_query = format!(
+            r#"UPDATE {tbl}inbox_events
+            SET status = 'completed'::InboxEventStatus,
+                payload = 'null'::jsonb,
+                error = NULL,
+                processed_at = COALESCE($2::timestamptz, NOW())
+            WHERE id = $1"#,
+            tbl = table_prefix
+        );
+
         let list_inbox_events_by_status_query = format!(
             r#"SELECT id, idempotency_key, payload, status::text AS "status!", error, recorded_at, processed_at
             FROM {tbl}inbox_events
@@ -1038,6 +1048,24 @@ FROM {}persistent_outbox_events_sequence_seq",
                             now
                         )
                         .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn complete_and_scrub_inbox_event(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    now: Option<chrono::DateTime<chrono::Utc>>,
+                    id: #crate_name::inbox::InboxEventId,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    async move {
+                        sqlx::query!(
+                            #complete_and_scrub_inbox_event_query,
+                            id as #crate_name::inbox::InboxEventId,
+                            now
+                        )
+                        .execute(pool)
                         .await?;
                         Ok(())
                     }

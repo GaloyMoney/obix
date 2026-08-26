@@ -326,6 +326,12 @@ pub trait MailboxTables: Send + Sync + 'static {
         error: Option<&str>,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
+    fn complete_and_scrub_inbox_event(
+        pool: &sqlx::PgPool,
+        now: Option<chrono::DateTime<chrono::Utc>>,
+        id: InboxEventId,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
     fn list_inbox_events_by_status(
         pool: &sqlx::PgPool,
         status: InboxEventStatus,
