@@ -188,7 +188,8 @@ impl<'inv, B> EventCtx<'inv, B> {
             );
         }
         parts.tracker.events_in_op += 1;
-        Ok(BatchOp { parts })
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(BatchOp { op })
     }
 
     /// Land the pending batch first (its collected items, its work and its
@@ -215,7 +216,8 @@ impl<'inv, B> EventCtx<'inv, B> {
                 .await?,
         );
         parts.tracker.events_in_op = 1;
-        Ok(IsolatedOp { parts })
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(IsolatedOp { op })
     }
 }
 
@@ -246,12 +248,15 @@ where
 /// An op joined to the pending batch. Implements
 /// [`AtomicOperation`](es_entity::AtomicOperation) — use it exactly like any
 /// atomic operation, then exit with [`commit`](Self::commit) or
-/// [`defer`](Self::defer). Committing or rolling back the underlying op
-/// directly is unrepresentable — work and checkpoint can only land together,
-/// through the runner.
+/// [`defer`](Self::defer).
+///
+/// There is no mutable access to the raw [`es_entity::DbOp`] (only a shared
+/// [`Deref`](std::ops::Deref) view): committing, rolling back, or swapping
+/// out the underlying op is unrepresentable, so work and checkpoint can only
+/// land together, through the runner.
 #[must_use = "exit with .commit() or .defer() to produce the Handled token"]
 pub struct BatchOp<'inv> {
-    parts: CtxParts<'inv>,
+    op: &'inv mut es_entity::DbOp<'static>,
 }
 
 impl<'inv> BatchOp<'inv> {
@@ -280,51 +285,33 @@ impl std::ops::Deref for BatchOp<'_> {
     type Target = es_entity::DbOp<'static>;
 
     fn deref(&self) -> &Self::Target {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("BatchOp always holds a materialized op")
+        self.op
     }
 }
 
-/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) —
-/// time, clock, executor, commit hooks, `supports_hooks`, and
-/// `savepoint_parts` — to the wrapped [`es_entity::DbOp`] via
-/// [`es_entity::WrapsOperation`], each reporting the op's real capability
-/// rather than a trait default (`supports_hooks() == true`, the op's cached
-/// time/clock, and — through `savepoint_parts` — the op's real hook buffer,
-/// so savepoints opened through this type work exactly as they would on the
-/// op directly).
-///
-/// This lets handlers pass `&mut op` directly to any
-/// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
-/// `spawn_in_op`, `publish_persisted_in_op`, …).
-impl es_entity::WrapsOperation for BatchOp<'_> {
-    type Inner = es_entity::DbOp<'static>;
-
-    fn op(&self) -> &Self::Inner {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("BatchOp always holds a materialized op")
-    }
-
-    fn op_mut(&mut self) -> &mut Self::Inner {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("BatchOp always holds a materialized op")
-    }
-}
+// Delegates the whole of AtomicOperation — time, clock, executor, commit
+// hooks, supports_hooks, and savepoint_parts — to the wrapped DbOp via
+// es_entity::delegate_atomic_operation!, each reporting the op's real
+// capability rather than a trait default (supports_hooks() == true, the
+// op's cached time/clock, and — through savepoint_parts — the op's real
+// hook buffer, so savepoints opened through this type work exactly as
+// they would on the op directly). The macro generates the impl in place
+// and adds no accessor, so the sealing above holds — there is still no
+// way to reach a &mut DbOp through a BatchOp.
+//
+// This lets handlers pass `&mut op` directly to any
+// `fn(&mut impl AtomicOperation)` API (service `*_in_op` methods,
+// `spawn_in_op`, `publish_persisted_in_op`, …).
+es_entity::delegate_atomic_operation!(BatchOp<'_>, { s => s.op });
 
 /// An op holding exactly this event's work, fenced from the batch history.
 /// Implements [`AtomicOperation`](es_entity::AtomicOperation). The only exit
 /// is [`commit`](Self::commit) — isolation from future events is guaranteed
-/// by construction, and (as with [`BatchOp`]) the op can only land through
-/// the runner.
+/// by construction, and (as with [`BatchOp`]) no mutable access to the raw
+/// [`es_entity::DbOp`] exists, so the op can only land through the runner.
 #[must_use = "exit with .commit() to produce the Handled token"]
 pub struct IsolatedOp<'inv> {
-    parts: CtxParts<'inv>,
+    op: &'inv mut es_entity::DbOp<'static>,
 }
 
 impl<'inv> IsolatedOp<'inv> {
@@ -342,33 +329,13 @@ impl std::ops::Deref for IsolatedOp<'_> {
     type Target = es_entity::DbOp<'static>;
 
     fn deref(&self) -> &Self::Target {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("IsolatedOp always holds a materialized op")
+        self.op
     }
 }
 
-/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) to
-/// the wrapped [`es_entity::DbOp`] via [`es_entity::WrapsOperation`] — see the
-/// notes on [`BatchOp`]'s impl.
-impl es_entity::WrapsOperation for IsolatedOp<'_> {
-    type Inner = es_entity::DbOp<'static>;
-
-    fn op(&self) -> &Self::Inner {
-        self.parts
-            .op_slot
-            .as_ref()
-            .expect("IsolatedOp always holds a materialized op")
-    }
-
-    fn op_mut(&mut self) -> &mut Self::Inner {
-        self.parts
-            .op_slot
-            .as_mut()
-            .expect("IsolatedOp always holds a materialized op")
-    }
-}
+// Delegates the whole of AtomicOperation to the wrapped DbOp via
+// es_entity::delegate_atomic_operation! — see the notes on BatchOp's impl.
+es_entity::delegate_atomic_operation!(IsolatedOp<'_>, { s => s.op });
 
 pub(crate) type BoxFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -391,7 +358,8 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the
 /// checkpoint is written and the transaction commits — items, work and
-/// pointer land atomically.
+/// pointer land atomically. There is no access to the raw
+/// [`es_entity::DbOp`], mirroring [`BatchOp`]/[`IsolatedOp`]'s sealing.
 pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
 
 impl<'a> FlushOp<'a> {
@@ -400,22 +368,12 @@ impl<'a> FlushOp<'a> {
     }
 }
 
-/// Delegates the whole of [`AtomicOperation`](es_entity::AtomicOperation) to
-/// the inner [`es_entity::DbOp`] via [`es_entity::WrapsOperation`] — see the
-/// notes on [`BatchOp`]'s impl. `add_commit_hook` delegation is what lets a
-/// flush body publish onto the batch op (e.g. `publish_all_persisted`) with
-/// the events buffered on the runner's commit.
-impl<'a> es_entity::WrapsOperation for FlushOp<'a> {
-    type Inner = es_entity::DbOp<'static>;
-
-    fn op(&self) -> &Self::Inner {
-        self.0
-    }
-
-    fn op_mut(&mut self) -> &mut Self::Inner {
-        self.0
-    }
-}
+// Delegates the whole of AtomicOperation to the inner DbOp via
+// es_entity::delegate_atomic_operation! — see the notes on BatchOp's impl.
+// add_commit_hook delegation is what lets a flush body publish onto the
+// batch op (e.g. publish_all_persisted) with the events buffered on the
+// runner's commit.
+es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
