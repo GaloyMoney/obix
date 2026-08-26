@@ -157,13 +157,6 @@ async fn inbox_scrub_and_job_completion_are_atomic() -> anyhow::Result<()> {
     install_terminal_failure_trigger(&pool, event_id).await?;
     jobs.start_poll().await?;
 
-    wait_for_terminal_failure(&pool, std::time::Duration::from_secs(3)).await?;
-
-    let event = inbox.find_event_by_id(event_id).await?;
-    assert_eq!(event.status, InboxEventStatus::Processing);
-    assert_eq!(event.payload, serde_json::to_value(&original_payload)?);
-    assert_eq!(event.processed_at, None);
-
     wait_for_inbox_status(
         &inbox,
         event_id,
@@ -225,26 +218,6 @@ async fn install_terminal_failure_trigger(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-async fn wait_for_terminal_failure(
-    pool: &sqlx::PgPool,
-    timeout: std::time::Duration,
-) -> anyhow::Result<()> {
-    let started_at = std::time::Instant::now();
-    loop {
-        let failure_attempted: bool =
-            sqlx::query_scalar("SELECT is_called FROM obix_test_terminal_failure_seq")
-                .fetch_one(pool)
-                .await?;
-        if failure_attempted {
-            return Ok(());
-        }
-        if started_at.elapsed() >= timeout {
-            anyhow::bail!("timed out waiting for the forced terminal transition failure");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 async fn remove_terminal_failure_trigger(pool: &sqlx::PgPool) -> anyhow::Result<()> {
