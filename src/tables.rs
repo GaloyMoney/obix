@@ -1,6 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 
-use es_entity::{AtomicOperation, hooks::HookOperation};
+use es_entity::hooks::HookOperation;
 
 use crate::{
     inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
@@ -115,21 +115,6 @@ pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 /// sequence position — `Ok` for a decoded event or a placeholder, `Err`
 /// for a stored payload that does not decode into `P`.
 pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>;
-
-#[doc(hidden)]
-pub async fn execute_complete_and_scrub_inbox_event_in_op(
-    op: &mut impl AtomicOperation,
-    query: &'static str,
-    id: InboxEventId,
-) -> Result<(), sqlx::Error> {
-    let now = op.maybe_now();
-    sqlx::query::<sqlx::Postgres>(query)
-        .bind(id)
-        .bind(now)
-        .execute(op.as_executor())
-        .await?;
-    Ok(())
-}
 
 pub trait MailboxTables: Send + Sync + 'static {
     fn highest_known_persistent_sequence<'a>(
