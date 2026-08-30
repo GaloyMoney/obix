@@ -198,9 +198,11 @@ where
         };
         let mut batch = <D::Subscriber as KeyedSubscriber<P>>::Batch::default();
 
-        // Armed once the persistent backlog is drained and nothing is
-        // pending; disarmed the moment a new event arrives. Firing means
-        // "caught up and quiet long enough" — passivate to Dormant.
+        // Armed while nothing is pending; disarmed when THIS MEMBER does
+        // work (see the outcome dispatch), not when any event arrives.
+        // Firing means "this member has had nothing to do for `linger`" —
+        // passivate to Dormant. `None` while `linger` is un-addable is how
+        // the documented always-on setting is expressed.
         let mut linger_deadline: Option<tokio::time::Instant> = None;
 
         loop {
@@ -234,9 +236,19 @@ where
                 }
             } else {
                 if linger_deadline.is_none() {
-                    linger_deadline = Some(tokio::time::Instant::now() + self.linger);
+                    // `checked_add`, not `+`: `linger` is documented as
+                    // `Duration::MAX` == always-on, and adding that to an
+                    // `Instant` panics. An un-addable linger leaves the
+                    // deadline unarmed, which disables the passivation arm
+                    // below — always-on falls out of the same arithmetic
+                    // instead of being a special case that has to be
+                    // remembered.
+                    linger_deadline = tokio::time::Instant::now().checked_add(self.linger);
                 }
-                let deadline = linger_deadline.expect("armed above");
+                // Only read when the arm is enabled; the fallback keeps the
+                // expression total, since `select!` evaluates a disabled
+                // branch's expression (it just never polls the future).
+                let deadline = linger_deadline.unwrap_or_else(tokio::time::Instant::now);
 
                 tokio::select! {
                     biased;
@@ -248,7 +260,7 @@ where
                         }
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = tokio::time::sleep_until(deadline), if linger_deadline.is_some() => {
                         if tracker.persisted_seq < state.sequence {
                             let mut op = es_entity::DbOp::init_with_clock(
                                 current_job.pool(),
@@ -272,7 +284,14 @@ where
                         continue;
                     }
                     event = persistent.next() => {
-                        linger_deadline = None;
+                        // Deliberately NOT disarmed here. A keyed member sees
+                        // the whole shared stream and skips most of it, so
+                        // resetting on arrival would tie its dormancy to
+                        // stream traffic rather than to its own idleness: on
+                        // any outbox busier than `linger` no member would
+                        // ever passivate. The deadline is disarmed only when
+                        // this member actually does work — see the outcome
+                        // dispatch below.
                         match event {
                             Some(item) => item,
                             None => {
@@ -370,9 +389,14 @@ where
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
                 Outcome::Skip => {
+                    // Not this member's event, so it is still idle: the
+                    // linger deadline stands. Scanning past other keys'
+                    // traffic must not keep a member resident.
                     state.sequence = event.sequence;
                 }
                 Outcome::Commit => {
+                    // Real work — this member is not idle. Restart linger.
+                    linger_deadline = None;
                     state.sequence = event.sequence;
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
@@ -385,6 +409,8 @@ where
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                 }
                 Outcome::Collect => {
+                    // Real work — this member is not idle. Restart linger.
+                    linger_deadline = None;
                     state.sequence = event.sequence;
                     if tracker.collected >= self.max_batch_size {
                         let mut parts = CtxParts {

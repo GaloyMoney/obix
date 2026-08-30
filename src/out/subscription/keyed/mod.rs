@@ -239,6 +239,28 @@ pub(in crate::out) struct KeyMsg {
     key: String,
 }
 
+/// Enumerate one subscriber type's subscribed keys.
+///
+/// Boxed for the same reason
+/// [`read_frontier`](crate::out::subscription::read_frontier) is, and the box
+/// is equally load-bearing: [`MailboxTables`]'s methods return opaque futures
+/// that capture their executor argument's lifetime, and awaiting one behind
+/// `&self` makes the enclosing future's `Send`-ness higher-ranked — which
+/// compiles here and then fails at any caller that `tokio::spawn`s it with
+/// "implementation of `Send` is not general enough". Owning the pool and
+/// erasing the future behind a box grounds the lifetime.
+async fn list_subscription_keys<Tables: MailboxTables>(
+    pool: &sqlx::PgPool,
+    subscriber_type: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let pool = pool.clone();
+    let subscriber_type = subscriber_type.to_string();
+    let fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, sqlx::Error>> + Send>,
+    > = Box::pin(async move { Tables::list_subscription_keys(&pool, &subscriber_type).await });
+    fut.await
+}
+
 /// Build a `'static` job type from a runtime string, once, at registration.
 /// `job::JobType::new` only accepts `&'static str`; leaking a handful of
 /// small strings once per process startup (one per registered keyed
@@ -347,7 +369,12 @@ where
         let key_str = key.to_string();
         let routing_keys: Vec<String> = routing.into_iter().map(|r| r.0).collect();
         let instance_config = serde_json::to_value(&cfg)?;
-        let start_after = Tables::highest_known_persistent_sequence(&self.pool).await?;
+        // Boxed, not `Tables::highest_known_persistent_sequence(&self.pool)`
+        // directly — see `read_frontier`'s rationale. Awaiting the raw
+        // opaque future behind `&self` makes this method's `Send`-ness
+        // higher-ranked and breaks `tokio::spawn` at the CALLER, while
+        // compiling cleanly here.
+        let start_after = crate::out::subscription::read_frontier::<Tables>(&self.pool).await?;
 
         Tables::insert_subscription_in_op(
             op,
@@ -415,7 +442,7 @@ where
     /// subscription.
     #[tracing::instrument(name = "obix.subscriptions.members", skip_all, err)]
     pub async fn members(&self) -> Members<D, P, Tables> {
-        let keys = Tables::list_subscription_keys(&self.pool, self.job_type.as_str()).await?;
+        let keys = list_subscription_keys::<Tables>(&self.pool, self.job_type.as_str()).await?;
         let mut members = Vec::with_capacity(keys.len());
         for key_str in keys {
             let Ok(key) = key_str.parse::<D::Key>() else {

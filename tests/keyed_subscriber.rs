@@ -8,7 +8,7 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use obix::{
@@ -1091,6 +1091,231 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
             "stage2:12"
         ],
         "a concluded event's token must not be visible to the next event"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract — the `Subscriptions` capability is `tokio::spawn`-able.
+///
+/// `MailboxTables`'s methods return opaque futures that capture their
+/// executor argument's lifetime. Awaiting one directly inside a method taking
+/// `&self` makes the enclosing future's `Send`-ness higher-ranked over that
+/// lifetime, which defeats inference at `tokio::spawn` with "implementation
+/// of `Send` is not general enough" (rust-lang/rust#100013). It compiles
+/// fine at the definition site, so only an actual spawn catches it.
+#[tokio::test]
+#[file_serial]
+async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let spawned_outbox = outbox.clone();
+    let spawned_subs = subs.clone();
+    tokio::spawn(async move {
+        let mut op = spawned_outbox.begin_op().await?;
+        spawned_subs
+            .subscribe_in_op(
+                &mut op,
+                OwnerId(1),
+                InstanceConfig::default(),
+                Vec::<RoutingKey>::new(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        op.commit().await?;
+
+        spawned_subs
+            .members()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        spawned_subs
+            .subscription(&OwnerId(1))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        spawned_subs
+            .cancel(&OwnerId(1))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract — dormancy is about THIS MEMBER's idleness, not the stream's.
+///
+/// A keyed member sees the whole shared persistent stream and skips almost
+/// all of it. If the linger deadline restarted on every arriving event, no
+/// member would ever passivate on an outbox busier than `linger` — idle
+/// members would hold a live job forever, and `cancel` could not take effect
+/// until the entire stream went quiet. The sweep is parked far beyond this
+/// test's patience and no routing keys are registered, so nothing can revive
+/// the member once it passivates.
+#[tokio::test]
+#[file_serial]
+async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(Duration::from_secs(3600))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            config,
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // Traffic for a key this member does not own, faster than `linger`, for
+    // longer than `linger` — the member skips every one of these.
+    let stop = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicUsize::new(0));
+    let publisher = {
+        let outbox = outbox.clone();
+        let stop = stop.clone();
+        let published = published.clone();
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                if publish_ping(&outbox, 999, n).await.is_err() {
+                    break;
+                }
+                published.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+    };
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let passivated = eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await;
+
+    // Capture how busy the stream actually was BEFORE stopping the
+    // publisher, so a pass cannot be explained by the traffic having dried
+    // up on its own.
+    let published_while_waiting = published.load(Ordering::SeqCst);
+    stop.store(true, Ordering::SeqCst);
+    let _ = publisher.await;
+    passivated?;
+
+    assert!(
+        published_while_waiting >= 5,
+        "the stream must still have been busy when the member passivated, \
+         published: {published_while_waiting}"
+    );
+    assert_eq!(
+        received_for(&shared, 1).await,
+        Vec::<u64>::new(),
+        "the member owns none of this traffic — it should have skipped all of it"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract — `linger: Duration::MAX` really is always-on.
+///
+/// The config documents it, and `Instant + Duration::MAX` panics, so the
+/// documented value must not be reachable by that arithmetic: an un-addable
+/// linger leaves the deadline unarmed and the passivation arm disabled.
+#[tokio::test]
+#[file_serial]
+async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(Duration::MAX)
+        .with_sweep_interval(Duration::from_secs(3600))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            config,
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // Delivery at all is the panic check: an overflowing deadline kills the
+    // run before it ever reads the stream.
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    // And it stays resident well past what any finite linger would allow.
+    tokio::time::sleep(TEST_LINGER * 10).await;
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert!(
+        !subscription.load().await?.job_status().is_terminal(),
+        "an always-on member must not passivate"
     );
 
     jobs.shutdown().await?;
