@@ -5,6 +5,7 @@ mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
 mod job;
+mod keyed_job;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -20,8 +21,14 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::any::TypeId;
 use std::sync::Arc;
 
-pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
+pub use self::ctx::{
+    BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, KeyedIsolatedOp,
+};
 pub use self::job::{OutboxEventJobConfig, SingletonSubscriber, StreamSelection};
+pub use self::keyed_job::{
+    KeyedSubscriber, KeyedSubscriberConfig, Members, RoutingKey, SubscriptionDef,
+    SubscriptionMember, Subscriptions,
+};
 pub use self::registered_handler::{
     Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
@@ -439,6 +446,55 @@ where
         let spawner = jobs.add_resident_initializer(initializer);
         let handle = spawner.spawn(job::OutboxEventJobData::default()).await?;
         Ok(Subscription::new(handle, self.pool.clone()))
+    }
+
+    /// Register a keyed subscriber type: per-entity consumers, created and
+    /// destroyed transactionally with the entity via the returned
+    /// [`Subscriptions`] capability's `subscribe_in_op`/`cancel_in_op`, each
+    /// with its own durable cursor, costing nothing while idle.
+    ///
+    /// Wakes via a periodic sweep only (`config.sweep_interval`) — the
+    /// wake-plane router (liveness-only, event-driven wakes) is a later,
+    /// separately-shippable addition. A fresh subscription is Active from
+    /// birth regardless, so this only affects re-wake latency after a member
+    /// has gone Dormant.
+    ///
+    /// Must be called **before** [`::job::Jobs::start_poll`].
+    pub async fn register_keyed_subscriber<D: keyed_job::SubscriptionDef<P>>(
+        &self,
+        jobs: &mut ::job::Jobs,
+        config: keyed_job::KeyedSubscriberConfig,
+        def: D,
+    ) -> Result<Subscriptions<D, P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
+        let def = Arc::new(def);
+        let initializer = keyed_job::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
+            self.clone(),
+            def,
+            &config,
+        );
+        let spawner = jobs.add_keyed_initializer(initializer);
+
+        // Wake plane: sweep-only for now (startup reconcile / repair /
+        // staleness bound). A fresh subscription is Active from birth
+        // regardless, so this is never on the critical path for first
+        // delivery — it only bounds re-wake latency after a member goes
+        // Dormant.
+        let sweep = keyed_job::SweepJobInitializer::<Tables>::new(
+            self.pool.clone(),
+            spawner.clone(),
+            &config,
+        );
+        jobs.add_resident_initializer(sweep)
+            .spawn(keyed_job::SweepJobData::default())
+            .await?;
+
+        Ok(Subscriptions::new(
+            self.pool.clone(),
+            self.clock.clone(),
+            config.job_type,
+            jobs.clone(),
+            spawner,
+        ))
     }
 
     /// The highest sequence the persistent outbox has handed out — the

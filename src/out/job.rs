@@ -597,6 +597,15 @@ where
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                     }
                 }
+                Outcome::Hold(_) | Outcome::CommitAndHold(_) => {
+                    // Type-gated unreachable: only KeyedEventCtx/
+                    // KeyedIsolatedOp can mint these, and a singleton
+                    // subscriber's EventCtx never does.
+                    unreachable!(
+                        "Outcome::Hold/CommitAndHold cannot be minted from a singleton \
+                         subscriber's EventCtx"
+                    )
+                }
             }
         }
     }

@@ -1,0 +1,516 @@
+//! Contracts for keyed subscribers (per-entity outbox consumers with
+//! wake-on-demand) — workstream 3 of the handoff: subscriptions table,
+//! `SubscriptionDef`/`KeyedSubscriber`, hold verbs, the per-key runner and
+//! the `Subscriptions` capability, waking via a periodic sweep only (the
+//! wake-plane router lands in a later, separately-shippable commit).
+
+mod helpers;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use obix::{
+    EventSequence, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, MailboxConfig,
+    RoutingKey, SubscriptionDef, out::Outbox,
+};
+use serde::{Deserialize, Serialize};
+use serial_test::file_serial;
+use tokio::sync::Mutex;
+
+use helpers::{TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeout_subscriptions};
+
+const JOB_TYPE: &str = "test-keyed-subscriber";
+
+/// Short enough for dormancy/sweep contracts to land inside a test's
+/// patience, per the handoff's own advice ("set default sweep_interval low
+/// in tests").
+const TEST_LINGER: Duration = Duration::from_millis(150);
+const TEST_SWEEP_INTERVAL: Duration = Duration::from_millis(150);
+const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum TestEvent {
+    Ping { owner: u64, n: u64 },
+}
+
+/// The domain key: an owning entity id. `Display`/`FromStr` round-trip it
+/// through the subscriptions table and job's string-keyed storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct OwnerId(u64);
+
+impl std::fmt::Display for OwnerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for OwnerId {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(OwnerId(s.parse()?))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct InstanceConfig {}
+
+/// Shared, cross-run observation point: every instantiated subscriber for a
+/// key clones this in, so the test can see what happened across the
+/// runner's many fresh `instantiate` calls (one per run/wake/retry).
+#[derive(Clone, Default)]
+struct Shared {
+    received: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    /// One-shot hold instruction per key: the next delivery for that key
+    /// parks at the given time instead of recording, then is consumed.
+    hold_once: Arc<Mutex<HashMap<u64, chrono::DateTime<chrono::Utc>>>>,
+}
+
+struct TestDef {
+    shared: Shared,
+}
+
+impl SubscriptionDef<TestEvent> for TestDef {
+    type Key = OwnerId;
+    type InstanceConfig = InstanceConfig;
+    type Subscriber = RecordingSubscriber;
+
+    fn routing_key(
+        &self,
+        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> impl IntoIterator<Item = RoutingKey> {
+        // No router in this workstream: the sweep is the whole wake plane,
+        // so routing keys are never consulted yet.
+        Vec::<RoutingKey>::new()
+    }
+
+    fn instantiate(&self, key: Self::Key, _cfg: Self::InstanceConfig) -> Self::Subscriber {
+        RecordingSubscriber {
+            key,
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Records every `Ping` addressed to its own key. Every subscriber for one
+/// keyed subscriber type sees the WHOLE persistent stream (there is no
+/// server-side routing yet), so it must filter events belonging to other
+/// keys itself — exactly like a real per-entity consumer would.
+struct RecordingSubscriber {
+    key: OwnerId,
+    shared: Shared,
+}
+
+impl KeyedSubscriber<TestEvent> for RecordingSubscriber {
+    type Batch = ();
+
+    async fn handle<'inv>(
+        &self,
+        ctx: KeyedEventCtx<'inv, ()>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping { owner, n }) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        if *owner != self.key.0 {
+            return Ok(ctx.skip());
+        }
+
+        if let Some(at) = self.shared.hold_once.lock().await.remove(&self.key.0) {
+            return Ok(ctx.hold_until(at));
+        }
+
+        self.shared
+            .received
+            .lock()
+            .await
+            .entry(self.key.0)
+            .or_default()
+            .push(*n);
+        Ok(ctx.skip())
+    }
+}
+
+async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    Ok(job::Jobs::init(job_config).await?)
+}
+
+async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+    helpers::wipeout_outbox_tables(pool).await?;
+    wipeout_keyed_subscriber_job_tables(pool, JOB_TYPE).await?;
+    wipeout_subscriptions(pool, JOB_TYPE).await?;
+
+    Ok(Outbox::<TestEvent, TestTables>::init(
+        pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?)
+}
+
+fn test_config() -> KeyedSubscriberConfig {
+    KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(TEST_SWEEP_INTERVAL)
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
+}
+
+async fn publish_ping(
+    outbox: &Outbox<TestEvent, TestTables>,
+    owner: u64,
+    n: u64,
+) -> anyhow::Result<()> {
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping { owner, n })
+        .await?;
+    op.commit().await?;
+    Ok(())
+}
+
+/// Poll `f` until it holds or `timeout` elapses.
+async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if f().await? {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!("condition did not hold within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn received_for(shared: &Shared, owner: u64) -> Vec<u64> {
+    shared
+        .received
+        .lock()
+        .await
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Contract 1/2 — per-key ordering and from-birth delivery: a subscription
+/// drains its own key's events in order from its birth onward, and never
+/// sees events published before it subscribed.
+#[tokio::test]
+#[file_serial]
+async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    // Published BEFORE any subscription exists — must never be delivered to
+    // a subscription born after it.
+    publish_ping(&outbox, 1, 999).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    for n in 1..=5u64 {
+        publish_ping(&outbox, 1, n).await?;
+    }
+
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1, 2, 3, 4, 5])
+    })
+    .await?;
+
+    // The pre-subscription event never arrives.
+    assert_eq!(received_for(&shared, 1).await, vec![1, 2, 3, 4, 5]);
+
+    Ok(())
+}
+
+/// Contract — key isolation: two independently-subscribed keys each see only
+/// their own events, interleaved on the same stream.
+#[tokio::test]
+#[file_serial]
+async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(2),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    publish_ping(&outbox, 1, 10).await?;
+    publish_ping(&outbox, 2, 20).await?;
+    publish_ping(&outbox, 1, 11).await?;
+    publish_ping(&outbox, 2, 21).await?;
+
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![10, 11]
+            && received_for(&shared, 2).await == vec![20, 21])
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Contract — hold: `hold_until` parks the cursor strictly before the held
+/// event (checkpoint does not advance), and the same event is redelivered
+/// once the hold expires — never skipped.
+#[tokio::test]
+#[file_serial]
+async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    // Arm a hold for the very first event this key will see, well past the
+    // checkpoint interval so a premature advance would be caught.
+    let hold_until = chrono::Utc::now() + chrono::Duration::milliseconds(600);
+    shared.hold_once.lock().await.insert(1, hold_until);
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 7).await?;
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // While parked: the event must not be recorded, and the checkpoint must
+    // stay at BEGIN — proving the hold did not advance past it.
+    eventually(Duration::from_secs(5), || {
+        let subscription = subscription.clone();
+        async move { Ok(!subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        received_for(&shared, 1).await,
+        Vec::<u64>::new(),
+        "event must not be recorded while held"
+    );
+    assert_eq!(
+        subscription.load().await?.checkpoint(),
+        EventSequence::BEGIN,
+        "checkpoint must not advance past a held event"
+    );
+
+    // Once the hold expires, the SAME event resumes and is delivered exactly
+    // once — not skipped, not duplicated.
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![7])
+    })
+    .await?;
+    eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.checkpoint() >= EventSequence::from(1u64)) }
+    })
+    .await?;
+
+    jobs.shutdown().await?;
+
+    Ok(())
+}
+
+/// Contract — cancel: row deletion is the tombstone. A cancelled key stops
+/// processing, and the periodic sweep never respawns it (the sweep only
+/// enumerates the subscriptions table, which no longer has the row).
+#[tokio::test]
+#[file_serial]
+async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    subs.cancel(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Give several sweep intervals a chance to fire and (wrongly) respawn.
+    tokio::time::sleep(TEST_SWEEP_INTERVAL * 5).await;
+    publish_ping(&outbox, 1, 2).await?;
+    tokio::time::sleep(TEST_SWEEP_INTERVAL * 5).await;
+
+    assert_eq!(
+        received_for(&shared, 1).await,
+        vec![1],
+        "a cancelled key must never process events published after cancellation"
+    );
+
+    let members = subs.members().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert!(
+        members.is_empty(),
+        "members() must not enumerate a cancelled key"
+    );
+
+    Ok(())
+}
+
+/// Contract — dormancy + sweep-wake: a caught-up member passivates to
+/// Dormant after `linger` elapses (no live execution), and the periodic
+/// sweep is what revives it to deliver events published while dormant. This
+/// is the whole wake mechanism at this workstream (no router yet), so it is
+/// the load-bearing proof that sweep-only waking is fully correct.
+#[tokio::test]
+#[file_serial]
+async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    // Let the member go idle past `linger`: it passivates to Dormant
+    // (terminal generation, watermark retained).
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+    // Watermark survives passivation (inherits_state = true).
+    assert_eq!(
+        subscription.load().await?.checkpoint(),
+        EventSequence::from(1u64)
+    );
+
+    // Publish while Dormant — nothing is running to observe it directly.
+    publish_ping(&outbox, 1, 2).await?;
+    publish_ping(&outbox, 1, 3).await?;
+
+    // The next sweep pass idempotently respawns the key and it drains the
+    // backlog it missed while dormant.
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1, 2, 3])
+    })
+    .await?;
+
+    Ok(())
+}

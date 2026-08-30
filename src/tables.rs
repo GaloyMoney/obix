@@ -331,4 +331,70 @@ pub trait MailboxTables: Send + Sync + 'static {
         status: InboxEventStatus,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<InboxEvent>, InboxError>> + Send;
+
+    // === Keyed-subscriber subscription methods ===
+
+    /// Insert a new subscription row, idempotently: a conflict on
+    /// `(subscriber_type, key)` — an already-live subscription — resolves to
+    /// success without overwriting the existing row's `start_after` or
+    /// `routing_keys`. Re-subscribing an already-subscribed key must never
+    /// silently rewind or fast-forward its birth frontier.
+    fn insert_subscription_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+        routing_keys: &[String],
+        instance_config: serde_json::Value,
+        start_after: EventSequence,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Delete a subscription row. Row absence is the tombstone: no job-kill
+    /// API exists or is needed — the runner's next run-start row check (or a
+    /// stray wake) observes the missing row and completes.
+    fn delete_subscription_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Point-read one subscription's identity and terms by primary key.
+    /// `None` means cancelled (or never subscribed) — the caller's row-is-truth
+    /// check.
+    fn find_subscription(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<SubscriptionRow>, sqlx::Error>> + Send;
+
+    /// Every currently-subscribed key of one subscriber type, in a stable
+    /// order. Backs both the sweep (idempotent respawn of every row) and
+    /// [`Subscriptions::members`](crate::out::Subscriptions::members) — never
+    /// `keyed_handles`, since a job row may outlive a cancelled subscription;
+    /// this table is the truth.
+    fn list_subscription_keys(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
+
+    /// The keys of one subscriber type whose `routing_keys` intersects
+    /// `routing_keys` — the router's flush-time lookup, run **on the flush
+    /// op** so the wakes it drives and the router's own checkpoint commit
+    /// atomically. Liveness-only: an over-approximating false positive here
+    /// is a harmless empty wake, never a correctness gap.
+    fn subscription_keys_for_routing_keys(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        routing_keys: &[String],
+    ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
+}
+
+/// One subscription's identity and terms, as stored — everything but the
+/// primary key `(subscriber_type, key)` itself, which the caller already
+/// knows from its own lookup.
+#[derive(Debug, Clone)]
+pub struct SubscriptionRow {
+    pub routing_keys: Vec<String>,
+    pub instance_config: serde_json::Value,
+    pub start_after: EventSequence,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }

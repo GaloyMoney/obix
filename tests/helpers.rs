@@ -88,6 +88,30 @@ where
     Ok(inbox)
 }
 
+/// Wipe every subscription row for one keyed subscriber type.
+pub async fn wipeout_subscriptions(
+    pool: &sqlx::PgPool,
+    subscriber_type: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM subscriptions WHERE subscriber_type = $1")
+        .bind(subscriber_type)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
+/// registration touches: the per-key job type itself and its derived
+/// `{job_type}.sweep` resident job.
+pub async fn wipeout_keyed_subscriber_job_tables(
+    pool: &sqlx::PgPool,
+    job_type: &str,
+) -> anyhow::Result<()> {
+    wipeout_outbox_job_tables(pool, job_type).await?;
+    wipeout_outbox_job_tables(pool, &format!("{job_type}.sweep")).await?;
+    Ok(())
+}
+
 pub async fn wipeout_outbox_job_tables(pool: &sqlx::PgPool, job_type: &str) -> anyhow::Result<()> {
     sqlx::query(&format!(
         "DELETE FROM job_events WHERE id IN (SELECT id FROM jobs WHERE job_type = '{job_type}')"

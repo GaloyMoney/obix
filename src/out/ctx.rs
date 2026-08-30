@@ -119,6 +119,15 @@ pub(crate) enum Outcome {
     Collect,
     Commit,
     Defer,
+    /// Keyed-only: my cursor holds *before* this event until the given time.
+    /// Only [`KeyedEventCtx::hold_until`] mints this — the singleton runner
+    /// never constructs a ctx that can, so this variant is unreachable from
+    /// [`EventCtx`].
+    Hold(chrono::DateTime<chrono::Utc>),
+    /// Keyed-only: commit my isolated work, but the cursor still holds
+    /// *before* this event until the given time. Only
+    /// [`KeyedIsolatedOp::commit_and_hold`] mints this.
+    CommitAndHold(chrono::DateTime<chrono::Utc>),
 }
 
 /// Per-event decision point handed to
@@ -475,3 +484,176 @@ pub(crate) async fn persist_checkpoint(
     op.commit().await?;
     Ok(())
 }
+
+// === Keyed subscribers ===
+//
+// [`KeyedEventCtx`] and [`KeyedIsolatedOp`] below are the keyed counterparts
+// of [`EventCtx`] and [`IsolatedOp`] — a facade over the exact same internals
+// (`CtxParts`, `Outcome`, `flush_batch`) rather than a fork of them. They add
+// exactly one capability past the shared verb set: the hold verbs
+// ([`KeyedEventCtx::hold_until`] / [`KeyedIsolatedOp::commit_and_hold`]),
+// kept on distinct types so the capability is type-gated — the singleton
+// runner never constructs a ctx that can mint `Outcome::Hold` /
+// `Outcome::CommitAndHold`. `BatchOp` needs no keyed variant: it carries no
+// hold exit in v1, so [`KeyedEventCtx::consume_in_batch`] hands back the
+// exact same [`BatchOp`] singleton subscribers use.
+
+/// Per-event decision point handed to
+/// [`KeyedSubscriber::handle`](super::keyed_job::KeyedSubscriber::handle) —
+/// the keyed counterpart of [`EventCtx`], sharing its verb semantics;
+/// [`hold_until`](Self::hold_until) is the one keyed-only addition.
+#[must_use = "resolve the KeyedEventCtx via skip / collect / consume_in_batch / consume_isolated / hold_until"]
+pub struct KeyedEventCtx<'inv, B = ()> {
+    pub(crate) parts: CtxParts<'inv>,
+    pub(crate) batch: &'inv mut B,
+    pub(crate) flusher: &'inv dyn ItemFlush<B>,
+}
+
+impl<'inv, B> KeyedEventCtx<'inv, B> {
+    /// Identical to [`EventCtx::skip`].
+    pub fn skip(self) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Skip,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Identical to [`EventCtx::collect_with`].
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        self.parts.tracker.events_in_op += 1;
+        self.parts.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Identical to [`EventCtx::consume_in_batch`]. Returns the exact same
+    /// [`BatchOp`] singleton subscribers use — it carries no hold exit in v1.
+    pub async fn consume_in_batch(self) -> Result<BatchOp<'inv>, HandlerError> {
+        let parts = self.parts;
+        if parts.op_slot.is_none() {
+            *parts.op_slot = Some(
+                es_entity::DbOp::init_with_clock(
+                    parts.current_job.pool(),
+                    parts.current_job.clock(),
+                )
+                .await?,
+            );
+        }
+        parts.tracker.events_in_op += 1;
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(BatchOp { op })
+    }
+
+    /// Identical to [`EventCtx::consume_isolated`], but returns a
+    /// [`KeyedIsolatedOp`] — the isolated op with the extra
+    /// [`commit_and_hold`](KeyedIsolatedOp::commit_and_hold) exit.
+    pub async fn consume_isolated(self) -> Result<KeyedIsolatedOp<'inv>, HandlerError>
+    where
+        B: Default,
+    {
+        let KeyedEventCtx {
+            mut parts,
+            batch,
+            flusher,
+        } = self;
+        flush_batch(&mut parts, batch, flusher, "isolated_entry").await?;
+        *parts.op_slot = Some(
+            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
+                .await?,
+        );
+        parts.tracker.events_in_op = 1;
+        let op = parts.op_slot.as_mut().expect("just materialized above");
+        Ok(KeyedIsolatedOp { op })
+    }
+
+    /// My cursor holds *before* this event until `at` — entry and exit in
+    /// one, nothing to record.
+    ///
+    /// The runner lands any pending batch first (the same fence as
+    /// [`consume_isolated`](Self::consume_isolated)'s entry — checkpoint at
+    /// the last fully-handled sequence, which is pre-this-event), persists
+    /// the checkpoint if dirty, then ends the run rescheduled at `at`. Does
+    /// **not** advance the checkpoint past this event: the next run re-reads
+    /// and re-evaluates it, so a hold is retried, not skipped.
+    ///
+    /// The resume time is domain knowledge (e.g. a retry schedule owned by
+    /// the delivery entity) — the one fact obix cannot derive on its own.
+    /// Everything else about parking and waking (passivation, generations,
+    /// wake) is derivable and stays internal.
+    pub fn hold_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Hold(at),
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl<'inv, T> KeyedEventCtx<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> KeyedEventCtx<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap` accumulators.
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
+    }
+}
+
+/// An isolated op for a keyed subscriber: everything [`IsolatedOp`] offers,
+/// plus [`commit_and_hold`](Self::commit_and_hold) — commit this event's work
+/// while keeping the cursor parked before it.
+///
+/// A distinct type from [`IsolatedOp`] so the hold capability is type-gated
+/// to keyed subscribers: the singleton runner never constructs one, so
+/// `Outcome::CommitAndHold` is unreachable from [`IsolatedOp`].
+#[must_use = "exit with .commit() or .commit_and_hold() to produce the Handled token"]
+pub struct KeyedIsolatedOp<'inv> {
+    op: &'inv mut es_entity::DbOp<'static>,
+}
+
+impl<'inv> KeyedIsolatedOp<'inv> {
+    /// Land my work and my checkpoint, atomically, when the invocation
+    /// returns. Identical to [`IsolatedOp::commit`].
+    pub fn commit(self) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Commit,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Commit my work atomically, but the cursor still holds *before* this
+    /// event — resume at `at`.
+    ///
+    /// The lana retry-scheduled-settle shape: attempt record + health fold +
+    /// (pre-event) checkpoint, one op, then rescheduled. The checkpoint
+    /// written here does **not** advance past this event — the next run
+    /// re-reads it and re-evaluates the hold condition.
+    pub fn commit_and_hold(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::CommitAndHold(at),
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl std::ops::Deref for KeyedIsolatedOp<'_> {
+    type Target = es_entity::DbOp<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        self.op
+    }
+}
+
+es_entity::delegate_atomic_operation!(KeyedIsolatedOp<'_>, { s => s.op });
