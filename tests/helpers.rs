@@ -100,16 +100,25 @@ pub async fn wipeout_subscriptions(
     Ok(())
 }
 
+/// The waker's job type: one per outbox rather than one per subscriber
+/// type, derived from the persistent table name.
+pub const KEYED_WAKER_JOB_TYPE: &str = "persistent_outbox_events.keyed-waker";
+
 /// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
-/// registration touches: the per-key job type itself and its derived
-/// `{job_type}.sweep` and `{job_type}.waker` jobs.
+/// registration touches: the per-key job type itself, its derived
+/// `{job_type}.sweep`, and the outbox-wide waker.
+///
+/// The waker must be wiped along with the outbox tables it tracks — it is
+/// shared across subscriber types and holds a durable checkpoint, so a
+/// surviving one would sit past the sequences a truncated stream reissues
+/// and silently stop waking anything.
 pub async fn wipeout_keyed_subscriber_job_tables(
     pool: &sqlx::PgPool,
     job_type: &str,
 ) -> anyhow::Result<()> {
     wipeout_outbox_job_tables(pool, job_type).await?;
     wipeout_outbox_job_tables(pool, &format!("{job_type}.sweep")).await?;
-    wipeout_outbox_job_tables(pool, &format!("{job_type}.waker")).await?;
+    wipeout_outbox_job_tables(pool, KEYED_WAKER_JOB_TYPE).await?;
     Ok(())
 }
 

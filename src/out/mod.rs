@@ -73,6 +73,10 @@ where
     /// Copy-on-write; snapshotted into each constructed hook at publish,
     /// like `post_persist_hooks`.
     persist_after: Arc<std::sync::RwLock<Arc<[TypeId]>>>,
+    /// One erased route per keyed-subscriber type registered on this outbox,
+    /// shared with the single waker job. Registration pushes here; the first
+    /// push is what registers the waker (see `register_keyed_subscriber`).
+    keyed_routes: subscription::keyed::WakeRoutes<P>,
 }
 
 impl<P, Tables> std::fmt::Debug for Outbox<P, Tables>
@@ -107,6 +111,7 @@ where
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
             persist_after: self.persist_after.clone(),
+            keyed_routes: self.keyed_routes.clone(),
         }
     }
 }
@@ -170,6 +175,7 @@ where
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
             persist_after: Arc::new(std::sync::RwLock::new(Vec::new().into())),
+            keyed_routes: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -480,25 +486,36 @@ where
         );
         let spawner = jobs.add_keyed_initializer(initializer);
 
-        // Wake plane: the waker (event-driven, liveness-only wakes) is a
-        // singleton subscriber built entirely on the existing
-        // register_singleton_subscriber machinery, plus a periodic sweep
-        // (startup reconcile / repair / staleness bound) as its own resident
-        // job. A fresh subscription is Active from birth regardless, so
-        // neither is on the critical path for first delivery.
-        let waker = subscription::keyed::waker_handler::<D, P, Tables>(
-            def,
-            config.job_type.clone(),
-            spawner.clone(),
-        );
-        self.register_singleton_subscriber(
-            jobs,
-            OutboxEventJobConfig::new(subscription::keyed::waker_job_type(
-                config.job_type.as_str(),
-            )),
-            waker,
-        )
-        .await?;
+        // Wake plane. The waker is ONE singleton subscriber for the whole
+        // outbox, holding one erased route per registered type — registering
+        // one per type would re-read, re-decode and re-checkpoint the entire
+        // stream once per type to answer a question that is one cheap
+        // synchronous classification per type over a single pass. The first
+        // registration is what creates it; later ones only add a route.
+        //
+        // The periodic sweep (startup reconcile / repair / staleness bound)
+        // stays a per-type resident job. A fresh subscription is Active from
+        // birth regardless, so neither is on the critical path for first
+        // delivery.
+        let first_route = {
+            let mut routes = self.keyed_routes.write().expect("wake routes poisoned");
+            let first = routes.is_empty();
+            routes.push(subscription::keyed::wake_route::<D, P>(
+                def,
+                config.job_type.clone(),
+                spawner.clone(),
+            ));
+            first
+        };
+        if first_route {
+            let waker = subscription::keyed::waker_handler::<P, Tables>(self.keyed_routes.clone());
+            self.register_singleton_subscriber(
+                jobs,
+                OutboxEventJobConfig::new(subscription::keyed::waker_job_type::<Tables>()),
+                waker,
+            )
+            .await?;
+        }
 
         let sweep = subscription::keyed::SweepJobInitializer::<Tables>::new(
             self.pool.clone(),

@@ -18,7 +18,9 @@
 //! the [`SubscriptionDef`]/[`KeyedSubscriber`] traits, [`KeyedSubscriberConfig`]
 //! and the [`Subscriptions`] capability. The moving parts live beside it:
 //! [`runner`] (the per-key job), [`waker`] and [`sweep`] (the two halves of
-//! the wake plane — event-driven wakes and the periodic backstop).
+//! the wake plane — event-driven wakes and the periodic backstop). The
+//! waker is one job per *outbox*, holding one erased route per registered
+//! type; the runner and the sweep are per type.
 
 mod runner;
 mod sweep;
@@ -36,7 +38,7 @@ use crate::tables::MailboxTables;
 
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
 pub(in crate::out) use sweep::{SweepJobData, SweepJobInitializer};
-pub(in crate::out) use waker::{waker_handler, waker_job_type};
+pub(in crate::out) use waker::{WakeRoutes, wake_route, waker_handler, waker_job_type};
 
 // === Wake key ===
 

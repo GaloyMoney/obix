@@ -19,9 +19,14 @@ use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
 
-use helpers::{TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeout_subscriptions};
+use helpers::{
+    KEYED_WAKER_JOB_TYPE, TestTables, init_pool, wipeout_keyed_subscriber_job_tables,
+    wipeout_subscriptions,
+};
 
 const JOB_TYPE: &str = "test-keyed-subscriber";
+/// A second subscriber type on the same outbox, for the shared-waker contract.
+const SECOND_JOB_TYPE: &str = "test-keyed-subscriber-2";
 const STAGED_JOB_TYPE: &str = "test-keyed-staged";
 
 /// Short enough for dormancy/sweep contracts to land inside a test's
@@ -655,6 +660,121 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     publish_ping(&outbox, 1, 2).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2])
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Contract — one waker per outbox, not per subscriber type.
+///
+/// Two keyed subscriber types are registered on the same outbox. Asserted:
+///
+/// - exactly ONE waker job row exists. Per-type wakers would give two, and
+///   with them two independent full passes over the persistent stream —
+///   every event read, decoded and checkpointed once per registered type.
+/// - both types' members are revived from Dormant by the same event, which
+///   is what proves the single waker classifies through *every* registered
+///   type's `wake_keys` rather than whichever one happened to register
+///   first. A waker that consulted only one route would leave the other
+///   member Dormant and the assertion below would time out.
+#[tokio::test]
+#[file_serial]
+async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+    wipeout_keyed_subscriber_job_tables(&pool, SECOND_JOB_TYPE).await?;
+    wipeout_subscriptions(&pool, SECOND_JOB_TYPE).await?;
+
+    let first_shared = Shared::default();
+    let second_shared = Shared::default();
+    let first = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: first_shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let second = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            KeyedSubscriberConfig::new(job::JobType::new(SECOND_JOB_TYPE))
+                .with_linger(TEST_LINGER)
+                .with_sweep_interval(Duration::from_secs(3600))
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            TestDef {
+                shared: second_shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    first
+        .subscribe_in_op(
+            &mut op,
+            OwnerId(1),
+            InstanceConfig::default(),
+            wake_keys_for(OwnerId(1)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    second
+        .subscribe_in_op(
+            &mut op,
+            OwnerId(1),
+            InstanceConfig::default(),
+            wake_keys_for(OwnerId(1)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&first_shared, 1).await == vec![1]
+            && received_for(&second_shared, 1).await == vec![1])
+    })
+    .await?;
+
+    let wakers: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"count!\" FROM jobs WHERE job_type = $1",
+        KEYED_WAKER_JOB_TYPE
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        wakers, 1,
+        "two subscriber types on one outbox must share a single waker job"
+    );
+
+    // Both passivate, then a single event revives both through the one waker.
+    let first_sub = first
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let second_sub = second
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let (first_sub, second_sub) = (first_sub.clone(), second_sub.clone());
+        async move {
+            Ok(first_sub.load().await?.job_status().is_terminal()
+                && second_sub.load().await?.job_status().is_terminal())
+        }
+    })
+    .await?;
+
+    publish_ping(&outbox, 1, 2).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&first_shared, 1).await == vec![1, 2]
+            && received_for(&second_shared, 1).await == vec![1, 2])
     })
     .await?;
 
