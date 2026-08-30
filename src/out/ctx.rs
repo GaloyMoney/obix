@@ -35,6 +35,31 @@
 //! and pointer are inseparable. A failed flush rolls everything back and
 //! replays the whole batch (items are re-collected), so collected work must
 //! tolerate wholesale replay.
+//!
+//! # The two ctx types, and why they differ
+//!
+//! [`EventCtx`] and [`KeyedEventCtx`] are facades over the same internals,
+//! not a fork — but they deliberately expose different verbs:
+//!
+//! | capability | singleton | keyed |
+//! |------------|-----------|-------|
+//! | ephemeral delivery | yes — by presence | no, statically |
+//! | [`hold_until`](KeyedEventCtx::hold_until), staged chains, resume token | no — by presence | yes |
+//! | dormancy / wake | no | yes |
+//!
+//! The asymmetry is the **presence contract**, not scheduling mechanics. A
+//! singleton subscriber is always on, and that presence is precisely what
+//! licenses its ephemeral subscription: ephemeral events cannot be replayed,
+//! so only an always-present consumer may hear them. A verb that pauses
+//! consumption contradicts the property that defines the mode — which is why
+//! the hold and staged verbs are keyed-only, and why nothing is gained by
+//! adding a hold-less staged variant to the singleton.
+//!
+//! A single-instance flow that genuinely needs to pause or stage is
+//! persistent-only by definition. Host it as a keyed subscriber with one
+//! static key — a legitimate and intended shape (foreign-system relays with
+//! backpressure, single-instance exporters), which also brings dormancy for
+//! free.
 
 use serde::{Deserialize, Serialize};
 
@@ -153,6 +178,39 @@ pub(crate) enum Outcome {
 /// [`Batch`](super::SingletonSubscriber::Batch) accumulator `B` (defaulting
 /// to `()` for handlers that never collect). See the [module docs](self)
 /// for the semantics of the three entry verbs.
+///
+/// # Presence contract
+///
+/// A singleton subscriber is **always on**, and that presence is what
+/// licenses its ephemeral subscription: ephemeral events cannot be replayed,
+/// so only an always-present consumer may hear them. This ctx therefore has
+/// no pausing verb — no `hold_until`, no staged chain, no resume token.
+/// Their absence is semantic, not an omission: a verb that suspends
+/// consumption would contradict the property that defines the mode.
+///
+/// ```compile_fail
+/// use obix::{EventCtx, Handled};
+///
+/// fn pause_it<'inv>(ctx: EventCtx<'inv>) -> Handled<'inv> {
+///     // error[E0599]: no method named `hold_until` found for struct `EventCtx`
+///     //
+///     // A flow that pauses or stages is persistent-only by definition —
+///     // host it as a keyed subscriber; a single static key is legitimate.
+///     ctx.hold_until()
+/// }
+/// ```
+///
+/// The control for the negative test above — same signature, with a verb a
+/// singleton ctx does have. If this stops compiling, the `compile_fail`
+/// above has started passing for the wrong reason:
+///
+/// ```
+/// use obix::{EventCtx, Handled};
+///
+/// fn resolve_it<'inv>(ctx: EventCtx<'inv>) -> Handled<'inv> {
+///     ctx.skip()
+/// }
+/// ```
 #[must_use = "resolve the EventCtx via skip / collect / consume"]
 pub struct EventCtx<'inv, B = ()> {
     pub(crate) parts: CtxParts<'inv>,
@@ -434,15 +492,22 @@ pub(crate) async fn persist_checkpoint(
 //
 // [`KeyedEventCtx`] below is the keyed counterpart of [`EventCtx`] — a facade
 // over the exact same internals (`CtxParts`, `Outcome`, `flush_batch`) rather
-// than a fork of them. It adds two capabilities past the shared verb set,
-// kept on distinct types so both are type-gated (the singleton runner never
-// constructs a ctx that can reach them):
+// than a fork of them. It adds two capabilities past the shared verb set:
 //
 //   - the hold verb ([`KeyedEventCtx::hold_until`]), which mints
 //     `Outcome::Hold`;
 //   - staged processing ([`StagedOp`] / [`StagedEvent`]), which lets one
 //     event be processed across N committed transactions with external I/O
 //     between them, and whose paused exit mints `Outcome::CommitAndHold`.
+//
+// Both live on a distinct type because the split is CONTRACTUAL, not just a
+// convenient type-gate. A singleton subscriber is always present, and that
+// presence is what licenses its ephemeral subscription (unreplayable events
+// need an always-present consumer); a verb that pauses consumption would
+// contradict it. So the type-gating is a consequence of the semantics
+// rather than the reason for it — the singleton runner never constructs a
+// ctx that can reach these, and its `Outcome::Hold`/`CommitAndHold` arm is
+// an `unreachable!` by construction.
 
 /// Per-event decision point handed to
 /// [`KeyedSubscriber::handle`](super::KeyedSubscriber::handle) — the keyed

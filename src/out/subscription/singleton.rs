@@ -31,6 +31,15 @@ pub enum StreamSelection {
 
 /// Handles the events of one outbox listener job.
 ///
+/// Exactly one instance exists per type, created at registration and
+/// **always on**. That presence is a contract, not an implementation detail:
+/// it is what licenses the ephemeral subscription below, since ephemeral
+/// events cannot be replayed and only an always-present consumer may hear
+/// them. It is also why a singleton subscriber has no way to pause — no
+/// `hold_until`, no staged chain, no resume token. For a single-instance
+/// flow that does need to pause or stage, see
+/// [`KeyedSubscriber`](crate::out::KeyedSubscriber) with one static key.
+///
 /// [`handle_persistent`](Self::handle_persistent) receives an [`EventCtx`]
 /// and must resolve it into a [`Handled`] token, deciding the transactional
 /// fate of every event:

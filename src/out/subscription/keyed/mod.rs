@@ -74,10 +74,19 @@ impl std::fmt::Display for RoutingKey {
 // === Traits ===
 
 /// Keyed subscribers — persistent-only by construction: there is no
-/// `handle_ephemeral` and no `SUBSCRIPTION` selector, because both are
-/// statically meaningless for a per-entity consumer (ephemeral events cannot
-/// be replayed, and a keyed subscriber for a not-yet-subscribed key does not
-/// exist to receive one).
+/// `handle_ephemeral` and no `SUBSCRIPTION` selector.
+///
+/// That is the other side of the presence contract. A keyed subscriber is
+/// *not* always present — it passivates when idle, waits out holds, and for
+/// a not-yet-subscribed key does not exist at all — so it cannot be offered
+/// unreplayable events. What it gets in exchange is everything presence
+/// forbids a [`SingletonSubscriber`](crate::out::SingletonSubscriber):
+/// [`hold_until`](KeyedEventCtx::hold_until), staged chains across external
+/// I/O, and the resume token.
+///
+/// A single-instance flow that needs those is persistent-only by definition
+/// — host it here with one static key rather than reaching for a paused
+/// singleton.
 pub trait KeyedSubscriber<P>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,

@@ -11,6 +11,30 @@
 //!   its subscription an explicit row in the `subscriptions` table (row
 //!   absence = cancelled), woken on demand and costing nothing while idle.
 //!
+//! # The capability split is the semantics
+//!
+//! | capability | singleton | keyed |
+//! |------------|-----------|-------|
+//! | ephemeral delivery | yes — by presence | no, statically |
+//! | `hold_until`, staged chains, resume token | no — by presence | yes |
+//! | dormancy / wake | no | yes |
+//!
+//! The two modes are not one mode with a flag, and the asymmetry is not
+//! scheduling mechanics — a resident job could perfectly well sleep. It is
+//! the **presence contract**: a singleton subscriber is always on, and that
+//! presence is exactly what licenses its ephemeral subscription, since
+//! ephemeral events cannot be replayed and only an always-present consumer
+//! may hear them. Pausing verbs contradict the property that defines the
+//! mode, so they are keyed-only.
+//!
+//! Consequently, a **single-instance flow that needs to pause or stage is
+//! persistent-only by definition** — host it as a keyed subscriber with one
+//! static key. That is an intended shape, not a workaround (foreign-system
+//! relays with backpressure, single-instance exporters), and it brings
+//! dormancy for free. Adding a hold-less staged variant to the singleton
+//! would buy a second sealed op type and answer a question this already
+//! answers better.
+//!
 //! This module root holds what both kinds share: [`Subscription`], the
 //! public read-back of a subscription's committed checkpoint, plus the
 //! caught-up barrier built on it. It is a capability, not a value — it
