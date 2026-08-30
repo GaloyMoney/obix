@@ -391,13 +391,19 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// below `below`, furthest behind first, capped at `limit` — the waker's
     /// catch-up scan.
     ///
-    /// Spans every subscriber type because the waker does: one scan per pass
-    /// for the whole outbox, not one per registered type. Ordering is what
+    /// Spans every *registered* subscriber type because the waker does: one
+    /// scan per pass for the whole outbox, not one per type. Ordering is what
     /// makes `limit` safe to apply — it sheds the members with the most
     /// slack, so a cap can bound the wake rate without ever starving the
     /// member closest to falling out of the cache.
+    ///
+    /// `subscriber_types` must filter in SQL, not afterwards: a row whose
+    /// type is not registered here has no runner to advance its checkpoint,
+    /// so it is permanently the furthest behind and would otherwise win every
+    /// scan and consume the entire limit.
     fn subscriptions_behind(
         op: &mut impl es_entity::AtomicOperation,
+        subscriber_types: &[String],
         below: EventSequence,
         limit: i64,
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;

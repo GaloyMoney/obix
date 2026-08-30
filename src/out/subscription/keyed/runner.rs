@@ -297,27 +297,59 @@ where
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(deadline), if linger_deadline.is_some() => {
-                        // Passivating is exactly when the mirrored cursor
-                        // starts to matter: from here nothing is reading the
-                        // stream for this key, so the waker's catch-up scan
-                        // is the only thing that will notice it drifting
-                        // toward the edge of the cache. Written
-                        // unconditionally, not only when the checkpoint
-                        // itself needs persisting — the checkpoint may
-                        // already be durable from an earlier tick while the
-                        // mirror still trails it.
-                        let mut op = es_entity::DbOp::init_with_clock(
-                            current_job.pool(),
-                            current_job.clock(),
-                        )
-                        .await?;
-                        if tracker.persisted_seq < state.sequence {
-                            current_job
-                                .update_execution_state_in_op(&mut op, &state)
+                        // The deadline being due is not on its own a licence
+                        // to passivate. `biased` polls this arm before the
+                        // stream arm, so a member with events ALREADY READY
+                        // would otherwise stop here and leave them at its
+                        // checkpoint — and, because the waker races the same
+                        // stream, it may already have classified those events
+                        // while this member was still Active, found it live,
+                        // no-op'd the spawn and checkpointed past them.
+                        // Nothing would then wake it for those events: not
+                        // the wake-key path (already consumed) and not the
+                        // catch-up scan until the stream advances another
+                        // three quarters of the cache. On an outbox that then
+                        // goes quiet, never.
+                        //
+                        // So idle means "deadline due AND nothing ready",
+                        // which is one non-blocking poll away.
+                        match persistent.next().now_or_never() {
+                            // Not idle after all — drop through and handle it.
+                            Some(Some(item)) => item,
+                            Some(None) => {
+                                if tracker.persisted_seq < state.sequence {
+                                    persist_checkpoint(&mut current_job, &state, Some(&mirror))
+                                        .await
+                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                }
+                                return Ok(job::JobCompletion::RescheduleNow);
+                            }
+                            None => {
+                                // Genuinely idle. Passivating is exactly when
+                                // the mirrored cursor starts to matter: from
+                                // here nothing is reading the stream for this
+                                // key, so the waker's catch-up scan is the
+                                // only thing that will notice it drifting
+                                // toward the edge of the cache. Written
+                                // unconditionally, not only when the
+                                // checkpoint itself needs persisting — the
+                                // checkpoint may already be durable from an
+                                // earlier tick while the mirror still trails
+                                // it.
+                                let mut op = es_entity::DbOp::init_with_clock(
+                                    current_job.pool(),
+                                    current_job.clock(),
+                                )
                                 .await?;
+                                if tracker.persisted_seq < state.sequence {
+                                    current_job
+                                        .update_execution_state_in_op(&mut op, &state)
+                                        .await?;
+                                }
+                                mirror.mirror(&mut op, state.sequence).await?;
+                                return Ok(job::JobCompletion::CompleteWithOp(op));
+                            }
                         }
-                        mirror.mirror(&mut op, state.sequence).await?;
-                        return Ok(job::JobCompletion::CompleteWithOp(op));
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted_seq < state.sequence => {

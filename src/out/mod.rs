@@ -24,7 +24,7 @@ pub use self::ctx::{
 };
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, Members, SubscribeError, SubscriptionDef,
-    SubscriptionMember, Subscriptions, WakeKey,
+    SubscriptionMember, Subscriptions, WakeKey, WakeKeys,
 };
 pub use self::subscription::singleton::{
     OutboxEventJobConfig, SingletonSubscriber, StreamSelection,

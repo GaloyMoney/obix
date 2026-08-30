@@ -74,6 +74,15 @@ pub enum SubscriptionError {
     /// state type — the checkpoint is unreadable rather than absent.
     #[error("SubscriptionError - StateDecode: {0}")]
     StateDecode(#[from] serde_json::Error),
+    /// A keyed member's job could not be resolved from
+    /// `(subscriber_type, key)` — no job of that type has ever been spawned
+    /// under the key. Distinct from a cancelled subscription, whose job rows
+    /// outlive the `subscriptions` row.
+    #[error("SubscriptionError - NoSuchJob: no job for ({subscriber_type}, {key})")]
+    NoSuchJob {
+        subscriber_type: String,
+        key: String,
+    },
     /// [`Subscription::await_sequence`] — or
     /// [`await_caught_up`](Subscription::await_caught_up), which
     /// delegates to it — hit its deadline. Carries the observed lag so the
@@ -255,9 +264,45 @@ pub struct Subscription<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    job: ::job::JobHandle,
+    anchor: JobAnchor,
     pool: sqlx::PgPool,
     _phantom: PhantomData<(P, Tables)>,
+}
+
+/// A keyed member's stable identity: `(subscriber_type, key)`, plus the
+/// handle onto the job service needed to resolve it.
+#[derive(Clone)]
+struct KeyedAnchor {
+    jobs: ::job::Jobs,
+    job_type: ::job::JobType,
+    key: String,
+}
+
+/// How a [`Subscription`] finds the job it reports on.
+///
+/// The distinction is load-bearing, not bookkeeping. A `job::JobHandle` is
+/// bound to one `JobId` for its whole life — `keyed_handle` resolves the
+/// live-or-latest generation *once* and freezes it — and the two kinds of
+/// job differ in whether that id stays meaningful.
+#[derive(Clone)]
+enum JobAnchor {
+    /// A resident job: exactly one, forever, for the type's lifetime.
+    /// Rescheduling is an in-place `UPDATE` of the same row, so the id never
+    /// changes and the execution-state row (keyed on that id) is never
+    /// deleted. A handle resolved once stays correct indefinitely.
+    Resident(::job::JobHandle),
+    /// A keyed job: every wake mints a NEW generation with a NEW `JobId`,
+    /// and the spawn that mints it carries the inherited execution state
+    /// onto the new id *and deletes every older generation's state row* —
+    /// including the one it just copied from.
+    ///
+    /// So a handle resolved once does not merely go stale after the next
+    /// wake: its id no longer has a state row at all, which reads as
+    /// `Ok(None)` and decodes to checkpoint 0 — maximal lag, permanently,
+    /// for a perfectly healthy subscription. The identity that survives a
+    /// wake is `(subscriber_type, key)`, so that is what is stored and
+    /// re-resolved per read.
+    Keyed(Box<KeyedAnchor>),
 }
 
 // Manual `Clone`: this is cloneable regardless of whether `P` is, so
@@ -269,7 +314,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            job: self.job.clone(),
+            anchor: self.anchor.clone(),
             pool: self.pool.clone(),
             _phantom: PhantomData,
         }
@@ -281,9 +326,14 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription")
-            .field("job_id", &self.job.id())
-            .finish_non_exhaustive()
+        let mut out = f.debug_struct("Subscription");
+        match &self.anchor {
+            JobAnchor::Resident(job) => out.field("job_id", &job.id()),
+            JobAnchor::Keyed(anchor) => out
+                .field("subscriber_type", &anchor.job_type)
+                .field("key", &anchor.key),
+        }
+        .finish_non_exhaustive()
     }
 }
 
@@ -292,17 +342,63 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
+    /// For a resident (singleton-subscriber) job, whose id is stable.
     pub(super) fn new(job: ::job::JobHandle, pool: sqlx::PgPool) -> Self {
         Self {
-            job,
+            anchor: JobAnchor::Resident(job),
             pool,
             _phantom: PhantomData,
         }
     }
 
-    /// The id of the job running this handler.
-    pub fn job_id(&self) -> ::job::JobId {
-        self.job.id()
+    /// For a keyed member, identified by `(subscriber_type, key)` rather than
+    /// by a job id — see [`JobAnchor::Keyed`].
+    pub(super) fn new_keyed(
+        jobs: ::job::Jobs,
+        job_type: ::job::JobType,
+        key: String,
+        pool: sqlx::PgPool,
+    ) -> Self {
+        Self {
+            anchor: JobAnchor::Keyed(Box::new(KeyedAnchor {
+                jobs,
+                job_type,
+                key,
+            })),
+            pool,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// The id of the job running this handler, when there is a stable one.
+    ///
+    /// `None` for a keyed member: every wake mints a new generation with a
+    /// new id, so there is no id that identifies the subscription over time.
+    /// Its stable identity is `(subscriber_type, key)`. The per-run id is
+    /// still available from a loaded snapshot via
+    /// [`SubscriptionSnapshot::job`].
+    pub fn job_id(&self) -> Option<::job::JobId> {
+        match &self.anchor {
+            JobAnchor::Resident(job) => Some(job.id()),
+            JobAnchor::Keyed { .. } => None,
+        }
+    }
+
+    /// Resolve the job to read. For a keyed member this re-resolves
+    /// `(subscriber_type, key)` on every call — see [`JobAnchor::Keyed`] for
+    /// why holding the resolved handle is wrong.
+    async fn handle(&self) -> Result<::job::JobHandle, SubscriptionError> {
+        match &self.anchor {
+            JobAnchor::Resident(job) => Ok(job.clone()),
+            JobAnchor::Keyed(anchor) => anchor
+                .jobs
+                .keyed_handle(anchor.job_type.clone(), anchor.key.clone())
+                .await?
+                .ok_or_else(|| SubscriptionError::NoSuchJob {
+                    subscriber_type: anchor.job_type.to_string(),
+                    key: anchor.key.clone(),
+                }),
+        }
     }
 
     /// Load a point-in-time [`SubscriptionSnapshot`]: the committed checkpoint,
@@ -316,7 +412,7 @@ where
     /// on an optimistic reading.
     #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
     pub async fn load(&self) -> Result<SubscriptionSnapshot, SubscriptionError> {
-        let job = self.job.load().await?;
+        let job = self.handle().await?.load().await?;
         let checkpoint = decode_checkpoint(&job)?;
         let frontier = self.frontier().await?;
         Ok(SubscriptionSnapshot {
@@ -439,7 +535,8 @@ where
     /// barrier's never-return-early invariant.
     async fn checkpoint(&self) -> Result<EventSequence, SubscriptionError> {
         Ok(self
-            .job
+            .handle()
+            .await?
             .execution_state::<OutboxEventJobState>()
             .await?
             .unwrap_or_default()

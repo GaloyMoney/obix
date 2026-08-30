@@ -388,17 +388,25 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        // The waker's catch-up scan, across every subscriber type: who has
-        // fallen far enough behind that waking them now serves them from the
-        // in-memory cache instead of a paged cold read. Ordered by lag so
-        // the limit sheds the least-endangered members, never the most.
+        // The waker's catch-up scan: who has fallen far enough behind that
+        // waking them now serves them from the in-memory cache instead of a
+        // paged cold read. Ordered by lag so the limit sheds the
+        // least-endangered members, never the most.
+        //
+        // Restricted to the subscriber types this process actually
+        // registered, and restricted HERE rather than by discarding rows
+        // afterwards. Rows of a retired or not-yet-registered type have no
+        // runner to advance their checkpoint, so they are permanently the
+        // furthest behind: they would win every ordered scan, consume the
+        // whole per-pass limit, and starve the live members the scan exists
+        // to protect.
         let subscriptions_behind_query = format!(
             r#"
             SELECT subscriber_type, key
             FROM {tbl}subscriptions
-            WHERE checkpoint < $1
+            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2
             ORDER BY checkpoint ASC
-            LIMIT $2"#,
+            LIMIT $3"#,
             tbl = table_prefix
         );
 
@@ -1231,14 +1239,21 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn subscriptions_behind(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_types: &[String],
                     below: #crate_name::EventSequence,
                     limit: i64,
                 ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
+                    let subscriber_types = subscriber_types.to_vec();
+
                     async move {
+                        if subscriber_types.is_empty() {
+                            return Ok(Vec::new());
+                        }
                         let rows = sqlx::query!(
                             #subscriptions_behind_query,
+                            &subscriber_types as _,
                             below as #crate_name::EventSequence,
                             limit,
                         )

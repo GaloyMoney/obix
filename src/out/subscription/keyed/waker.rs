@@ -50,6 +50,8 @@ use std::sync::{Arc, RwLock};
 use job::JobType;
 
 use super::{KeyMsg, SubscriptionDef, WakeKey, derived_job_type};
+use es_entity::AtomicOperation as _;
+
 use crate::out::ctx::{EventCtx, FlushOp, Handled};
 use crate::out::event::PersistentOutboxEvent;
 use crate::out::subscription::singleton::SingletonSubscriber;
@@ -155,11 +157,19 @@ where
     /// `MailboxConfig::event_cache_size`.
     catch_up_lag: u64,
     catch_up_stride: u64,
-    /// Head sequence at the last catch-up scan. The stream's own advance is
-    /// the clock here: this handler is a `SingletonSubscriber` with no timer
-    /// branch, and it does not need one — eviction pressure is a function of
-    /// how far the stream has moved, which is exactly what it observes.
-    last_catch_up: std::sync::atomic::AtomicU64,
+    /// Head sequence at the last catch-up scan that actually **committed**.
+    /// The stream's own advance is the clock here: this handler is a
+    /// `SingletonSubscriber` with no timer branch, and it does not need one —
+    /// eviction pressure is a function of how far the stream has moved, which
+    /// is exactly what it observes.
+    ///
+    /// Advanced from a commit hook rather than when the pass is decided.
+    /// Deciding happens in `handle_persistent`, long before the batch flush
+    /// commits, and this handler is shared across runner retries — so a
+    /// claim taken at decision time would survive a rolled-back flush and
+    /// suppress the retry's scan, leaving members at the cache cliff waiting
+    /// out another full stride. Erring the other way merely rescans.
+    last_catch_up: Arc<std::sync::atomic::AtomicU64>,
     _marker: std::marker::PhantomData<fn() -> Tables>,
 }
 
@@ -195,7 +205,7 @@ where
         catch_up_lag: (cache_size * CATCH_UP_TRIGGER_NUMERATOR / CATCH_UP_TRIGGER_DENOMINATOR)
             .max(1),
         catch_up_stride: (cache_size / CATCH_UP_TRIGGER_DENOMINATOR).max(1),
-        last_catch_up: std::sync::atomic::AtomicU64::new(0),
+        last_catch_up: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         _marker: std::marker::PhantomData,
     }
 }
@@ -226,22 +236,22 @@ where
                 })
                 .collect()
         };
-        let catch_up_below = self.catch_up_due(event.sequence);
+        let catch_up_head = self.catch_up_due(event.sequence).then_some(event.sequence);
 
-        if matched.is_empty() && catch_up_below.is_none() {
+        if matched.is_empty() && catch_up_head.is_none() {
             return Ok(ctx.skip());
         }
         Ok(ctx.collect_with(move |batch| {
             for (idx, keys) in matched {
                 batch.per_route.entry(idx).or_default().extend(keys);
             }
-            // Keep the deepest floor of the batch: whichever pass is due,
-            // one scan at flush covers all of them.
-            if let Some(below) = catch_up_below {
-                batch.catch_up_below = Some(
+            // Keep the highest head of the batch: however many events came
+            // due while it was open, one scan at flush covers all of them.
+            if let Some(head) = catch_up_head {
+                batch.catch_up_head = Some(
                     batch
-                        .catch_up_below
-                        .map_or(below, |current| current.max(below)),
+                        .catch_up_head
+                        .map_or(head, |current| current.max(head)),
                 );
             }
         }))
@@ -254,9 +264,9 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let WakeBatch {
             per_route,
-            catch_up_below,
+            catch_up_head,
         } = items;
-        if per_route.is_empty() && catch_up_below.is_none() {
+        if per_route.is_empty() && catch_up_head.is_none() {
             return Ok(());
         }
         // Snapshot (cheap — one `Arc` clone per registered type) so no lock
@@ -277,11 +287,17 @@ where
 
         // The catch-up pass: whoever has fallen far enough behind that a
         // wake now serves them from memory instead of a paged cold read.
-        // Uncapped above by design on the wake-key path above — a matching
-        // event is a real arrival and must not be delayed — but capped here,
-        // because this path can select every subscription at once.
-        if let Some(below) = catch_up_below {
-            let behind = Tables::subscriptions_behind(op, below, CATCH_UP_WAKE_LIMIT).await?;
+        // Uncapped by design on the wake-key path above — a matching event is
+        // a real arrival and must not be delayed — but capped here, because
+        // this path can select every subscription at once.
+        if let Some(head) = catch_up_head {
+            let below = EventSequence::from(u64::from(head).saturating_sub(self.catch_up_lag));
+            let registered: Vec<String> = routes
+                .iter()
+                .map(|r| r.subscriber_type().to_string())
+                .collect();
+            let behind =
+                Tables::subscriptions_behind(op, &registered, below, CATCH_UP_WAKE_LIMIT).await?;
             for (subscriber_type, key) in behind {
                 let Some(route) = routes
                     .iter()
@@ -291,6 +307,11 @@ where
                 };
                 self.spawn_all(op, route, vec![key]).await?;
             }
+            // Claimed only if all of this lands: the hook runs after commit.
+            let _ = op.add_commit_hook(CatchUpClaimed {
+                cell: self.last_catch_up.clone(),
+                head: u64::from(head),
+            });
         }
         Ok(())
     }
@@ -305,8 +326,23 @@ pub(in crate::out) struct WakeBatch {
     /// the batch holds no strings it would only have to look up again.
     per_route: HashMap<usize, HashSet<WakeKey>>,
     /// Set when the stream advanced far enough for a catch-up scan; carries
-    /// the floor to scan below.
-    catch_up_below: Option<EventSequence>,
+    /// the head it came due at, from which the floor is derived at flush.
+    catch_up_head: Option<EventSequence>,
+}
+
+/// Advances the waker's catch-up clock, but only once the flush that ran the
+/// scan has actually committed — so a rolled-back batch re-scans on retry
+/// instead of silently skipping a pass.
+struct CatchUpClaimed {
+    cell: Arc<std::sync::atomic::AtomicU64>,
+    head: u64,
+}
+
+impl es_entity::hooks::CommitHook for CatchUpClaimed {
+    fn post_commit(self) {
+        self.cell
+            .fetch_max(self.head, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl<P, Tables> WakerHandler<P, Tables>
@@ -314,27 +350,20 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    /// Whether the stream has advanced a full stride since the last scan,
-    /// and if so the floor to scan below. Claims the slot as it reports it,
-    /// so a due pass is reported once.
-    fn catch_up_due(&self, head: EventSequence) -> Option<EventSequence> {
+    /// Whether the stream has advanced a full stride since the last scan
+    /// that committed. A pure predicate: nothing is claimed here, because
+    /// nothing is durable here — see [`last_catch_up`](Self::last_catch_up).
+    fn catch_up_due(&self, head: EventSequence) -> bool {
         use std::sync::atomic::Ordering;
 
         let head = u64::from(head);
         // Nothing can be behind the floor yet, and on a young stream the
         // subtraction would saturate to zero and scan for nobody anyway.
-        let below = head.checked_sub(self.catch_up_lag)?;
-
-        let last = self.last_catch_up.load(Ordering::Relaxed);
-        if head < last.saturating_add(self.catch_up_stride) {
-            return None;
+        if head.checked_sub(self.catch_up_lag).is_none() {
+            return false;
         }
-        // A lost race means another event in this same batch claimed the
-        // pass — one scan per batch is exactly what is wanted.
-        self.last_catch_up
-            .compare_exchange(last, head, Ordering::Relaxed, Ordering::Relaxed)
-            .ok()?;
-        Some(EventSequence::from(below))
+        let last = self.last_catch_up.load(Ordering::Relaxed);
+        head >= last.saturating_add(self.catch_up_stride)
     }
 
     async fn spawn_all(

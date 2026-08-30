@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use obix::{
     EventSequence, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, MailboxConfig,
-    SubscriptionDef, WakeKey, out::Outbox,
+    SubscriptionDef, WakeKey, WakeKeys, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -65,6 +65,12 @@ struct InstanceConfig {
     /// partitions that are none of them its own id.
     #[serde(default)]
     watched: Vec<u64>,
+    /// Work per event, in milliseconds. Zero everywhere except the ready-
+    /// backlog contract, which needs a handler slower than its own `linger`
+    /// so the deadline comes due *while* events are still queued — the
+    /// situation a real subscriber doing real work is in constantly.
+    #[serde(default)]
+    work_ms: u64,
 }
 
 /// Shared, cross-run observation point: every instantiated subscriber for a
@@ -101,6 +107,7 @@ impl SubscriptionDef<TestEvent> for TestDef {
         RecordingSubscriber {
             key,
             watched: cfg.watched,
+            work_ms: cfg.work_ms,
             shared: self.shared.clone(),
         }
     }
@@ -114,6 +121,7 @@ struct RecordingSubscriber {
     key: OwnerId,
     /// Extra owners to record for beyond `key`, from the instance config.
     watched: Vec<u64>,
+    work_ms: u64,
     shared: Shared,
 }
 
@@ -134,6 +142,10 @@ impl KeyedSubscriber<TestEvent> for RecordingSubscriber {
 
         if let Some(at) = self.shared.hold_once.lock().await.remove(&self.key.0) {
             return Ok(ctx.hold_until(at));
+        }
+
+        if self.work_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.work_ms)).await;
         }
 
         self.shared
@@ -209,12 +221,29 @@ async fn publish_ping(
     Ok(())
 }
 
+/// Publish several pings in ONE transaction, so they become visible together
+/// and a single waker batch covers all of them.
+async fn publish_ping_burst(
+    outbox: &Outbox<TestEvent, TestTables>,
+    owner: u64,
+    ns: std::ops::Range<u64>,
+) -> anyhow::Result<()> {
+    let mut op = outbox.begin_op().await?;
+    for n in ns {
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping { owner, n })
+            .await?;
+    }
+    op.commit().await?;
+    Ok(())
+}
+
 /// The wake keys a subscription for `owner` declares: the one partition its
 /// own key names, which is exactly the string `TestDef::wake_keys`
 /// classifies a `Ping` for that owner to. Traffic addressed to any other
 /// owner therefore never wakes it — several contracts below depend on that.
-fn wake_keys_for(owner: OwnerId) -> Vec<WakeKey> {
-    vec![WakeKey::from(owner.to_string())]
+fn wake_keys_for(owner: OwnerId) -> WakeKey {
+    WakeKey::from(owner.to_string())
 }
 
 /// Poll `f` until it holds or `timeout` elapses.
@@ -245,60 +274,27 @@ async fn received_for(shared: &Shared, owner: u64) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-/// Contract — an empty wake-key set is refused, not stored.
+/// Contract — an empty wake-key set is unrepresentable.
 ///
 /// Matching is set overlap and `{} && {anything}` is false, so a
 /// subscription declaring no wake keys can never be reached by the waker:
 /// it works while Active (a live member reads the whole stream regardless)
-/// and is stranded the first time it passivates. The type system permits it
-/// — `IntoIterator` can yield nothing — so the guard is the only thing
-/// standing between a caller and a subscription that silently stops.
+/// and is stranded the first time it passivates.
 ///
-/// Asserted on the returned error AND on the table: nothing may be written,
-/// since a rejected subscribe must not leave a row that the waker would
-/// then enumerate.
-#[tokio::test]
-#[file_serial]
-async fn an_empty_wake_key_set_is_refused() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    let mut jobs = init_jobs(&pool).await?;
-    let outbox = init_outbox(&pool).await?;
+/// `subscribe_in_op` takes `impl Into<WakeKeys>`, and `WakeKeys` has no
+/// empty state, so there is nothing to test at the call site — passing an
+/// empty collection does not compile (pinned by a `compile_fail` doctest on
+/// `WakeKeys`, paired with compiling controls for the single-key and
+/// multi-key forms). What remains testable is the one path a type cannot
+/// decide: keys built from runtime data.
+#[test]
+fn an_empty_wake_key_set_cannot_be_built() {
+    let from_data: Vec<WakeKey> = vec![];
+    let err = WakeKeys::try_from(from_data).expect_err("empty must not convert");
+    assert!(matches!(err, obix::SubscribeError::EmptyWakeKeys));
 
-    let shared = Shared::default();
-    let def = TestDef {
-        shared: shared.clone(),
-    };
-    let subs = outbox
-        .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut op = outbox.begin_op().await?;
-    let err = subs
-        .subscribe_in_op(
-            &mut op,
-            OwnerId(1),
-            InstanceConfig::default(),
-            Vec::<WakeKey>::new(),
-        )
-        .await
-        .expect_err("an empty wake-key set must be refused");
-    assert!(
-        err.downcast_ref::<obix::SubscribeError>()
-            .is_some_and(|e| matches!(e, obix::SubscribeError::EmptyWakeKeys)),
-        "expected SubscribeError::EmptyWakeKeys, got: {err}"
-    );
-    drop(op);
-
-    let rows: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) AS \"count!\" FROM subscriptions WHERE subscriber_type = $1",
-        JOB_TYPE
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(rows, 0, "a refused subscribe must not write a row");
-
-    Ok(())
+    let ok = WakeKeys::try_from(vec![WakeKey::from("7")]).expect("one key is a valid set");
+    assert_eq!(ok.len(), 1);
 }
 
 /// Contract 1/2 — per-key ordering and from-birth delivery: a subscription
@@ -688,7 +684,7 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        vec![WakeKey::from(OwnerId(1).to_string())],
+        WakeKey::from(OwnerId(1).to_string()),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -815,6 +811,186 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
         vec![1],
         "a catch-up wake must not deliver another key's events"
     );
+
+    Ok(())
+}
+
+/// Contract — a ready backlog defeats the linger deadline.
+///
+/// The passivation arm is polled before the stream arm (`biased`), so a due
+/// deadline would otherwise stop a member that has events *already queued*,
+/// leaving them at its checkpoint. That is not merely late delivery: the
+/// waker races the same stream, so it can have classified those events while
+/// the member was still Active, found it live, no-op'd the spawn and
+/// checkpointed past them. Nothing would then wake the member for them —
+/// the wake-key path is spent and the catch-up scan needs another three
+/// quarters of a cache of traffic — so on an outbox that goes quiet they are
+/// stranded indefinitely.
+///
+/// Forced rather than waited for. The handler takes 5ms per event against a
+/// 1ms `linger`, so from the second event onward the deadline is already due
+/// while the rest of the burst sits queued — and it stays due, because this
+/// subscriber resolves every event with `skip`, which by design never
+/// disarms it. The burst is published in ONE transaction so it lands as a
+/// single ready backlog. (A handler slower than its own linger is not a
+/// contrived case; it is what any subscriber doing real work looks like.)
+///
+/// Critically, the member declares a wake key that **nothing published here
+/// classifies to**. That removes the waker as a rescuer, which is what makes
+/// the failure deterministic rather than a race won or lost against the
+/// waker's flush: if the deadline is allowed to passivate over a ready
+/// backlog, these events have nothing left to deliver them. Idle must mean
+/// "deadline due AND nothing ready".
+#[tokio::test]
+#[file_serial]
+async fn a_ready_backlog_defeats_the_linger_deadline() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    // Default cache size, so 24 events cannot reach the catch-up threshold
+    // either — the ready backlog is the only path to delivery.
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(Duration::from_millis(1))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            config,
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig {
+            work_ms: 5,
+            ..Default::default()
+        },
+        WakeKey::from("a-partition-nothing-publishes-to"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping_burst(&outbox, 1, 0..24).await?;
+
+    let expected: Vec<u64> = (0..24).collect();
+    eventually(Duration::from_secs(10), || {
+        let expected = expected.clone();
+        let shared = shared.clone();
+        async move { Ok(received_for(&shared, 1).await == expected) }
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Contract — a catch-up scan is not starved by unregistered types.
+///
+/// The scan orders by lag across the whole `subscriptions` table and caps
+/// the result. Rows belonging to a subscriber type this process has not
+/// registered have no runner to advance their checkpoint, so they sit at
+/// their birth frontier forever — permanently the furthest behind. Filtered
+/// in memory rather than in SQL, they would win every ordered scan, consume
+/// the entire per-pass limit, and starve the live members the scan exists to
+/// protect.
+///
+/// `CATCH_UP_WAKE_LIMIT` worth of retired rows are planted directly (there is
+/// no API to create a subscription for an unregistered type, which is the
+/// point — they arrive by deploy, not by call), each further behind than the
+/// real member.
+#[tokio::test]
+#[file_serial]
+async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox_with_cache_size(&pool, 8).await?;
+    sqlx::query("DELETE FROM subscriptions WHERE subscriber_type = 'retired-type'")
+        .execute(&pool)
+        .await?;
+
+    // 64 = CATCH_UP_WAKE_LIMIT: exactly enough to fill a pass on their own.
+    for i in 0..64 {
+        sqlx::query(
+            "INSERT INTO subscriptions
+               (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint)
+             VALUES ('retired-type', $1, ARRAY['x']::varchar[], '{}'::jsonb, 0, 0)",
+        )
+        .bind(i.to_string())
+        .execute(&pool)
+        .await?;
+    }
+
+    let shared = Shared::default();
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            config,
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        wake_keys_for(OwnerId(1)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+    let dormant_at = subscription.load().await?.checkpoint();
+
+    // Traffic for a partition this member does not watch: only the catch-up
+    // scan can revive it, and only if the retired rows do not eat the pass.
+    for n in 0..12 {
+        publish_ping(&outbox, 2, n).await?;
+    }
+
+    let subs_probe = subs.clone();
+    eventually(Duration::from_secs(10), || {
+        let subs_probe = subs_probe.clone();
+        async move {
+            let subscription = subs_probe
+                .subscription(&OwnerId(1))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(subscription.load().await?.checkpoint() > dormant_at)
+        }
+    })
+    .await?;
 
     Ok(())
 }
@@ -979,8 +1155,9 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         OwnerId(10),
         InstanceConfig {
             watched: vec![7, 8],
+            ..Default::default()
         },
-        vec![WakeKey::from("7"), WakeKey::from("8")],
+        WakeKeys::new(WakeKey::from("7")).and(WakeKey::from("8")),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -989,8 +1166,9 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         OwnerId(20),
         InstanceConfig {
             watched: vec![21, 22],
+            ..Default::default()
         },
-        vec![WakeKey::from("21"), WakeKey::from("22")],
+        WakeKeys::new(WakeKey::from("21")).and(WakeKey::from("22")),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;

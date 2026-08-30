@@ -35,7 +35,7 @@ pub use out::{
     PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedEvent,
     StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
     SubscriptionMember, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
-    UndecodableEventError, WakeKey,
+    UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

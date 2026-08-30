@@ -75,6 +75,105 @@ impl From<&str> for WakeKey {
     }
 }
 
+/// The set of wake keys a subscription declares — **non-empty by
+/// construction**.
+///
+/// Matching is set overlap, and `{} && {anything}` is false, so a
+/// subscription declaring nothing could never be reached by the waker: it
+/// would work while Active (a live member reads the whole stream regardless)
+/// and strand itself the first time it passivated. That is not a
+/// configuration anyone wants, so it is not a value anyone can build.
+///
+/// ```
+/// use obix::{WakeKey, WakeKeys};
+///
+/// // One key — the common case, infallible.
+/// let one: WakeKeys = WakeKey::from("endpoint-7").into();
+///
+/// // Several known at the call site.
+/// let many = WakeKeys::new(WakeKey::from("7")).and(WakeKey::from("8"));
+/// assert_eq!(many.len(), 2);
+/// ```
+///
+/// There is no way to reach `subscribe_in_op` with nothing — a bare
+/// collection is not `Into<WakeKeys>`, so the empty case has no syntax:
+///
+/// ```compile_fail
+/// # use obix::WakeKey;
+/// fn takes(_: impl Into<obix::WakeKeys>) {}
+/// takes(Vec::<WakeKey>::new());
+/// ```
+///
+/// Keys computed from runtime data are the one case a type cannot decide:
+/// build with [`try_from`](Self::try_from) and handle the empty case where
+/// the domain context to interpret it actually lives.
+///
+/// ```
+/// use obix::{WakeKey, WakeKeys};
+///
+/// let configured: Vec<WakeKey> = vec![];
+/// assert!(WakeKeys::try_from(configured).is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeKeys(Vec<WakeKey>);
+
+impl WakeKeys {
+    /// Start from one key; add more with [`and`](Self::and).
+    pub fn new(first: WakeKey) -> Self {
+        Self(vec![first])
+    }
+
+    pub fn and(mut self, key: WakeKey) -> Self {
+        self.0.push(key);
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Never true — the type has no empty state. Present because clippy asks
+    /// for it beside `len`, and because saying so is cheaper than a reader
+    /// wondering.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &WakeKey> {
+        self.0.iter()
+    }
+
+    pub(crate) fn into_strings(self) -> Vec<String> {
+        self.0.into_iter().map(|k| k.0).collect()
+    }
+}
+
+impl From<WakeKey> for WakeKeys {
+    fn from(key: WakeKey) -> Self {
+        Self::new(key)
+    }
+}
+
+impl TryFrom<Vec<WakeKey>> for WakeKeys {
+    type Error = SubscribeError;
+
+    fn try_from(keys: Vec<WakeKey>) -> Result<Self, Self::Error> {
+        if keys.is_empty() {
+            return Err(SubscribeError::EmptyWakeKeys);
+        }
+        Ok(Self(keys))
+    }
+}
+
+impl IntoIterator for WakeKeys {
+    type Item = WakeKey;
+    type IntoIter = std::vec::IntoIter<WakeKey>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 impl std::fmt::Display for WakeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -188,17 +287,22 @@ where
 
 // === Errors ===
 
-/// Why [`Subscriptions::subscribe_in_op`] refused to create a subscription.
+/// Why a set of wake keys could not be accepted.
 #[derive(Debug, thiserror::Error)]
 pub enum SubscribeError {
-    /// The subscription declared no wake keys.
+    /// A runtime-built collection of wake keys turned out to be empty.
     ///
     /// Matching is set overlap, so an empty set intersects nothing: no event
-    /// could ever reach this subscription through the waker, and the first
+    /// could ever reach such a subscription through the waker, and the first
     /// time it passivated it would stay Dormant forever with its events
-    /// unread. It is accepted at the type level (an `IntoIterator` can be
-    /// empty) and meaningless at the semantic level, so it is rejected here
-    /// rather than stored.
+    /// unread.
+    ///
+    /// [`WakeKeys`] makes that unrepresentable, so this is reachable only
+    /// through [`WakeKeys::try_from`] — the one place a type cannot decide,
+    /// because the keys came from data rather than from the call site. It is
+    /// deliberately raised *there* rather than inside
+    /// [`Subscriptions::subscribe_in_op`], so the caller handles it where the
+    /// domain context to interpret an empty set actually exists.
     ///
     /// A subscriber that genuinely wants waking on *every* event says so
     /// explicitly: declare one constant key and return that key from
@@ -417,22 +521,23 @@ where
     /// existing row (its original `start_after` and `wake_keys` are never
     /// overwritten) and the existing live job.
     ///
-    /// `wake_keys` must be non-empty — see
-    /// [`SubscribeError::EmptyWakeKeys`] for why an empty set is a
-    /// subscription that could never be woken.
+    /// `wake_keys` takes anything convertible into [`WakeKeys`], which is
+    /// non-empty by construction — a single [`WakeKey`] converts directly.
+    /// See [`WakeKeys`] for why an empty set is a subscription that could
+    /// never be woken, and how to build one from runtime data.
     #[tracing::instrument(name = "obix.subscriptions.subscribe_in_op", skip_all, err)]
     pub async fn subscribe_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: D::Key,
         cfg: D::InstanceConfig,
-        wake_keys: impl IntoIterator<Item = WakeKey>,
+        wake_keys: impl Into<WakeKeys>,
     ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
         let key_str = key.to_string();
-        let wake_keys: Vec<String> = wake_keys.into_iter().map(|r| r.0).collect();
-        if wake_keys.is_empty() {
-            return Err(SubscribeError::EmptyWakeKeys.into());
-        }
+        // Non-empty by the type, so there is no emptiness check here — see
+        // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
+        // as the backstop against any other writer to the table.
+        let wake_keys = wake_keys.into().into_strings();
         let instance_config = serde_json::to_value(&cfg)?;
         // Boxed, not `Tables::highest_known_persistent_sequence(&self.pool)`
         // directly — see `read_frontier`'s rationale. Awaiting the raw
@@ -451,12 +556,25 @@ where
         )
         .await?;
 
-        let spawned = self
-            .spawner
-            .spawn_in_op(op, key_str.clone(), KeyMsg { key: key_str })
+        self.spawner
+            .spawn_in_op(
+                op,
+                key_str.clone(),
+                KeyMsg {
+                    key: key_str.clone(),
+                },
+            )
             .await?;
 
-        Ok(Subscription::new(spawned.handle, self.pool.clone()))
+        // Anchored to (subscriber_type, key), NOT to the handle the spawn
+        // just returned: that handle names this generation, and the next
+        // wake mints another. See `JobAnchor::Keyed`.
+        Ok(Subscription::new_keyed(
+            self.jobs.clone(),
+            self.job_type.clone(),
+            key_str,
+            self.pool.clone(),
+        ))
     }
 
     /// Cancel a subscription on the caller's own operation — atomic with,
@@ -484,21 +602,32 @@ where
         Ok(())
     }
 
-    /// Observe one subscription's checkpoint, frontier and job status —
+    /// Observe one subscription's checkpoint, frontier and job status.
+    ///
+    /// The returned [`Subscription`] tracks the key across wakes: each read
     /// resolves the live generation, or the latest terminal generation for a
-    /// Dormant key (its watermark stays readable there because the runner
-    /// registers with `inherits_state = true`).
+    /// Dormant key (whose watermark stays readable because the runner
+    /// registers with `inherits_state = true`). It is safe to hold — holding
+    /// a job handle instead would report checkpoint 0 from the next wake
+    /// onward.
     #[tracing::instrument(name = "obix.subscriptions.subscription", skip_all, err)]
     pub async fn subscription(
         &self,
         key: &D::Key,
     ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
-        let handle = self
-            .jobs
-            .keyed_handle(self.job_type.clone(), key.to_string())
+        let key_str = key.to_string();
+        // Resolved once here only to report "never subscribed" as an error
+        // rather than deferring it to the first read.
+        self.jobs
+            .keyed_handle(self.job_type.clone(), key_str.clone())
             .await?
             .ok_or("no subscription has ever existed for this key")?;
-        Ok(Subscription::new(handle, self.pool.clone()))
+        Ok(Subscription::new_keyed(
+            self.jobs.clone(),
+            self.job_type.clone(),
+            key_str,
+            self.pool.clone(),
+        ))
     }
 
     /// Every currently-subscribed key, paired with its observable
@@ -513,14 +642,23 @@ where
             let Ok(key) = key_str.parse::<D::Key>() else {
                 continue;
             };
-            let Some(handle) = self
+            if self
                 .jobs
-                .keyed_handle(self.job_type.clone(), key_str)
+                .keyed_handle(self.job_type.clone(), key_str.clone())
                 .await?
-            else {
+                .is_none()
+            {
                 continue;
-            };
-            members.push((key, Subscription::new(handle, self.pool.clone())));
+            }
+            members.push((
+                key,
+                Subscription::new_keyed(
+                    self.jobs.clone(),
+                    self.job_type.clone(),
+                    key_str,
+                    self.pool.clone(),
+                ),
+            ));
         }
         Ok(members)
     }
