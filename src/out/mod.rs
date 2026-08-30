@@ -470,12 +470,18 @@ where
     /// [`Subscriptions`] capability's `subscribe_in_op`/`cancel_in_op`, each
     /// with its own durable cursor, costing nothing while idle.
     ///
-    /// A passivated member is revived by the wake plane: the waker matches
-    /// each event's [`wake_keys`](subscription::keyed::SubscriptionDef::wake_keys)
-    /// against the sets subscriptions declared, and a periodic sweep backstops
-    /// it (`config.sweep_interval`). A fresh subscription is Active from birth
-    /// regardless, so neither is on the critical path for first delivery —
-    /// they only govern re-wake latency after a member has gone Dormant.
+    /// A passivated member is revived by the waker, which matches each
+    /// event's [`wake_keys`](subscription::keyed::SubscriptionDef::wake_keys)
+    /// against the sets subscriptions declared, and additionally wakes
+    /// members drifting toward the bottom of the in-memory event cache so
+    /// they catch up from memory rather than from a paged cold read. Both
+    /// are driven by the stream; there is no periodic reconciler and no
+    /// timer. A fresh subscription is Active from birth, so neither is on
+    /// the critical path for first delivery — they govern re-wake latency
+    /// after a member has gone Dormant.
+    ///
+    /// The waker is one job for the whole outbox no matter how many types
+    /// are registered here; the per-key runner is per type.
     ///
     /// Must be called **before** [`::job::Jobs::start_poll`].
     pub async fn register_keyed_subscriber<D: subscription::keyed::SubscriptionDef<P>>(
@@ -498,11 +504,6 @@ where
         // stream once per type to answer a question that is one cheap
         // synchronous classification per type over a single pass. The first
         // registration is what creates it; later ones only add a route.
-        //
-        // The periodic sweep (startup reconcile / repair / staleness bound)
-        // stays a per-type resident job. A fresh subscription is Active from
-        // birth regardless, so neither is on the critical path for first
-        // delivery.
         let first_route = {
             let mut routes = self.keyed_routes.write().expect("wake routes poisoned");
             let first = routes.is_empty();
@@ -525,15 +526,6 @@ where
             )
             .await?;
         }
-
-        let sweep = subscription::keyed::SweepJobInitializer::<Tables>::new(
-            self.pool.clone(),
-            spawner.clone(),
-            &config,
-        );
-        jobs.add_resident_initializer(sweep)
-            .spawn(subscription::keyed::SweepJobData::default())
-            .await?;
 
         Ok(Subscriptions::new(
             self.pool.clone(),

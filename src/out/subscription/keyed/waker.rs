@@ -20,8 +20,7 @@
 //! empty spawn (resolves to the live holder, or an empty lookup for an
 //! unsubscribed key — the majority case). Wake keys must never gate
 //! delivery, so they are never consulted by the per-key runner itself — only
-//! by this waker, to decide who to wake. The periodic backstop that covers
-//! a *missed* wake is [`sweep`](super::sweep).
+//! by this waker, to decide who to wake.
 //!
 //! # Two wake paths, two service levels
 //!
@@ -38,9 +37,11 @@
 //! [`CATCH_UP_WAKE_LIMIT`].
 //!
 //! The catch-up path needs no timer and no signal from the cache, which is
-//! why it fits inside a `SingletonSubscriber` where the periodic
-//! [`sweep`](super::sweep) could not: eviction pressure is a function of how
-//! far the stream has advanced, and this handler sees every event.
+//! what lets the whole wake plane live in a `SingletonSubscriber` and its
+//! shared runner loop: eviction pressure is a function of how far the stream
+//! has advanced, and this handler sees every event. It is also the reason
+//! there is no periodic reconciler — a clock-driven pass fires hardest when
+//! the stream is quiet, which is precisely when nothing needs waking.
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};

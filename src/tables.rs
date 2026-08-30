@@ -367,7 +367,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<SubscriptionRow>, sqlx::Error>> + Send;
 
     /// Every currently-subscribed key of one subscriber type, in a stable
-    /// order. Backs both the sweep (idempotent respawn of every row) and
+    /// order. Backs
     /// [`Subscriptions::members`](crate::out::Subscriptions::members) — never
     /// `keyed_handles`, since a job row may outlive a cancelled subscription;
     /// this table is the truth.

@@ -17,13 +17,16 @@
 //! This module root holds what a keyed subscriber *is* — the [`WakeKey`],
 //! the [`SubscriptionDef`]/[`KeyedSubscriber`] traits, [`KeyedSubscriberConfig`]
 //! and the [`Subscriptions`] capability. The moving parts live beside it:
-//! [`runner`] (the per-key job), [`waker`] and [`sweep`] (the two halves of
-//! the wake plane — event-driven wakes and the periodic backstop). The
-//! waker is one job per *outbox*, holding one erased route per registered
-//! type; the runner and the sweep are per type.
+//! [`runner`] (the per-key job, one per type) and [`waker`] (the whole wake
+//! plane, one per *outbox*, holding one erased route per registered type).
+//!
+//! There is no periodic reconciler. Every wake is driven by the stream:
+//! wake-key matches for arrivals, and cache-pressure catch-up for members
+//! drifting toward a cold read. A timer would have to run — and cost a job
+//! slot per process — whether or not anything had happened, which on a quiet
+//! outbox is exactly when there is nothing for it to find.
 
 mod runner;
-mod sweep;
 mod waker;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -37,7 +40,6 @@ use crate::out::event::{PersistentOutboxEvent, UndecodableEventError};
 use crate::tables::MailboxTables;
 
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
-pub(in crate::out) use sweep::{SweepJobData, SweepJobInitializer};
 pub(in crate::out) use waker::{WakeRoutes, wake_route, waker_handler, waker_job_type};
 
 // === Wake key ===
@@ -210,22 +212,48 @@ pub enum SubscribeError {
 // === Configuration ===
 
 const DEFAULT_LINGER: Duration = Duration::from_secs(30);
-const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 const DEFAULT_MAX_BATCH_SIZE: usize = 100;
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Per-type tuning for one keyed-subscriber registration.
+///
+/// Everything here is an operator dial: it varies per deployment and must be
+/// settable without recompiling the subscriber. What the subscriber *is* —
+/// its key type, instance config, batch accumulator and classification —
+/// lives on [`SubscriptionDef`]/[`KeyedSubscriber`] instead, because the
+/// compiler needs it and it cannot vary per deployment.
+///
+/// Retry settings are deliberately absent: a keyed member retries
+/// indefinitely, since giving up would leave a live subscription silently
+/// stopped with no cancellation and no error anywhere.
 #[derive(Clone)]
 pub struct KeyedSubscriberConfig {
     pub job_type: JobType,
     /// How long an idle (caught-up) member stays Active before passivating to
     /// Dormant. `Duration::MAX` = always-on. Default 30s.
+    ///
+    /// Counts this member's *own* idleness, not stream quiet: a member that
+    /// only skips is idle however busy the outbox is.
     pub linger: Duration,
-    /// How often the wake plane enumerates every subscribed key of this type
-    /// and respawns them all (idempotent) — the startup reconcile, the repair
-    /// path, and the staleness bound. Default 10 minutes.
-    pub sweep_interval: Duration,
+    /// Maximum staleness of the persisted checkpoint over skip-only
+    /// stretches, where nothing else would open a transaction. Never delays
+    /// handling — it only bounds how many harmless replays a crash costs,
+    /// and how stale the mirrored cursor the waker's catch-up scan reads can
+    /// be. Default 5s.
     pub checkpoint_interval: Duration,
+    /// Backstop on how many `collect_with` events may share one batch before
+    /// the runner force-flushes, bounding both the replay window after a
+    /// mid-batch failure and the in-memory accumulator. Handlers that
+    /// periodically `consume` land the batch at that fence anyway and are
+    /// largely unaffected. Default 100.
     pub max_batch_size: usize,
+    /// Cap on how many keys *of this type* run concurrently on one process.
+    /// `None` defers to the job crate's own default.
+    ///
+    /// Exists for keyed subscribers and not singletons because cardinality
+    /// does: a singleton is one job, whereas a keyed type can be one per
+    /// entity, and a burst that wakes thousands at once would otherwise
+    /// contend for every job slot and pool connection in the process.
     pub max_concurrent_per_process: Option<usize>,
 }
 
@@ -234,7 +262,6 @@ impl KeyedSubscriberConfig {
         Self {
             job_type,
             linger: DEFAULT_LINGER,
-            sweep_interval: DEFAULT_SWEEP_INTERVAL,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_concurrent_per_process: None,
@@ -243,11 +270,6 @@ impl KeyedSubscriberConfig {
 
     pub fn with_linger(mut self, linger: Duration) -> Self {
         self.linger = linger;
-        self
-    }
-
-    pub fn with_sweep_interval(mut self, sweep_interval: Duration) -> Self {
-        self.sweep_interval = sweep_interval;
         self
     }
 

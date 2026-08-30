@@ -106,7 +106,7 @@ pub const KEYED_WAKER_JOB_TYPE: &str = "persistent_outbox_events.keyed-waker";
 
 /// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
 /// registration touches: the per-key job type itself, its derived
-/// `{job_type}.sweep`, and the outbox-wide waker.
+/// and the outbox-wide waker.
 ///
 /// The waker must be wiped along with the outbox tables it tracks — it is
 /// shared across subscriber types and holds a durable checkpoint, so a
@@ -117,7 +117,6 @@ pub async fn wipeout_keyed_subscriber_job_tables(
     job_type: &str,
 ) -> anyhow::Result<()> {
     wipeout_outbox_job_tables(pool, job_type).await?;
-    wipeout_outbox_job_tables(pool, &format!("{job_type}.sweep")).await?;
     wipeout_outbox_job_tables(pool, KEYED_WAKER_JOB_TYPE).await?;
     Ok(())
 }

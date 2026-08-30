@@ -2,7 +2,7 @@
 //! wake-on-demand — the `subscriptions` table,
 //! `SubscriptionDef`/`KeyedSubscriber`, the hold verbs, the per-key runner,
 //! the `Subscriptions` capability, and both halves of the wake plane (the
-//! event-driven waker and the periodic sweep that backstops it).
+//! waker's two paths — wake-key matches and cache-pressure catch-up).
 
 mod helpers;
 
@@ -29,10 +29,8 @@ const JOB_TYPE: &str = "test-keyed-subscriber";
 const SECOND_JOB_TYPE: &str = "test-keyed-subscriber-2";
 const STAGED_JOB_TYPE: &str = "test-keyed-staged";
 
-/// Short enough for dormancy/sweep contracts to land inside a test's
-/// patience.
+/// Short enough for dormancy contracts to land inside a test's patience.
 const TEST_LINGER: Duration = Duration::from_millis(150);
-const TEST_SWEEP_INTERVAL: Duration = Duration::from_millis(150);
 const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,7 +193,6 @@ async fn init_outbox_with_cache_size(
 fn test_config() -> KeyedSubscriberConfig {
     KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(TEST_SWEEP_INTERVAL)
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
 }
 
@@ -488,11 +485,25 @@ async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resul
 }
 
 /// Contract — cancel: row deletion is the tombstone. A cancelled key stops
-/// processing, and the periodic sweep never respawns it (the sweep only
-/// enumerates the subscriptions table, which no longer has the row).
+/// processing, and no wake revives it — every wake path resolves through the
+/// `subscriptions` table, which no longer has the row.
+///
+/// Cancellation takes effect at the end of the member's *current* run: a
+/// live runner already holding the stream is not killed mid-flight, it
+/// re-reads the row at its next run start and completes. So the test waits
+/// for that run to end before publishing — the earlier version of this
+/// contract published immediately and only passed because a sleep sized to
+/// the old sweep interval happened to exceed `linger`.
+///
+/// The event published after cancellation carries the cancelled key's own
+/// wake key, so the waker actively tries to match it. A live bystander
+/// subscription supplies the happens-before: once *it* has received an event
+/// published after the cancelled one, the waker has demonstrably processed
+/// past both, and the cancelled member's silence is a result rather than a
+/// race that a longer sleep might have lost.
 #[tokio::test]
 #[file_serial]
-async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Result<()> {
+async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -515,6 +526,14 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(2),
+        InstanceConfig::default(),
+        wake_keys_for(OwnerId(2)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -524,14 +543,32 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
     })
     .await?;
 
+    // The handle is captured before cancelling and deliberately not
+    // re-resolved: it observes the generation that is live right now, and
+    // that generation reaching a terminal state is the signal that the run
+    // cancel had to outlive has actually ended.
+    let cancelled = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     subs.cancel(&OwnerId(1))
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let cancelled = cancelled.clone();
+        async move { Ok(cancelled.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
 
-    // Give several sweep intervals a chance to fire and (wrongly) respawn.
-    tokio::time::sleep(TEST_SWEEP_INTERVAL * 5).await;
+    // Addressed to the cancelled key's own wake key, so the waker looks it up
+    // and finds the tombstone; then one for the bystander, whose arrival
+    // proves the waker got past both.
     publish_ping(&outbox, 1, 2).await?;
-    tokio::time::sleep(TEST_SWEEP_INTERVAL * 5).await;
+    publish_ping(&outbox, 2, 3).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 2).await == vec![3])
+    })
+    .await?;
 
     assert_eq!(
         received_for(&shared, 1).await,
@@ -540,10 +577,12 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
     );
 
     let members = subs.members().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    assert!(
-        members.is_empty(),
-        "members() must not enumerate a cancelled key"
+    assert_eq!(
+        members.len(),
+        1,
+        "members() must enumerate the live key and not the cancelled one"
     );
+    assert_eq!(members[0].0, OwnerId(2));
 
     Ok(())
 }
@@ -622,10 +661,9 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     Ok(())
 }
 
-/// Contract — waker: a matching event wakes a Dormant member on its own,
-/// well inside the sweep interval, proving the event-driven wake is the fast
-/// path and not merely a side effect of the sweep also being armed. The
-/// subscription registers with a wake key matching its own owner id.
+/// Contract — waker: a matching event wakes a Dormant member on its own.
+/// The subscription registers with a wake key matching its own owner id,
+/// and the event published while it is Dormant carries that key.
 #[tokio::test]
 #[file_serial]
 async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<()> {
@@ -637,11 +675,8 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     let def = TestDef {
         shared: shared.clone(),
     };
-    // A deliberately huge sweep interval: if the event is delivered well
-    // before this could ever fire, it can only have been the waker.
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(Duration::from_secs(3600))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
@@ -676,8 +711,10 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     })
     .await?;
 
-    // Published while Dormant, with a sweep interval far longer than this
-    // test's patience — only the waker can deliver this in time.
+    // Published while Dormant: nothing is listening for this key, so the
+    // wake-key match is the only thing that can deliver it. The catch-up
+    // path cannot explain it either — one event is nowhere near the cache
+    // depth that path triggers on.
     publish_ping(&outbox, 1, 2).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2])
@@ -693,10 +730,9 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
 ///
 /// The member watches partition "1"; every event published after it
 /// passivates is addressed to partition "2", so the wake-key path cannot
-/// fire — the sweep is parked an hour out for the same reason. The only
-/// mechanism left that can move this member is the catch-up scan, and the
-/// only thing that triggers that is the stream advancing past three
-/// quarters of the cache depth.
+/// fire. The only mechanism left that can move this member is the catch-up
+/// scan, and the only thing that triggers that is the stream advancing past
+/// three quarters of the cache depth.
 ///
 /// Asserted on the durable checkpoint rather than on received events,
 /// because a woken member correctly *skips* all of this traffic: the
@@ -716,7 +752,6 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
     };
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(Duration::from_secs(3600))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
@@ -822,7 +857,6 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
             &mut jobs,
             KeyedSubscriberConfig::new(job::JobType::new(SECOND_JOB_TYPE))
                 .with_linger(TEST_LINGER)
-                .with_sweep_interval(Duration::from_secs(3600))
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             TestDef {
                 shared: second_shared.clone(),
@@ -928,11 +962,8 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
     let def = TestDef {
         shared: shared.clone(),
     };
-    // As in the waker contract above: a sweep interval far beyond this
-    // test's patience, so any wake observed here can only be the waker's.
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(Duration::from_secs(3600))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
@@ -1227,7 +1258,6 @@ async fn init_staged_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEv
 fn staged_config() -> KeyedSubscriberConfig {
     KeyedSubscriberConfig::new(job::JobType::new(STAGED_JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(TEST_SWEEP_INTERVAL)
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
 }
 
@@ -1487,9 +1517,9 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
 /// all of it. If the linger deadline restarted on every arriving event, no
 /// member would ever passivate on an outbox busier than `linger` — idle
 /// members would hold a live job forever, and `cancel` could not take effect
-/// until the entire stream went quiet. The sweep is parked far beyond this
-/// test's patience and no wake keys are registered, so nothing can revive
-/// the member once it passivates.
+/// until the entire stream went quiet. None of the traffic carries this
+/// member's wake key, and the burst is far short of the cache depth the
+/// catch-up path triggers on, so nothing can revive it once it passivates.
 #[tokio::test]
 #[file_serial]
 async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Result<()> {
@@ -1500,7 +1530,6 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
     let shared = Shared::default();
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
-        .with_sweep_interval(Duration::from_secs(3600))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(
@@ -1595,7 +1624,6 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
     let shared = Shared::default();
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(Duration::MAX)
-        .with_sweep_interval(Duration::from_secs(3600))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(
