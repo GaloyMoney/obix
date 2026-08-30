@@ -43,21 +43,15 @@ pub enum StreamSelection {
 ///   write. The runner applies the whole accumulator via
 ///   [`flush`](Self::flush) exactly once per batch landing, inside the
 ///   transaction that commits the checkpoint — N per-event statements
-///   become one batched flush. Same replay contract as `defer`.
-/// - [`consume_in_batch`](EventCtx::consume_in_batch) then
-///   [`defer`](BatchOp::defer) — coalesce my work with neighboring events
-///   into one transaction and one checkpoint write. The batch lands when the
-///   ready persistent backlog is drained (a pending batch is never held open
-///   waiting on the network), when `max_batch_size` is reached, when a later
-///   event commits or isolates, or on shutdown. Requires the work to
-///   tolerate whole-batch replay after a mid-batch failure.
-/// - [`consume_in_batch`](EventCtx::consume_in_batch) then
-///   [`commit`](BatchOp::commit) — join the batch and close it with me.
-/// - [`consume_isolated`](EventCtx::consume_isolated) then
-///   [`commit`](IsolatedOp::commit) — my event is its own atomic unit: the
-///   pending batch (items + work + checkpoint) lands before my work starts,
-///   and my op commits at return. Exact legacy per-event semantics when
-///   nothing is pending. Use for causally significant or risky work.
+///   become one batched flush. The batch lands when the ready persistent
+///   backlog is drained (it is never held open waiting on the network), when
+///   `max_batch_size` is reached, when a later event consumes, or on
+///   shutdown. Requires the work to tolerate whole-batch replay after a
+///   mid-batch failure.
+/// - [`consume`](EventCtx::consume) then [`commit`](IsolatedOp::commit) — my
+///   event is its own atomic unit: the pending batch (items + checkpoint)
+///   lands before my work starts, and my op commits at return. Use for
+///   causally significant or risky work.
 ///
 /// Ephemeral events are delivered on their own stream and are handled
 /// between batches: they never interrupt a pending batch, and nothing is
@@ -164,7 +158,7 @@ where
 }
 
 /// Object-safe bridge handing the handler's typed [`flush`] to the runner's
-/// flush path (and to [`EventCtx::consume_isolated`]'s entry fence) with the
+/// flush path (and to [`EventCtx::consume`]'s entry fence) with the
 /// handler type erased.
 ///
 /// [`flush`]: SingletonSubscriber::flush
@@ -240,13 +234,13 @@ impl OutboxEventJobConfig {
         self
     }
 
-    /// Backstop on how many deferred or collected events may share one
-    /// batch before the runner force-flushes. Bounds the replay window, the
-    /// transaction size and the flushed accumulator size of handlers that
-    /// always [`defer`](crate::out::BatchOp::defer) or
+    /// Backstop on how many collected events may share one batch before the
+    /// runner force-flushes. Bounds the replay window and the flushed
+    /// accumulator size of handlers that always
     /// [`collect`](crate::out::EventCtx::collect_with); handlers remain the
-    /// primary size control by exiting with
-    /// [`commit`](crate::out::BatchOp::commit).
+    /// primary size control by entering
+    /// [`consume`](crate::out::EventCtx::consume), whose fence lands the
+    /// pending batch.
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size.max(1);
         self
@@ -407,7 +401,6 @@ where
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
-            events_in_op: 0,
             collected: 0,
             persisted_seq: state.sequence,
             last_persist: tokio::time::Instant::now(),
@@ -419,8 +412,8 @@ where
         };
 
         loop {
-            let item = if op_slot.is_some() || tracker.collected > 0 {
-                // A batch is pending (an open op, collected items, or both):
+            let item = if tracker.collected > 0 {
+                // A batch is pending (collected items awaiting a flush):
                 // only take persistent events that are already buffered —
                 // the batch is never held open waiting on the network. A
                 // pending stream is itself the flush trigger.
@@ -516,7 +509,7 @@ where
             // checkpoint (at the sequence *before* this event) are durable
             // regardless of the outcome, and no batch transaction spans the
             // foreign handle_undecodable await (the same fence as
-            // consume_isolated's entry). Then `Ok` acknowledges the event
+            // consume's entry). Then `Ok` acknowledges the event
             // (the checkpoint advances over it like a skip); any `Err` — the
             // default — fails the job with the checkpoint parked before the
             // event, so every retry re-reads it and nothing is ever skipped.
@@ -584,8 +577,8 @@ where
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                 }
-                Outcome::Defer | Outcome::Collect => {
-                    if tracker.events_in_op >= self.max_batch_size {
+                Outcome::Collect => {
+                    if tracker.collected >= self.max_batch_size {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,

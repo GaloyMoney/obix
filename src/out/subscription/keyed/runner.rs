@@ -191,7 +191,6 @@ where
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
-            events_in_op: 0,
             collected: 0,
             persisted_seq: state.sequence,
             last_persist: tokio::time::Instant::now(),
@@ -204,7 +203,7 @@ where
         let mut linger_deadline: Option<tokio::time::Instant> = None;
 
         loop {
-            let item = if op_slot.is_some() || tracker.collected > 0 {
+            let item = if tracker.collected > 0 {
                 match persistent.next().now_or_never() {
                     Some(Some(item)) => item,
                     Some(None) => {
@@ -383,9 +382,9 @@ where
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                 }
-                Outcome::Defer | Outcome::Collect => {
+                Outcome::Collect => {
                     state.sequence = event.sequence;
-                    if tracker.events_in_op >= self.max_batch_size {
+                    if tracker.collected >= self.max_batch_size {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
