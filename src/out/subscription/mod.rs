@@ -1,16 +1,29 @@
-//! [`Subscription`] — public read-back of a registered outbox event
-//! handler's committed checkpoint, plus the caught-up barrier built on it.
+//! Subscriptions — a consumer's durable relationship to the outbox stream,
+//! in its two kinds.
 //!
-//! Returned by
-//! [`Outbox::register_singleton_subscriber`](super::Outbox::register_singleton_subscriber).
-//! It is a capability, not a value: it caches nothing, and every read goes
-//! to committed state.
+//! A **subscriber** consumes outbox events; a **subscription** is one
+//! identity's durable relationship to the stream. The two kinds differ in
+//! what brings them into existence:
+//!
+//! - [`singleton`] — exists because *code* declares it. Exactly one per
+//!   type, permanent, registered at startup.
+//! - [`keyed`] — exists because *data* creates it. One per key, cancellable,
+//!   its subscription an explicit row in the `subscriptions` table (row
+//!   absence = cancelled), woken on demand and costing nothing while idle.
+//!
+//! This module root holds what both kinds share: [`Subscription`], the
+//! public read-back of a subscription's committed checkpoint, plus the
+//! caught-up barrier built on it. It is a capability, not a value — it
+//! caches nothing, and every read goes to committed state.
+
+pub(crate) mod keyed;
+pub(crate) mod singleton;
 
 use serde::{Serialize, de::DeserializeOwned};
 
 use std::{marker::PhantomData, time::Duration};
 
-use super::ctx::OutboxEventJobState;
+use crate::out::ctx::OutboxEventJobState;
 use crate::{
     sequence::EventSequence,
     tables::{DefaultMailboxTables, MailboxTables},
@@ -177,7 +190,7 @@ impl SubscriptionSnapshot {
 /// runtime status of the job hosting it, and the caught-up barrier.
 ///
 /// Returned by
-/// [`Outbox::register_singleton_subscriber`](super::Outbox::register_singleton_subscriber).
+/// [`Outbox::register_singleton_subscriber`](crate::out::Outbox::register_singleton_subscriber).
 /// This does not own the handler — it is a cloneable, cheap-to-hold capability
 /// for observing and fencing one, and it caches nothing, so every read
 /// reflects the latest committed state.

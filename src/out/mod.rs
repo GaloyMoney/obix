@@ -4,8 +4,6 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
-mod job;
-mod keyed_job;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -13,7 +11,7 @@ mod persist_events_hook;
 mod persistent;
 mod pg_notify;
 mod post_persist_hook;
-mod registered_handler;
+mod subscription;
 
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
@@ -24,12 +22,14 @@ use std::sync::Arc;
 pub use self::ctx::{
     BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, KeyedIsolatedOp,
 };
-pub use self::job::{OutboxEventJobConfig, SingletonSubscriber, StreamSelection};
-pub use self::keyed_job::{
+pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, Members, RoutingKey, SubscriptionDef,
     SubscriptionMember, Subscriptions,
 };
-pub use self::registered_handler::{
+pub use self::subscription::singleton::{
+    OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
+};
+pub use self::subscription::{
     Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
@@ -441,10 +441,15 @@ where
     where
         H: SingletonSubscriber<P>,
     {
-        let initializer =
-            job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
+        let initializer = subscription::singleton::OutboxEventJobInitializer::<H, P, Tables>::new(
+            self.clone(),
+            handler,
+            &config,
+        );
         let spawner = jobs.add_resident_initializer(initializer);
-        let handle = spawner.spawn(job::OutboxEventJobData::default()).await?;
+        let handle = spawner
+            .spawn(subscription::singleton::OutboxEventJobData::default())
+            .await?;
         Ok(Subscription::new(handle, self.pool.clone()))
     }
 
@@ -460,14 +465,14 @@ where
     /// has gone Dormant.
     ///
     /// Must be called **before** [`::job::Jobs::start_poll`].
-    pub async fn register_keyed_subscriber<D: keyed_job::SubscriptionDef<P>>(
+    pub async fn register_keyed_subscriber<D: subscription::keyed::SubscriptionDef<P>>(
         &self,
         jobs: &mut ::job::Jobs,
-        config: keyed_job::KeyedSubscriberConfig,
+        config: subscription::keyed::KeyedSubscriberConfig,
         def: D,
     ) -> Result<Subscriptions<D, P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
         let def = Arc::new(def);
-        let initializer = keyed_job::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
+        let initializer = subscription::keyed::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
             self.clone(),
             def.clone(),
             &config,
@@ -480,25 +485,27 @@ where
         // (startup reconcile / repair / staleness bound) as its own resident
         // job. A fresh subscription is Active from birth regardless, so
         // neither is on the critical path for first delivery.
-        let router = keyed_job::router_handler::<D, P, Tables>(
+        let router = subscription::keyed::router_handler::<D, P, Tables>(
             def,
             config.job_type.clone(),
             spawner.clone(),
         );
         self.register_singleton_subscriber(
             jobs,
-            OutboxEventJobConfig::new(keyed_job::router_job_type(config.job_type.as_str())),
+            OutboxEventJobConfig::new(subscription::keyed::router_job_type(
+                config.job_type.as_str(),
+            )),
             router,
         )
         .await?;
 
-        let sweep = keyed_job::SweepJobInitializer::<Tables>::new(
+        let sweep = subscription::keyed::SweepJobInitializer::<Tables>::new(
             self.pool.clone(),
             spawner.clone(),
             &config,
         );
         jobs.add_resident_initializer(sweep)
-            .spawn(keyed_job::SweepJobData::default())
+            .spawn(subscription::keyed::SweepJobData::default())
             .await?;
 
         Ok(Subscriptions::new(
@@ -519,7 +526,7 @@ where
     /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
     pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        registered_handler::read_frontier::<Tables>(&self.pool).await
+        subscription::read_frontier::<Tables>(&self.pool).await
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a

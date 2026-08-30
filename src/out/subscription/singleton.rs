@@ -8,8 +8,8 @@ use job::{
     RetrySettings,
 };
 
-use super::ctx::*;
-use super::{EphemeralOutboxListener, Outbox, event::*};
+use crate::out::ctx::*;
+use crate::out::{EphemeralOutboxListener, Outbox, event::*};
 use crate::tables::MailboxTables;
 
 /// Which delivery streams an event-handler job subscribes to — see
@@ -243,10 +243,10 @@ impl OutboxEventJobConfig {
     /// Backstop on how many deferred or collected events may share one
     /// batch before the runner force-flushes. Bounds the replay window, the
     /// transaction size and the flushed accumulator size of handlers that
-    /// always [`defer`](super::BatchOp::defer) or
-    /// [`collect`](super::EventCtx::collect_with); handlers remain the
+    /// always [`defer`](crate::out::BatchOp::defer) or
+    /// [`collect`](crate::out::EventCtx::collect_with); handlers remain the
     /// primary size control by exiting with
-    /// [`commit`](super::BatchOp::commit).
+    /// [`commit`](crate::out::BatchOp::commit).
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size.max(1);
         self
@@ -263,9 +263,9 @@ impl OutboxEventJobConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(super) struct OutboxEventJobData {}
+pub(in crate::out) struct OutboxEventJobData {}
 
-pub(super) struct OutboxEventJobInitializer<H, P, Tables>
+pub(in crate::out) struct OutboxEventJobInitializer<H, P, Tables>
 where
     H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
