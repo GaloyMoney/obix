@@ -1,8 +1,8 @@
-//! Contracts for keyed subscribers (per-entity outbox consumers with
-//! wake-on-demand) — workstream 3 of the handoff: subscriptions table,
-//! `SubscriptionDef`/`KeyedSubscriber`, hold verbs, the per-key runner and
-//! the `Subscriptions` capability, waking via a periodic sweep only (the
-//! wake-plane router lands in a later, separately-shippable commit).
+//! Contracts for keyed subscribers: per-entity outbox consumers with
+//! wake-on-demand — the `subscriptions` table,
+//! `SubscriptionDef`/`KeyedSubscriber`, the hold verbs, the per-key runner,
+//! the `Subscriptions` capability, and both halves of the wake plane (the
+//! event-driven router and the periodic sweep that backstops it).
 
 mod helpers;
 
@@ -23,8 +23,7 @@ use helpers::{TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeou
 const JOB_TYPE: &str = "test-keyed-subscriber";
 
 /// Short enough for dormancy/sweep contracts to land inside a test's
-/// patience, per the handoff's own advice ("set default sweep_interval low
-/// in tests").
+/// patience.
 const TEST_LINGER: Duration = Duration::from_millis(150);
 const TEST_SWEEP_INTERVAL: Duration = Duration::from_millis(150);
 const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
@@ -53,7 +52,15 @@ impl std::str::FromStr for OwnerId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct InstanceConfig {}
+struct InstanceConfig {
+    /// Owners this subscription records for *in addition to* its own key.
+    /// Empty for every contract where the routing key and the domain key
+    /// coincide; non-empty only for the multi-routing-key contract, which
+    /// deliberately separates the two so a subscription can watch several
+    /// partitions that are none of them its own id.
+    #[serde(default)]
+    watched: Vec<u64>,
+}
 
 /// Shared, cross-run observation point: every instantiated subscriber for a
 /// key clones this in, so the test can see what happened across the
@@ -85,9 +92,10 @@ impl SubscriptionDef<TestEvent> for TestDef {
         }
     }
 
-    fn instantiate(&self, key: Self::Key, _cfg: Self::InstanceConfig) -> Self::Subscriber {
+    fn instantiate(&self, key: Self::Key, cfg: Self::InstanceConfig) -> Self::Subscriber {
         RecordingSubscriber {
             key,
+            watched: cfg.watched,
             shared: self.shared.clone(),
         }
     }
@@ -99,6 +107,8 @@ impl SubscriptionDef<TestEvent> for TestDef {
 /// keys itself — exactly like a real per-entity consumer would.
 struct RecordingSubscriber {
     key: OwnerId,
+    /// Extra owners to record for beyond `key`, from the instance config.
+    watched: Vec<u64>,
     shared: Shared,
 }
 
@@ -113,7 +123,7 @@ impl KeyedSubscriber<TestEvent> for RecordingSubscriber {
         let Some(TestEvent::Ping { owner, n }) = &event.payload else {
             return Ok(ctx.skip());
         };
-        if *owner != self.key.0 {
+        if *owner != self.key.0 && !self.watched.contains(owner) {
             return Ok(ctx.skip());
         }
 
@@ -448,9 +458,8 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
 
 /// Contract — dormancy + sweep-wake: a caught-up member passivates to
 /// Dormant after `linger` elapses (no live execution), and the periodic
-/// sweep is what revives it to deliver events published while dormant. This
-/// is the whole wake mechanism at this workstream (no router yet), so it is
-/// the load-bearing proof that sweep-only waking is fully correct.
+/// sweep is what revives it to deliver events published while dormant —
+/// the backstop path, independent of whether the router ever fires.
 #[tokio::test]
 #[file_serial]
 async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Result<()> {
@@ -578,5 +587,137 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
     })
     .await?;
 
+    Ok(())
+}
+
+/// Contract — router, multi-routing-key matching: the reason
+/// `subscriptions.routing_keys` is a set rather than a scalar.
+///
+/// Every other contract here registers zero or one routing key, so the
+/// array-ness of the column, the `&&` overlap semantics and the
+/// `$2::varchar[]` cast are all exercised at cardinality one — which is
+/// exactly the cardinality at which the missing cast once compiled clean and
+/// failed on every call. This registers a subscription watching TWO
+/// partitions, neither of which is its own key, and wakes it through each in
+/// turn:
+///
+/// - woken by an event matching only its SECOND routing key (so a match on
+///   the first element, or an equality comparison against a scalar, would
+///   not explain the wake),
+/// - woken again by an event matching only its FIRST,
+/// - and a second subscription watching two entirely different partitions is
+///   never woken by either event — asserted on its durable checkpoint, which
+///   cannot advance unless the member actually ran.
+#[tokio::test]
+#[file_serial]
+async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    // As in the router contract above: a sweep interval far beyond this
+    // test's patience, so any wake observed here can only be the router's.
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(Duration::from_secs(3600))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, config, def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // The watcher's key (10) is deliberately none of the partitions it
+    // watches (7 and 8), so nothing about this can pass by conflating the
+    // domain key with a routing key.
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(10),
+        InstanceConfig {
+            watched: vec![7, 8],
+        },
+        vec![RoutingKey::from("7"), RoutingKey::from("8")],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(20),
+        InstanceConfig {
+            watched: vec![21, 22],
+        },
+        vec![RoutingKey::from("21"), RoutingKey::from("22")],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    // Both are born Active; let both passivate before anything is published,
+    // so every delivery below requires a wake rather than an already-running
+    // member happening to see the event.
+    let watcher = subs
+        .subscription(&OwnerId(10))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bystander = subs
+        .subscription(&OwnerId(20))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let both_dormant = || {
+        let watcher = watcher.clone();
+        let bystander = bystander.clone();
+        async move {
+            Ok(watcher.load().await?.job_status().is_terminal()
+                && bystander.load().await?.job_status().is_terminal())
+        }
+    };
+    eventually(Duration::from_secs(10), both_dormant).await?;
+
+    // The bystander's durable cursor at rest. It can only move if the member
+    // actually runs, so it is the assertion that it was never woken —
+    // strictly stronger than re-reading a status that would also read
+    // Dormant after a spurious wake had come and gone.
+    let bystander_checkpoint = bystander.load().await?.checkpoint();
+
+    // Matches the watcher's SECOND routing key only.
+    publish_ping(&outbox, 8, 42).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 10).await == vec![42])
+    })
+    .await?;
+
+    // Let it passivate again so the next delivery is a fresh wake too.
+    eventually(Duration::from_secs(10), || {
+        let watcher = watcher.clone();
+        async move { Ok(watcher.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+
+    // Matches the watcher's FIRST routing key only.
+    publish_ping(&outbox, 7, 41).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 10).await == vec![42, 41])
+    })
+    .await?;
+
+    assert_eq!(
+        received_for(&shared, 20).await,
+        Vec::<u64>::new(),
+        "a subscription must not receive events for partitions it does not watch"
+    );
+    assert_eq!(
+        bystander.load().await?.checkpoint(),
+        bystander_checkpoint,
+        "a subscription watching neither routing key must never be woken: \
+         its durable checkpoint cannot advance without the member running"
+    );
+
+    jobs.shutdown().await?;
     Ok(())
 }
