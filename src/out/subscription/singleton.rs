@@ -434,6 +434,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: None,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
@@ -446,6 +447,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: None,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
                             .await
@@ -458,7 +460,7 @@ where
                     biased;
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted_seq < state.sequence {
-                            persist_checkpoint(&mut current_job, &state)
+                            persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
@@ -466,7 +468,7 @@ where
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted_seq < state.sequence => {
-                        persist_checkpoint(&mut current_job, &state)
+                        persist_checkpoint(&mut current_job, &state, None)
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                         tracker.persisted_seq = state.sequence;
@@ -503,7 +505,7 @@ where
                     NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
                         if tracker.persisted_seq < state.sequence {
-                            persist_checkpoint(&mut current_job, &state)
+                            persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
@@ -530,6 +532,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: None,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
                         .await
@@ -541,7 +544,7 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted_seq < state.sequence {
-                                persist_checkpoint(&mut current_job, &state)
+                                persist_checkpoint(&mut current_job, &state, None)
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;
                             }
@@ -557,6 +560,7 @@ where
                     current_job: &mut current_job,
                     state: &mut state,
                     tracker: &mut tracker,
+                    mirror: None,
                 },
                 batch: &mut batch,
                 flusher: &flusher,
@@ -581,6 +585,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: None,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
                         .await
@@ -593,6 +598,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: None,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
                             .await

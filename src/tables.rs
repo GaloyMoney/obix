@@ -376,6 +376,32 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_type: &str,
     ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
 
+    /// Advance one subscription's mirrored cursor, in the caller's op so it
+    /// shares the fate of the job checkpoint it copies. Monotonic: a lower
+    /// value than the stored one is ignored rather than applied, so a write
+    /// from a superseded generation cannot rewind it.
+    fn update_subscription_checkpoint_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+        checkpoint: EventSequence,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// `(subscriber_type, key)` of the subscriptions whose mirrored cursor is
+    /// below `below`, furthest behind first, capped at `limit` — the waker's
+    /// catch-up scan.
+    ///
+    /// Spans every subscriber type because the waker does: one scan per pass
+    /// for the whole outbox, not one per registered type. Ordering is what
+    /// makes `limit` safe to apply — it sheds the members with the most
+    /// slack, so a cap can bound the wake rate without ever starving the
+    /// member closest to falling out of the cache.
+    fn subscriptions_behind(
+        op: &mut impl es_entity::AtomicOperation,
+        below: EventSequence,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+
     /// The keys of one subscriber type whose declared `wake_keys` intersect
     /// the `wake_keys` an event classified to — the waker's flush-time
     /// lookup, run **on the flush op** so the wakes it drives and the

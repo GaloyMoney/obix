@@ -133,6 +133,34 @@ where
     }
 }
 
+/// Mirrors this member's checkpoint into its `subscriptions` row on whatever
+/// op is persisting the checkpoint, so obix owns a copy of how far each
+/// member has got without reading job-crate tables. Feeds the waker's
+/// catch-up scan; see [`MailboxTables::subscriptions_behind`].
+struct KeyedCheckpointMirror<Tables> {
+    subscriber_type: JobType,
+    key: String,
+    _tables: PhantomData<fn() -> Tables>,
+}
+
+impl<Tables: MailboxTables> CheckpointMirror for KeyedCheckpointMirror<Tables> {
+    fn mirror<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+        checkpoint: crate::sequence::EventSequence,
+    ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            Tables::update_subscription_checkpoint_in_op(
+                op,
+                self.subscriber_type.as_str(),
+                &self.key,
+                checkpoint,
+            )
+            .await
+        })
+    }
+}
+
 struct KeyedSubscriberJobRunner<D, P, Tables>
 where
     D: SubscriptionDef<P>,
@@ -188,6 +216,12 @@ where
                 staged: None,
             });
 
+        let mirror = KeyedCheckpointMirror::<Tables> {
+            subscriber_type: self.job_type.clone(),
+            key: key_str.clone(),
+            _tables: PhantomData,
+        };
+
         let mut persistent = self.outbox.listen_persisted(Some(state.sequence));
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
@@ -215,6 +249,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: Some(&mirror),
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
@@ -227,6 +262,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: Some(&mirror),
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
                             .await
@@ -254,29 +290,38 @@ where
                     biased;
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted_seq < state.sequence {
-                            persist_checkpoint(&mut current_job, &state)
+                            persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
                         }
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(deadline), if linger_deadline.is_some() => {
+                        // Passivating is exactly when the mirrored cursor
+                        // starts to matter: from here nothing is reading the
+                        // stream for this key, so the waker's catch-up scan
+                        // is the only thing that will notice it drifting
+                        // toward the edge of the cache. Written
+                        // unconditionally, not only when the checkpoint
+                        // itself needs persisting — the checkpoint may
+                        // already be durable from an earlier tick while the
+                        // mirror still trails it.
+                        let mut op = es_entity::DbOp::init_with_clock(
+                            current_job.pool(),
+                            current_job.clock(),
+                        )
+                        .await?;
                         if tracker.persisted_seq < state.sequence {
-                            let mut op = es_entity::DbOp::init_with_clock(
-                                current_job.pool(),
-                                current_job.clock(),
-                            )
-                            .await?;
                             current_job
                                 .update_execution_state_in_op(&mut op, &state)
                                 .await?;
-                            return Ok(job::JobCompletion::CompleteWithOp(op));
                         }
-                        return Ok(job::JobCompletion::Complete);
+                        mirror.mirror(&mut op, state.sequence).await?;
+                        return Ok(job::JobCompletion::CompleteWithOp(op));
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted_seq < state.sequence => {
-                        persist_checkpoint(&mut current_job, &state)
+                        persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                         tracker.persisted_seq = state.sequence;
@@ -296,7 +341,7 @@ where
                             Some(item) => item,
                             None => {
                                 if tracker.persisted_seq < state.sequence {
-                                    persist_checkpoint(&mut current_job, &state)
+                                    persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                         .await
                                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                                 }
@@ -315,6 +360,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: Some(&mirror),
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
                         .await
@@ -326,7 +372,7 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted_seq < state.sequence {
-                                persist_checkpoint(&mut current_job, &state)
+                                persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;
                             }
@@ -342,6 +388,7 @@ where
                     current_job: &mut current_job,
                     state: &mut state,
                     tracker: &mut tracker,
+                    mirror: Some(&mirror),
                 },
                 batch: &mut batch,
                 flusher: &flusher,
@@ -363,12 +410,13 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: Some(&mirror),
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "hold_entry")
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     if tracker.persisted_seq < state.sequence {
-                        persist_checkpoint(&mut current_job, &state)
+                        persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                     }
@@ -382,6 +430,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: Some(&mirror),
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "staged_hold")
                         .await
@@ -403,6 +452,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
+                        mirror: Some(&mirror),
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
                         .await
@@ -418,6 +468,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
+                            mirror: Some(&mirror),
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
                             .await

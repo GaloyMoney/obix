@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT subscriber_type, key\n            FROM subscriptions\n            WHERE checkpoint < $1\n            ORDER BY checkpoint ASC\n            LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subscriber_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f734233e698016920001e6c5941e10476f9f5c83aff1143eb1de4aeaebd3c96f"
+}

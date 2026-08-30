@@ -171,6 +171,27 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     .await?)
 }
 
+/// An outbox whose in-memory cache holds only `event_cache_size` events, so
+/// the waker's catch-up threshold (three quarters of it) is reachable within
+/// a test rather than after the default 750.
+async fn init_outbox_with_cache_size(
+    pool: &sqlx::PgPool,
+    event_cache_size: usize,
+) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+    helpers::wipeout_outbox_tables(pool).await?;
+    wipeout_keyed_subscriber_job_tables(pool, JOB_TYPE).await?;
+    wipeout_subscriptions(pool, JOB_TYPE).await?;
+
+    Ok(Outbox::<TestEvent, TestTables>::init(
+        pool,
+        MailboxConfig::builder()
+            .event_cache_size(event_cache_size)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?)
+}
+
 fn test_config() -> KeyedSubscriberConfig {
     KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
@@ -666,6 +687,103 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     Ok(())
 }
 
+/// Contract — catch-up wake: a Dormant member drifting toward the bottom of
+/// the in-memory cache is woken to drain from memory, without any wake key
+/// matching and without a timer.
+///
+/// The member watches partition "1"; every event published after it
+/// passivates is addressed to partition "2", so the wake-key path cannot
+/// fire — the sweep is parked an hour out for the same reason. The only
+/// mechanism left that can move this member is the catch-up scan, and the
+/// only thing that triggers that is the stream advancing past three
+/// quarters of the cache depth.
+///
+/// Asserted on the durable checkpoint rather than on received events,
+/// because a woken member correctly *skips* all of this traffic: the
+/// checkpoint is the observable that cannot advance unless the member
+/// actually ran.
+#[tokio::test]
+#[file_serial]
+async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    // Small enough that a handful of events crosses the threshold.
+    let outbox = init_outbox_with_cache_size(&pool, 8).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(Duration::from_secs(3600))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, config, def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        wake_keys_for(OwnerId(1)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+    let dormant_at = subscription.load().await?.checkpoint();
+
+    // Traffic for a partition this member does not watch. No wake key can
+    // match it, so nothing here is a reason to wake — until the accumulated
+    // drift is itself the reason.
+    for n in 0..12 {
+        publish_ping(&outbox, 2, n).await?;
+    }
+
+    // Re-resolved each poll rather than reused: a handle captured before the
+    // respawn observes the generation it was minted for, and a catch-up wake
+    // starts a new one.
+    let subs_probe = subs.clone();
+    eventually(Duration::from_secs(10), || {
+        let subs_probe = subs_probe.clone();
+        async move {
+            let subscription = subs_probe
+                .subscription(&OwnerId(1))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(subscription.load().await?.checkpoint() > dormant_at)
+        }
+    })
+    .await?;
+
+    assert_eq!(
+        received_for(&shared, 1).await,
+        vec![1],
+        "a catch-up wake must not deliver another key's events"
+    );
+
+    Ok(())
+}
+
 /// Contract — one waker per outbox, not per subscriber type.
 ///
 /// Two keyed subscriber types are registered on the same outbox. Asserted:
@@ -874,6 +992,11 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
     // actually runs, so it is the assertion that it was never woken —
     // strictly stronger than re-reading a status that would also read
     // Dormant after a spurious wake had come and gone.
+    //
+    // Re-resolved at the end rather than read through this handle: a
+    // `Subscription` observes the job generation it was minted for, and a
+    // wake starts a new one. Comparing two reads of the same handle would
+    // hold even if the bystander HAD been woken.
     let bystander_checkpoint = bystander.load().await?.checkpoint();
 
     // Matches the watcher's SECOND wake key only.
@@ -903,7 +1026,12 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         "a subscription must not receive events for partitions it does not watch"
     );
     assert_eq!(
-        bystander.load().await?.checkpoint(),
+        subs.subscription(&OwnerId(20))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .load()
+            .await?
+            .checkpoint(),
         bystander_checkpoint,
         "a subscription watching neither wake key must never be woken: \
          its durable checkpoint cannot advance without the member running"

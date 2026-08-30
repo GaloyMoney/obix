@@ -103,15 +103,32 @@ CREATE INDEX idx_inbox_events_status ON inbox_events(status)
 -- A set rather than a scalar because a subscription's identity is its
 -- `key`, so watching several partitions of the stream cannot be expressed
 -- as extra rows.
+-- `checkpoint` mirrors the member's durable cursor, written in the same
+-- transaction as the job's own checkpoint. The authoritative cursor still
+-- lives in the job crate's execution state; this is a copy obix owns so the
+-- waker can ask "who has fallen far enough behind the in-memory event cache
+-- that waking them now would save a paged cold read from disk" without
+-- joining across the schema boundary into job-crate tables.
+--
+-- It is a lower bound, never an over-estimate: a member that dies without
+-- passivating leaves it behind its true position, which costs at worst a
+-- spurious wake (idempotent, resolves to the live holder or an empty run).
 CREATE TABLE subscriptions (
   subscriber_type  VARCHAR NOT NULL,
   key              VARCHAR NOT NULL,
   wake_keys        VARCHAR[] NOT NULL CHECK (cardinality(wake_keys) > 0),
   instance_config  JSONB NOT NULL,
   start_after      BIGINT NOT NULL,
+  checkpoint       BIGINT NOT NULL,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (subscriber_type, key)
 );
+
+-- Backs the waker's catch-up scan: `WHERE checkpoint < $1 ORDER BY
+-- checkpoint ASC LIMIT $2` across every subscriber type, so the members
+-- nearest the eviction cliff are the ones woken first and the per-pass
+-- limit bounds the wake rate.
+CREATE INDEX idx_subscriptions_checkpoint ON subscriptions (checkpoint);
 
 -- Backs the waker's flush-time lookup: `WHERE subscriber_type = $1 AND
 -- wake_keys && $2::varchar[]`. The cast is load-bearing — Postgres has no

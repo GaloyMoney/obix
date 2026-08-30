@@ -112,6 +112,23 @@ pub(crate) struct BatchTracker {
     pub(crate) last_persist: tokio::time::Instant,
 }
 
+/// Copies a keyed member's durable cursor into its `subscriptions` row,
+/// inside the same transaction that persists the job checkpoint it mirrors.
+///
+/// Indirected through a trait object rather than a `Tables` type parameter
+/// because everything in this module is shared with the singleton path,
+/// which has no subscription row to mirror into and passes `None`. It also
+/// keeps the mirror atomic with the checkpoint by construction: both writes
+/// land on the same op, so the copy can never claim progress the job did not
+/// commit.
+pub(crate) trait CheckpointMirror: Send + Sync {
+    fn mirror<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+        checkpoint: EventSequence,
+    ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>>;
+}
+
 pub(crate) struct CtxParts<'inv> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
@@ -119,6 +136,9 @@ pub(crate) struct CtxParts<'inv> {
     /// the runner is about to persist. `sequence` remains the runner's alone.
     pub(crate) state: &'inv mut OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
+    /// `Some` for keyed members, `None` for singletons — see
+    /// [`CheckpointMirror`].
+    pub(crate) mirror: Option<&'inv dyn CheckpointMirror>,
 }
 
 /// Proof that a persistent event was resolved in one of the legal ways.
@@ -462,6 +482,9 @@ pub(crate) async fn flush_batch<B: Default>(
         .current_job
         .update_execution_state_in_op(&mut op, parts.state)
         .await?;
+    if let Some(mirror) = parts.mirror {
+        mirror.mirror(&mut op, parts.state.sequence).await?;
+    }
     op.commit().await?;
     parts.tracker.persisted_seq = parts.state.sequence;
     parts.tracker.last_persist = tokio::time::Instant::now();
@@ -479,11 +502,15 @@ pub(crate) async fn flush_batch<B: Default>(
 pub(crate) async fn persist_checkpoint(
     current_job: &mut CurrentJob,
     state: &OutboxEventJobState,
+    mirror: Option<&dyn CheckpointMirror>,
 ) -> Result<(), HandlerError> {
     let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
     current_job
         .update_execution_state_in_op(&mut op, state)
         .await?;
+    if let Some(mirror) = mirror {
+        mirror.mirror(&mut op, state.sequence).await?;
+    }
     op.commit().await?;
     Ok(())
 }

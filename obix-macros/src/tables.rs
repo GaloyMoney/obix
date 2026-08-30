@@ -371,9 +371,34 @@ FROM {}persistent_outbox_events_sequence_seq",
         // exactly once, at the subscription's true birth.
         let insert_subscription_query = format!(
             r#"
-            INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, created_at)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, NOW()))
+            INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint, created_at)
+            VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6::timestamptz, NOW()))
             ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        // The mirrored cursor only ever moves forward: `GREATEST` makes a
+        // late-committing write from a superseded generation a no-op rather
+        // than a rewind that would re-select the row on every catch-up scan.
+        let update_subscription_checkpoint_query = format!(
+            r#"
+            UPDATE {tbl}subscriptions
+            SET checkpoint = GREATEST(checkpoint, $3)
+            WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        // The waker's catch-up scan, across every subscriber type: who has
+        // fallen far enough behind that waking them now serves them from the
+        // in-memory cache instead of a paged cold read. Ordered by lag so
+        // the limit sheds the least-endangered members, never the most.
+        let subscriptions_behind_query = format!(
+            r#"
+            SELECT subscriber_type, key
+            FROM {tbl}subscriptions
+            WHERE checkpoint < $1
+            ORDER BY checkpoint ASC
+            LIMIT $2"#,
             tbl = table_prefix
         );
 
@@ -1177,6 +1202,52 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .fetch_all(&pool)
                             .await?;
                         Ok(rows.into_iter().map(|row| row.key).collect())
+                    }
+                }
+
+                fn update_subscription_checkpoint_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    checkpoint: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #update_subscription_checkpoint_query,
+                            subscriber_type,
+                            key,
+                            checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn subscriptions_behind(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    below: #crate_name::EventSequence,
+                    limit: i64,
+                ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #subscriptions_behind_query,
+                            below as #crate_name::EventSequence,
+                            limit,
+                        )
+                        .fetch_all(op.as_executor())
+                        .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| (row.subscriber_type, row.key))
+                            .collect())
                     }
                 }
 

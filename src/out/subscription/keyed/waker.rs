@@ -22,6 +22,25 @@
 //! delivery, so they are never consulted by the per-key runner itself — only
 //! by this waker, to decide who to wake. The periodic backstop that covers
 //! a *missed* wake is [`sweep`](super::sweep).
+//!
+//! # Two wake paths, two service levels
+//!
+//! **Wake-key match** — instant and uncapped. A matching event is a real
+//! arrival for a specific subscription; delaying or shedding it would break
+//! the latency contract the whole mechanism exists to provide.
+//!
+//! **Catch-up** — capped and cascading. A Dormant member whose cursor is
+//! drifting toward the bottom of the in-memory cache will, if left alone,
+//! eventually resume with a paged cold read from disk: one `SELECT` per
+//! `backfill_page_size` events it fell behind. Waking it while its backlog
+//! is still resident turns that into a memory read. Unlike a wake-key match
+//! this can select *every* subscription at once, so it is bounded — see
+//! [`CATCH_UP_WAKE_LIMIT`].
+//!
+//! The catch-up path needs no timer and no signal from the cache, which is
+//! why it fits inside a `SingletonSubscriber` where the periodic
+//! [`sweep`](super::sweep) could not: eviction pressure is a function of how
+//! far the stream has advanced, and this handler sees every event.
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +52,7 @@ use super::{KeyMsg, SubscriptionDef, WakeKey, derived_job_type};
 use crate::out::ctx::{EventCtx, FlushOp, Handled};
 use crate::out::event::PersistentOutboxEvent;
 use crate::out::subscription::singleton::SingletonSubscriber;
+use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
 
 /// One registered keyed-subscriber type, with its [`SubscriptionDef`] erased
@@ -105,12 +125,40 @@ where
     })
 }
 
+/// Most a single catch-up pass may wake.
+///
+/// Not configurable, and deliberately so: it bounds a *repair* rate, not a
+/// throughput knob, and the ordering is what makes a cap safe at all — the
+/// scan returns the furthest-behind members first, so a pass sheds the ones
+/// with the most cache slack left and the next pass takes the next slice.
+/// Members therefore cascade rather than storm, prioritised by how close
+/// they are to falling out of the cache instead of by an arbitrary
+/// randomised schedule.
+const CATCH_UP_WAKE_LIMIT: i64 = 64;
+
+/// Fraction of the cache a member may fall behind before a catch-up wake:
+/// wake at three quarters, leaving the last quarter as the margin it has to
+/// actually drain the backlog from memory before the events it still needs
+/// are evicted.
+const CATCH_UP_TRIGGER_NUMERATOR: u64 = 3;
+const CATCH_UP_TRIGGER_DENOMINATOR: u64 = 4;
+
 pub(in crate::out) struct WakerHandler<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
     routes: WakeRoutes<P>,
+    /// How far behind the head a member may fall before a catch-up wake, and
+    /// how far the stream must advance between scans — both derived from
+    /// `MailboxConfig::event_cache_size`.
+    catch_up_lag: u64,
+    catch_up_stride: u64,
+    /// Head sequence at the last catch-up scan. The stream's own advance is
+    /// the clock here: this handler is a `SingletonSubscriber` with no timer
+    /// branch, and it does not need one — eviction pressure is a function of
+    /// how far the stream has moved, which is exactly what it observes.
+    last_catch_up: std::sync::atomic::AtomicU64,
     _marker: std::marker::PhantomData<fn() -> Tables>,
 }
 
@@ -124,13 +172,29 @@ pub(in crate::out) fn waker_job_type<Tables: MailboxTables>() -> JobType {
 
 /// Construct the waker handler — a plain [`SingletonSubscriber`], registered
 /// via [`crate::out::Outbox::register_singleton_subscriber`] like any other.
-pub(in crate::out) fn waker_handler<P, Tables>(routes: WakeRoutes<P>) -> WakerHandler<P, Tables>
+///
+/// `event_cache_size` is the configured depth of the in-memory persistent
+/// cache, which is all the catch-up scan needs to know about it: the cache
+/// exposes no low-water mark and needs no eviction signal, because the
+/// waker already observes the head and can derive the pressure from it.
+/// That derivation is approximate — the retained window floats either side
+/// of the configured size and the head counts pre-commit allocations — and
+/// the quarter-cache margin absorbs the imprecision.
+pub(in crate::out) fn waker_handler<P, Tables>(
+    routes: WakeRoutes<P>,
+    event_cache_size: usize,
+) -> WakerHandler<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
+    let cache_size = event_cache_size as u64;
     WakerHandler {
         routes,
+        catch_up_lag: (cache_size * CATCH_UP_TRIGGER_NUMERATOR / CATCH_UP_TRIGGER_DENOMINATOR)
+            .max(1),
+        catch_up_stride: (cache_size / CATCH_UP_TRIGGER_DENOMINATOR).max(1),
+        last_catch_up: std::sync::atomic::AtomicU64::new(0),
         _marker: std::marker::PhantomData,
     }
 }
@@ -140,10 +204,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    /// Wake keys accumulated per registered type, indexed by that type's
-    /// position in [`WakeRoutes`] — an index rather than the type's name so
-    /// the batch holds no strings it would only have to look up again.
-    type Batch = HashMap<usize, HashSet<WakeKey>>;
+    type Batch = WakeBatch;
 
     async fn handle_persistent<'inv>(
         &self,
@@ -164,13 +225,23 @@ where
                 })
                 .collect()
         };
+        let catch_up_below = self.catch_up_due(event.sequence);
 
-        if matched.is_empty() {
+        if matched.is_empty() && catch_up_below.is_none() {
             return Ok(ctx.skip());
         }
         Ok(ctx.collect_with(move |batch| {
             for (idx, keys) in matched {
-                batch.entry(idx).or_default().extend(keys);
+                batch.per_route.entry(idx).or_default().extend(keys);
+            }
+            // Keep the deepest floor of the batch: whichever pass is due,
+            // one scan at flush covers all of them.
+            if let Some(below) = catch_up_below {
+                batch.catch_up_below = Some(
+                    batch
+                        .catch_up_below
+                        .map_or(below, |current| current.max(below)),
+                );
             }
         }))
     }
@@ -180,7 +251,11 @@ where
         op: &mut FlushOp<'_>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if items.is_empty() {
+        let WakeBatch {
+            per_route,
+            catch_up_below,
+        } = items;
+        if per_route.is_empty() && catch_up_below.is_none() {
             return Ok(());
         }
         // Snapshot (cheap — one `Arc` clone per registered type) so no lock
@@ -188,7 +263,7 @@ where
         let routes: Vec<Arc<dyn WakeRoute<P>>> =
             self.routes.read().expect("wake routes poisoned").clone();
 
-        for (idx, keys) in items {
+        for (idx, keys) in per_route {
             let Some(route) = routes.get(idx) else {
                 continue;
             };
@@ -196,15 +271,85 @@ where
             let subscribed =
                 Tables::subscription_keys_for_wake_keys(op, route.subscriber_type(), &wake_keys)
                     .await?;
-            if subscribed.is_empty() {
-                continue;
-            }
-            let specs = subscribed
-                .into_iter()
-                .map(|key| job::KeyedJobSpec::new(key.clone(), KeyMsg { key }))
-                .collect();
-            route.spawner().spawn_all_in_op(op, specs).await?;
+            self.spawn_all(op, route, subscribed).await?;
         }
+
+        // The catch-up pass: whoever has fallen far enough behind that a
+        // wake now serves them from memory instead of a paged cold read.
+        // Uncapped above by design on the wake-key path above — a matching
+        // event is a real arrival and must not be delayed — but capped here,
+        // because this path can select every subscription at once.
+        if let Some(below) = catch_up_below {
+            let behind = Tables::subscriptions_behind(op, below, CATCH_UP_WAKE_LIMIT).await?;
+            for (subscriber_type, key) in behind {
+                let Some(route) = routes
+                    .iter()
+                    .find(|r| r.subscriber_type() == subscriber_type)
+                else {
+                    continue;
+                };
+                self.spawn_all(op, route, vec![key]).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one waker batch accumulated: wake-key matches per registered type,
+/// plus whether a catch-up scan came due while the batch was open.
+#[derive(Default)]
+pub(in crate::out) struct WakeBatch {
+    /// Wake keys accumulated per registered type, indexed by that type's
+    /// position in [`WakeRoutes`] — an index rather than the type's name so
+    /// the batch holds no strings it would only have to look up again.
+    per_route: HashMap<usize, HashSet<WakeKey>>,
+    /// Set when the stream advanced far enough for a catch-up scan; carries
+    /// the floor to scan below.
+    catch_up_below: Option<EventSequence>,
+}
+
+impl<P, Tables> WakerHandler<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    /// Whether the stream has advanced a full stride since the last scan,
+    /// and if so the floor to scan below. Claims the slot as it reports it,
+    /// so a due pass is reported once.
+    fn catch_up_due(&self, head: EventSequence) -> Option<EventSequence> {
+        use std::sync::atomic::Ordering;
+
+        let head = u64::from(head);
+        // Nothing can be behind the floor yet, and on a young stream the
+        // subtraction would saturate to zero and scan for nobody anyway.
+        let below = head.checked_sub(self.catch_up_lag)?;
+
+        let last = self.last_catch_up.load(Ordering::Relaxed);
+        if head < last.saturating_add(self.catch_up_stride) {
+            return None;
+        }
+        // A lost race means another event in this same batch claimed the
+        // pass — one scan per batch is exactly what is wanted.
+        self.last_catch_up
+            .compare_exchange(last, head, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        Some(EventSequence::from(below))
+    }
+
+    async fn spawn_all(
+        &self,
+        op: &mut FlushOp<'_>,
+        route: &Arc<dyn WakeRoute<P>>,
+        keys: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let specs = keys
+            .into_iter()
+            .map(|key| job::KeyedJobSpec::new(key.clone(), KeyMsg { key }))
+            .collect();
+        route.spawner().spawn_all_in_op(op, specs).await?;
         Ok(())
     }
 }

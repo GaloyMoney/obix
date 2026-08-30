@@ -51,6 +51,10 @@ where
 {
     pool: sqlx::PgPool,
     event_buffer_size: usize,
+    /// Configured depth of the in-memory persistent cache. Read by the waker
+    /// to decide how far a Dormant member may drift before a catch-up wake
+    /// saves it a cold read.
+    event_cache_size: usize,
     persist_events_batch_size: usize,
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
@@ -100,6 +104,7 @@ where
         Self {
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
+            event_cache_size: self.event_cache_size,
             persist_events_batch_size: self.persist_events_batch_size,
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
@@ -164,6 +169,7 @@ where
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
+            event_cache_size: config.event_cache_size,
             persist_events_batch_size: config.persist_events_batch_size,
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
@@ -508,7 +514,10 @@ where
             first
         };
         if first_route {
-            let waker = subscription::keyed::waker_handler::<P, Tables>(self.keyed_routes.clone());
+            let waker = subscription::keyed::waker_handler::<P, Tables>(
+                self.keyed_routes.clone(),
+                self.event_cache_size,
+            );
             self.register_singleton_subscriber(
                 jobs,
                 OutboxEventJobConfig::new(subscription::keyed::waker_job_type::<Tables>()),
