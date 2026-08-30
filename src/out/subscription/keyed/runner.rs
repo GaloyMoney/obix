@@ -185,6 +185,7 @@ where
             .execution_state::<OutboxEventJobState>()?
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
+                staged: None,
             });
 
         let mut persistent = self.outbox.listen_persisted(Some(state.sequence));
@@ -210,7 +211,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
@@ -222,7 +223,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
@@ -293,7 +294,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
@@ -320,11 +321,12 @@ where
                 parts: CtxParts {
                     op_slot: &mut op_slot,
                     current_job: &mut current_job,
-                    state: &state,
+                    state: &mut state,
                     tracker: &mut tracker,
                 },
                 batch: &mut batch,
                 flusher: &flusher,
+                event_seq: event.sequence,
             };
             let outcome = subscriber
                 .handle(ctx, &event)
@@ -340,7 +342,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "hold_entry")
@@ -359,7 +361,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit_and_hold")
@@ -375,7 +377,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
@@ -388,7 +390,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")

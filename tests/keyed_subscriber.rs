@@ -8,6 +8,7 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use obix::{
@@ -21,6 +22,7 @@ use tokio::sync::Mutex;
 use helpers::{TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeout_subscriptions};
 
 const JOB_TYPE: &str = "test-keyed-subscriber";
+const STAGED_JOB_TYPE: &str = "test-keyed-staged";
 
 /// Short enough for dormancy/sweep contracts to land inside a test's
 /// patience.
@@ -716,6 +718,379 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
         bystander_checkpoint,
         "a subscription watching neither routing key must never be woken: \
          its durable checkpoint cannot advance without the member running"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// === Staged processing: multi-transaction events with external I/O between
+// stages, and the opaque resume token that makes the interim stages
+// exactly-once on replay. ===
+
+/// The subscriber's own token schema. obix stores it as opaque JSON and never
+/// interprets it — this shape exists only so the test can prove round-trip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StageToken {
+    stage: u8,
+    n: u64,
+}
+
+#[derive(Clone, Default)]
+struct StagedShared {
+    /// Ordered trace of everything the subscriber did, across every run.
+    trace: Arc<Mutex<Vec<String>>>,
+    /// Return `Err` once, immediately after stage 1 committed — standing in
+    /// for a crash in the external-I/O gap.
+    fail_after_stage_one: Arc<AtomicBool>,
+    /// Pause once, in the gap between the stages.
+    hold_in_gap: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+}
+
+struct StagedDef {
+    shared: StagedShared,
+}
+
+impl SubscriptionDef<TestEvent> for StagedDef {
+    type Key = OwnerId;
+    type InstanceConfig = InstanceConfig;
+    type Subscriber = StagedSubscriber;
+
+    fn routing_key(
+        &self,
+        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> impl IntoIterator<Item = RoutingKey> {
+        Vec::<RoutingKey>::new()
+    }
+
+    fn instantiate(&self, key: Self::Key, _cfg: Self::InstanceConfig) -> Self::Subscriber {
+        StagedSubscriber {
+            key,
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Collects small `n` (landing at flush) and processes large `n` as a
+/// two-stage chain, so one subscriber exercises both the batch fence and the
+/// staged chain.
+struct StagedSubscriber {
+    key: OwnerId,
+    shared: StagedShared,
+}
+
+/// Every effect lands here as a labelled row, so the test can assert both
+/// *what* happened and *in what order* it committed.
+async fn insert_label(
+    op: &mut impl es_entity::AtomicOperation,
+    label: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO test_staged_effects (label) VALUES ($1)")
+        .bind(label)
+        .execute(op.as_executor())
+        .await?;
+    Ok(())
+}
+
+impl KeyedSubscriber<TestEvent> for StagedSubscriber {
+    type Batch = Vec<String>;
+
+    async fn handle<'inv>(
+        &self,
+        ctx: KeyedEventCtx<'inv, Self::Batch>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping { owner, n }) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        if *owner != self.key.0 {
+            return Ok(ctx.skip());
+        }
+        if *n < 10 {
+            self.shared.trace.lock().await.push(format!("collect:{n}"));
+            return Ok(ctx.collect(format!("collect:{n}")));
+        }
+
+        let mut op = ctx.consume().await?;
+        let staged = match op.resume::<StageToken>()? {
+            // Stage 1 is already durable from an earlier attempt — skip it
+            // rather than relying on it being idempotent.
+            Some(token) => {
+                self.shared
+                    .trace
+                    .lock()
+                    .await
+                    .push(format!("resumed:{}", token.n));
+                op
+            }
+            None => {
+                insert_label(&mut op, &format!("stage1:{n}")).await?;
+                self.shared.trace.lock().await.push(format!("stage1:{n}"));
+                let gap = op.proceed_with(&StageToken { stage: 1, n: *n }).await?;
+
+                // The external-I/O gap: no transaction is open here.
+                if self
+                    .shared
+                    .fail_after_stage_one
+                    .swap(false, Ordering::SeqCst)
+                {
+                    self.shared.trace.lock().await.push("crash".to_string());
+                    return Err("injected crash in the external-I/O gap".into());
+                }
+                if let Some(at) = self.shared.hold_in_gap.lock().await.take() {
+                    self.shared.trace.lock().await.push("hold".to_string());
+                    return Ok(gap.hold_until(at));
+                }
+                gap.op().await?
+            }
+        };
+
+        let mut op = staged;
+        insert_label(&mut op, &format!("stage2:{n}")).await?;
+        self.shared.trace.lock().await.push(format!("stage2:{n}"));
+        Ok(op.conclude())
+    }
+
+    async fn flush(
+        &self,
+        op: &mut obix::FlushOp<'_>,
+        items: Self::Batch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for label in items {
+            insert_label(op, &label).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn reset_staged_effects(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS test_staged_effects")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE test_staged_effects (id BIGSERIAL PRIMARY KEY, label VARCHAR NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Committed effects in commit order.
+async fn staged_effects(pool: &sqlx::PgPool) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT label FROM test_staged_effects ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+async fn trace_of(shared: &StagedShared) -> Vec<String> {
+    shared.trace.lock().await.clone()
+}
+
+async fn init_staged_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+    helpers::wipeout_outbox_tables(pool).await?;
+    wipeout_keyed_subscriber_job_tables(pool, STAGED_JOB_TYPE).await?;
+    wipeout_subscriptions(pool, STAGED_JOB_TYPE).await?;
+    reset_staged_effects(pool).await?;
+
+    Ok(Outbox::<TestEvent, TestTables>::init(
+        pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?)
+}
+
+fn staged_config() -> KeyedSubscriberConfig {
+    KeyedSubscriberConfig::new(job::JobType::new(STAGED_JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(TEST_SWEEP_INTERVAL)
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
+}
+
+/// Contract — staged fence: the pending batch (its collected items AND its
+/// checkpoint) lands *before* stage 1's op exists, exactly as the
+/// single-stage consume fence always did. Asserted on commit order, so a
+/// stage-1 write that leaked ahead of the fence would be visible.
+#[tokio::test]
+#[file_serial]
+async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_staged_outbox(&pool).await?;
+
+    let shared = StagedShared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            staged_config(),
+            StagedDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    publish_ping(&outbox, 1, 2).await?;
+    publish_ping(&outbox, 1, 11).await?;
+
+    eventually(Duration::from_secs(10), || async {
+        Ok(staged_effects(&pool).await?.len() == 4)
+    })
+    .await?;
+
+    assert_eq!(
+        staged_effects(&pool).await?,
+        vec!["collect:1", "collect:2", "stage1:11", "stage2:11"],
+        "collected items must land before the staged event's first stage"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract — interim durability and chain error: a failure in the gap
+/// between stages leaves stage 1's writes committed and the cursor unmoved,
+/// so the event is re-read; the resume token is what lets the retry skip the
+/// stage instead of redoing it. Stage 1 must appear exactly once.
+#[tokio::test]
+#[file_serial]
+async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_staged_outbox(&pool).await?;
+
+    let shared = StagedShared::default();
+    shared.fail_after_stage_one.store(true, Ordering::SeqCst);
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            staged_config(),
+            StagedDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 11).await?;
+
+    eventually(Duration::from_secs(20), || async {
+        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage2:11"])
+    })
+    .await?;
+
+    // Stage 1 ran once and survived the crash; the replay saw the token and
+    // went straight to stage 2 rather than re-running stage 1.
+    let trace = trace_of(&shared).await;
+    assert_eq!(
+        trace,
+        vec!["stage1:11", "crash", "resumed:11", "stage2:11"],
+        "expected stage 1 to commit, crash, then resume from the token"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract — token lifetime: a hold is part of processing the event, so the
+/// token survives it (the cursor is still parked before the event). Once
+/// `conclude` advances the cursor the token is gone, and the next event
+/// starts fresh — proving the slot is scoped to one event, not to the
+/// subscription.
+#[tokio::test]
+#[file_serial]
+async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_staged_outbox(&pool).await?;
+
+    let shared = StagedShared::default();
+    *shared.hold_in_gap.lock().await =
+        Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            staged_config(),
+            StagedDef {
+                shared: shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        Vec::<RoutingKey>::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 11).await?;
+
+    eventually(Duration::from_secs(20), || async {
+        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage2:11"])
+    })
+    .await?;
+    assert_eq!(
+        trace_of(&shared).await,
+        vec!["stage1:11", "hold", "resumed:11", "stage2:11"],
+        "the token must survive the hold and be readable when processing resumes"
+    );
+
+    // A second staged event: its own sequence, so the concluded event's
+    // token is not visible to it — it must run stage 1 from scratch.
+    publish_ping(&outbox, 1, 12).await?;
+    eventually(Duration::from_secs(20), || async {
+        Ok(staged_effects(&pool).await?.len() == 4)
+    })
+    .await?;
+    assert_eq!(
+        staged_effects(&pool).await?,
+        vec!["stage1:11", "stage2:11", "stage1:12", "stage2:12"]
+    );
+    assert_eq!(
+        trace_of(&shared).await,
+        vec![
+            "stage1:11",
+            "hold",
+            "resumed:11",
+            "stage2:11",
+            "stage1:12",
+            "stage2:12"
+        ],
+        "a concluded event's token must not be visible to the next event"
     );
 
     jobs.shutdown().await?;

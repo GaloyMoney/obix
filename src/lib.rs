@@ -31,9 +31,9 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
-    KeyedIsolatedOp, KeyedSubscriber, KeyedSubscriberConfig, Members, OpCursor, Outbox,
-    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook, RoutingKey,
-    SingletonSubscriber, StreamSelection, Subscription, SubscriptionDef, SubscriptionError,
+    KeyedSubscriber, KeyedSubscriberConfig, Members, OpCursor, Outbox, OutboxEventJobConfig,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, RoutingKey, SingletonSubscriber,
+    StagedEvent, StagedOp, StreamSelection, Subscription, SubscriptionDef, SubscriptionError,
     SubscriptionMember, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
     UndecodableEventError,
 };

@@ -423,7 +423,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
@@ -435,7 +435,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
@@ -519,7 +519,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
@@ -546,7 +546,7 @@ where
                 parts: CtxParts {
                     op_slot: &mut op_slot,
                     current_job: &mut current_job,
-                    state: &state,
+                    state: &mut state,
                     tracker: &mut tracker,
                 },
                 batch: &mut batch,
@@ -570,7 +570,7 @@ where
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
-                        state: &state,
+                        state: &mut state,
                         tracker: &mut tracker,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
@@ -582,7 +582,7 @@ where
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
-                            state: &state,
+                            state: &mut state,
                             tracker: &mut tracker,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")

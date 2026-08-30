@@ -48,10 +48,29 @@ use crate::sequence::EventSequence;
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Persisted execution state of an outbox event-handler job: the sequence of
-/// the last fully handled persistent event.
-#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+/// the last fully handled persistent event, plus (keyed subscribers only)
+/// the resume token of the event currently being processed.
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEventJobState {
     pub(crate) sequence: EventSequence,
+    /// `serde(default)` so execution-state rows written before staged
+    /// processing existed still decode; `skip_serializing_if` so a singleton
+    /// subscriber's state stays byte-identical to what it always wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) staged: Option<StagedState>,
+}
+
+/// The resume-token slot: an opaque JSON value scoped to one event.
+///
+/// obix owns the slot and its lifetime; the meaning of what is in it belongs
+/// entirely to the subscriber. obix never interprets the token.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StagedState {
+    /// The event the token belongs to. Validity is checked at read time
+    /// against the event being processed, which is what makes clearing lazy:
+    /// a stale token is unreadable by construction.
+    pub(crate) sequence: EventSequence,
+    pub(crate) token: serde_json::Value,
 }
 
 /// Book-keeping the runner shares with [`EventCtx`].
@@ -71,7 +90,9 @@ pub(crate) struct BatchTracker {
 pub(crate) struct CtxParts<'inv> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
-    pub(crate) state: &'inv OutboxEventJobState,
+    /// Mutable so the staged verbs can write the resume token into the state
+    /// the runner is about to persist. `sequence` remains the runner's alone.
+    pub(crate) state: &'inv mut OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
 }
 
@@ -119,9 +140,9 @@ pub(crate) enum Outcome {
     /// never constructs a ctx that can, so this variant is unreachable from
     /// [`EventCtx`].
     Hold(chrono::DateTime<chrono::Utc>),
-    /// Keyed-only: commit my isolated work, but the cursor still holds
-    /// *before* this event until the given time. Only
-    /// [`KeyedIsolatedOp::commit_and_hold`] mints this.
+    /// Keyed-only: commit the staged op left in `op_slot`, but the cursor
+    /// still holds *before* this event until the given time. Only
+    /// [`StagedOp::hold_until`] mints this.
     CommitAndHold(chrono::DateTime<chrono::Utc>),
 }
 
@@ -412,20 +433,30 @@ pub(crate) async fn persist_checkpoint(
 //
 // [`KeyedEventCtx`] below is the keyed counterpart of [`EventCtx`] — a facade
 // over the exact same internals (`CtxParts`, `Outcome`, `flush_batch`) rather
-// than a fork of them. It adds one capability past the shared verb set: the
-// hold verb ([`KeyedEventCtx::hold_until`]), kept on a distinct type so the
-// capability is type-gated — the singleton runner never constructs a ctx that
-// can mint `Outcome::Hold` / `Outcome::CommitAndHold`.
+// than a fork of them. It adds two capabilities past the shared verb set,
+// kept on distinct types so both are type-gated (the singleton runner never
+// constructs a ctx that can reach them):
+//
+//   - the hold verb ([`KeyedEventCtx::hold_until`]), which mints
+//     `Outcome::Hold`;
+//   - staged processing ([`StagedOp`] / [`StagedEvent`]), which lets one
+//     event be processed across N committed transactions with external I/O
+//     between them, and whose paused exit mints `Outcome::CommitAndHold`.
 
 /// Per-event decision point handed to
 /// [`KeyedSubscriber::handle`](super::KeyedSubscriber::handle) — the keyed
 /// counterpart of [`EventCtx`], sharing its verb semantics;
-/// [`hold_until`](Self::hold_until) is the one keyed-only addition.
+/// [`hold_until`](Self::hold_until) and [`consume`](Self::consume)'s staged
+/// chain are the keyed-only additions.
 #[must_use = "resolve the KeyedEventCtx via skip / collect / consume / hold_until"]
 pub struct KeyedEventCtx<'inv, B = ()> {
     pub(crate) parts: CtxParts<'inv>,
     pub(crate) batch: &'inv mut B,
     pub(crate) flusher: &'inv dyn ItemFlush<B>,
+    /// Sequence of the event being processed. Distinct from
+    /// `parts.state.sequence`, which is the last *fully handled* sequence —
+    /// i.e. strictly before this one.
+    pub(crate) event_seq: EventSequence,
 }
 
 impl<'inv, B> KeyedEventCtx<'inv, B> {
@@ -447,10 +478,25 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
         }
     }
 
-    /// Identical to [`EventCtx::consume`], but returns a
-    /// [`KeyedIsolatedOp`] — the isolated op with the extra
-    /// [`commit_and_hold`](KeyedIsolatedOp::commit_and_hold) exit.
-    pub async fn consume(self) -> Result<KeyedIsolatedOp<'inv>, HandlerError>
+    /// Take this event's work, in one stage or many.
+    ///
+    /// Same entry fence as [`EventCtx::consume`]: the pending batch (its
+    /// collected items and its checkpoint, at the last fully-handled
+    /// sequence — strictly before this event) lands first, then a fresh op
+    /// is opened. The difference is the exit: a [`StagedOp`] can be
+    /// *concluded* (cursor advances, today's isolated-commit semantics), or
+    /// it can [`proceed`](StagedOp::proceed) — commit this stage and hand
+    /// back a [`StagedEvent`] with **no transaction open**, so the
+    /// subscriber can do external I/O before opening the next stage's op.
+    ///
+    /// The single-transaction case is the one-stage degenerate case: consume,
+    /// work, [`conclude`](StagedOp::conclude).
+    ///
+    /// Interim stages are fenced before the cursor and replayed on crash:
+    /// nothing a `proceed` committed is lost, but the event itself is
+    /// re-read and re-handled until a `conclude` advances past it. Use
+    /// [`resume`](StagedOp::resume) to skip stages already durable.
+    pub async fn consume(self) -> Result<StagedOp<'inv>, HandlerError>
     where
         B: Default,
     {
@@ -458,14 +504,17 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
             mut parts,
             batch,
             flusher,
+            event_seq,
         } = self;
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
-        *parts.op_slot = Some(
+        let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?,
-        );
-        let op = parts.op_slot.as_mut().expect("just materialized above");
-        Ok(KeyedIsolatedOp { op })
+                .await?;
+        Ok(StagedOp {
+            op,
+            parts,
+            event_seq,
+        })
     }
 
     /// My cursor holds *before* this event until `at` — entry and exit in
@@ -510,49 +559,301 @@ where
     }
 }
 
-/// An isolated op for a keyed subscriber: everything [`IsolatedOp`] offers,
-/// plus [`commit_and_hold`](Self::commit_and_hold) — commit this event's work
-/// while keeping the cursor parked before it.
+/// One stage of a keyed subscriber's processing of one event: an open op,
+/// which every exit commits.
 ///
-/// A distinct type from [`IsolatedOp`] so the hold capability is type-gated
-/// to keyed subscribers: the singleton runner never constructs one, so
-/// `Outcome::CommitAndHold` is unreachable from [`IsolatedOp`].
-#[must_use = "exit with .commit() or .commit_and_hold() to produce the Handled token"]
-pub struct KeyedIsolatedOp<'inv> {
-    op: &'inv mut es_entity::DbOp<'static>,
+/// Implements [`AtomicOperation`](es_entity::AtomicOperation) — use it like
+/// any atomic operation, then take exactly one exit:
+///
+/// | exit | meaning | cursor |
+/// |------|---------|--------|
+/// | [`proceed`](Self::proceed) | this stage is done, the chain continues | unmoved |
+/// | [`hold_until`](Self::hold_until) | this stage is done, processing pauses until `at` | unmoved |
+/// | [`conclude`](Self::conclude) | processing of this event is done | advances past the event |
+///
+/// "Commit" appears in none of the names because all three commit: saying it
+/// every time would be mechanics leaking into a semantic surface. What
+/// differs is what happens to the *cursor*.
+///
+/// As with [`IsolatedOp`], there is no mutable access to the raw
+/// [`es_entity::DbOp`] — the op can only land through one of the exits, so
+/// no stage can commit without the runner knowing what it meant.
+///
+/// Sealed to its invocation by the same brand [`Handled`] carries, so a
+/// staged op cannot be stashed and resumed from a later event:
+///
+/// ```compile_fail
+/// use obix::StagedOp;
+///
+/// struct Evil {
+///     stash: std::sync::Mutex<Option<StagedOp<'static>>>,
+/// }
+///
+/// async fn stash_it(op: StagedOp<'_>, evil: &Evil) {
+///     // error[E0521]: borrowed data escapes outside of function
+///     *evil.stash.lock().unwrap() = Some(op);
+/// }
+/// ```
+#[must_use = "exit with .proceed() / .hold_until() / .conclude()"]
+pub struct StagedOp<'inv> {
+    op: es_entity::DbOp<'static>,
+    parts: CtxParts<'inv>,
+    event_seq: EventSequence,
 }
 
-impl<'inv> KeyedIsolatedOp<'inv> {
-    /// Land my work and my checkpoint, atomically, when the invocation
-    /// returns. Identical to [`IsolatedOp::commit`].
-    pub fn commit(self) -> Handled<'inv> {
-        Handled {
-            outcome: Outcome::Commit,
-            _invocation: PhantomData,
-        }
+impl<'inv> StagedOp<'inv> {
+    /// Commit this stage and continue: the returned [`StagedEvent`] holds
+    /// **no open transaction**, so the subscriber can await external I/O
+    /// before opening the next stage's op.
+    ///
+    /// The cursor does not move — this event is still being processed, and a
+    /// crash here replays it (with everything this stage committed already
+    /// durable).
+    pub async fn proceed(self) -> Result<StagedEvent<'inv>, HandlerError> {
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        op.commit().await?;
+        Ok(StagedEvent { parts, event_seq })
     }
 
-    /// Commit my work atomically, but the cursor still holds *before* this
-    /// event — resume at `at`.
+    /// [`proceed`](Self::proceed), and rewrite the resume token in the same
+    /// transaction as this stage's work.
     ///
-    /// The lana retry-scheduled-settle shape: attempt record + health fold +
-    /// (pre-event) checkpoint, one op, then rescheduled. The checkpoint
-    /// written here does **not** advance past this event — the next run
-    /// re-reads it and re-evaluates the hold condition.
-    pub fn commit_and_hold(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+    /// That atomicity is the point: a crash after this returns leaves the
+    /// stage's writes *and* the token that records them durable together, so
+    /// the replay skips the stage via [`resume`](Self::resume) rather than
+    /// relying on the work being idempotent.
+    pub async fn proceed_with<T: Serialize>(
+        self,
+        token: &T,
+    ) -> Result<StagedEvent<'inv>, HandlerError> {
+        let StagedOp {
+            mut op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.staged = Some(StagedState {
+            sequence: event_seq,
+            token: serde_json::to_value(token)?,
+        });
+        parts
+            .current_job
+            .update_execution_state_in_op(&mut op, &*parts.state)
+            .await?;
+        op.commit().await?;
+        Ok(StagedEvent { parts, event_seq })
+    }
+
+    /// The resume token, if one was written while processing *this* event.
+    ///
+    /// In-memory — the runner already loaded the execution state — so this
+    /// does no I/O. `None` when nothing was staged, and also when a token
+    /// left over from a different event is still in the slot: validity is
+    /// checked against the current event's sequence, which is why stale
+    /// tokens never need explicit clearing.
+    ///
+    /// A deserialization failure surfaces as `Err`; what to do about it is
+    /// the subscriber's call. Tokens survive holds, so they can outlive a
+    /// deploy — schema-stamping them and treating a mismatch as "start
+    /// fresh" is the recommended consumer contract.
+    pub fn resume<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        resume_token(self.parts.state, self.event_seq)
+    }
+
+    /// Commit this stage; processing pauses with the cursor still parked
+    /// *before* this event, resuming at `at`.
+    ///
+    /// The op's work lands, but the checkpoint the runner folds in is still
+    /// pre-this-event: the next run re-reads the event and re-evaluates. The
+    /// resume time is domain knowledge (a retry schedule owned by the
+    /// consumer's entities) — the one fact obix cannot derive.
+    /// The token survives a hold: a hold is part of processing the event, and
+    /// concluded-for-now is not the same as the cursor advancing. It can
+    /// therefore live for as long as the backoff does.
+    pub fn hold_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let StagedOp { op, parts, .. } = self;
+        *parts.op_slot = Some(op);
         Handled {
             outcome: Outcome::CommitAndHold(at),
             _invocation: PhantomData,
         }
     }
-}
 
-impl std::ops::Deref for KeyedIsolatedOp<'_> {
-    type Target = es_entity::DbOp<'static>;
+    /// [`hold_until`](Self::hold_until), and rewrite the resume token in the
+    /// same transaction as this stage's work — the runner folds the state
+    /// write into the op it lands.
+    pub fn hold_until_with<T: Serialize>(
+        self,
+        at: chrono::DateTime<chrono::Utc>,
+        token: &T,
+    ) -> Result<Handled<'inv>, HandlerError> {
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.staged = Some(StagedState {
+            sequence: event_seq,
+            token: serde_json::to_value(token)?,
+        });
+        *parts.op_slot = Some(op);
+        Ok(Handled {
+            outcome: Outcome::CommitAndHold(at),
+            _invocation: PhantomData,
+        })
+    }
 
-    fn deref(&self) -> &Self::Target {
-        self.op
+    /// Commit this stage and conclude processing of this event: the runner
+    /// folds the checkpoint at this event's sequence into the same
+    /// transaction, so work and cursor advance together.
+    ///
+    /// There is deliberately no `conclude_with`: the token's lifetime *is*
+    /// the event's processing, so concluding clears it — opportunistically,
+    /// since this path writes the state anyway.
+    pub fn conclude(self) -> Handled<'inv> {
+        let StagedOp { op, parts, .. } = self;
+        parts.state.staged = None;
+        *parts.op_slot = Some(op);
+        Handled {
+            outcome: Outcome::Commit,
+            _invocation: PhantomData,
+        }
     }
 }
 
-es_entity::delegate_atomic_operation!(KeyedIsolatedOp<'_>, { s => s.op });
+impl std::ops::Deref for StagedOp<'_> {
+    type Target = es_entity::DbOp<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.op
+    }
+}
+
+es_entity::delegate_atomic_operation!(StagedOp<'_>, { s => s.op });
+
+/// The gap between two stages of processing one event: **no transaction is
+/// open**, which is exactly the point — this is where a subscriber awaits
+/// external I/O.
+///
+/// Open the next stage's op with [`op`](Self::op) (it comes from the job's
+/// pool and clock, and is traced like any other, which is why this is
+/// ctx-mediated rather than a side-op the consumer opens itself), or pause
+/// with [`hold_until`](Self::hold_until).
+///
+/// Sealed to its invocation, exactly as [`StagedOp`] is:
+///
+/// ```compile_fail
+/// use obix::StagedEvent;
+///
+/// struct Evil {
+///     stash: std::sync::Mutex<Option<StagedEvent<'static>>>,
+/// }
+///
+/// async fn stash_it(staged: StagedEvent<'_>, evil: &Evil) {
+///     // error[E0521]: borrowed data escapes outside of function
+///     *evil.stash.lock().unwrap() = Some(staged);
+/// }
+/// ```
+#[must_use = "continue with .op() or pause with .hold_until()"]
+pub struct StagedEvent<'inv> {
+    parts: CtxParts<'inv>,
+    event_seq: EventSequence,
+}
+
+impl<'inv> StagedEvent<'inv> {
+    /// Open the next stage's op.
+    pub async fn op(self) -> Result<StagedOp<'inv>, HandlerError> {
+        let StagedEvent { parts, event_seq } = self;
+        let op =
+            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
+                .await?;
+        Ok(StagedOp {
+            op,
+            parts,
+            event_seq,
+        })
+    }
+
+    /// Pause with nothing further to record: the cursor holds *before* this
+    /// event until `at`, exactly as [`KeyedEventCtx::hold_until`] does. The
+    /// resume token (if any) is preserved.
+    pub fn hold_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Hold(at),
+            _invocation: PhantomData,
+        }
+    }
+
+    /// See [`StagedOp::resume`].
+    pub fn resume<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        resume_token(self.parts.state, self.event_seq)
+    }
+}
+
+/// Shared read path for [`StagedOp::resume`] / [`StagedEvent::resume`]: the
+/// token is only visible to the event it was written for.
+fn resume_token<T: serde::de::DeserializeOwned>(
+    state: &OutboxEventJobState,
+    event_seq: EventSequence,
+) -> Result<Option<T>, serde_json::Error> {
+    match &state.staged {
+        Some(staged) if staged.sequence == event_seq => {
+            serde_json::from_value(staged.token.clone()).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Execution-state rows written before staged processing existed have no
+    /// `staged` field. They must still decode — a keyed subscriber upgrading
+    /// into this version resumes from its checkpoint rather than restarting.
+    #[test]
+    fn pre_staged_execution_state_still_decodes() {
+        let state: OutboxEventJobState =
+            serde_json::from_str(r#"{"sequence":42}"#).expect("legacy state must decode");
+        assert_eq!(u64::from(state.sequence), 42);
+        assert!(state.staged.is_none());
+    }
+
+    /// And a state with no token serializes back to exactly what a singleton
+    /// subscriber has always written — the new field adds no bytes.
+    #[test]
+    fn state_without_a_token_serializes_unchanged() {
+        let state = OutboxEventJobState {
+            sequence: EventSequence::from(7u64),
+            staged: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&state).expect("serializes"),
+            r#"{"sequence":7}"#
+        );
+    }
+
+    /// The token is only readable by the event it was written for: validity
+    /// is a sequence match, which is what makes stale-token clearing lazy.
+    #[test]
+    fn a_token_is_invisible_to_any_other_event() {
+        let state = OutboxEventJobState {
+            sequence: EventSequence::from(4u64),
+            staged: Some(StagedState {
+                sequence: EventSequence::from(5u64),
+                token: serde_json::json!({ "stage": 1 }),
+            }),
+        };
+
+        let mine: Option<serde_json::Value> =
+            resume_token(&state, EventSequence::from(5u64)).expect("reads");
+        assert_eq!(mine, Some(serde_json::json!({ "stage": 1 })));
+
+        let other: Option<serde_json::Value> =
+            resume_token(&state, EventSequence::from(6u64)).expect("reads");
+        assert!(other.is_none(), "a stale token must not be readable");
+    }
+}
