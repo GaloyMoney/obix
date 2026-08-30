@@ -321,7 +321,8 @@ es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
 pub struct FlushError {
     /// Which trigger landed the batch (`"backlog_drained"`, `"batch_full"`,
     /// `"commit"`, `"consume_entry"`, `"shutdown"`, `"stream_closed"`,
-    /// `"undecodable_event"`).
+    /// `"undecodable_event"`, and for keyed subscribers `"hold_entry"` and
+    /// `"staged_hold"`).
     pub reason: &'static str,
     /// The batch covers sequences strictly after this (the last durable
     /// checkpoint)…

@@ -591,9 +591,9 @@ where
                     }
                 }
                 Outcome::Hold(_) | Outcome::CommitAndHold(_) => {
-                    // Type-gated unreachable: only KeyedEventCtx/
-                    // KeyedIsolatedOp can mint these, and a singleton
-                    // subscriber's EventCtx never does.
+                    // Type-gated unreachable: only KeyedEventCtx, StagedOp
+                    // and StagedEvent can mint these, and a singleton
+                    // subscriber's EventCtx reaches none of them.
                     unreachable!(
                         "Outcome::Hold/CommitAndHold cannot be minted from a singleton \
                          subscriber's EventCtx"

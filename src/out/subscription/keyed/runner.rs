@@ -356,7 +356,7 @@ where
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
                 Outcome::CommitAndHold(at) => {
-                    // Same non-advance as Hold: the isolated op's work lands,
+                    // Same non-advance as Hold: the staged op's work lands,
                     // but the checkpoint it carries is still pre-this-event.
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
@@ -364,7 +364,7 @@ where
                         state: &mut state,
                         tracker: &mut tracker,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit_and_hold")
+                    flush_batch(&mut parts, &mut batch, &flusher, "staged_hold")
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     return Ok(job::JobCompletion::RescheduleAt(at));
