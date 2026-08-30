@@ -186,6 +186,14 @@ async fn publish_ping(
     Ok(())
 }
 
+/// The wake keys a subscription for `owner` declares: the one partition its
+/// own key names, which is exactly the string `TestDef::wake_keys`
+/// classifies a `Ping` for that owner to. Traffic addressed to any other
+/// owner therefore never wakes it — several contracts below depend on that.
+fn wake_keys_for(owner: OwnerId) -> Vec<WakeKey> {
+    vec![WakeKey::from(owner.to_string())]
+}
+
 /// Poll `f` until it holds or `timeout` elapses.
 async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<()>
 where
@@ -212,6 +220,62 @@ async fn received_for(shared: &Shared, owner: u64) -> Vec<u64> {
         .get(&owner)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Contract — an empty wake-key set is refused, not stored.
+///
+/// Matching is set overlap and `{} && {anything}` is false, so a
+/// subscription declaring no wake keys can never be reached by the waker:
+/// it works while Active (a live member reads the whole stream regardless)
+/// and is stranded the first time it passivates. The type system permits it
+/// — `IntoIterator` can yield nothing — so the guard is the only thing
+/// standing between a caller and a subscription that silently stops.
+///
+/// Asserted on the returned error AND on the table: nothing may be written,
+/// since a rejected subscribe must not leave a row that the waker would
+/// then enumerate.
+#[tokio::test]
+#[file_serial]
+async fn an_empty_wake_key_set_is_refused() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    let err = subs
+        .subscribe_in_op(
+            &mut op,
+            OwnerId(1),
+            InstanceConfig::default(),
+            Vec::<WakeKey>::new(),
+        )
+        .await
+        .expect_err("an empty wake-key set must be refused");
+    assert!(
+        err.downcast_ref::<obix::SubscribeError>()
+            .is_some_and(|e| matches!(e, obix::SubscribeError::EmptyWakeKeys)),
+        "expected SubscribeError::EmptyWakeKeys, got: {err}"
+    );
+    drop(op);
+
+    let rows: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"count!\" FROM subscriptions WHERE subscriber_type = $1",
+        JOB_TYPE
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows, 0, "a refused subscribe must not write a row");
+
+    Ok(())
 }
 
 /// Contract 1/2 — per-key ordering and from-birth delivery: a subscription
@@ -242,7 +306,7 @@ async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<(
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -288,7 +352,7 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -296,7 +360,7 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
         &mut op,
         OwnerId(2),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(2)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -342,7 +406,7 @@ async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resul
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -421,7 +485,7 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -458,13 +522,18 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
     Ok(())
 }
 
-/// Contract — dormancy + sweep-wake: a caught-up member passivates to
-/// Dormant after `linger` elapses (no live execution), and the periodic
-/// sweep is what revives it to deliver events published while dormant —
-/// the backstop path, independent of whether the waker ever fires.
+/// Contract — dormancy + backlog drain: a caught-up member passivates to
+/// Dormant after `linger` elapses (no live execution), retains its
+/// watermark across passivation, and on its next wake drains everything
+/// published while it was Dormant, in order.
+///
+/// Distinct from the single-event wake contract below: what is asserted
+/// here is that the *watermark survives* passivation and that a multi-event
+/// backlog accumulated during dormancy is delivered whole rather than
+/// resumed from the wake point.
 #[tokio::test]
 #[file_serial]
-async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Result<()> {
+async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -483,7 +552,7 @@ async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Resu
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -517,8 +586,8 @@ async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Resu
     publish_ping(&outbox, 1, 2).await?;
     publish_ping(&outbox, 1, 3).await?;
 
-    // The next sweep pass idempotently respawns the key and it drains the
-    // backlog it missed while dormant.
+    // Respawned, it resumes from the retained watermark and drains the whole
+    // backlog it missed while dormant — not just the event that woke it.
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2, 3])
     })
@@ -756,6 +825,11 @@ impl SubscriptionDef<TestEvent> for StagedDef {
     type InstanceConfig = InstanceConfig;
     type Subscriber = StagedSubscriber;
 
+    /// Classifies nothing: these contracts drive the runner and the staged
+    /// chain directly and must not have holds or mid-chain crashes disturbed
+    /// by a wake. Empty here is the *event* side — "this event concerns
+    /// nobody" — which is ordinary and unrelated to the empty *subscription*
+    /// side that [`SubscribeError::EmptyWakeKeys`] rejects.
     fn wake_keys(
         &self,
         _event: &obix::out::PersistentOutboxEvent<TestEvent>,
@@ -937,7 +1011,7 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -992,7 +1066,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> 
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1050,7 +1124,7 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1133,7 +1207,7 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
                 &mut op,
                 OwnerId(1),
                 InstanceConfig::default(),
-                Vec::<WakeKey>::new(),
+                wake_keys_for(OwnerId(1)),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1196,7 +1270,7 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1291,7 +1365,7 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<WakeKey>::new(),
+        wake_keys_for(OwnerId(1)),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;

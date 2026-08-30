@@ -182,6 +182,29 @@ where
     fn instantiate(&self, key: Self::Key, cfg: Self::InstanceConfig) -> Self::Subscriber;
 }
 
+// === Errors ===
+
+/// Why [`Subscriptions::subscribe_in_op`] refused to create a subscription.
+#[derive(Debug, thiserror::Error)]
+pub enum SubscribeError {
+    /// The subscription declared no wake keys.
+    ///
+    /// Matching is set overlap, so an empty set intersects nothing: no event
+    /// could ever reach this subscription through the waker, and the first
+    /// time it passivated it would stay Dormant forever with its events
+    /// unread. It is accepted at the type level (an `IntoIterator` can be
+    /// empty) and meaningless at the semantic level, so it is rejected here
+    /// rather than stored.
+    ///
+    /// A subscriber that genuinely wants waking on *every* event says so
+    /// explicitly: declare one constant key and return that key from
+    /// [`SubscriptionDef::wake_keys`] for every event. That costs a wake per
+    /// event by construction, which is the point — the price is visible in
+    /// the caller's own code instead of hidden in an empty vector.
+    #[error("SubscribeError - EmptyWakeKeys: a subscription must declare at least one wake key")]
+    EmptyWakeKeys,
+}
+
 // === Configuration ===
 
 const DEFAULT_LINGER: Duration = Duration::from_secs(30);
@@ -369,6 +392,10 @@ where
     /// Idempotent: re-subscribing an already-subscribed key resolves to the
     /// existing row (its original `start_after` and `wake_keys` are never
     /// overwritten) and the existing live job.
+    ///
+    /// `wake_keys` must be non-empty — see
+    /// [`SubscribeError::EmptyWakeKeys`] for why an empty set is a
+    /// subscription that could never be woken.
     #[tracing::instrument(name = "obix.subscriptions.subscribe_in_op", skip_all, err)]
     pub async fn subscribe_in_op(
         &self,
@@ -379,6 +406,9 @@ where
     ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
         let key_str = key.to_string();
         let wake_keys: Vec<String> = wake_keys.into_iter().map(|r| r.0).collect();
+        if wake_keys.is_empty() {
+            return Err(SubscribeError::EmptyWakeKeys.into());
+        }
         let instance_config = serde_json::to_value(&cfg)?;
         // Boxed, not `Tables::highest_known_persistent_sequence(&self.pool)`
         // directly — see `read_frontier`'s rationale. Awaiting the raw

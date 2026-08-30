@@ -106,7 +106,7 @@ CREATE INDEX idx_inbox_events_status ON inbox_events(status)
 CREATE TABLE subscriptions (
   subscriber_type  VARCHAR NOT NULL,
   key              VARCHAR NOT NULL,
-  wake_keys        VARCHAR[] NOT NULL,
+  wake_keys        VARCHAR[] NOT NULL CHECK (cardinality(wake_keys) > 0),
   instance_config  JSONB NOT NULL,
   start_after      BIGINT NOT NULL,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
