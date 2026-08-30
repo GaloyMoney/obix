@@ -1,8 +1,8 @@
-//! [`RegisteredEventHandler`] — public read-back of a registered outbox event
+//! [`Subscription`] — public read-back of a registered outbox event
 //! handler's committed checkpoint, plus the caught-up barrier built on it.
 //!
 //! Returned by
-//! [`Outbox::register_event_handler`](super::Outbox::register_event_handler).
+//! [`Outbox::register_singleton_subscriber`](super::Outbox::register_singleton_subscriber).
 //! It is a capability, not a value: it caches nothing, and every read goes
 //! to committed state.
 
@@ -16,29 +16,29 @@ use crate::{
     tables::{DefaultMailboxTables, MailboxTables},
 };
 
-/// First poll interval used by [`RegisteredEventHandler::await_caught_up`], doubling
+/// First poll interval used by [`Subscription::await_caught_up`], doubling
 /// up to [`MAX_POLL_INTERVAL`].
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Ceiling for the [`RegisteredEventHandler::await_caught_up`] poll interval.
+/// Ceiling for the [`Subscription::await_caught_up`] poll interval.
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Failure modes of the checkpoint read-back and the caught-up barrier.
 #[derive(Debug, thiserror::Error)]
-pub enum HandlerCheckpointError {
+pub enum SubscriptionError {
     /// Reading the stream frontier failed.
-    #[error("HandlerCheckpointError - Sqlx: {0}")]
+    #[error("SubscriptionError - Sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
     /// Reading the handler job failed — a snapshot load (including the job
     /// never having existed), or a checkpoint point-read whose stored state
     /// did not decode.
-    #[error("HandlerCheckpointError - Job: {0}")]
+    #[error("SubscriptionError - Job: {0}")]
     Job(#[from] ::job::JobError),
     /// The committed execution state did not decode as the handler job's
     /// state type — the checkpoint is unreadable rather than absent.
-    #[error("HandlerCheckpointError - StateDecode: {0}")]
+    #[error("SubscriptionError - StateDecode: {0}")]
     StateDecode(#[from] serde_json::Error),
-    /// [`RegisteredEventHandler::await_sequence`] — or
-    /// [`await_caught_up`](RegisteredEventHandler::await_caught_up), which
+    /// [`Subscription::await_sequence`] — or
+    /// [`await_caught_up`](Subscription::await_caught_up), which
     /// delegates to it — hit its deadline. Carries the observed lag so the
     /// caller can alert with real numbers instead of reporting a bare
     /// timeout.
@@ -46,7 +46,7 @@ pub enum HandlerCheckpointError {
     /// `target` is the sequence being awaited: the caller's own for
     /// `await_sequence`, the call-time frontier for `await_caught_up`.
     #[error(
-        "HandlerCheckpointError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
+        "SubscriptionError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
     )]
     CaughtUpTimeout {
         checkpoint: EventSequence,
@@ -56,16 +56,16 @@ pub enum HandlerCheckpointError {
 }
 
 /// A `{ checkpoint, frontier }` pair sampled by
-/// [`HandlerSnapshot::stream_status`].
+/// [`SubscriptionSnapshot::stream_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandlerStreamStatus {
+pub struct SubscriptionStreamStatus {
     /// Highest sequence the handler has durably applied.
     pub checkpoint: EventSequence,
     /// Highest sequence the outbox has handed out.
     pub frontier: EventSequence,
 }
 
-impl HandlerStreamStatus {
+impl SubscriptionStreamStatus {
     /// How far the handler trails the frontier, saturating at zero.
     ///
     /// Zero does not by itself prove the handler is idle — see
@@ -81,7 +81,7 @@ impl HandlerStreamStatus {
 }
 
 /// A point-in-time view of a registered handler, produced by
-/// [`RegisteredEventHandler::load`].
+/// [`Subscription::load`].
 ///
 /// One `load()` pairs the handler's committed checkpoint with the stream
 /// frontier, so every accessor below is synchronous and infallible — a
@@ -92,13 +92,13 @@ impl HandlerStreamStatus {
 /// The checkpoint is decoded eagerly during `load()` (obix knows the handler
 /// job's state type, so there is no reason to defer it to the caller), which
 /// is why these accessors cannot fail.
-pub struct HandlerSnapshot {
+pub struct SubscriptionSnapshot {
     job: ::job::JobSnapshot,
     checkpoint: EventSequence,
     frontier: EventSequence,
 }
 
-impl HandlerSnapshot {
+impl SubscriptionSnapshot {
     /// The handler's committed checkpoint: every persistent event with a
     /// sequence at or below this has been handled and its effects committed
     /// (semantics 1). A handler that has never checkpointed reads as
@@ -114,8 +114,8 @@ impl HandlerSnapshot {
     }
 
     /// The `{ checkpoint, frontier }` pair.
-    pub fn stream_status(&self) -> HandlerStreamStatus {
-        HandlerStreamStatus {
+    pub fn stream_status(&self) -> SubscriptionStreamStatus {
+        SubscriptionStreamStatus {
             checkpoint: self.checkpoint,
             frontier: self.frontier,
         }
@@ -135,7 +135,7 @@ impl HandlerSnapshot {
     ///
     /// A resident handler job stays `Running`; a terminal status means the
     /// handler is no longer consuming, which is the case
-    /// [`RegisteredEventHandler::await_caught_up`] reports as a timeout rather than a
+    /// [`Subscription::await_caught_up`] reports as a timeout rather than a
     /// hang.
     pub fn job_status(&self) -> ::job::JobStatus {
         self.job.state()
@@ -177,7 +177,7 @@ impl HandlerSnapshot {
 /// runtime status of the job hosting it, and the caught-up barrier.
 ///
 /// Returned by
-/// [`Outbox::register_event_handler`](super::Outbox::register_event_handler).
+/// [`Outbox::register_singleton_subscriber`](super::Outbox::register_singleton_subscriber).
 /// This does not own the handler — it is a cloneable, cheap-to-hold capability
 /// for observing and fencing one, and it caches nothing, so every read
 /// reflects the latest committed state.
@@ -214,7 +214,7 @@ impl HandlerSnapshot {
 ///    anchors to its own call-time frontier, and sequential barriers still
 ///    compose: the first commits its emissions before returning, so the
 ///    second's snapshot includes them.
-pub struct RegisteredEventHandler<P, Tables = DefaultMailboxTables>
+pub struct Subscription<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -226,7 +226,7 @@ where
 // Manual `Clone`: this is cloneable regardless of whether `P` is, so
 // deriving (which would bound `P: Clone` through `PhantomData`) is wrong.
 // Mirrors `Outbox`'s manual impl.
-impl<P, Tables> Clone for RegisteredEventHandler<P, Tables>
+impl<P, Tables> Clone for Subscription<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -239,18 +239,18 @@ where
     }
 }
 
-impl<P, Tables> std::fmt::Debug for RegisteredEventHandler<P, Tables>
+impl<P, Tables> std::fmt::Debug for Subscription<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegisteredEventHandler")
+        f.debug_struct("Subscription")
             .field("job_id", &self.job.id())
             .finish_non_exhaustive()
     }
 }
 
-impl<P, Tables> RegisteredEventHandler<P, Tables>
+impl<P, Tables> Subscription<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -268,21 +268,21 @@ where
         self.job.id()
     }
 
-    /// Load a point-in-time [`HandlerSnapshot`]: the committed checkpoint,
+    /// Load a point-in-time [`SubscriptionSnapshot`]: the committed checkpoint,
     /// the stream frontier, and the hosting job's runtime status, in one
     /// round-trip pair. Every accessor on the result is synchronous.
     ///
     /// The checkpoint is read **first**, then the frontier, so a concurrent
     /// advance between the two can only overstate the snapshot's lag — never
     /// understate it. A caller acting on
-    /// [`is_caught_up`](HandlerSnapshot::is_caught_up) therefore never acts
+    /// [`is_caught_up`](SubscriptionSnapshot::is_caught_up) therefore never acts
     /// on an optimistic reading.
     #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
-    pub async fn load(&self) -> Result<HandlerSnapshot, HandlerCheckpointError> {
+    pub async fn load(&self) -> Result<SubscriptionSnapshot, SubscriptionError> {
         let job = self.job.load().await?;
         let checkpoint = decode_checkpoint(&job)?;
         let frontier = self.frontier().await?;
-        Ok(HandlerSnapshot {
+        Ok(SubscriptionSnapshot {
             job,
             checkpoint,
             frontier,
@@ -311,7 +311,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`HandlerCheckpointError::CaughtUpTimeout`] — carrying the
+    /// Returns [`SubscriptionError::CaughtUpTimeout`] — carrying the
     /// observed checkpoint, the target and the elapsed wait — if the deadline
     /// passes first.
     #[tracing::instrument(
@@ -326,7 +326,7 @@ where
         &self,
         target: EventSequence,
         timeout: Duration,
-    ) -> Result<(), HandlerCheckpointError> {
+    ) -> Result<(), SubscriptionError> {
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
 
@@ -339,7 +339,7 @@ where
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(HandlerCheckpointError::CaughtUpTimeout {
+                return Err(SubscriptionError::CaughtUpTimeout {
                     checkpoint,
                     target,
                     waited: now.duration_since(start),
@@ -368,7 +368,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`HandlerCheckpointError::CaughtUpTimeout`] — where `target`
+    /// Returns [`SubscriptionError::CaughtUpTimeout`] — where `target`
     /// is the sampled frontier — if the deadline passes first.
     #[tracing::instrument(
         name = "obix.registered_handler.await_caught_up",
@@ -376,7 +376,7 @@ where
         fields(timeout_ms = timeout.as_millis()),
         err
     )]
-    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), HandlerCheckpointError> {
+    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), SubscriptionError> {
         // Sampled ONCE: the fence is anchored to the stream position at call
         // time, so a handler that publishes as it drains cannot extend its
         // own barrier indefinitely (semantics 5).
@@ -396,11 +396,11 @@ where
     /// when a handler is wedged and someone is watching a fence time out.
     ///
     /// Safe because this does not serve
-    /// [`job_status`](HandlerSnapshot::job_status): a missing or
+    /// [`job_status`](SubscriptionSnapshot::job_status): a missing or
     /// mid-transition row reads `None` ⇒ [`EventSequence::BEGIN`], which can
     /// only under-report progress, and under-reporting preserves the
     /// barrier's never-return-early invariant.
-    async fn checkpoint(&self) -> Result<EventSequence, HandlerCheckpointError> {
+    async fn checkpoint(&self) -> Result<EventSequence, SubscriptionError> {
         Ok(self
             .job
             .execution_state::<OutboxEventJobState>()
@@ -439,7 +439,7 @@ pub(super) async fn read_frontier<Tables: MailboxTables>(
 /// Decode a handler job's committed checkpoint. Absent state — no execution
 /// row, or a job that has not checkpointed yet — reads as
 /// [`EventSequence::BEGIN`] (semantics 4).
-fn decode_checkpoint(job: &::job::JobSnapshot) -> Result<EventSequence, HandlerCheckpointError> {
+fn decode_checkpoint(job: &::job::JobSnapshot) -> Result<EventSequence, SubscriptionError> {
     Ok(job
         .execution_state::<OutboxEventJobState>()?
         .unwrap_or_default()

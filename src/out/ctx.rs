@@ -1,14 +1,14 @@
 //! Handler-controlled transaction scoping for outbox event-handler jobs.
 //!
 //! Every persistent event delivered to an
-//! [`OutboxEventHandler`](super::OutboxEventHandler) comes with an
+//! [`SingletonSubscriber`](super::SingletonSubscriber) comes with an
 //! [`EventCtx`] that the handler must resolve into a [`Handled`] token by
 //! choosing exactly one of four entry verbs — a monotone cost ladder:
 //!
 //! | verb | meaning | cost |
 //! |------|---------|------|
 //! | [`EventCtx::skip`] | not my event | zero — no transaction is opened |
-//! | [`EventCtx::collect_with`] (and the [`collect`](EventCtx::collect) sugar) | contribute an item to the pending batch's accumulator | zero at collect time — one [`flush`](super::OutboxEventHandler::flush) call per batch applies all items |
+//! | [`EventCtx::collect_with`] (and the [`collect`](EventCtx::collect) sugar) | contribute an item to the pending batch's accumulator | zero at collect time — one [`flush`](super::SingletonSubscriber::flush) call per batch applies all items |
 //! | [`EventCtx::consume_in_batch`] | do work joined to the pending batch op | shares one transaction (and one checkpoint) with neighboring events |
 //! | [`EventCtx::consume_isolated`] | land the pending batch first, then do my work in a fresh op | my event is its own atomic unit, fenced from history |
 //!
@@ -28,11 +28,11 @@
 //! transaction never spans the foreign `handle_ephemeral` await, and between
 //! batches the two streams race fairly so neither can starve the other.
 //! Handlers that only consume one stream should declare it via
-//! [`SUBSCRIPTION`](super::OutboxEventHandler::SUBSCRIPTION) — the other
+//! [`SUBSCRIPTION`](super::SingletonSubscriber::SUBSCRIPTION) — the other
 //! stream is then never subscribed at all.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
-//! items to the handler's [`flush`](super::OutboxEventHandler::flush) inside
+//! items to the handler's [`flush`](super::SingletonSubscriber::flush) inside
 //! the batch transaction, then persists the checkpoint at the last *fully
 //! handled* sequence (skips included), then commits: items, work and pointer
 //! are inseparable. A failed flush rolls everything back and replays the
@@ -84,7 +84,7 @@ pub(crate) struct CtxParts<'inv> {
 /// Only obtainable from [`EventCtx::skip`], [`EventCtx::collect_with`] (or
 /// its [`collect`](EventCtx::collect) sugar), [`BatchOp::commit`],
 /// [`BatchOp::defer`] or [`IsolatedOp::commit`] — the type system forces
-/// every [`handle_persistent`](super::OutboxEventHandler::handle_persistent)
+/// every [`handle_persistent`](super::SingletonSubscriber::handle_persistent)
 /// invocation to decide the transactional fate of its event.
 ///
 /// The token is branded with the invocation's lifetime, so it cannot leave
@@ -122,10 +122,10 @@ pub(crate) enum Outcome {
 }
 
 /// Per-event decision point handed to
-/// [`handle_persistent`](super::OutboxEventHandler::handle_persistent).
+/// [`handle_persistent`](super::SingletonSubscriber::handle_persistent).
 ///
 /// Generic over the handler's
-/// [`Batch`](super::OutboxEventHandler::Batch) accumulator `B` (defaulting
+/// [`Batch`](super::SingletonSubscriber::Batch) accumulator `B` (defaulting
 /// to `()` for handlers that never collect). See the [module docs](self)
 /// for the semantics of the four entry verbs.
 #[must_use = "resolve the EventCtx via skip / collect / consume_in_batch / consume_isolated"]
@@ -149,7 +149,7 @@ impl<'inv, B> EventCtx<'inv, B> {
     /// Contribute to the pending batch's accumulator — a pure memory write:
     /// no transaction is opened and no statement is executed now. The runner
     /// hands the accumulated batch to the handler's
-    /// [`flush`](super::OutboxEventHandler::flush) exactly once per batch
+    /// [`flush`](super::SingletonSubscriber::flush) exactly once per batch
     /// landing, inside the transaction that commits the checkpoint.
     ///
     /// Like [`defer`](BatchOp::defer), collected work shares fate with its
@@ -327,7 +327,7 @@ pub(crate) type BoxFuture<'a, T> =
 
 /// Object-safe bridge from the runner (and [`EventCtx::consume_isolated`]'s
 /// entry fence) to the handler's typed
-/// [`flush`](super::OutboxEventHandler::flush) — erases the handler type so
+/// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
 /// [`EventCtx`] only needs to know the accumulator `B`.
 pub(crate) trait ItemFlush<B>: Send + Sync {
     fn flush_items<'a>(
@@ -338,7 +338,7 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
 }
 
 /// Restricted view of the batch op handed to
-/// [`flush`](super::OutboxEventHandler::flush) — everything an
+/// [`flush`](super::SingletonSubscriber::flush) — everything an
 /// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else.
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the

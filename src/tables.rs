@@ -25,7 +25,7 @@ pub struct DefaultMailboxTables;
 /// panic/retry loop — nor be silently dropped: it becomes the `Err` arm
 /// ([`UndecodableEventError`]), still occupying its sequence position, and
 /// its fate is decided by consumer policy (see
-/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)).
+/// [`SingletonSubscriber::handle_undecodable`](crate::SingletonSubscriber::handle_undecodable)).
 #[doc(hidden)]
 pub fn decode_persistent_event<P>(
     id: OutboxEventId,

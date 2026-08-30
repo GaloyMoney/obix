@@ -13,7 +13,7 @@ use super::{EphemeralOutboxListener, Outbox, event::*};
 use crate::tables::MailboxTables;
 
 /// Which delivery streams an event-handler job subscribes to — see
-/// [`OutboxEventHandler::SUBSCRIPTION`].
+/// [`SingletonSubscriber::SUBSCRIPTION`].
 ///
 /// - [`PersistentOnly`](Self::PersistentOnly): only the durable, checkpointed
 ///   stream. The ephemeral stream is never subscribed, so batching is
@@ -23,7 +23,7 @@ use crate::tables::MailboxTables;
 ///   the job never reads or writes execution state.
 /// - [`All`](Self::All): both streams, raced fairly between batches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventSubscription {
+pub enum StreamSelection {
     All,
     PersistentOnly,
     EphemeralOnly,
@@ -65,20 +65,20 @@ pub enum EventSubscription {
 /// handlers only consume one of the two streams — declare it via
 /// [`SUBSCRIPTION`](Self::SUBSCRIPTION) and the other stream is never even
 /// subscribed.
-pub trait OutboxEventHandler<P>: Send + Sync + 'static
+pub trait SingletonSubscriber<P>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
     /// Which delivery streams this handler's job subscribes to. Defaults to
-    /// [`All`](EventSubscription::All).
+    /// [`All`](StreamSelection::All).
     ///
     /// Declaring a single-stream mode is a contract, not a filter: the other
     /// stream is never subscribed, so its handler method is never called —
     /// overriding [`handle_ephemeral`](Self::handle_ephemeral) on a
-    /// [`PersistentOnly`](EventSubscription::PersistentOnly) handler (or
+    /// [`PersistentOnly`](StreamSelection::PersistentOnly) handler (or
     /// [`handle_persistent`](Self::handle_persistent) on an
-    /// [`EphemeralOnly`](EventSubscription::EphemeralOnly) one) is dead code.
-    const SUBSCRIPTION: EventSubscription = EventSubscription::All;
+    /// [`EphemeralOnly`](StreamSelection::EphemeralOnly) one) is dead code.
+    const SUBSCRIPTION: StreamSelection = StreamSelection::All;
 
     /// Accumulator for events resolved via
     /// [`collect_with`](EventCtx::collect_with) — `Vec<T>` for append-style
@@ -167,15 +167,15 @@ where
 /// flush path (and to [`EventCtx::consume_isolated`]'s entry fence) with the
 /// handler type erased.
 ///
-/// [`flush`]: OutboxEventHandler::flush
-struct HandlerFlusher<H, P> {
+/// [`flush`]: SingletonSubscriber::flush
+struct SubscriberFlusher<H, P> {
     handler: Arc<H>,
     _payload: std::marker::PhantomData<fn() -> P>,
 }
 
-impl<H, P> ItemFlush<H::Batch> for HandlerFlusher<H, P>
+impl<H, P> ItemFlush<H::Batch> for SubscriberFlusher<H, P>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
     fn flush_items<'a>(
@@ -200,7 +200,7 @@ where
 }
 
 /// Next ephemeral event — or pend forever when the handler's
-/// [`SUBSCRIPTION`](OutboxEventHandler::SUBSCRIPTION) never subscribed the
+/// [`SUBSCRIPTION`](SingletonSubscriber::SUBSCRIPTION) never subscribed the
 /// ephemeral stream.
 async fn next_if_subscribed<P>(
     listener: &mut Option<EphemeralOutboxListener<P>>,
@@ -267,7 +267,7 @@ pub(super) struct OutboxEventJobData {}
 
 pub(super) struct OutboxEventJobInitializer<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
@@ -281,7 +281,7 @@ where
 
 impl<H, P, Tables> OutboxEventJobInitializer<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
@@ -299,7 +299,7 @@ where
 
 impl<H, P, Tables> ResidentJobInitializer for OutboxEventJobInitializer<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
@@ -325,7 +325,7 @@ where
 
 struct OutboxEventJobRunner<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
@@ -338,7 +338,7 @@ where
 #[async_trait]
 impl<H, P, Tables> ResidentJobRunner for OutboxEventJobRunner<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
@@ -347,8 +347,8 @@ where
         current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         match H::SUBSCRIPTION {
-            EventSubscription::EphemeralOnly => self.run_ephemeral_only(current_job).await,
-            EventSubscription::All | EventSubscription::PersistentOnly => {
+            StreamSelection::EphemeralOnly => self.run_ephemeral_only(current_job).await,
+            StreamSelection::All | StreamSelection::PersistentOnly => {
                 self.run_with_persistent(current_job).await
             }
         }
@@ -357,11 +357,11 @@ where
 
 impl<H, P, Tables> OutboxEventJobRunner<H, P, Tables>
 where
-    H: OutboxEventHandler<P>,
+    H: SingletonSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    /// [`EphemeralOnly`](EventSubscription::EphemeralOnly): a bare dispatch
+    /// [`EphemeralOnly`](StreamSelection::EphemeralOnly): a bare dispatch
     /// loop — no persistent subscription, no execution state, no batch or
     /// checkpoint machinery.
     async fn run_ephemeral_only(
@@ -403,7 +403,7 @@ where
         // all.
         let mut persistent = self.outbox.listen_persisted(Some(state.sequence));
         let mut ephemeral =
-            (H::SUBSCRIPTION == EventSubscription::All).then(|| self.outbox.listen_ephemeral());
+            (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
@@ -413,7 +413,7 @@ where
             last_persist: tokio::time::Instant::now(),
         };
         let mut batch = H::Batch::default();
-        let flusher = HandlerFlusher::<H, P> {
+        let flusher = SubscriberFlusher::<H, P> {
             handler: self.handler.clone(),
             _payload: std::marker::PhantomData,
         };

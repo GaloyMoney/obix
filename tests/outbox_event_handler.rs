@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use obix::{
-    EventCtx, EventSubscription, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    EventCtx, Handled, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
     out::Outbox,
 };
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ struct SkippingObserver {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for SkippingObserver {
+impl SingletonSubscriber<TestEvent> for SkippingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -73,7 +73,7 @@ struct AckingObserver {
     acked: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for AckingObserver {
+impl SingletonSubscriber<TestEvent> for AckingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -101,7 +101,7 @@ struct CheckpointingObserver {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for CheckpointingObserver {
+impl SingletonSubscriber<TestEvent> for CheckpointingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -121,7 +121,7 @@ struct TestEphemeralHandler {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestEphemeralHandler {
+impl SingletonSubscriber<TestEvent> for TestEphemeralHandler {
     type Batch = ();
 
     async fn handle_ephemeral(
@@ -139,7 +139,7 @@ struct TestBothHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestBothHandler {
+impl SingletonSubscriber<TestEvent> for TestBothHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -187,7 +187,7 @@ struct DeferringEffectHandler {
     failed: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for DeferringEffectHandler {
+impl SingletonSubscriber<TestEvent> for DeferringEffectHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -223,7 +223,7 @@ struct IsolatingEffectHandler {
     fail_isolated_once: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
+impl SingletonSubscriber<TestEvent> for IsolatingEffectHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -261,7 +261,7 @@ struct SlowDeferringHandler {
     rows_at_ephemeral: Arc<Mutex<usize>>,
 }
 
-impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
+impl SingletonSubscriber<TestEvent> for SlowDeferringHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -308,7 +308,7 @@ struct CollectingHandler {
     fail_first_flush: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for CollectingHandler {
+impl SingletonSubscriber<TestEvent> for CollectingHandler {
     type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
@@ -352,7 +352,7 @@ struct CoalescingHandler {
     flush_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for CoalescingHandler {
+impl SingletonSubscriber<TestEvent> for CoalescingHandler {
     type Batch = std::collections::HashMap<i64, i64>;
 
     async fn handle_persistent<'inv>(
@@ -388,7 +388,7 @@ struct MixedHandler {
     flush_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for MixedHandler {
+impl SingletonSubscriber<TestEvent> for MixedHandler {
     type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
@@ -432,7 +432,7 @@ struct CollectThenIsolateHandler {
     fail_isolated_once: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for CollectThenIsolateHandler {
+impl SingletonSubscriber<TestEvent> for CollectThenIsolateHandler {
     type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
@@ -477,7 +477,7 @@ struct FairnessProbeHandler {
     persistent_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for FairnessProbeHandler {
+impl SingletonSubscriber<TestEvent> for FairnessProbeHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -509,8 +509,8 @@ struct PersistentOnlyHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for PersistentOnlyHandler {
-    const SUBSCRIPTION: EventSubscription = EventSubscription::PersistentOnly;
+impl SingletonSubscriber<TestEvent> for PersistentOnlyHandler {
+    const SUBSCRIPTION: StreamSelection = StreamSelection::PersistentOnly;
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -541,8 +541,8 @@ struct EphemeralOnlyHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for EphemeralOnlyHandler {
-    const SUBSCRIPTION: EventSubscription = EventSubscription::EphemeralOnly;
+impl SingletonSubscriber<TestEvent> for EphemeralOnlyHandler {
+    const SUBSCRIPTION: StreamSelection = StreamSelection::EphemeralOnly;
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -566,7 +566,7 @@ impl OutboxEventHandler<TestEvent> for EphemeralOnlyHandler {
     }
 }
 
-async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
+async fn init_outbox_with_handler<H: SingletonSubscriber<TestEvent>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     handler: H,
@@ -580,7 +580,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     .await
 }
 
-async fn init_outbox_with_handler_config<H: OutboxEventHandler<TestEvent>>(
+async fn init_outbox_with_handler_config<H: SingletonSubscriber<TestEvent>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     config: OutboxEventJobConfig,
@@ -598,7 +598,7 @@ async fn init_outbox_with_handler_config<H: OutboxEventHandler<TestEvent>>(
     .await?;
 
     outbox
-        .register_event_handler(jobs, config, handler)
+        .register_singleton_subscriber(jobs, config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -850,7 +850,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         .await?;
 
         outbox
-            .register_event_handler(
+            .register_singleton_subscriber(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 CheckpointingObserver {
@@ -1836,7 +1836,7 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
         )
         .await?;
         outbox
-            .register_event_handler(
+            .register_singleton_subscriber(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
                     .with_retry_settings(fast_retry_settings())
