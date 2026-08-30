@@ -18,10 +18,11 @@
 //! for routing, and the runner must never treat job-row existence as
 //! subscription existence — the `subscriptions` row is the truth.
 //!
-//! This is workstream 3 of the handoff: subscriptions table, traits, ctx
-//! extensions, per-key runner and the [`Subscriptions`] capability, waking
-//! via a periodic sweep only. The wake-plane router (liveness-only,
-//! event-driven wakes) is a later, separately-shippable addition.
+//! Covers workstreams 3 and 4 of the handoff: the subscriptions table,
+//! traits, ctx extensions, per-key runner and the [`Subscriptions`]
+//! capability (workstream 3), plus the wake plane — an internal router
+//! (liveness-only, event-driven wakes) and the periodic sweep that backstops
+//! it (workstream 4).
 
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -30,6 +31,7 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 use job::{CurrentJob, Job, JobType, ResidentJobCompletion, ResidentJobInitializer, RetrySettings};
 
 use super::ctx::*;
+use super::job::SingletonSubscriber;
 use super::{Outbox, Subscription, event::*};
 use crate::tables::MailboxTables;
 
@@ -616,16 +618,120 @@ where
     }
 }
 
-// === Sweep (step-3 wake plane: sweep-only, router deferred) ===
+// === Router (wake plane, part 1: liveness-only, event-driven wakes) ===
+//
+// An internal singleton subscriber — built entirely on the EXISTING
+// SingletonSubscriber/EventCtx/FlushOp machinery, no fork — that classifies
+// every persistent event into routing keys, collects them per batch, and at
+// flush time looks up which subscribed keys care and idempotently respawns
+// them, all on the flush op so the wakes and the router's own checkpoint
+// commit atomically: a crash cannot checkpoint past events whose wakes were
+// lost.
+//
+// Liveness-only by construction: a false-positive routing match costs one
+// harmless empty spawn (resolves to the live holder, or an empty lookup for
+// an unsubscribed key — the majority case). Routing must never gate
+// delivery, so it is never consulted by the per-key runner itself — only by
+// this router, to decide who to wake.
+pub(super) struct RouterHandler<D, P, Tables>
+where
+    D: SubscriptionDef<P>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    def: Arc<D>,
+    subscriber_type: JobType,
+    spawner: job::KeyedJobSpawner<KeyMsg>,
+    _marker: PhantomData<fn() -> (P, Tables)>,
+}
+
+/// Build the router's job type: `{base}.router`, `'static`-leaked once at
+/// registration (see [`derived_job_type`]).
+pub(super) fn router_job_type(base: &str) -> JobType {
+    derived_job_type(base, "router")
+}
+
+/// Construct the router handler — a plain [`SingletonSubscriber`], registered
+/// via [`super::Outbox::register_singleton_subscriber`] like any other.
+pub(super) fn router_handler<D, P, Tables>(
+    def: Arc<D>,
+    subscriber_type: JobType,
+    spawner: job::KeyedJobSpawner<KeyMsg>,
+) -> RouterHandler<D, P, Tables>
+where
+    D: SubscriptionDef<P>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    RouterHandler {
+        def,
+        subscriber_type,
+        spawner,
+        _marker: PhantomData,
+    }
+}
+
+impl<D, P, Tables> SingletonSubscriber<P> for RouterHandler<D, P, Tables>
+where
+    D: SubscriptionDef<P>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    type Batch = std::collections::HashSet<RoutingKey>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Self::Batch>,
+        event: &PersistentOutboxEvent<P>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let keys: Vec<RoutingKey> = self.def.routing_key(event).into_iter().collect();
+        if keys.is_empty() {
+            return Ok(ctx.skip());
+        }
+        Ok(ctx.collect_with(move |batch| batch.extend(keys)))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut FlushOp<'_>,
+        items: Self::Batch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let routing_keys: Vec<String> = items.into_iter().map(|r| r.0).collect();
+        let keys = Tables::subscription_keys_for_routing_keys(
+            op,
+            self.subscriber_type.as_str(),
+            &routing_keys,
+        )
+        .await?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let specs = keys
+            .into_iter()
+            .map(|key| job::KeyedJobSpec::new(key.clone(), KeyMsg { key }))
+            .collect();
+        self.spawner.spawn_all_in_op(op, specs).await?;
+        Ok(())
+    }
+}
+
+// === Sweep (wake plane, part 2: startup reconcile, repair, staleness bound) ===
 //
 // A single per-process-independent resident job per keyed-subscriber type:
 // on a timer, enumerate every currently-subscribed key and idempotently
-// respawn it. This is the whole wake mechanism until the router lands (a
-// later, separately-shippable commit) — a fresh subscription is Active from
-// birth (see `Subscriptions::subscribe_in_op`) so it needs no wake until its
-// first dormancy, and the sweep bounds how long a Dormant member can stay
-// unwoken: the startup reconcile, the repair path, and the staleness bound,
-// all in one.
+// respawn it. Registered alongside the router (a distinct resident job
+// rather than fused into the router's own — the smallest change that stays
+// correct, since folding a sweep timer into the shared singleton runner
+// loop would touch every registered singleton subscriber in the crate, not
+// just this one). Complements the router: a fresh subscription is Active
+// from birth (see `Subscriptions::subscribe_in_op`) so it needs no wake
+// until its first dormancy; from then on the router's liveness-only routing
+// is the fast path, and the sweep is the backstop — the startup reconcile
+// (a fresh process has no router state yet), the repair path (a routing_key
+// bug or a lost wake), and the bound on staleness under either.
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct SweepJobData {}

@@ -77,11 +77,12 @@ impl SubscriptionDef<TestEvent> for TestDef {
 
     fn routing_key(
         &self,
-        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> impl IntoIterator<Item = RoutingKey> {
-        // No router in this workstream: the sweep is the whole wake plane,
-        // so routing keys are never consulted yet.
-        Vec::<RoutingKey>::new()
+        match &event.payload {
+            Some(TestEvent::Ping { owner, .. }) => vec![RoutingKey::from(owner.to_string())],
+            None => vec![],
+        }
     }
 
     fn instantiate(&self, key: Self::Key, _cfg: Self::InstanceConfig) -> Self::Subscriber {
@@ -509,6 +510,71 @@ async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Resu
     // backlog it missed while dormant.
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2, 3])
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Contract — router: a routed event wakes a Dormant member on its own,
+/// well inside the sweep interval, proving the event-driven wake is the fast
+/// path and not merely a side effect of the sweep also being armed. The
+/// subscription registers with a routing key matching its own owner id.
+#[tokio::test]
+#[file_serial]
+async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    // A deliberately huge sweep interval: if the event is delivered well
+    // before this could ever fire, it can only have been the router.
+    let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
+        .with_linger(TEST_LINGER)
+        .with_sweep_interval(Duration::from_secs(3600))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, config, def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        vec![RoutingKey::from(OwnerId(1).to_string())],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1])
+    })
+    .await?;
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let subscription = subscription.clone();
+        async move { Ok(subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+
+    // Published while Dormant, with a sweep interval far longer than this
+    // test's patience — only the router can deliver this in time.
+    publish_ping(&outbox, 1, 2).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1, 2])
     })
     .await?;
 

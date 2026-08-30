@@ -469,16 +469,29 @@ where
         let def = Arc::new(def);
         let initializer = keyed_job::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
             self.clone(),
-            def,
+            def.clone(),
             &config,
         );
         let spawner = jobs.add_keyed_initializer(initializer);
 
-        // Wake plane: sweep-only for now (startup reconcile / repair /
-        // staleness bound). A fresh subscription is Active from birth
-        // regardless, so this is never on the critical path for first
-        // delivery — it only bounds re-wake latency after a member goes
-        // Dormant.
+        // Wake plane: the router (event-driven, liveness-only wakes) is a
+        // singleton subscriber built entirely on the existing
+        // register_singleton_subscriber machinery, plus a periodic sweep
+        // (startup reconcile / repair / staleness bound) as its own resident
+        // job. A fresh subscription is Active from birth regardless, so
+        // neither is on the critical path for first delivery.
+        let router = keyed_job::router_handler::<D, P, Tables>(
+            def,
+            config.job_type.clone(),
+            spawner.clone(),
+        );
+        self.register_singleton_subscriber(
+            jobs,
+            OutboxEventJobConfig::new(keyed_job::router_job_type(config.job_type.as_str())),
+            router,
+        )
+        .await?;
+
         let sweep = keyed_job::SweepJobInitializer::<Tables>::new(
             self.pool.clone(),
             spawner.clone(),

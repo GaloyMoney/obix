@@ -102,13 +102,14 @@ pub async fn wipeout_subscriptions(
 
 /// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
 /// registration touches: the per-key job type itself and its derived
-/// `{job_type}.sweep` resident job.
+/// `{job_type}.sweep` and `{job_type}.router` jobs.
 pub async fn wipeout_keyed_subscriber_job_tables(
     pool: &sqlx::PgPool,
     job_type: &str,
 ) -> anyhow::Result<()> {
     wipeout_outbox_job_tables(pool, job_type).await?;
     wipeout_outbox_job_tables(pool, &format!("{job_type}.sweep")).await?;
+    wipeout_outbox_job_tables(pool, &format!("{job_type}.router")).await?;
     Ok(())
 }
 
