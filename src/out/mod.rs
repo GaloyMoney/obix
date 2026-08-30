@@ -23,8 +23,8 @@ pub use self::ctx::{
     EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedEvent, StagedOp,
 };
 pub use self::subscription::keyed::{
-    KeyedSubscriber, KeyedSubscriberConfig, Members, RoutingKey, SubscriptionDef,
-    SubscriptionMember, Subscriptions,
+    KeyedSubscriber, KeyedSubscriberConfig, Members, SubscriptionDef, SubscriptionMember,
+    Subscriptions, WakeKey,
 };
 pub use self::subscription::singleton::{
     OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
@@ -458,11 +458,12 @@ where
     /// [`Subscriptions`] capability's `subscribe_in_op`/`cancel_in_op`, each
     /// with its own durable cursor, costing nothing while idle.
     ///
-    /// Wakes via a periodic sweep only (`config.sweep_interval`) — the
-    /// wake-plane router (liveness-only, event-driven wakes) is a later,
-    /// separately-shippable addition. A fresh subscription is Active from
-    /// birth regardless, so this only affects re-wake latency after a member
-    /// has gone Dormant.
+    /// A passivated member is revived by the wake plane: the waker matches
+    /// each event's [`wake_keys`](subscription::keyed::SubscriptionDef::wake_keys)
+    /// against the sets subscriptions declared, and a periodic sweep backstops
+    /// it (`config.sweep_interval`). A fresh subscription is Active from birth
+    /// regardless, so neither is on the critical path for first delivery —
+    /// they only govern re-wake latency after a member has gone Dormant.
     ///
     /// Must be called **before** [`::job::Jobs::start_poll`].
     pub async fn register_keyed_subscriber<D: subscription::keyed::SubscriptionDef<P>>(
@@ -479,23 +480,23 @@ where
         );
         let spawner = jobs.add_keyed_initializer(initializer);
 
-        // Wake plane: the router (event-driven, liveness-only wakes) is a
+        // Wake plane: the waker (event-driven, liveness-only wakes) is a
         // singleton subscriber built entirely on the existing
         // register_singleton_subscriber machinery, plus a periodic sweep
         // (startup reconcile / repair / staleness bound) as its own resident
         // job. A fresh subscription is Active from birth regardless, so
         // neither is on the critical path for first delivery.
-        let router = subscription::keyed::router_handler::<D, P, Tables>(
+        let waker = subscription::keyed::waker_handler::<D, P, Tables>(
             def,
             config.job_type.clone(),
             spawner.clone(),
         );
         self.register_singleton_subscriber(
             jobs,
-            OutboxEventJobConfig::new(subscription::keyed::router_job_type(
+            OutboxEventJobConfig::new(subscription::keyed::waker_job_type(
                 config.job_type.as_str(),
             )),
-            router,
+            waker,
         )
         .await?;
 

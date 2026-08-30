@@ -371,7 +371,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         // exactly once, at the subscription's true birth.
         let insert_subscription_query = format!(
             r#"
-            INSERT INTO {tbl}subscriptions (subscriber_type, key, routing_keys, instance_config, start_after, created_at)
+            INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, created_at)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, NOW()))
             ON CONFLICT (subscriber_type, key) DO NOTHING"#,
             tbl = table_prefix
@@ -385,7 +385,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let find_subscription_query = format!(
             r#"
-            SELECT routing_keys, instance_config, start_after AS "start_after!: i64", created_at
+            SELECT wake_keys, instance_config, start_after AS "start_after!: i64", created_at
             FROM {tbl}subscriptions
             WHERE subscriber_type = $1 AND key = $2"#,
             tbl = table_prefix
@@ -396,7 +396,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        // The router's flush-time lookup: liveness-only, so an
+        // The waker's flush-time lookup: liveness-only, so an
         // over-approximating false positive here is a harmless empty wake,
         // never a correctness gap.
         // The `$2::varchar[]` cast is required, not decorative: Postgres has
@@ -405,8 +405,8 @@ FROM {}persistent_outbox_events_sequence_seq",
         // compile-time check does not catch it — DESCRIBE happily infers
         // `text[]` for an untyped array parameter, so an uncast `$2` compiles
         // clean and fails at EXECUTE time on every call, on live data only.
-        let subscription_keys_for_routing_keys_query = format!(
-            r#"SELECT key FROM {tbl}subscriptions WHERE subscriber_type = $1 AND routing_keys && $2::varchar[]"#,
+        let subscription_keys_for_wake_keys_query = format!(
+            r#"SELECT key FROM {tbl}subscriptions WHERE subscriber_type = $1 AND wake_keys && $2::varchar[]"#,
             tbl = table_prefix
         );
 
@@ -1097,7 +1097,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,
                     key: &str,
-                    routing_keys: &[String],
+                    wake_keys: &[String],
                     instance_config: #crate_name::prelude::serde_json::Value,
                     start_after: #crate_name::EventSequence,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
@@ -1105,7 +1105,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                     let subscriber_type = subscriber_type.to_string();
                     let key = key.to_string();
-                    let routing_keys = routing_keys.to_vec();
+                    let wake_keys = wake_keys.to_vec();
                     let now = op.maybe_now();
 
                     async move {
@@ -1113,7 +1113,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             #insert_subscription_query,
                             subscriber_type,
                             key,
-                            &routing_keys as _,
+                            &wake_keys as _,
                             instance_config,
                             start_after as #crate_name::EventSequence,
                             now
@@ -1157,7 +1157,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .await?;
 
                         Ok(row.map(|row| #crate_name::SubscriptionRow {
-                            routing_keys: row.routing_keys,
+                            wake_keys: row.wake_keys,
                             instance_config: row.instance_config,
                             start_after: #crate_name::EventSequence::from(row.start_after as u64),
                             created_at: row.created_at,
@@ -1180,24 +1180,24 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn subscription_keys_for_routing_keys(
+                fn subscription_keys_for_wake_keys(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,
-                    routing_keys: &[String],
+                    wake_keys: &[String],
                 ) -> impl std::future::Future<Output = Result<Vec<String>, #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
                     let subscriber_type = subscriber_type.to_string();
-                    let routing_keys = routing_keys.to_vec();
+                    let wake_keys = wake_keys.to_vec();
 
                     async move {
-                        if routing_keys.is_empty() {
+                        if wake_keys.is_empty() {
                             return Ok(Vec::new());
                         }
                         let rows = sqlx::query!(
-                            #subscription_keys_for_routing_keys_query,
+                            #subscription_keys_for_wake_keys_query,
                             subscriber_type,
-                            &routing_keys as _,
+                            &wake_keys as _,
                         )
                         .fetch_all(op.as_executor())
                         .await?;

@@ -163,7 +163,7 @@ where
 
         // Run start: the subscriptions row is the truth. Missing → cancelled;
         // a stray wake respawning a just-cancelled key hits this and dies
-        // harmlessly (the router/sweep can't route to it anyway — lookups go
+        // harmlessly (the waker/sweep can't reach it anyway — lookups go
         // through this same table).
         let Some(row) =
             Tables::find_subscription(current_job.pool(), self.job_type.as_str(), &key_str).await?

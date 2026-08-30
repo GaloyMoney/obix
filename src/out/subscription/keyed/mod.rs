@@ -11,18 +11,18 @@
 //! the `job` crate owns execution and progress (liveness, generations,
 //! attempts, watermark) via its keyed-job machinery, addressed by
 //! `(subscriber_type, key)`. This module must never query job-crate tables
-//! for routing, and the runner must never treat job-row existence as
+//! to decide wakes, and the runner must never treat job-row existence as
 //! subscription existence — the `subscriptions` row is the truth.
 //!
-//! This module root holds what a keyed subscriber *is* — the [`RoutingKey`],
+//! This module root holds what a keyed subscriber *is* — the [`WakeKey`],
 //! the [`SubscriptionDef`]/[`KeyedSubscriber`] traits, [`KeyedSubscriberConfig`]
 //! and the [`Subscriptions`] capability. The moving parts live beside it:
-//! [`runner`] (the per-key job), [`router`] and [`sweep`] (the two halves of
+//! [`runner`] (the per-key job), [`waker`] and [`sweep`] (the two halves of
 //! the wake plane — event-driven wakes and the periodic backstop).
 
-mod router;
 mod runner;
 mod sweep;
+mod waker;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
@@ -34,38 +34,44 @@ use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
 use crate::out::event::{PersistentOutboxEvent, UndecodableEventError};
 use crate::tables::MailboxTables;
 
-pub(in crate::out) use router::{router_handler, router_job_type};
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
 pub(in crate::out) use sweep::{SweepJobData, SweepJobInitializer};
+pub(in crate::out) use waker::{waker_handler, waker_job_type};
 
-// === Routing key ===
+// === Wake key ===
 
 /// A pure classification of an event into a partition of the stream,
-/// declared by a subscription at creation. Liveness-only: a false-positive
-/// match costs one harmless empty wake, never a correctness gap — routing
-/// must never gate delivery.
+/// declared by a subscription at creation.
+///
+/// **A wake key is a liveness signal, not a delivery filter.** A live member
+/// reads the whole stream from its own cursor and decides event by event in
+/// [`KeyedSubscriber::handle`]; wake keys are consulted only to decide whom
+/// to *wake* once a member has passivated. So a false-positive match costs
+/// one harmless empty run, while a missed match strands a member until
+/// something else wakes it — which is why over-approximating is always the
+/// safe direction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RoutingKey(pub(crate) String);
+pub struct WakeKey(pub(crate) String);
 
-impl RoutingKey {
+impl WakeKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl From<String> for RoutingKey {
+impl From<String> for WakeKey {
     fn from(s: String) -> Self {
         Self(s)
     }
 }
 
-impl From<&str> for RoutingKey {
+impl From<&str> for WakeKey {
     fn from(s: &str) -> Self {
         Self(s.to_string())
     }
 }
 
-impl std::fmt::Display for RoutingKey {
+impl std::fmt::Display for WakeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -155,13 +161,18 @@ where
 
     type Subscriber: KeyedSubscriber<P>;
 
-    /// Which partition(s) of the stream this event belongs to. Empty = no
-    /// interest — there is no separate `interest` prefilter; an empty return
-    /// IS no-interest. Must never miss an event a live subscription would act
-    /// on: over-approximation is always safe, under-approximation is a
-    /// correctness bug.
-    fn routing_key(&self, event: &PersistentOutboxEvent<P>)
-    -> impl IntoIterator<Item = RoutingKey>;
+    /// Which partition(s) of the stream this event belongs to — i.e. which
+    /// subscriptions must be *awake* to see it. Empty = this event wakes
+    /// nobody of this type; there is no separate `interest` prefilter, an
+    /// empty return IS no-interest.
+    ///
+    /// This decides wakes, never delivery: a woken member reads the whole
+    /// stream from its cursor and filters in
+    /// [`handle`](KeyedSubscriber::handle). Over-approximating costs an empty
+    /// run; under-approximating leaves a passivated member unwoken with its
+    /// events unread, so it must never miss an event a live subscription
+    /// would act on.
+    fn wake_keys(&self, event: &PersistentOutboxEvent<P>) -> impl IntoIterator<Item = WakeKey>;
 
     /// Build the subscriber instance for one run. Called fresh on every run —
     /// every wake, every hold expiry, every retry, on any node — so this must
@@ -356,7 +367,7 @@ where
     /// birth without needing any wake until its first dormancy.
     ///
     /// Idempotent: re-subscribing an already-subscribed key resolves to the
-    /// existing row (its original `start_after` and `routing_keys` are never
+    /// existing row (its original `start_after` and `wake_keys` are never
     /// overwritten) and the existing live job.
     #[tracing::instrument(name = "obix.subscriptions.subscribe_in_op", skip_all, err)]
     pub async fn subscribe_in_op(
@@ -364,10 +375,10 @@ where
         op: &mut impl es_entity::AtomicOperation,
         key: D::Key,
         cfg: D::InstanceConfig,
-        routing: impl IntoIterator<Item = RoutingKey>,
+        wake_keys: impl IntoIterator<Item = WakeKey>,
     ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
         let key_str = key.to_string();
-        let routing_keys: Vec<String> = routing.into_iter().map(|r| r.0).collect();
+        let wake_keys: Vec<String> = wake_keys.into_iter().map(|r| r.0).collect();
         let instance_config = serde_json::to_value(&cfg)?;
         // Boxed, not `Tables::highest_known_persistent_sequence(&self.pool)`
         // directly — see `read_frontier`'s rationale. Awaiting the raw
@@ -380,7 +391,7 @@ where
             op,
             self.job_type.as_str(),
             &key_str,
-            &routing_keys,
+            &wake_keys,
             instance_config,
             start_after,
         )

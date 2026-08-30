@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT key FROM subscriptions WHERE subscriber_type = $1 AND routing_keys && $2::varchar[]",
+  "query": "SELECT key FROM subscriptions WHERE subscriber_type = $1 AND wake_keys && $2::varchar[]",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       false
     ]
   },
-  "hash": "3656871068aa799596e1f68102242ba24be0e9530d605f2c91f9289ad1b474d5"
+  "hash": "7e8cffdcfef7243ced491926bdaccb40d6f9175ceb27fb344e6f1d6fe4bfe6ac"
 }

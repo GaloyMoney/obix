@@ -2,7 +2,7 @@
 //! wake-on-demand — the `subscriptions` table,
 //! `SubscriptionDef`/`KeyedSubscriber`, the hold verbs, the per-key runner,
 //! the `Subscriptions` capability, and both halves of the wake plane (the
-//! event-driven router and the periodic sweep that backstops it).
+//! event-driven waker and the periodic sweep that backstops it).
 
 mod helpers;
 
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use obix::{
     EventSequence, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, MailboxConfig,
-    RoutingKey, SubscriptionDef, out::Outbox,
+    SubscriptionDef, WakeKey, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -56,8 +56,8 @@ impl std::str::FromStr for OwnerId {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct InstanceConfig {
     /// Owners this subscription records for *in addition to* its own key.
-    /// Empty for every contract where the routing key and the domain key
-    /// coincide; non-empty only for the multi-routing-key contract, which
+    /// Empty for every contract where the wake key and the domain key
+    /// coincide; non-empty only for the multi-wake-key contract, which
     /// deliberately separates the two so a subscription can watch several
     /// partitions that are none of them its own id.
     #[serde(default)]
@@ -84,12 +84,12 @@ impl SubscriptionDef<TestEvent> for TestDef {
     type InstanceConfig = InstanceConfig;
     type Subscriber = RecordingSubscriber;
 
-    fn routing_key(
+    fn wake_keys(
         &self,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> impl IntoIterator<Item = RoutingKey> {
+    ) -> impl IntoIterator<Item = WakeKey> {
         match &event.payload {
-            Some(TestEvent::Ping { owner, .. }) => vec![RoutingKey::from(owner.to_string())],
+            Some(TestEvent::Ping { owner, .. }) => vec![WakeKey::from(owner.to_string())],
             None => vec![],
         }
     }
@@ -104,9 +104,9 @@ impl SubscriptionDef<TestEvent> for TestDef {
 }
 
 /// Records every `Ping` addressed to its own key. Every subscriber for one
-/// keyed subscriber type sees the WHOLE persistent stream (there is no
-/// server-side routing yet), so it must filter events belonging to other
-/// keys itself — exactly like a real per-entity consumer would.
+/// keyed subscriber type sees the WHOLE persistent stream — wake keys
+/// decide who runs, never who receives — so it must filter events belonging
+/// to other keys itself, exactly like a real per-entity consumer would.
 struct RecordingSubscriber {
     key: OwnerId,
     /// Extra owners to record for beyond `key`, from the instance config.
@@ -242,7 +242,7 @@ async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<(
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -288,7 +288,7 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -296,7 +296,7 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
         &mut op,
         OwnerId(2),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -342,7 +342,7 @@ async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resul
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -421,7 +421,7 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -461,7 +461,7 @@ async fn cancel_stops_delivery_and_the_sweep_never_revives_it() -> anyhow::Resul
 /// Contract — dormancy + sweep-wake: a caught-up member passivates to
 /// Dormant after `linger` elapses (no live execution), and the periodic
 /// sweep is what revives it to deliver events published while dormant —
-/// the backstop path, independent of whether the router ever fires.
+/// the backstop path, independent of whether the waker ever fires.
 #[tokio::test]
 #[file_serial]
 async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Result<()> {
@@ -483,7 +483,7 @@ async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Resu
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -527,13 +527,13 @@ async fn dormant_member_wakes_via_sweep_and_drains_the_backlog() -> anyhow::Resu
     Ok(())
 }
 
-/// Contract — router: a routed event wakes a Dormant member on its own,
+/// Contract — waker: a matching event wakes a Dormant member on its own,
 /// well inside the sweep interval, proving the event-driven wake is the fast
 /// path and not merely a side effect of the sweep also being armed. The
-/// subscription registers with a routing key matching its own owner id.
+/// subscription registers with a wake key matching its own owner id.
 #[tokio::test]
 #[file_serial]
-async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<()> {
+async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -543,7 +543,7 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
         shared: shared.clone(),
     };
     // A deliberately huge sweep interval: if the event is delivered well
-    // before this could ever fire, it can only have been the router.
+    // before this could ever fire, it can only have been the waker.
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
         .with_sweep_interval(Duration::from_secs(3600))
@@ -558,7 +558,7 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        vec![RoutingKey::from(OwnerId(1).to_string())],
+        vec![WakeKey::from(OwnerId(1).to_string())],
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -582,7 +582,7 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
     .await?;
 
     // Published while Dormant, with a sweep interval far longer than this
-    // test's patience — only the router can deliver this in time.
+    // test's patience — only the waker can deliver this in time.
     publish_ping(&outbox, 1, 2).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2])
@@ -592,10 +592,10 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
     Ok(())
 }
 
-/// Contract — router, multi-routing-key matching: the reason
-/// `subscriptions.routing_keys` is a set rather than a scalar.
+/// Contract — waker, multi-wake-key matching: the reason
+/// `subscriptions.wake_keys` is a set rather than a scalar.
 ///
-/// Every other contract here registers zero or one routing key, so the
+/// Every other contract here registers a single wake key, so the
 /// array-ness of the column, the `&&` overlap semantics and the
 /// `$2::varchar[]` cast are all exercised at cardinality one — which is
 /// exactly the cardinality at which the missing cast once compiled clean and
@@ -603,7 +603,7 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
 /// partitions, neither of which is its own key, and wakes it through each in
 /// turn:
 ///
-/// - woken by an event matching only its SECOND routing key (so a match on
+/// - woken by an event matching only its SECOND wake key (so a match on
 ///   the first element, or an equality comparison against a scalar, would
 ///   not explain the wake),
 /// - woken again by an event matching only its FIRST,
@@ -612,7 +612,7 @@ async fn router_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<(
 ///   cannot advance unless the member actually ran.
 #[tokio::test]
 #[file_serial]
-async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> anyhow::Result<()> {
+async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -621,8 +621,8 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
     let def = TestDef {
         shared: shared.clone(),
     };
-    // As in the router contract above: a sweep interval far beyond this
-    // test's patience, so any wake observed here can only be the router's.
+    // As in the waker contract above: a sweep interval far beyond this
+    // test's patience, so any wake observed here can only be the waker's.
     let config = KeyedSubscriberConfig::new(job::JobType::new(JOB_TYPE))
         .with_linger(TEST_LINGER)
         .with_sweep_interval(Duration::from_secs(3600))
@@ -634,7 +634,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
 
     // The watcher's key (10) is deliberately none of the partitions it
     // watches (7 and 8), so nothing about this can pass by conflating the
-    // domain key with a routing key.
+    // domain key with a wake key.
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
         &mut op,
@@ -642,7 +642,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
         InstanceConfig {
             watched: vec![7, 8],
         },
-        vec![RoutingKey::from("7"), RoutingKey::from("8")],
+        vec![WakeKey::from("7"), WakeKey::from("8")],
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -652,7 +652,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
         InstanceConfig {
             watched: vec![21, 22],
         },
-        vec![RoutingKey::from("21"), RoutingKey::from("22")],
+        vec![WakeKey::from("21"), WakeKey::from("22")],
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -687,7 +687,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
     // Dormant after a spurious wake had come and gone.
     let bystander_checkpoint = bystander.load().await?.checkpoint();
 
-    // Matches the watcher's SECOND routing key only.
+    // Matches the watcher's SECOND wake key only.
     publish_ping(&outbox, 8, 42).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 10).await == vec![42])
@@ -701,7 +701,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
     })
     .await?;
 
-    // Matches the watcher's FIRST routing key only.
+    // Matches the watcher's FIRST wake key only.
     publish_ping(&outbox, 7, 41).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 10).await == vec![42, 41])
@@ -716,7 +716,7 @@ async fn a_subscription_wakes_on_any_of_its_routing_keys_and_only_on_those() -> 
     assert_eq!(
         bystander.load().await?.checkpoint(),
         bystander_checkpoint,
-        "a subscription watching neither routing key must never be woken: \
+        "a subscription watching neither wake key must never be woken: \
          its durable checkpoint cannot advance without the member running"
     );
 
@@ -756,11 +756,11 @@ impl SubscriptionDef<TestEvent> for StagedDef {
     type InstanceConfig = InstanceConfig;
     type Subscriber = StagedSubscriber;
 
-    fn routing_key(
+    fn wake_keys(
         &self,
         _event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> impl IntoIterator<Item = RoutingKey> {
-        Vec::<RoutingKey>::new()
+    ) -> impl IntoIterator<Item = WakeKey> {
+        Vec::<WakeKey>::new()
     }
 
     fn instantiate(&self, key: Self::Key, _cfg: Self::InstanceConfig) -> Self::Subscriber {
@@ -937,7 +937,7 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -992,7 +992,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> 
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1050,7 +1050,7 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1133,7 +1133,7 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
                 &mut op,
                 OwnerId(1),
                 InstanceConfig::default(),
-                Vec::<RoutingKey>::new(),
+                Vec::<WakeKey>::new(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1166,7 +1166,7 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
 /// member would ever passivate on an outbox busier than `linger` — idle
 /// members would hold a live job forever, and `cancel` could not take effect
 /// until the entire stream went quiet. The sweep is parked far beyond this
-/// test's patience and no routing keys are registered, so nothing can revive
+/// test's patience and no wake keys are registered, so nothing can revive
 /// the member once it passivates.
 #[tokio::test]
 #[file_serial]
@@ -1196,7 +1196,7 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1291,7 +1291,7 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
         &mut op,
         OwnerId(1),
         InstanceConfig::default(),
-        Vec::<RoutingKey>::new(),
+        Vec::<WakeKey>::new(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;

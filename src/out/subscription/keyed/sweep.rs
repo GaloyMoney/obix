@@ -2,17 +2,17 @@
 //!
 //! A single per-process-independent resident job per keyed-subscriber type:
 //! on a timer, enumerate every currently-subscribed key and idempotently
-//! respawn it. Registered alongside the [`router`](super::router) as a
+//! respawn it. Registered alongside the [`waker`](super::waker) as a
 //! distinct resident job rather than fused into it — folding a sweep timer
 //! into the shared singleton runner loop would touch every registered
 //! singleton subscriber in the crate, not just this one.
 //!
-//! Complements the router: a fresh subscription is Active from birth (see
+//! Complements the waker: a fresh subscription is Active from birth (see
 //! [`Subscriptions::subscribe_in_op`](super::Subscriptions::subscribe_in_op))
-//! so it needs no wake until its first dormancy; from then on the router's
-//! liveness-only routing is the fast path, and the sweep is the backstop —
-//! the startup reconcile (a fresh process has no router state yet), the
-//! repair path (a routing-key bug or a lost wake), and the bound on
+//! so it needs no wake until its first dormancy; from then on the waker's
+//! liveness-only wake-key matching is the fast path, and the sweep is the
+//! backstop — the startup reconcile (a fresh process has no waker state
+//! yet), the repair path (a wake-key bug or a lost wake), and the bound on
 //! staleness under either.
 
 use serde::{Deserialize, Serialize};

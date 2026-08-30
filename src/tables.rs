@@ -337,13 +337,13 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// Insert a new subscription row, idempotently: a conflict on
     /// `(subscriber_type, key)` — an already-live subscription — resolves to
     /// success without overwriting the existing row's `start_after` or
-    /// `routing_keys`. Re-subscribing an already-subscribed key must never
+    /// `wake_keys`. Re-subscribing an already-subscribed key must never
     /// silently rewind or fast-forward its birth frontier.
     fn insert_subscription_in_op(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,
         key: &str,
-        routing_keys: &[String],
+        wake_keys: &[String],
         instance_config: serde_json::Value,
         start_after: EventSequence,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
@@ -376,15 +376,16 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_type: &str,
     ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
 
-    /// The keys of one subscriber type whose `routing_keys` intersects
-    /// `routing_keys` — the router's flush-time lookup, run **on the flush
-    /// op** so the wakes it drives and the router's own checkpoint commit
-    /// atomically. Liveness-only: an over-approximating false positive here
-    /// is a harmless empty wake, never a correctness gap.
-    fn subscription_keys_for_routing_keys(
+    /// The keys of one subscriber type whose declared `wake_keys` intersect
+    /// the `wake_keys` an event classified to — the waker's flush-time
+    /// lookup, run **on the flush op** so the wakes it drives and the
+    /// waker's own checkpoint commit atomically. Liveness-only: an
+    /// over-approximating false positive here is a harmless empty wake,
+    /// never a correctness gap.
+    fn subscription_keys_for_wake_keys(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,
-        routing_keys: &[String],
+        wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
 }
 
@@ -393,7 +394,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 /// knows from its own lookup.
 #[derive(Debug, Clone)]
 pub struct SubscriptionRow {
-    pub routing_keys: Vec<String>,
+    pub wake_keys: Vec<String>,
     pub instance_config: serde_json::Value,
     pub start_after: EventSequence,
     pub created_at: chrono::DateTime<chrono::Utc>,

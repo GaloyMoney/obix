@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT routing_keys, instance_config, start_after AS \"start_after!: i64\", created_at\n            FROM subscriptions\n            WHERE subscriber_type = $1 AND key = $2",
+  "query": "\n            SELECT wake_keys, instance_config, start_after AS \"start_after!: i64\", created_at\n            FROM subscriptions\n            WHERE subscriber_type = $1 AND key = $2",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "routing_keys",
+        "name": "wake_keys",
         "type_info": "VarcharArray"
       },
       {
@@ -37,5 +37,5 @@
       false
     ]
   },
-  "hash": "5df7e6f28f0788046010921aef33246f13b4081ceb6a2dee0e1380334fc8013f"
+  "hash": "ccef9db199e42bb92383deda71411dc8b2a5a593d25f5d4dab00113d9dd8f042"
 }

@@ -84,29 +84,37 @@ CREATE INDEX idx_inbox_events_status ON inbox_events(status)
 -- identity.
 --
 -- Row presence IS the subscription: absence means cancelled. This table
--- holds identity and terms only (key, routing keys, instance config, birth
+-- holds identity and terms only (key, wake keys, instance config, birth
 -- frontier); execution and progress (liveness, generations, attempts,
 -- watermark) live entirely in the job crate's own tables, addressed by
 -- (subscriber_type, key) through job's keyed-job machinery. Readers here
--- must never join against job-crate tables for routing (schema boundary).
+-- must never join against job-crate tables to decide wakes (schema
+-- boundary).
 --
--- `routing_keys` is a set, not a scalar: a subscription's identity is its
--- `key`, so watching several stream partitions cannot be expressed as extra
--- rows. Matching is set-overlap on both sides — an event classifies to a set
--- of routing keys, a subscription declares the set it watches, and the
--- router wakes on intersection.
+-- `wake_keys` are a liveness signal, NOT a delivery filter: a live member
+-- reads the whole stream from its own cursor and decides per event in its
+-- own handler. These keys only decide whom to *wake* when a member has
+-- passivated. Matching is set-overlap on both sides — an event classifies
+-- to a set of wake keys, a subscription declares the set it watches, and an
+-- intersection respawns it. Never empty (rejected at subscribe time): an
+-- empty set overlaps nothing, so such a row could never be woken again once
+-- it passivated.
+--
+-- A set rather than a scalar because a subscription's identity is its
+-- `key`, so watching several partitions of the stream cannot be expressed
+-- as extra rows.
 CREATE TABLE subscriptions (
   subscriber_type  VARCHAR NOT NULL,
   key              VARCHAR NOT NULL,
-  routing_keys     VARCHAR[] NOT NULL,
+  wake_keys        VARCHAR[] NOT NULL,
   instance_config  JSONB NOT NULL,
   start_after      BIGINT NOT NULL,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (subscriber_type, key)
 );
 
--- Backs the router's flush-time lookup: `WHERE subscriber_type = $1 AND
--- routing_keys && $2::varchar[]`. The cast is load-bearing — Postgres has no
+-- Backs the waker's flush-time lookup: `WHERE subscriber_type = $1 AND
+-- wake_keys && $2::varchar[]`. The cast is load-bearing — Postgres has no
 -- implicit varchar[]/text[] cast for `&&`, and sqlx infers text[] for an
 -- untyped array parameter.
-CREATE INDEX idx_subscriptions_routing_keys ON subscriptions USING GIN (routing_keys);
+CREATE INDEX idx_subscriptions_wake_keys ON subscriptions USING GIN (wake_keys);
