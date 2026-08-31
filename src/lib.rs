@@ -28,7 +28,7 @@ pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,
 };
-pub use obix_macros::{MailboxTables, OutboxEvent};
+pub use obix_macros::{MailboxTables, OutboxEvent, OutboxEventKind};
 pub use out::{
     BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
     HandlerCheckpointError, HandlerSnapshot, HandlerStreamStatus, IsolatedOp, OpCursor, Outbox,
