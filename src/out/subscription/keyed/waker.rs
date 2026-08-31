@@ -273,17 +273,35 @@ where
         // guard is alive across the awaits below.
         let routes: Vec<Arc<dyn WakeRoute<P>>> =
             self.routes.read().expect("wake routes poisoned").clone();
+        let route_idx: HashMap<&str, usize> = routes
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| (r.subscriber_type(), idx))
+            .collect();
 
-        for (idx, keys) in per_route {
-            let Some(route) = routes.get(idx) else {
-                continue;
-            };
-            let wake_keys: Vec<String> = keys.into_iter().map(|k| k.0).collect();
-            // @@ seems like an n+1 - can we batch the query and spawn fns?
-            let subscribed =
-                Tables::subscription_keys_for_wake_keys(op, route.subscriber_type(), &wake_keys)
-                    .await?;
-            self.spawn_all(op, route, subscribed).await?;
+        // Both paths select `(subscriber_type, key)` and both feed this, so
+        // the whole flush issues one lookup per path and one spawn call per
+        // registered type — never one per key, and never one per key twice
+        // for a member both paths select.
+        let mut to_wake: HashMap<usize, HashSet<String>> = HashMap::new();
+
+        // The wake-key path, as one query zipping every type's matches
+        // together (see `subscriptions_for_wake_keys`).
+        let (types, wake_keys): (Vec<String>, Vec<String>) = per_route
+            .into_iter()
+            .filter_map(|(idx, keys)| routes.get(idx).map(|route| (route, keys)))
+            .flat_map(|(route, keys)| {
+                keys.into_iter()
+                    .map(|key| (route.subscriber_type().to_string(), key.0))
+            })
+            .unzip();
+        for (subscriber_type, key) in Tables::subscriptions_for_wake_keys(op, &types, &wake_keys)
+            .await?
+            .into_iter()
+        {
+            if let Some(idx) = route_idx.get(subscriber_type.as_str()) {
+                to_wake.entry(*idx).or_default().insert(key);
+            }
         }
 
         // The catch-up pass: whoever has fallen far enough behind that a
@@ -300,20 +318,23 @@ where
             let behind =
                 Tables::subscriptions_behind(op, &registered, below, CATCH_UP_WAKE_LIMIT).await?;
             for (subscriber_type, key) in behind {
-                let Some(route) = routes
-                    .iter()
-                    .find(|r| r.subscriber_type() == subscriber_type)
-                else {
-                    continue;
-                };
-                // @@ seems like an n+1 - can we batch the spawn
-                self.spawn_all(op, route, vec![key]).await?;
+                if let Some(idx) = route_idx.get(subscriber_type.as_str()) {
+                    to_wake.entry(*idx).or_default().insert(key);
+                }
             }
             // Claimed only if all of this lands: the hook runs after commit.
             let _ = op.add_commit_hook(CatchUpClaimed {
                 cell: self.last_catch_up.clone(),
                 head: u64::from(head),
             });
+        }
+
+        for (idx, keys) in to_wake {
+            let Some(route) = routes.get(idx) else {
+                continue;
+            };
+            self.spawn_all(op, route, keys.into_iter().collect())
+                .await?;
         }
         Ok(())
     }

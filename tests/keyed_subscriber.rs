@@ -113,6 +113,38 @@ impl SubscriptionDef<TestEvent> for TestDef {
     }
 }
 
+/// A second subscriber type whose classification is *namespaced*: the same
+/// event yields `p:{owner}` here where [`TestDef`] yields `{owner}`. Used by
+/// the cross-type wake-key contract; everything else about it is `TestDef`.
+struct PrefixedDef {
+    shared: Shared,
+}
+
+impl SubscriptionDef<TestEvent> for PrefixedDef {
+    type Key = OwnerId;
+    type InstanceConfig = InstanceConfig;
+    type Subscriber = RecordingSubscriber;
+
+    fn wake_keys(
+        &self,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> impl IntoIterator<Item = WakeKey> {
+        match &event.payload {
+            Some(TestEvent::Ping { owner, .. }) => vec![WakeKey::from(format!("p:{owner}"))],
+            None => vec![],
+        }
+    }
+
+    fn instantiate(&self, key: Self::Key, cfg: Self::InstanceConfig) -> Self::Subscriber {
+        RecordingSubscriber {
+            key,
+            watched: cfg.watched,
+            work_ms: cfg.work_ms,
+            shared: self.shared.clone(),
+        }
+    }
+}
+
 /// Records every `Ping` addressed to its own key. Every subscriber for one
 /// keyed subscriber type sees the WHOLE persistent stream — wake keys
 /// decide who runs, never who receives — so it must filter events belonging
@@ -1112,6 +1144,122 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
     })
     .await?;
 
+    Ok(())
+}
+
+/// Contract — a wake key belongs to its own subscriber type.
+///
+/// The waker resolves every registered type's matches in ONE query, which is
+/// only sound while that query keeps `(subscriber_type, wake key)` paired.
+/// Here the two types classify the same event differently — `TestDef` to
+/// `"1"`, `PrefixedDef` to `"p:1"` — and the `PrefixedDef` subscription
+/// declares `"1"`, a key its own type never produces. It must not be woken.
+///
+/// A union query (every registered type against every key the batch
+/// collected) passes every other contract in this file, including the
+/// shared-waker one above where both types classify identically, and fails
+/// only here.
+///
+/// The negative is anchored: the first type's member receiving the same
+/// event proves the waker processed it, so the second's silence is a result
+/// rather than a race.
+#[tokio::test]
+#[file_serial]
+async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+    wipeout_keyed_subscriber_job_tables(&pool, SECOND_JOB_TYPE).await?;
+    wipeout_subscriptions(&pool, SECOND_JOB_TYPE).await?;
+
+    let plain_shared = Shared::default();
+    let prefixed_shared = Shared::default();
+    let plain = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: plain_shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prefixed = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            KeyedSubscriberConfig::new(job::JobType::new(SECOND_JOB_TYPE))
+                .with_linger(TEST_LINGER)
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            PrefixedDef {
+                shared: prefixed_shared.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    plain
+        .subscribe_in_op(
+            &mut op,
+            OwnerId(1),
+            InstanceConfig::default(),
+            wake_keys_for(OwnerId(1)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Deliberately the *other* type's wake key: `PrefixedDef` classifies this
+    // event to "p:1" and never to "1".
+    prefixed
+        .subscribe_in_op(
+            &mut op,
+            OwnerId(1),
+            InstanceConfig::default(),
+            WakeKey::from("1"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    // Both are Active on subscribe and a live member reads the whole stream,
+    // so the first event lands in both. Wake keys only matter from here on.
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 1).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&plain_shared, 1).await == vec![1]
+            && received_for(&prefixed_shared, 1).await == vec![1])
+    })
+    .await?;
+
+    let plain_sub = plain
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prefixed_sub = prefixed
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eventually(Duration::from_secs(10), || {
+        let (plain_sub, prefixed_sub) = (plain_sub.clone(), prefixed_sub.clone());
+        async move {
+            Ok(plain_sub.load().await?.job_status().is_terminal()
+                && prefixed_sub.load().await?.job_status().is_terminal())
+        }
+    })
+    .await?;
+
+    publish_ping(&outbox, 1, 2).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&plain_shared, 1).await == vec![1, 2])
+    })
+    .await?;
+
+    assert_eq!(
+        received_for(&prefixed_shared, 1).await,
+        vec![1],
+        "a subscription must not be woken by a key its own type never classifies to"
+    );
+
+    jobs.shutdown().await?;
     Ok(())
 }
 

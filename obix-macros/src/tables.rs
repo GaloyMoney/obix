@@ -432,14 +432,27 @@ FROM {}persistent_outbox_events_sequence_seq",
         // The waker's flush-time lookup: liveness-only, so an
         // over-approximating false positive here is a harmless empty wake,
         // never a correctness gap.
-        // The `$2::varchar[]` cast is required, not decorative: Postgres has
-        // no `varchar[] && text[]` operator (unlike scalar varchar/text,
-        // array element types do not implicitly cast for `&&`), and sqlx's
-        // compile-time check does not catch it — DESCRIBE happily infers
-        // `text[]` for an untyped array parameter, so an uncast `$2` compiles
-        // clean and fails at EXECUTE time on every call, on live data only.
-        let subscription_keys_for_wake_keys_query = format!(
-            r#"SELECT key FROM {tbl}subscriptions WHERE subscriber_type = $1 AND wake_keys && $2::varchar[]"#,
+        //
+        // One query for every registered type at once. `$1`/`$2` are parallel
+        // arrays zipped by `unnest` into (subscriber_type, wake key) pairs, so
+        // batching costs no precision: a type only ever matches against its
+        // own keys, never against another type's that happens to collide.
+        //
+        // The `::varchar[]` casts are required, not decorative: Postgres has
+        // no `varchar[] @> text[]` operator (unlike scalar varchar/text, array
+        // element types do not implicitly cast for the containment operators),
+        // and sqlx's compile-time check does not catch it — DESCRIBE happily
+        // infers `text[]` for an untyped array parameter, so an uncast
+        // parameter compiles clean and fails at EXECUTE time on every call, on
+        // live data only. `@> ARRAY[...]` rather than `= ANY(...)` so the GIN
+        // index on `wake_keys` is usable for each zipped pair.
+        let subscriptions_for_wake_keys_query = format!(
+            r#"
+            SELECT DISTINCT s.subscriber_type AS "subscriber_type!", s.key AS "key!"
+            FROM {tbl}subscriptions s
+            JOIN unnest($1::varchar[], $2::varchar[]) AS q(subscriber_type, wake_key)
+              ON s.subscriber_type = q.subscriber_type
+             AND s.wake_keys @> ARRAY[q.wake_key]::varchar[]"#,
             tbl = table_prefix
         );
 
@@ -1253,28 +1266,32 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn subscription_keys_for_wake_keys(
+                fn subscriptions_for_wake_keys(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
-                    subscriber_type: &str,
+                    subscriber_types: &[String],
                     wake_keys: &[String],
-                ) -> impl std::future::Future<Output = Result<Vec<String>, #crate_name::prelude::sqlx::Error>> + Send {
+                ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
-                    let subscriber_type = subscriber_type.to_string();
+                    let subscriber_types = subscriber_types.to_vec();
                     let wake_keys = wake_keys.to_vec();
 
                     async move {
+                        debug_assert_eq!(subscriber_types.len(), wake_keys.len());
                         if wake_keys.is_empty() {
                             return Ok(Vec::new());
                         }
                         let rows = sqlx::query!(
-                            #subscription_keys_for_wake_keys_query,
-                            subscriber_type,
+                            #subscriptions_for_wake_keys_query,
+                            &subscriber_types as _,
                             &wake_keys as _,
                         )
                         .fetch_all(op.as_executor())
                         .await?;
-                        Ok(rows.into_iter().map(|row| row.key).collect())
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| (row.subscriber_type, row.key))
+                            .collect())
                     }
                 }
             }

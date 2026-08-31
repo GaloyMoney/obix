@@ -403,17 +403,22 @@ pub trait MailboxTables: Send + Sync + 'static {
         limit: i64,
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
 
-    /// The keys of one subscriber type whose declared `wake_keys` intersect
-    /// the `wake_keys` an event classified to — the waker's flush-time
-    /// lookup, run **on the flush op** so the wakes it drives and the
-    /// waker's own checkpoint commit atomically. Liveness-only: an
-    /// over-approximating false positive here is a harmless empty wake,
-    /// never a correctness gap.
-    fn subscription_keys_for_wake_keys(
+    /// The `(subscriber_type, key)` of every subscription whose declared
+    /// `wake_keys` contain a key the batch classified an event to for that
+    /// same type — the waker's flush-time lookup, run **on the flush op** so
+    /// the wakes it drives and the waker's own checkpoint commit atomically.
+    /// Liveness-only: an over-approximating false positive here is a harmless
+    /// empty wake, never a correctness gap.
+    ///
+    /// `subscriber_types` and `wake_keys` are **parallel arrays**: element `i`
+    /// of each names one (type, wake key) pair to match. One query covers
+    /// every registered type without losing per-type precision — a type is
+    /// never matched against another type's keys.
+    fn subscriptions_for_wake_keys(
         op: &mut impl es_entity::AtomicOperation,
-        subscriber_type: &str,
+        subscriber_types: &[String],
         wake_keys: &[String],
-    ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
+    ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
 }
 
 /// One subscription's identity and terms, as stored — everything but the
