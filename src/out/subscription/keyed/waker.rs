@@ -49,7 +49,7 @@ use std::sync::{Arc, RwLock};
 
 use job::JobType;
 
-use super::{KeyMsg, SubscriptionDef, WakeKey, derived_job_type};
+use super::{KeyMsg, SubscriptionDef, WakeKey};
 use es_entity::AtomicOperation as _;
 
 use crate::out::ctx::{EventCtx, FlushOp, Handled};
@@ -174,11 +174,11 @@ where
 }
 
 /// The waker's job type, scoped to the outbox rather than to any one
-/// subscriber type: `{persistent table}.keyed-waker`, `'static`-leaked once
-/// at registration (see [`derived_job_type`]). Two outboxes in one process
-/// have different persistent tables and so cannot collide.
+/// subscriber type: [`MailboxTables::KEYED_WAKER_JOB_TYPE`], i.e.
+/// `{persistent table}.keyed-waker`. Two outboxes in one process have
+/// different persistent tables and so cannot collide.
 pub(in crate::out) fn waker_job_type<Tables: MailboxTables>() -> JobType {
-    derived_job_type(Tables::persistent_outbox_events_table(), "keyed-waker")
+    JobType::new(Tables::KEYED_WAKER_JOB_TYPE)
 }
 
 /// Construct the waker handler — a plain [`SingletonSubscriber`], registered
@@ -279,6 +279,7 @@ where
                 continue;
             };
             let wake_keys: Vec<String> = keys.into_iter().map(|k| k.0).collect();
+            // @@ seems like an n+1 - can we batch the query and spawn fns?
             let subscribed =
                 Tables::subscription_keys_for_wake_keys(op, route.subscriber_type(), &wake_keys)
                     .await?;
@@ -305,6 +306,7 @@ where
                 else {
                     continue;
                 };
+                // @@ seems like an n+1 - can we batch the spawn
                 self.spawn_all(op, route, vec![key]).await?;
             }
             // Claimed only if all of this lands: the hook runs after commit.

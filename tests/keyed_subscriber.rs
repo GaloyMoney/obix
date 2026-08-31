@@ -572,13 +572,19 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
         "a cancelled key must never process events published after cancellation"
     );
 
-    let members = subs.members().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Row absence is the tombstone, so assert on the table itself: the
+    // cancelled key's row is gone and the bystander's is untouched.
+    let live: Vec<String> = sqlx::query_scalar!(
+        "SELECT key FROM subscriptions WHERE subscriber_type = $1 ORDER BY key",
+        JOB_TYPE
+    )
+    .fetch_all(&pool)
+    .await?;
     assert_eq!(
-        members.len(),
-        1,
-        "members() must enumerate the live key and not the cancelled one"
+        live,
+        vec![OwnerId(2).to_string()],
+        "cancel must delete the subscription row and leave the bystander's"
     );
-    assert_eq!(members[0].0, OwnerId(2));
 
     Ok(())
 }
@@ -1669,10 +1675,6 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         op.commit().await?;
 
-        spawned_subs
-            .members()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
         spawned_subs
             .subscription(&OwnerId(1))
             .await

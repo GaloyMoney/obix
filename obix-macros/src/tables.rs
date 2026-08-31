@@ -108,6 +108,11 @@ impl ToTokens for MailboxTables {
         // (`{table}_sequence_seq`) from it.
         let persistent_outbox_events_table = format!("{}persistent_outbox_events", table_prefix);
 
+        // The keyed waker is one job per outbox, so its type is scoped to the
+        // persistent table rather than to any subscriber type. Composed here,
+        // at expansion time, so the generated const is a plain literal.
+        let keyed_waker_job_type = format!("{}.keyed-waker", persistent_outbox_events_table);
+
         let highest_known_query = format!(
             "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
 FROM {}persistent_outbox_events_sequence_seq",
@@ -424,11 +429,6 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        let list_subscription_keys_query = format!(
-            r#"SELECT key FROM {tbl}subscriptions WHERE subscriber_type = $1 ORDER BY key"#,
-            tbl = table_prefix
-        );
-
         // The waker's flush-time lookup: liveness-only, so an
         // over-approximating false positive here is a harmless empty wake,
         // never a correctness gap.
@@ -458,6 +458,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn persistent_outbox_events_table() -> &'static str {
                     #persistent_outbox_events_table
                 }
+
+                const KEYED_WAKER_JOB_TYPE: &'static str = #keyed_waker_job_type;
 
                 // === Outbox methods ===
 
@@ -1195,21 +1197,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                             start_after: #crate_name::EventSequence::from(row.start_after as u64),
                             created_at: row.created_at,
                         }))
-                    }
-                }
-
-                fn list_subscription_keys(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    subscriber_type: &str,
-                ) -> impl std::future::Future<Output = Result<Vec<String>, #crate_name::prelude::sqlx::Error>> + Send {
-                    let pool = pool.clone();
-                    let subscriber_type = subscriber_type.to_string();
-
-                    async move {
-                        let rows = sqlx::query!(#list_subscription_keys_query, subscriber_type)
-                            .fetch_all(&pool)
-                            .await?;
-                        Ok(rows.into_iter().map(|row| row.key).collect())
                     }
                 }
 

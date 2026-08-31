@@ -2,11 +2,6 @@
 //! webhook endpoint), created and destroyed transactionally with the entity,
 //! each with its own durable cursor, costing nothing while idle.
 //!
-//! Where a [`singleton`](super::singleton) subscriber exists because code
-//! declares it, a keyed subscriber exists because *data* creates it — one
-//! per key, cancellable, its subscription an explicit row in the
-//! `subscriptions` table (row absence = cancelled).
-//!
 //! obix owns identity and terms (this module + the `subscriptions` table);
 //! the `job` crate owns execution and progress (liveness, generations,
 //! attempts, watermark) via its keyed-job machinery, addressed by
@@ -20,11 +15,8 @@
 //! [`runner`] (the per-key job, one per type) and [`waker`] (the whole wake
 //! plane, one per *outbox*, holding one erased route per registered type).
 //!
-//! There is no periodic reconciler. Every wake is driven by the stream:
-//! wake-key matches for arrivals, and cache-pressure catch-up for members
-//! drifting toward a cold read. A timer would have to run — and cost a job
-//! slot per process — whether or not anything had happened, which on a quiet
-//! outbox is exactly when there is nothing for it to find.
+//! Every wake is driven by the stream: wake-key matches for arrivals, and
+//! cache-pressure catch-up for members drifting toward a cold read.
 
 mod runner;
 mod waker;
@@ -401,48 +393,7 @@ pub(in crate::out) struct KeyMsg {
     key: String,
 }
 
-/// Enumerate one subscriber type's subscribed keys.
-///
-/// Boxed for the same reason
-/// [`read_frontier`](crate::out::subscription::read_frontier) is, and the box
-/// is equally load-bearing: [`MailboxTables`]'s methods return opaque futures
-/// that capture their executor argument's lifetime, and awaiting one behind
-/// `&self` makes the enclosing future's `Send`-ness higher-ranked — which
-/// compiles here and then fails at any caller that `tokio::spawn`s it with
-/// "implementation of `Send` is not general enough". Owning the pool and
-/// erasing the future behind a box grounds the lifetime.
-async fn list_subscription_keys<Tables: MailboxTables>(
-    pool: &sqlx::PgPool,
-    subscriber_type: &str,
-) -> Result<Vec<String>, sqlx::Error> {
-    let pool = pool.clone();
-    let subscriber_type = subscriber_type.to_string();
-    let fut: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>, sqlx::Error>> + Send>,
-    > = Box::pin(async move { Tables::list_subscription_keys(&pool, &subscriber_type).await });
-    fut.await
-}
-
-/// Build a `'static` job type from a runtime string, once, at registration.
-/// `job::JobType::new` only accepts `&'static str`; leaking a handful of
-/// small strings once per process startup (one per registered keyed
-/// subscriber type) for identifiers that live for the process's whole
-/// lifetime is the standard, safe way to bridge that — not an ongoing leak.
-fn derived_job_type(base: &str, suffix: &str) -> JobType {
-    let s: &'static str = Box::leak(format!("{base}.{suffix}").into_boxed_str());
-    JobType::new(s)
-}
-
 // === Subscriptions capability ===
-
-/// One entry of [`Subscriptions::members`]: a subscribed key paired with its
-/// observable [`Subscription`].
-pub type SubscriptionMember<D, P, Tables> =
-    (<D as SubscriptionDef<P>>::Key, Subscription<P, Tables>);
-
-/// [`Subscriptions::members`]'s return type.
-pub type Members<D, P, Tables> =
-    Result<Vec<SubscriptionMember<D, P, Tables>>, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Capability returned by
 /// [`Outbox::register_keyed_subscriber`](crate::out::Outbox::register_keyed_subscriber):
@@ -628,38 +579,5 @@ where
             key_str,
             self.pool.clone(),
         ))
-    }
-
-    /// Every currently-subscribed key, paired with its observable
-    /// [`Subscription`]. Enumerates the `subscriptions` table (the truth),
-    /// not job-crate handles — a job row may outlive a cancelled
-    /// subscription.
-    #[tracing::instrument(name = "obix.subscriptions.members", skip_all, err)]
-    pub async fn members(&self) -> Members<D, P, Tables> {
-        let keys = list_subscription_keys::<Tables>(&self.pool, self.job_type.as_str()).await?;
-        let mut members = Vec::with_capacity(keys.len());
-        for key_str in keys {
-            let Ok(key) = key_str.parse::<D::Key>() else {
-                continue;
-            };
-            if self
-                .jobs
-                .keyed_handle(self.job_type.clone(), key_str.clone())
-                .await?
-                .is_none()
-            {
-                continue;
-            }
-            members.push((
-                key,
-                Subscription::new_keyed(
-                    self.jobs.clone(),
-                    self.job_type.clone(),
-                    key_str,
-                    self.pool.clone(),
-                ),
-            ));
-        }
-        Ok(members)
     }
 }

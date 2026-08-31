@@ -31,11 +31,11 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
-    KeyedSubscriber, KeyedSubscriberConfig, Members, OpCursor, Outbox, OutboxEventJobConfig,
+    KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedEvent,
     StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
-    SubscriptionMember, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
-    UndecodableEventError, WakeKey, WakeKeys,
+    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, UndecodableEventError, WakeKey,
+    WakeKeys,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

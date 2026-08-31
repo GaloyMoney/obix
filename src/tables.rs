@@ -296,6 +296,11 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// from it.
     fn persistent_outbox_events_table() -> &'static str;
 
+    /// Job type of this outbox's keyed waker: `{persistent table}.keyed-waker`.
+    /// Composed at macro-expansion time so the waker's `job::JobType` — which
+    /// only accepts `&'static str` — needs no runtime formatting and no leak.
+    const KEYED_WAKER_JOB_TYPE: &'static str;
+
     // === Inbox methods ===
 
     fn insert_inbox_event<P>(
@@ -365,16 +370,6 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_type: &str,
         key: &str,
     ) -> impl Future<Output = Result<Option<SubscriptionRow>, sqlx::Error>> + Send;
-
-    /// Every currently-subscribed key of one subscriber type, in a stable
-    /// order. Backs
-    /// [`Subscriptions::members`](crate::out::Subscriptions::members) — never
-    /// `keyed_handles`, since a job row may outlive a cancelled subscription;
-    /// this table is the truth.
-    fn list_subscription_keys(
-        pool: &sqlx::PgPool,
-        subscriber_type: &str,
-    ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
 
     /// Advance one subscription's mirrored cursor, in the caller's op so it
     /// shares the fate of the job checkpoint it copies. Monotonic: a lower

@@ -23,8 +23,8 @@ pub use self::ctx::{
     EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedEvent, StagedOp,
 };
 pub use self::subscription::keyed::{
-    KeyedSubscriber, KeyedSubscriberConfig, Members, SubscribeError, SubscriptionDef,
-    SubscriptionMember, Subscriptions, WakeKey, WakeKeys,
+    KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,
+    WakeKey, WakeKeys,
 };
 pub use self::subscription::singleton::{
     OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
