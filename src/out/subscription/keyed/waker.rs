@@ -17,7 +17,7 @@
 //! promises `wake_keys` is synchronous, DB-free and cheap.
 //!
 //! Liveness-only by construction: a false-positive match costs one harmless
-//! empty spawn (resolves to the live holder, or an empty lookup for an
+//! wake (pulls a live holder's deadline forward, or an empty lookup for an
 //! unsubscribed key — the majority case). Wake keys must never gate
 //! delivery, so they are never consulted by the per-key runner itself — only
 //! by this waker, to decide who to wake.
@@ -283,7 +283,9 @@ where
         // the whole flush issues one lookup per path and one spawn call per
         // registered type — never one per key, and never one per key twice
         // for a member both paths select.
-        let mut to_wake: HashMap<usize, HashSet<String>> = HashMap::new();
+        // Key -> whether the wake may pull a live holder forward: a wake-key
+        // match is a real arrival and may, a catch-up wake may not.
+        let mut to_wake: HashMap<usize, HashMap<String, bool>> = HashMap::new();
 
         // The wake-key path, as one query zipping every type's matches
         // together (see `subscriptions_for_wake_keys`).
@@ -300,7 +302,7 @@ where
             .into_iter()
         {
             if let Some(idx) = route_idx.get(subscriber_type.as_str()) {
-                to_wake.entry(*idx).or_default().insert(key);
+                to_wake.entry(*idx).or_default().insert(key, true);
             }
         }
 
@@ -319,7 +321,7 @@ where
                 Tables::subscriptions_behind(op, &registered, below, CATCH_UP_WAKE_LIMIT).await?;
             for (subscriber_type, key) in behind {
                 if let Some(idx) = route_idx.get(subscriber_type.as_str()) {
-                    to_wake.entry(*idx).or_default().insert(key);
+                    to_wake.entry(*idx).or_default().entry(key).or_insert(false);
                 }
             }
             // Claimed only if all of this lands: the hook runs after commit.
@@ -393,14 +395,21 @@ where
         &self,
         op: &mut FlushOp<'_>,
         route: &Arc<dyn WakeRoute<P>>,
-        keys: Vec<String>,
+        keys: Vec<(String, bool)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if keys.is_empty() {
             return Ok(());
         }
         let specs = keys
             .into_iter()
-            .map(|key| job::KeyedJobSpec::new(key.clone(), KeyMsg { key }))
+            .map(|(key, pull_forward)| {
+                let spec = job::KeyedJobSpec::new(key.clone(), KeyMsg { key });
+                if pull_forward {
+                    spec.force_reschedule()
+                } else {
+                    spec
+                }
+            })
             .collect();
         route.spawner().spawn_all_in_op(op, specs).await?;
         Ok(())
