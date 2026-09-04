@@ -32,10 +32,12 @@ CREATE TABLE persistent_outbox_events_default
 
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (
-  event_type VARCHAR NOT NULL UNIQUE,
+  event_type VARCHAR NOT NULL,
+  conflation_key VARCHAR NOT NULL DEFAULT '',
   payload JSONB NOT NULL,
   tracing_context JSONB,
-  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(event_type, conflation_key)
 );
 
 -- SECURITY: the ephemeral notification is a hint, not a transport.

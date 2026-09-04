@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO ephemeral_outbox_events (event_type, conflation_key, payload, tracing_context, recorded_at)\n            VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW()))\n            ON CONFLICT (event_type, conflation_key) DO UPDATE\n            SET payload = EXCLUDED.payload,\n                tracing_context = EXCLUDED.tracing_context,\n                recorded_at = COALESCE($5::timestamptz, NOW())\n            RETURNING recorded_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Jsonb",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5196caad617bacfb020ac7c16fe8273722cb7e5f12580d9ec7ccbcaa25d78ad1"
+}

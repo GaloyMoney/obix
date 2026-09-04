@@ -5,7 +5,7 @@ use es_entity::hooks::HookOperation;
 use crate::{
     inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{
-        DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
+        DecodeFailure, EphemeralEventKey, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
         PersistentOutboxEvent, UndecodableEventError,
     },
     sequence::*,
@@ -267,6 +267,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         now: Option<chrono::DateTime<chrono::Utc>>,
         event_type: EphemeralEventType,
+        conflation_key: EphemeralEventKey,
         payload: P,
     ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
     where
@@ -275,6 +276,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     fn persist_ephemeral_event_in_op<'a, P>(
         op: &mut HookOperation<'a>,
         event_type: EphemeralEventType,
+        conflation_key: EphemeralEventKey,
         payload: P,
     ) -> impl Future<Output = Result<EphemeralOutboxEvent<P>, sqlx::Error>> + Send
     where

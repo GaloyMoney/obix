@@ -1705,6 +1705,117 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_events_conflation_keys_are_independent() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let event_type = obix::out::EphemeralEventType::new("keyed_type");
+    let key_a = obix::out::EphemeralEventKey::new("provider-a");
+    let key_b = obix::out::EphemeralEventKey::new("provider-b");
+
+    // Two keys of the same event type coexist; republishing one key
+    // overwrites only its own slot.
+    outbox
+        .publish_ephemeral_with_key(event_type.clone(), key_a.clone(), TestEvent::Ping(1))
+        .await?;
+    outbox
+        .publish_ephemeral_with_key(event_type.clone(), key_b.clone(), TestEvent::Ping(2))
+        .await?;
+    outbox
+        .publish_ephemeral_with_key(event_type.clone(), key_a.clone(), TestEvent::Ping(3))
+        .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Backfill delivers the latest event per (type, key) — two slots, not one.
+    let mut listener = outbox.listen_ephemeral();
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        received.push(
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
+                .await?
+                .expect("should have event"),
+        );
+    }
+
+    let latest_for = |key: &obix::out::EphemeralEventKey| {
+        received
+            .iter()
+            .find(|e| e.event_type == event_type && &e.conflation_key == key)
+            .map(|e| match e.payload {
+                TestEvent::Ping(n) => n,
+                _ => panic!("unexpected payload"),
+            })
+    };
+    assert_eq!(
+        latest_for(&key_a),
+        Some(3),
+        "key A slot holds only its latest"
+    );
+    assert_eq!(
+        latest_for(&key_b),
+        Some(2),
+        "key B slot is untouched by key A republish"
+    );
+
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(200), listener.next()).await;
+    assert!(
+        extra.is_err(),
+        "backfill should not yield superseded events"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_events_keyless_publish_uses_default_key() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    // Keyless publishes share the default '' slot, preserving the legacy
+    // one-row-per-event_type behavior.
+    let event_type = obix::out::EphemeralEventType::new("keyless_type");
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(1))
+        .await?;
+    outbox
+        .publish_ephemeral(event_type.clone(), TestEvent::Ping(2))
+        .await?;
+
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT count(*)::bigint FROM ephemeral_outbox_events WHERE event_type = 'keyless_type'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 1);
+
+    let (key,): (String,) = sqlx::query_as(
+        "SELECT conflation_key FROM ephemeral_outbox_events WHERE event_type = 'keyless_type'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(key, "");
+
+    Ok(())
+}
+
 /// Regression: an event whose NOTIFY fires while the LISTEN connection is
 /// down must still reach consumers.
 ///

@@ -5,18 +5,16 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
-use crate::out::event::{EphemeralEventType, EphemeralOutboxEvent};
+use crate::out::event::EphemeralOutboxEvent;
+
+use super::cache::EphemeralCacheMapEntry;
 
 enum BackfillState<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    WaitingForHashMap(
-        oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
-    ),
-    IteratingHashMap(
-        im::hashmap::ConsumingIter<(EphemeralEventType, Arc<EphemeralOutboxEvent<P>>)>,
-    ),
+    WaitingForHashMap(oneshot::Receiver<super::cache::EphemeralCacheMap<P>>),
+    IteratingHashMap(im::hashmap::ConsumingIter<EphemeralCacheMapEntry<P>>),
 
     Done,
 }
