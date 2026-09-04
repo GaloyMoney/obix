@@ -610,6 +610,15 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
         })
     }
 
+    /// The resume token, if one was written while processing *this* event
+    /// — see [`StagedOp::resume`]. Readable before [`consume`](Self::consume)
+    /// because it is in-memory state the runner already loaded: a subscriber
+    /// can decide where a run begins, or that the event is not its to
+    /// handle and [`skip`](Self::skip) it, before anything is opened.
+    pub fn resume<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        resume_token(self.parts.state, self.event_seq)
+    }
+
     /// My cursor holds *before* this event until `at` — entry and exit in
     /// one, nothing to record.
     ///
