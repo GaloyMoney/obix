@@ -512,6 +512,75 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     Ok(())
 }
 
+/// Contract — wake: a pause is cut short by traffic, never by the match
+/// for the paused event itself. With the pause an hour out, an event for
+/// the same key behind the paused one wakes the member, which re-reads the
+/// paused event (delivered, since the hold was one-shot) and then the new
+/// one — long before the deadline.
+#[tokio::test]
+#[file_serial]
+async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let def = TestDef {
+        shared: shared.clone(),
+    };
+    let subs = outbox
+        .register_keyed_subscriber(&mut jobs, test_config(), def)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(
+        &mut op,
+        OwnerId(1),
+        InstanceConfig::default(),
+        wake_keys_for(OwnerId(1)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    op.commit().await?;
+
+    let pause_until = chrono::Utc::now() + chrono::Duration::hours(1);
+    shared.hold_once.lock().await.insert(1, pause_until);
+
+    jobs.start_poll().await?;
+    publish_ping(&outbox, 1, 7).await?;
+
+    let subscription = subs
+        .subscription(&OwnerId(1))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Parked: the only wake so far was the match for the paused event
+    // itself, which must not have cut the pause short.
+    eventually(Duration::from_secs(5), || {
+        let subscription = subscription.clone();
+        async move { Ok(!subscription.load().await?.job_status().is_terminal()) }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        received_for(&shared, 1).await,
+        Vec::<u64>::new(),
+        "the match for the paused event must not wake the member"
+    );
+
+    // Traffic behind the paused event: wakes the member an hour early.
+    publish_ping(&outbox, 1, 8).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![7, 8])
+    })
+    .await?;
+
+    jobs.shutdown().await?;
+
+    Ok(())
+}
+
 /// Contract — cancel: row deletion is the tombstone. A cancelled key stops
 /// processing, and no wake revives it — every wake path resolves through the
 /// `subscriptions` table, which no longer has the row.

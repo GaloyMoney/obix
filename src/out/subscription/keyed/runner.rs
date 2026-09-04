@@ -214,7 +214,24 @@ where
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
                 staged: None,
+                paused: None,
             });
+
+        // A wake that lands on a pause with nothing persisted beyond the
+        // paused event is the match for that event itself, not traffic
+        // behind it: pause again, and leave the subscriber out of it. Read
+        // from the database rather than the cache, since the wake that got
+        // here was flushed after its event was persisted.
+        if let Some(paused) = &state.paused
+            && paused.sequence > state.sequence
+            && paused.until > current_job.clock().now()
+        {
+            let head =
+                crate::out::subscription::read_frontier::<Tables>(current_job.pool()).await?;
+            if head <= paused.sequence {
+                return Ok(job::JobCompletion::RescheduleAt(paused.until));
+            }
+        }
 
         let mirror = KeyedCheckpointMirror::<Tables> {
             subscriber_type: self.job_type.clone(),
@@ -436,7 +453,9 @@ where
                 Outcome::Pause(at) => {
                     // Does NOT advance state.sequence: the cursor stays
                     // strictly before this event, so the next run re-reads
-                    // and re-evaluates it.
+                    // and re-evaluates it. The pause itself is state, so it
+                    // is written even when no batch was pending to land.
+                    let landed = op_slot.is_some() || tracker.collected > 0;
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
                         current_job: &mut current_job,
@@ -447,7 +466,7 @@ where
                     flush_batch(&mut parts, &mut batch, &flusher, "pause_entry")
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
-                    if tracker.persisted_seq < state.sequence {
+                    if !landed {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;

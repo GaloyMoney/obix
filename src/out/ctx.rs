@@ -83,6 +83,20 @@ pub(crate) struct OutboxEventJobState {
     /// subscriber's state stays byte-identical to what it always wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) staged: Option<StagedState>,
+    /// Where and until when the member last paused. Read at run start: a
+    /// wake that finds nothing persisted beyond the paused event is answered
+    /// by pausing again, without the subscriber being invoked. Stale by
+    /// construction once the cursor is past `sequence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paused: Option<PausedState>,
+}
+
+/// The pause slot: the event the cursor is parked before, and the instant
+/// the member asked to be woken at.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PausedState {
+    pub(crate) sequence: EventSequence,
+    pub(crate) until: chrono::DateTime<chrono::Utc>,
 }
 
 /// The resume-token slot: an opaque JSON value scoped to one event.
@@ -646,7 +660,21 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
     /// the delivery entity) — the one fact obix cannot derive on its own.
     /// Everything else about parking and waking (passivation, generations,
     /// wake) is derivable and stays internal.
+    ///
+    /// A pause is cut short by traffic, not by time alone: a wake-key match
+    /// for an event *behind* the paused one re-delivers the paused event
+    /// early, so a subscriber that still cannot proceed pauses again. A wake
+    /// with nothing persisted beyond the paused event — the match for that
+    /// very event landing after the pause did — is answered by the runner
+    /// pausing again, without the subscriber being invoked.
     pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let KeyedEventCtx {
+            parts, event_seq, ..
+        } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
         Handled {
             outcome: Outcome::Pause(at),
             _invocation: PhantomData,
@@ -776,7 +804,15 @@ impl<'inv> StagedOp<'inv> {
     /// and landed-for-now is not the same as the cursor advancing. It can
     /// therefore live for as long as the backoff does.
     pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
-        let StagedOp { op, parts, .. } = self;
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
         *parts.op_slot = Some(op);
         Handled {
             outcome: Outcome::CommitAndPause(at),
@@ -800,6 +836,10 @@ impl<'inv> StagedOp<'inv> {
         parts.state.staged = Some(StagedState {
             sequence: event_seq,
             token: serde_json::to_value(token)?,
+        });
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
         });
         *parts.op_slot = Some(op);
         Ok(Handled {
@@ -883,6 +923,11 @@ impl<'inv> Suspended<'inv> {
     /// event until `at`, exactly as [`KeyedEventCtx::pause_until`] does. The
     /// resume token (if any) is preserved.
     pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let Suspended { parts, event_seq } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
         Handled {
             outcome: Outcome::Pause(at),
             _invocation: PhantomData,
@@ -926,6 +971,7 @@ mod tests {
         let state = OutboxEventJobState {
             sequence: EventSequence::from(7u64),
             staged: None,
+            paused: None,
         };
         assert_eq!(
             serde_json::to_string(&state).expect("serializes"),
@@ -943,6 +989,7 @@ mod tests {
                 sequence: EventSequence::from(5u64),
                 token: serde_json::json!({ "stage": 1 }),
             }),
+            paused: None,
         };
 
         let mine: Option<serde_json::Value> =

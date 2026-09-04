@@ -52,6 +52,7 @@ use job::JobType;
 use super::{KeyMsg, SubscriptionDef, WakeKey};
 use es_entity::AtomicOperation as _;
 
+use crate::out::StreamSelection;
 use crate::out::ctx::{EventCtx, FlushOp, Handled};
 use crate::out::event::PersistentOutboxEvent;
 use crate::out::subscription::singleton::SingletonSubscriber;
@@ -215,6 +216,10 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
+    // Classification reads persistent events only; the ephemeral stream
+    // would just spend the runner's turns on deliveries that skip.
+    const SUBSCRIPTION: StreamSelection = StreamSelection::PersistentOnly;
+
     type Batch = WakeBatch;
 
     async fn handle_persistent<'inv>(
