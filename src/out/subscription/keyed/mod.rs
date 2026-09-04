@@ -489,12 +489,30 @@ where
         // as the backstop against any other writer to the table.
         let wake_keys = wake_keys.into().into_strings();
         let instance_config = serde_json::to_value(&cfg)?;
-        // Boxed, not `Tables::highest_known_persistent_sequence(&self.pool)`
-        // directly — see `read_frontier`'s rationale. Awaiting the raw
+        // Read on the caller's own operation, never on the pool: the caller
+        // holds a transaction across this call, so a pool read here would
+        // check out a SECOND connection while the first is still held and
+        // deadlock a pool under concurrent subscribes.
+        //
+        // Reading inside the transaction is if anything more conservative
+        // than reading beside it — the snapshot frontier can only be at or
+        // behind the true one, so a racing event is delivered rather than
+        // missed.
+        //
+        // Boxed for the reason `read_frontier` documents: awaiting the raw
         // opaque future behind `&self` makes this method's `Send`-ness
-        // higher-ranked and breaks `tokio::spawn` at the CALLER, while
-        // compiling cleanly here.
-        let start_after = crate::out::subscription::read_frontier::<Tables>(&self.pool).await?;
+        // higher-ranked and breaks `tokio::spawn` at the CALLER. Boxing
+        // grounds the lifetime to the operation's borrow.
+        let start_after = {
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<crate::EventSequence, sqlx::Error>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
+            fut.await?
+        };
 
         Tables::insert_subscription_in_op(
             op,
