@@ -20,7 +20,7 @@ use std::any::TypeId;
 use std::sync::Arc;
 
 pub use self::ctx::{
-    EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedEvent, StagedOp,
+    EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
 };
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,

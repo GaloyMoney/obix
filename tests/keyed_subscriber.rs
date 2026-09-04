@@ -173,7 +173,7 @@ impl KeyedSubscriber<TestEvent> for RecordingSubscriber {
         }
 
         if let Some(at) = self.shared.hold_once.lock().await.remove(&self.key.0) {
-            return Ok(ctx.hold_until(at));
+            return Ok(ctx.pause_until(at));
         }
 
         if self.work_ms > 0 {
@@ -433,12 +433,12 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Contract — hold: `hold_until` parks the cursor strictly before the held
+/// Contract — hold: `pause_until` parks the cursor strictly before the held
 /// event (checkpoint does not advance), and the same event is redelivered
 /// once the hold expires — never skipped.
 #[tokio::test]
 #[file_serial]
-async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Result<()> {
+async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -465,8 +465,8 @@ async fn hold_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resul
 
     // Arm a hold for the very first event this key will see, well past the
     // checkpoint interval so a premature advance would be caught.
-    let hold_until = chrono::Utc::now() + chrono::Duration::milliseconds(600);
-    shared.hold_once.lock().await.insert(1, hold_until);
+    let pause_until = chrono::Utc::now() + chrono::Duration::milliseconds(600);
+    shared.hold_once.lock().await.insert(1, pause_until);
 
     jobs.start_poll().await?;
     publish_ping(&outbox, 1, 7).await?;
@@ -1496,8 +1496,9 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
             return Ok(ctx.collect(format!("collect:{n}")));
         }
 
+        let token = ctx.token::<StageToken>()?;
         let mut op = ctx.consume().await?;
-        let staged = match op.resume::<StageToken>()? {
+        let staged = match token {
             // Stage 1 is already durable from an earlier attempt — skip it
             // rather than relying on it being idempotent.
             Some(token) => {
@@ -1511,7 +1512,7 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
             None => {
                 insert_label(&mut op, &format!("stage1:{n}")).await?;
                 self.shared.trace.lock().await.push(format!("stage1:{n}"));
-                let gap = op.proceed_with(&StageToken { stage: 1, n: *n }).await?;
+                let gap = op.suspend_with(&StageToken { stage: 1, n: *n }).await?;
 
                 // The external-I/O gap: no transaction is open here.
                 if self
@@ -1524,16 +1525,16 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
                 }
                 if let Some(at) = self.shared.hold_in_gap.lock().await.take() {
                     self.shared.trace.lock().await.push("hold".to_string());
-                    return Ok(gap.hold_until(at));
+                    return Ok(gap.pause_until(at));
                 }
-                gap.op().await?
+                gap.resume().await?
             }
         };
 
         let mut op = staged;
         insert_label(&mut op, &format!("stage2:{n}")).await?;
         self.shared.trace.lock().await.push(format!("stage2:{n}"));
-        Ok(op.conclude())
+        Ok(op.commit())
     }
 
     async fn flush(
@@ -1705,7 +1706,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> 
 
 /// Contract — token lifetime: a hold is part of processing the event, so the
 /// token survives it (the cursor is still parked before the event). Once
-/// `conclude` advances the cursor the token is gone, and the next event
+/// `commit` advances the cursor the token is gone, and the next event
 /// starts fresh — proving the slot is scoped to one event, not to the
 /// subscription.
 #[tokio::test]
@@ -1753,7 +1754,7 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
         "the token must survive the hold and be readable when processing resumes"
     );
 
-    // A second staged event: its own sequence, so the concluded event's
+    // A second staged event: its own sequence, so the committed event's
     // token is not visible to it — it must run stage 1 from scratch.
     publish_ping(&outbox, 1, 12).await?;
     eventually(Duration::from_secs(20), || async {
@@ -1774,7 +1775,7 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
             "stage1:12",
             "stage2:12"
         ],
-        "a concluded event's token must not be visible to the next event"
+        "a committed event's token must not be visible to the next event"
     );
 
     jobs.shutdown().await?;

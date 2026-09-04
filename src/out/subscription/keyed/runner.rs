@@ -2,12 +2,12 @@
 //!
 //! Structurally the singleton runner's loop
 //! ([`singleton`](crate::out::subscription::singleton)), minus the ephemeral
-//! stream and plus the two things only a keyed member has: the hold verbs
+//! stream and plus the two things only a keyed member has: the pause verbs
 //! (which park the cursor without advancing it) and linger-based dormancy
 //! (an idle, caught-up member completes its job rather than holding a slot).
 //!
 //! The `subscriptions` row is read fresh on every run — the subscriber is
-//! rebuilt from it via [`SubscriptionDef::instantiate`] on every wake, hold
+//! rebuilt from it via [`SubscriptionDef::instantiate`] on every wake, pause
 //! expiry and retry, so nothing may be cached in the instance between runs.
 
 use futures::{FutureExt, StreamExt};
@@ -199,7 +199,7 @@ where
             return Ok(job::JobCompletion::Complete);
         };
 
-        // The factory runs fresh every run: every wake, hold expiry, retry,
+        // The factory runs fresh every run: every wake, pause expiry, retry,
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)?;
@@ -433,8 +433,8 @@ where
                 .outcome;
 
             match outcome {
-                Outcome::Hold(at) => {
-                    // Does NOT advance state.sequence: the cursor holds
+                Outcome::Pause(at) => {
+                    // Does NOT advance state.sequence: the cursor stays
                     // strictly before this event, so the next run re-reads
                     // and re-evaluates it.
                     let mut parts = CtxParts {
@@ -444,7 +444,7 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "hold_entry")
+                    flush_batch(&mut parts, &mut batch, &flusher, "pause_entry")
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     if tracker.persisted_seq < state.sequence {
@@ -454,8 +454,8 @@ where
                     }
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
-                Outcome::CommitAndHold(at) => {
-                    // Same non-advance as Hold: the staged op's work lands,
+                Outcome::CommitAndPause(at) => {
+                    // Same non-advance as Pause: the staged op's work lands,
                     // but the checkpoint it carries is still pre-this-event.
                     let mut parts = CtxParts {
                         op_slot: &mut op_slot,
@@ -464,7 +464,7 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "staged_hold")
+                    flush_batch(&mut parts, &mut batch, &flusher, "staged_pause")
                         .await
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     return Ok(job::JobCompletion::RescheduleAt(at));

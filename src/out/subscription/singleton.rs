@@ -36,7 +36,7 @@ pub enum StreamSelection {
 /// it is what licenses the ephemeral subscription below, since ephemeral
 /// events cannot be replayed and only an always-present consumer may hear
 /// them. It is also why a singleton subscriber has no way to pause — no
-/// `hold_until`, no staged chain, no resume token. For a single-instance
+/// `pause_until`, no staged chain, no resume token. For a single-instance
 /// flow that does need to pause or stage, see
 /// [`KeyedSubscriber`](crate::out::KeyedSubscriber) with one static key.
 ///
@@ -605,12 +605,12 @@ where
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                     }
                 }
-                Outcome::Hold(_) | Outcome::CommitAndHold(_) => {
+                Outcome::Pause(_) | Outcome::CommitAndPause(_) => {
                     // Type-gated unreachable: only KeyedEventCtx, StagedOp
-                    // and StagedEvent can mint these, and a singleton
+                    // and Suspended can mint these, and a singleton
                     // subscriber's EventCtx reaches none of them.
                     unreachable!(
-                        "Outcome::Hold/CommitAndHold cannot be minted from a singleton \
+                        "Outcome::Pause/CommitAndPause cannot be minted from a singleton \
                          subscriber's EventCtx"
                     )
                 }

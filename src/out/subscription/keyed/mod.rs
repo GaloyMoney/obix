@@ -178,11 +178,11 @@ impl std::fmt::Display for WakeKey {
 /// `handle_ephemeral` and no `SUBSCRIPTION` selector.
 ///
 /// That is the other side of the presence contract. A keyed subscriber is
-/// *not* always present — it passivates when idle, waits out holds, and for
+/// *not* always present — it passivates when idle, waits out pauses, and for
 /// a not-yet-subscribed key does not exist at all — so it cannot be offered
 /// unreplayable events. What it gets in exchange is everything presence
 /// forbids a [`SingletonSubscriber`](crate::out::SingletonSubscriber):
-/// [`hold_until`](KeyedEventCtx::hold_until), staged chains across external
+/// [`pause_until`](KeyedEventCtx::pause_until), staged chains across external
 /// I/O, and the resume token.
 ///
 /// A single-instance flow that needs those is persistent-only by definition
@@ -232,7 +232,7 @@ where
 
 /// The definition of one keyed-subscriber type: pure classification plus a
 /// factory. NO async, NO DB deps — everything here is cheap and synchronous,
-/// called on every wake, hold expiry and retry (see [`KeyedSubscriber`]'s
+/// called on every wake, pause expiry and retry (see [`KeyedSubscriber`]'s
 /// factory contract on [`instantiate`](Self::instantiate)).
 pub trait SubscriptionDef<P>: Send + Sync + 'static
 where
@@ -270,7 +270,7 @@ where
     fn wake_keys(&self, event: &PersistentOutboxEvent<P>) -> impl IntoIterator<Item = WakeKey>;
 
     /// Build the subscriber instance for one run. Called fresh on every run —
-    /// every wake, every hold expiry, every retry, on any node — so this must
+    /// every wake, every pause expiry, every retry, on any node — so this must
     /// be cheap and the subscriber must be stateless between runs: durable
     /// state is the cursor plus whatever the subscriber's own entities record,
     /// never anything held in the instance itself.

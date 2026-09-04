@@ -32,10 +32,10 @@ pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
     KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
-    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedEvent,
-    StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
-    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, UndecodableEventError, WakeKey,
-    WakeKeys,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
+    StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
+    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
+    UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;

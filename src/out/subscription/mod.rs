@@ -16,7 +16,7 @@
 //! | capability | singleton | keyed |
 //! |------------|-----------|-------|
 //! | ephemeral delivery | yes — by presence | no, statically |
-//! | `hold_until`, staged chains, resume token | no — by presence | yes |
+//! | `pause_until`, staged chains, resume token | no — by presence | yes |
 //! | dormancy / wake | no | yes |
 //!
 //! The two modes are not one mode with a flag, and the asymmetry is not
@@ -31,7 +31,7 @@
 //! persistent-only by definition** — host it as a keyed subscriber with one
 //! static key. That is an intended shape, not a workaround (foreign-system
 //! relays with backpressure, single-instance exporters), and it brings
-//! dormancy for free. Adding a hold-less staged variant to the singleton
+//! dormancy for free. Adding a pause-less staged variant to the singleton
 //! would buy a second sealed op type and answer a question this already
 //! answers better.
 //!
