@@ -1,43 +1,65 @@
 //! Handler-controlled transaction scoping for outbox event-handler jobs.
 //!
 //! Every persistent event delivered to an
-//! [`OutboxEventHandler`](super::OutboxEventHandler) comes with an
+//! [`SingletonSubscriber`](super::SingletonSubscriber) comes with an
 //! [`EventCtx`] that the handler must resolve into a [`Handled`] token by
-//! choosing exactly one of four entry verbs — a monotone cost ladder:
+//! choosing exactly one of three entry verbs — a monotone cost ladder:
 //!
 //! | verb | meaning | cost |
 //! |------|---------|------|
 //! | [`EventCtx::skip`] | not my event | zero — no transaction is opened |
-//! | [`EventCtx::collect_with`] (and the [`collect`](EventCtx::collect) sugar) | contribute an item to the pending batch's accumulator | zero at collect time — one [`flush`](super::OutboxEventHandler::flush) call per batch applies all items |
-//! | [`EventCtx::consume_in_batch`] | do work joined to the pending batch op | shares one transaction (and one checkpoint) with neighboring events |
-//! | [`EventCtx::consume_isolated`] | land the pending batch first, then do my work in a fresh op | my event is its own atomic unit, fenced from history |
+//! | [`EventCtx::collect_with`] (and the [`collect`](EventCtx::collect) sugar) | contribute an item to the pending batch's accumulator | zero at collect time — one [`flush`](super::SingletonSubscriber::flush) call per batch applies all items |
+//! | [`EventCtx::consume`] | land the pending batch first, then do my work in a fresh op | my event is its own atomic unit, fenced from history |
 //!
-//! and — when an op was taken — one of two exit verbs:
+//! and — when an op was taken — the single exit verb
+//! [`IsolatedOp::commit`], which lands the op (work + checkpoint,
+//! atomically) when the invocation returns.
 //!
-//! | verb | meaning |
-//! |------|---------|
-//! | [`BatchOp::commit`] / [`IsolatedOp::commit`] | land the op (work + checkpoint, atomically) when the invocation returns |
-//! | [`BatchOp::defer`] | leave the op open so subsequent events can coalesce into it |
-//!
-//! A pending batch — an open op, collected items, or both — only ever exists
-//! while there is ready persistent backlog: the runner never awaits the
-//! stream while a batch is pending, so a pending stream is itself a flush
-//! trigger. Batching therefore rides bursts that already happened and adds
-//! no latency at low traffic. Ephemeral events travel on their own stream
+//! A pending batch is **only ever collected items**: no transaction is left
+//! open across event invocations. It exists only while there is ready
+//! persistent backlog — the runner never awaits the stream while items are
+//! pending, so a pending stream is itself a flush trigger. Batching
+//! therefore rides bursts that already happened and adds no latency at low
+//! traffic. Ephemeral events travel on their own stream
 //! and are handled between batches — they never interrupt a batch, a
 //! transaction never spans the foreign `handle_ephemeral` await, and between
 //! batches the two streams race fairly so neither can starve the other.
 //! Handlers that only consume one stream should declare it via
-//! [`SUBSCRIPTION`](super::OutboxEventHandler::SUBSCRIPTION) — the other
+//! [`SUBSCRIPTION`](super::SingletonSubscriber::SUBSCRIPTION) — the other
 //! stream is then never subscribed at all.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
-//! items to the handler's [`flush`](super::OutboxEventHandler::flush) inside
-//! the batch transaction, then persists the checkpoint at the last *fully
-//! handled* sequence (skips included), then commits: items, work and pointer
-//! are inseparable. A failed flush rolls everything back and replays the
-//! whole batch (items are re-collected), so collected work must tolerate
-//! wholesale replay — the same contract as [`defer`](BatchOp::defer).
+//! items to the handler's [`flush`](super::SingletonSubscriber::flush) inside
+//! a transaction opened for the landing, then persists the checkpoint at the
+//! last *fully handled* sequence (skips included), then commits: items, work
+//! and pointer are inseparable. A failed flush rolls everything back and
+//! replays the whole batch (items are re-collected), so collected work must
+//! tolerate wholesale replay.
+//!
+//! # The two ctx types, and why they differ
+//!
+//! [`EventCtx`] and [`KeyedEventCtx`] are facades over the same internals,
+//! not a fork — but they deliberately expose different verbs:
+//!
+//! | capability | singleton | keyed |
+//! |------------|-----------|-------|
+//! | ephemeral delivery | yes — by presence | no, statically |
+//! | [`pause_until`](KeyedEventCtx::pause_until), staged chains, resume token | no — by presence | yes |
+//! | dormancy / wake | no | yes |
+//!
+//! The asymmetry is the **presence contract**, not scheduling mechanics. A
+//! singleton subscriber is always on, and that presence is precisely what
+//! licenses its ephemeral subscription: ephemeral events cannot be replayed,
+//! so only an always-present consumer may hear them. A verb that pauses
+//! consumption contradicts the property that defines the mode — which is why
+//! the pause and staged verbs are keyed-only, and why nothing is gained by
+//! adding a pause-less staged variant to the singleton.
+//!
+//! A single-instance flow that genuinely needs to pause or stage is
+//! persistent-only by definition. Host it as a keyed subscriber with one
+//! static key — a legitimate and intended shape (foreign-system relays with
+//! backpressure, single-instance exporters), which also brings dormancy for
+//! free.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,20 +73,52 @@ use crate::sequence::EventSequence;
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Persisted execution state of an outbox event-handler job: the sequence of
-/// the last fully handled persistent event.
-#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+/// the last fully handled persistent event, plus (keyed subscribers only)
+/// the resume token of the event currently being processed.
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEventJobState {
     pub(crate) sequence: EventSequence,
+    /// `serde(default)` so execution-state rows written before staged
+    /// processing existed still decode; `skip_serializing_if` so a singleton
+    /// subscriber's state stays byte-identical to what it always wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) staged: Option<StagedState>,
+    /// Where and until when the member last paused. Read at run start: a
+    /// wake that finds nothing persisted beyond the paused event is answered
+    /// by pausing again, without the subscriber being invoked. Stale by
+    /// construction once the cursor is past `sequence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paused: Option<PausedState>,
+}
+
+/// The pause slot: the event the cursor is parked before, and the instant
+/// the member asked to be woken at.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PausedState {
+    pub(crate) sequence: EventSequence,
+    pub(crate) until: chrono::DateTime<chrono::Utc>,
+}
+
+/// The resume-token slot: an opaque JSON value scoped to one event.
+///
+/// obix owns the slot and its lifetime; the meaning of what is in it belongs
+/// entirely to the subscriber. obix never interprets the token.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StagedState {
+    /// The event the token belongs to. Validity is checked at read time
+    /// against the event being processed, which is what makes clearing lazy:
+    /// a stale token is unreadable by construction.
+    pub(crate) sequence: EventSequence,
+    pub(crate) token: serde_json::Value,
 }
 
 /// Book-keeping the runner shares with [`EventCtx`].
 pub(crate) struct BatchTracker {
-    /// Number of events contributing to the pending batch (consumed into the
-    /// op or collected into the accumulator) — drives `max_batch_size`.
-    pub(crate) events_in_op: usize,
     /// Number of events that collected items since the last flush. Nonzero
-    /// means the accumulator is dirty: the batch is open even without an op,
-    /// and no checkpoint may be persisted before the items are flushed.
+    /// means the accumulator is dirty: a batch is pending, and no checkpoint
+    /// may be persisted before the items are flushed. Also what
+    /// `max_batch_size` bounds — with no deferred ops, the pending batch is
+    /// exactly its collected events.
     pub(crate) collected: usize,
     /// Highest sequence whose checkpoint has been persisted to the database.
     pub(crate) persisted_seq: EventSequence,
@@ -72,19 +126,41 @@ pub(crate) struct BatchTracker {
     pub(crate) last_persist: tokio::time::Instant,
 }
 
+/// Copies a keyed member's durable cursor into its `subscriptions` row,
+/// inside the same transaction that persists the job checkpoint it mirrors.
+///
+/// Indirected through a trait object rather than a `Tables` type parameter
+/// because everything in this module is shared with the singleton path,
+/// which has no subscription row to mirror into and passes `None`. It also
+/// keeps the mirror atomic with the checkpoint by construction: both writes
+/// land on the same op, so the copy can never claim progress the job did not
+/// commit.
+pub(crate) trait CheckpointMirror: Send + Sync {
+    fn mirror<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+        checkpoint: EventSequence,
+    ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>>;
+}
+
 pub(crate) struct CtxParts<'inv> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
-    pub(crate) state: &'inv OutboxEventJobState,
+    /// Mutable so the staged verbs can write the resume token into the state
+    /// the runner is about to persist. `sequence` remains the runner's alone.
+    pub(crate) state: &'inv mut OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
+    /// `Some` for keyed members, `None` for singletons — see
+    /// [`CheckpointMirror`].
+    pub(crate) mirror: Option<&'inv dyn CheckpointMirror>,
 }
 
 /// Proof that a persistent event was resolved in one of the legal ways.
 ///
 /// Only obtainable from [`EventCtx::skip`], [`EventCtx::collect_with`] (or
-/// its [`collect`](EventCtx::collect) sugar), [`BatchOp::commit`],
-/// [`BatchOp::defer`] or [`IsolatedOp::commit`] — the type system forces
-/// every [`handle_persistent`](super::OutboxEventHandler::handle_persistent)
+/// its [`collect`](EventCtx::collect) sugar) or [`IsolatedOp::commit`] — the
+/// type system forces every
+/// [`handle_persistent`](super::SingletonSubscriber::handle_persistent)
 /// invocation to decide the transactional fate of its event.
 ///
 /// The token is branded with the invocation's lifetime, so it cannot leave
@@ -118,17 +194,58 @@ pub(crate) enum Outcome {
     Skip,
     Collect,
     Commit,
-    Defer,
+    /// Keyed-only: my cursor stays *before* this event until the given time.
+    /// Only [`KeyedEventCtx::pause_until`] mints this — the singleton runner
+    /// never constructs a ctx that can, so this variant is unreachable from
+    /// [`EventCtx`].
+    Pause(chrono::DateTime<chrono::Utc>),
+    /// Keyed-only: commit the staged op left in `op_slot`, but the cursor
+    /// still stays *before* this event until the given time. Only
+    /// [`StagedOp::pause_until`] mints this.
+    CommitAndPause(chrono::DateTime<chrono::Utc>),
 }
 
 /// Per-event decision point handed to
-/// [`handle_persistent`](super::OutboxEventHandler::handle_persistent).
+/// [`handle_persistent`](super::SingletonSubscriber::handle_persistent).
 ///
 /// Generic over the handler's
-/// [`Batch`](super::OutboxEventHandler::Batch) accumulator `B` (defaulting
+/// [`Batch`](super::SingletonSubscriber::Batch) accumulator `B` (defaulting
 /// to `()` for handlers that never collect). See the [module docs](self)
-/// for the semantics of the four entry verbs.
-#[must_use = "resolve the EventCtx via skip / collect / consume_in_batch / consume_isolated"]
+/// for the semantics of the three entry verbs.
+///
+/// # Presence contract
+///
+/// A singleton subscriber is **always on**, and that presence is what
+/// licenses its ephemeral subscription: ephemeral events cannot be replayed,
+/// so only an always-present consumer may hear them. This ctx therefore has
+/// no pausing verb — no `pause_until`, no staged chain, no resume token.
+/// Their absence is semantic, not an omission: a verb that suspends
+/// consumption would contradict the property that defines the mode.
+///
+/// ```compile_fail
+/// use obix::{EventCtx, Handled};
+///
+/// fn pause_it<'inv>(ctx: EventCtx<'inv>) -> Handled<'inv> {
+///     // error[E0599]: no method named `pause_until` found for struct `EventCtx`
+///     //
+///     // A flow that pauses or stages is persistent-only by definition —
+///     // host it as a keyed subscriber; a single static key is legitimate.
+///     ctx.pause_until()
+/// }
+/// ```
+///
+/// The control for the negative test above — same signature, with a verb a
+/// singleton ctx does have. If this stops compiling, the `compile_fail`
+/// above has started passing for the wrong reason:
+///
+/// ```
+/// use obix::{EventCtx, Handled};
+///
+/// fn resolve_it<'inv>(ctx: EventCtx<'inv>) -> Handled<'inv> {
+///     ctx.skip()
+/// }
+/// ```
+#[must_use = "resolve the EventCtx via skip / collect / consume"]
 pub struct EventCtx<'inv, B = ()> {
     pub(crate) parts: CtxParts<'inv>,
     pub(crate) batch: &'inv mut B,
@@ -149,18 +266,17 @@ impl<'inv, B> EventCtx<'inv, B> {
     /// Contribute to the pending batch's accumulator — a pure memory write:
     /// no transaction is opened and no statement is executed now. The runner
     /// hands the accumulated batch to the handler's
-    /// [`flush`](super::OutboxEventHandler::flush) exactly once per batch
+    /// [`flush`](super::SingletonSubscriber::flush) exactly once per batch
     /// landing, inside the transaction that commits the checkpoint.
     ///
-    /// Like [`defer`](BatchOp::defer), collected work shares fate with its
-    /// neighbors and must tolerate whole-batch replay: on a failed flush the
-    /// events replay and their items are re-collected.
+    /// Collected work shares fate with its neighbors and must tolerate
+    /// whole-batch replay: on a failed flush the events replay and their
+    /// items are re-collected.
     ///
     /// For `Vec` and `HashMap` accumulators the [`collect`](Self::collect)
     /// sugar is usually more convenient.
     pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
         f(self.batch);
-        self.parts.tracker.events_in_op += 1;
         self.parts.tracker.collected += 1;
         Handled {
             outcome: Outcome::Collect,
@@ -168,40 +284,15 @@ impl<'inv, B> EventCtx<'inv, B> {
         }
     }
 
-    /// Do transactional work joined to the pending batch op (opening a fresh
-    /// one if none is pending).
-    ///
-    /// Work in a batch shares fate with its neighbors: a failure anywhere in
-    /// the batch rolls back and replays the whole batch from the last
-    /// committed checkpoint. Only choose this when the handler's work is
-    /// idempotent under such replay (pure in-op DB writes and in-op job
-    /// spawns are — they roll back with the op).
-    pub async fn consume_in_batch(self) -> Result<BatchOp<'inv>, HandlerError> {
-        let parts = self.parts;
-        if parts.op_slot.is_none() {
-            *parts.op_slot = Some(
-                es_entity::DbOp::init_with_clock(
-                    parts.current_job.pool(),
-                    parts.current_job.clock(),
-                )
-                .await?,
-            );
-        }
-        parts.tracker.events_in_op += 1;
-        let op = parts.op_slot.as_mut().expect("just materialized above");
-        Ok(BatchOp { op })
-    }
-
-    /// Land the pending batch first (its collected items, its work and its
-    /// checkpoint, at the last fully handled sequence), then hand back a
-    /// fresh op: this event is its own atomic unit, sharing no fate with
-    /// history — and none with the future either, since [`IsolatedOp`] only
-    /// offers [`commit`](IsolatedOp::commit).
+    /// Land the pending batch first (its collected items and its checkpoint,
+    /// at the last fully handled sequence), then hand back a fresh op: this
+    /// event is its own atomic unit, sharing no fate with history — and none
+    /// with the future either, since [`IsolatedOp`] only offers
+    /// [`commit`](IsolatedOp::commit).
     ///
     /// This is the failure-isolation fence: if this event's work fails, only
-    /// this event replays; and it is the exact legacy per-event semantics
-    /// when no batch is pending.
-    pub async fn consume_isolated(self) -> Result<IsolatedOp<'inv>, HandlerError>
+    /// this event replays.
+    pub async fn consume(self) -> Result<IsolatedOp<'inv>, HandlerError>
     where
         B: Default,
     {
@@ -210,12 +301,11 @@ impl<'inv, B> EventCtx<'inv, B> {
             batch,
             flusher,
         } = self;
-        flush_batch(&mut parts, batch, flusher, "isolated_entry").await?;
+        flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await?,
         );
-        parts.tracker.events_in_op = 1;
         let op = parts.op_slot.as_mut().expect("just materialized above");
         Ok(IsolatedOp { op })
     }
@@ -245,57 +335,14 @@ where
     }
 }
 
-/// An op joined to the pending batch. Implements
-/// [`AtomicOperation`](es_entity::AtomicOperation) — use it exactly like any
-/// atomic operation, then exit with [`commit`](Self::commit) or
-/// [`defer`](Self::defer).
-///
-/// There is no mutable access to the raw [`es_entity::DbOp`] (only a shared
-/// [`Deref`](std::ops::Deref) view): committing, rolling back, or swapping
-/// out the underlying op is unrepresentable, so work and checkpoint can only
-/// land together, through the runner.
-#[must_use = "exit with .commit() or .defer() to produce the Handled token"]
-pub struct BatchOp<'inv> {
-    op: &'inv mut es_entity::DbOp<'static>,
-}
-
-impl<'inv> BatchOp<'inv> {
-    /// Land the whole batch (my work included) when the invocation returns:
-    /// checkpoint at my sequence → commit.
-    pub fn commit(self) -> Handled<'inv> {
-        Handled {
-            outcome: Outcome::Commit,
-            _invocation: PhantomData,
-        }
-    }
-
-    /// Leave the op open so subsequent events can coalesce into it. The
-    /// runner lands it when the ready persistent backlog is drained, when
-    /// the configured max batch size is reached, when a later event commits
-    /// or isolates, or on shutdown.
-    pub fn defer(self) -> Handled<'inv> {
-        Handled {
-            outcome: Outcome::Defer,
-            _invocation: PhantomData,
-        }
-    }
-}
-
-impl std::ops::Deref for BatchOp<'_> {
-    type Target = es_entity::DbOp<'static>;
-
-    fn deref(&self) -> &Self::Target {
-        self.op
-    }
-}
-
-es_entity::delegate_atomic_operation!(BatchOp<'_>, { s => s.op });
-
 /// An op holding exactly this event's work, fenced from the batch history.
 /// Implements [`AtomicOperation`](es_entity::AtomicOperation). The only exit
 /// is [`commit`](Self::commit) — isolation from future events is guaranteed
-/// by construction, and (as with [`BatchOp`]) no mutable access to the raw
-/// [`es_entity::DbOp`] exists, so the op can only land through the runner.
+/// by construction, and there is no mutable access to the raw
+/// [`es_entity::DbOp`] (only a shared [`Deref`](std::ops::Deref) view):
+/// committing, rolling back, or swapping out the underlying op is
+/// unrepresentable, so work and checkpoint can only land together, through
+/// the runner.
 #[must_use = "exit with .commit() to produce the Handled token"]
 pub struct IsolatedOp<'inv> {
     op: &'inv mut es_entity::DbOp<'static>,
@@ -325,9 +372,9 @@ es_entity::delegate_atomic_operation!(IsolatedOp<'_>, { s => s.op });
 pub(crate) type BoxFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-/// Object-safe bridge from the runner (and [`EventCtx::consume_isolated`]'s
+/// Object-safe bridge from the runner (and [`EventCtx::consume`]'s
 /// entry fence) to the handler's typed
-/// [`flush`](super::OutboxEventHandler::flush) — erases the handler type so
+/// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
 /// [`EventCtx`] only needs to know the accumulator `B`.
 pub(crate) trait ItemFlush<B>: Send + Sync {
     fn flush_items<'a>(
@@ -338,13 +385,13 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
 }
 
 /// Restricted view of the batch op handed to
-/// [`flush`](super::OutboxEventHandler::flush) — everything an
+/// [`flush`](super::SingletonSubscriber::flush) — everything an
 /// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else.
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the
 /// checkpoint is written and the transaction commits — items, work and
 /// pointer land atomically. There is no access to the raw
-/// [`es_entity::DbOp`], mirroring [`BatchOp`]/[`IsolatedOp`]'s sealing.
+/// [`es_entity::DbOp`], mirroring [`IsolatedOp`]'s sealing.
 pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
 
 impl<'a> FlushOp<'a> {
@@ -358,15 +405,16 @@ es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
 /// happened to trigger the landing — e.g. a later event entering
-/// [`consume_isolated`](EventCtx::consume_isolated).
+/// [`consume`](EventCtx::consume).
 ///
 /// Propagates through `handle_persistent` as a boxed error; downcast to
 /// re-attribute in logs or traces.
 #[derive(Debug)]
 pub struct FlushError {
     /// Which trigger landed the batch (`"backlog_drained"`, `"batch_full"`,
-    /// `"commit"`, `"isolated_entry"`, `"shutdown"`, `"stream_closed"`,
-    /// `"undecodable_event"`).
+    /// `"commit"`, `"consume_entry"`, `"shutdown"`, `"stream_closed"`,
+    /// `"undecodable_event"`, and for keyed subscribers `"pause_entry"` and
+    /// `"staged_pause"`).
     pub reason: &'static str,
     /// The batch covers sequences strictly after this (the last durable
     /// checkpoint)…
@@ -393,15 +441,14 @@ impl std::error::Error for FlushError {
 }
 
 /// Land the pending batch, if any: hand collected items to the handler's
-/// flush (inside the batch transaction, opening one if only items are
-/// pending) → checkpoint at the last fully handled sequence → commit. No-op
-/// when nothing is pending.
+/// flush (inside a transaction opened for the landing) → checkpoint at the
+/// last fully handled sequence → commit. Also lands a runner-committed op
+/// left in `op_slot` by [`EventCtx::consume`]. No-op when nothing is pending.
 #[tracing::instrument(
     name = "outbox.flush_batch",
     skip_all,
     fields(
         reason = reason,
-        batch_size = parts.tracker.events_in_op,
         collected = parts.tracker.collected,
         checkpoint_seq = u64::from(parts.state.sequence),
     ),
@@ -449,10 +496,12 @@ pub(crate) async fn flush_batch<B: Default>(
         .current_job
         .update_execution_state_in_op(&mut op, parts.state)
         .await?;
+    if let Some(mirror) = parts.mirror {
+        mirror.mirror(&mut op, parts.state.sequence).await?;
+    }
     op.commit().await?;
     parts.tracker.persisted_seq = parts.state.sequence;
     parts.tracker.last_persist = tokio::time::Instant::now();
-    parts.tracker.events_in_op = 0;
     Ok(())
 }
 
@@ -467,11 +516,488 @@ pub(crate) async fn flush_batch<B: Default>(
 pub(crate) async fn persist_checkpoint(
     current_job: &mut CurrentJob,
     state: &OutboxEventJobState,
+    mirror: Option<&dyn CheckpointMirror>,
 ) -> Result<(), HandlerError> {
     let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
     current_job
         .update_execution_state_in_op(&mut op, state)
         .await?;
+    if let Some(mirror) = mirror {
+        mirror.mirror(&mut op, state.sequence).await?;
+    }
     op.commit().await?;
     Ok(())
+}
+
+// === Keyed subscribers ===
+//
+// [`KeyedEventCtx`] below is the keyed counterpart of [`EventCtx`] — a facade
+// over the exact same internals (`CtxParts`, `Outcome`, `flush_batch`) rather
+// than a fork of them. It adds two capabilities past the shared verb set:
+//
+//   - the pause verb ([`KeyedEventCtx::pause_until`]), which mints
+//     `Outcome::Pause`;
+//   - staged processing ([`StagedOp`] / [`Suspended`]), which lets one
+//     event be processed across N committed transactions with external I/O
+//     between them, and whose paused exit mints `Outcome::CommitAndPause`.
+//
+// Both live on a distinct type because the split is CONTRACTUAL, not just a
+// convenient type-gate. A singleton subscriber is always present, and that
+// presence is what licenses its ephemeral subscription (unreplayable events
+// need an always-present consumer); a verb that pauses consumption would
+// contradict it. So the type-gating is a consequence of the semantics
+// rather than the reason for it — the singleton runner never constructs a
+// ctx that can reach these, and its `Outcome::Pause`/`CommitAndPause` arm is
+// an `unreachable!` by construction.
+
+/// Per-event decision point handed to
+/// [`KeyedSubscriber::handle`](super::KeyedSubscriber::handle) — the keyed
+/// counterpart of [`EventCtx`], sharing its verb semantics;
+/// [`pause_until`](Self::pause_until) and [`consume`](Self::consume)'s staged
+/// chain are the keyed-only additions.
+#[must_use = "resolve the KeyedEventCtx via skip / collect / consume / pause_until"]
+pub struct KeyedEventCtx<'inv, B = ()> {
+    pub(crate) parts: CtxParts<'inv>,
+    pub(crate) batch: &'inv mut B,
+    pub(crate) flusher: &'inv dyn ItemFlush<B>,
+    /// Sequence of the event being processed. Distinct from
+    /// `parts.state.sequence`, which is the last *fully handled* sequence —
+    /// i.e. strictly before this one.
+    pub(crate) event_seq: EventSequence,
+}
+
+impl<'inv, B> KeyedEventCtx<'inv, B> {
+    /// Identical to [`EventCtx::skip`].
+    pub fn skip(self) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Skip,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Identical to [`EventCtx::collect_with`].
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        self.parts.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Take this event's work, in one stage or many.
+    ///
+    /// Same entry fence as [`EventCtx::consume`]: the pending batch (its
+    /// collected items and its checkpoint, at the last fully-handled
+    /// sequence — strictly before this event) lands first, then a fresh op
+    /// is opened. The difference is the exits: a [`StagedOp`] can be
+    /// [`commit`](StagedOp::commit)ted (cursor advances, exactly the
+    /// isolated-commit semantics), or it can [`suspend`](StagedOp::suspend)
+    /// — land this stage and hand back a [`Suspended`] with **no transaction
+    /// open**, so the subscriber can do external I/O before
+    /// [`resume`](Suspended::resume) opens the next stage's op.
+    ///
+    /// The single-transaction case is the one-stage degenerate case: consume,
+    /// work, [`commit`](StagedOp::commit).
+    ///
+    /// Interim stages are fenced before the cursor and replayed on crash:
+    /// nothing a `suspend` landed is lost, but the event itself is re-read
+    /// and re-handled until a `commit` advances past it. Use
+    /// [`token`](Self::token) to skip stages already durable.
+    pub async fn consume(self) -> Result<StagedOp<'inv>, HandlerError>
+    where
+        B: Default,
+    {
+        let KeyedEventCtx {
+            mut parts,
+            batch,
+            flusher,
+            event_seq,
+        } = self;
+        flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
+        let op =
+            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
+                .await?;
+        Ok(StagedOp {
+            op,
+            parts,
+            event_seq,
+        })
+    }
+
+    /// The resume token, if one was written while processing *this* event
+    /// — what the last [`suspend_with`](StagedOp::suspend_with) or
+    /// [`pause_until_with`](StagedOp::pause_until_with) left. Readable
+    /// before [`consume`](Self::consume) because it is in-memory state the
+    /// runner already loaded: a subscriber decides where a run begins, or
+    /// that the event is not its to handle and [`skip`](Self::skip)s it,
+    /// before anything is opened.
+    ///
+    /// `None` when nothing was staged, and also when a token left over from
+    /// a different event is still in the slot: validity is checked against
+    /// the current event's sequence, which is why stale tokens never need
+    /// explicit clearing.
+    ///
+    /// A deserialization failure surfaces as `Err`; what to do about it is
+    /// the subscriber's call. Tokens survive pauses, so they can outlive a
+    /// deploy — schema-stamping them and treating a mismatch as "start
+    /// fresh" is the recommended consumer contract.
+    pub fn token<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        staged_token(self.parts.state, self.event_seq)
+    }
+
+    /// My cursor stays *before* this event until `at` — entry and exit in
+    /// one, nothing to record.
+    ///
+    /// The runner lands any pending batch first (the same fence as
+    /// [`consume`](Self::consume)'s entry — checkpoint at
+    /// the last fully-handled sequence, which is pre-this-event), persists
+    /// the checkpoint if dirty, then ends the run rescheduled at `at`. Does
+    /// **not** advance the checkpoint past this event: the next run re-reads
+    /// and re-evaluates it, so a paused event is retried, not skipped.
+    ///
+    /// The resume time is domain knowledge (e.g. a retry schedule owned by
+    /// the delivery entity) — the one fact obix cannot derive on its own.
+    /// Everything else about parking and waking (passivation, generations,
+    /// wake) is derivable and stays internal.
+    ///
+    /// A pause is cut short by traffic, not by time alone: a wake-key match
+    /// for an event *behind* the paused one re-delivers the paused event
+    /// early, so a subscriber that still cannot proceed pauses again. A wake
+    /// with nothing persisted beyond the paused event — the match for that
+    /// very event landing after the pause did — is answered by the runner
+    /// pausing again, without the subscriber being invoked.
+    pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let KeyedEventCtx {
+            parts, event_seq, ..
+        } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
+        Handled {
+            outcome: Outcome::Pause(at),
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl<'inv, T> KeyedEventCtx<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> KeyedEventCtx<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap` accumulators.
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
+    }
+}
+
+/// One stage of a keyed subscriber's processing of one event: an open op,
+/// whose work lands whichever exit is taken.
+///
+/// Implements [`AtomicOperation`](es_entity::AtomicOperation) — use it like
+/// any atomic operation, then take exactly one exit:
+///
+/// | exit | meaning | cursor |
+/// |------|---------|--------|
+/// | [`commit`](Self::commit) | processing of this event is done | advances past the event |
+/// | [`suspend`](Self::suspend) | this stage is done, the chain continues | unmoved |
+/// | [`pause_until`](Self::pause_until) | this stage is done, processing pauses until `at` | unmoved |
+///
+/// The verbs are about the *event*, not the transaction: every exit lands
+/// this stage's writes, and what differs is what happens to the cursor.
+/// `commit` means what [`IsolatedOp::commit`] means — work and checkpoint
+/// land together — so a keyed subscriber that never stages reads exactly
+/// like a singleton one: consume, work, commit. `suspend` and `pause_until`
+/// land the work and leave the checkpoint where it was.
+///
+/// As with [`IsolatedOp`], there is no mutable access to the raw
+/// [`es_entity::DbOp`] — the op can only land through one of the exits, so
+/// no stage can commit without the runner knowing what it meant.
+///
+/// Sealed to its invocation by the same brand [`Handled`] carries, so a
+/// staged op cannot be stashed and resumed from a later event:
+///
+/// ```compile_fail
+/// use obix::StagedOp;
+///
+/// struct Evil {
+///     stash: std::sync::Mutex<Option<StagedOp<'static>>>,
+/// }
+///
+/// async fn stash_it(op: StagedOp<'_>, evil: &Evil) {
+///     // error[E0521]: borrowed data escapes outside of function
+///     *evil.stash.lock().unwrap() = Some(op);
+/// }
+/// ```
+#[must_use = "exit with .commit() / .suspend() / .pause_until()"]
+pub struct StagedOp<'inv> {
+    op: es_entity::DbOp<'static>,
+    parts: CtxParts<'inv>,
+    event_seq: EventSequence,
+}
+
+impl<'inv> StagedOp<'inv> {
+    /// This stage is done, the event is not: the returned [`Suspended`]
+    /// holds **no open transaction**, so the subscriber can await external
+    /// I/O before [`resume`](Suspended::resume) opens the next stage's op.
+    ///
+    /// The cursor does not move — this event is still being processed, and a
+    /// crash here replays it (with everything this stage committed already
+    /// durable).
+    pub async fn suspend(self) -> Result<Suspended<'inv>, HandlerError> {
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        op.commit().await?;
+        Ok(Suspended { parts, event_seq })
+    }
+
+    /// [`suspend`](Self::suspend), and rewrite the resume token in the same
+    /// transaction as this stage's work.
+    ///
+    /// That atomicity is the point: a crash after this returns leaves the
+    /// stage's writes *and* the token that records them durable together, so
+    /// the replay skips the stage via [`KeyedEventCtx::token`] rather than
+    /// relying on the work being idempotent.
+    pub async fn suspend_with<T: Serialize>(
+        self,
+        token: &T,
+    ) -> Result<Suspended<'inv>, HandlerError> {
+        let StagedOp {
+            mut op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.staged = Some(StagedState {
+            sequence: event_seq,
+            token: serde_json::to_value(token)?,
+        });
+        parts
+            .current_job
+            .update_execution_state_in_op(&mut op, &*parts.state)
+            .await?;
+        op.commit().await?;
+        Ok(Suspended { parts, event_seq })
+    }
+
+    /// This stage is done and processing pauses, with the cursor still
+    /// parked *before* this event, until `at`.
+    ///
+    /// The op's work lands, but the checkpoint the runner folds in is still
+    /// pre-this-event: the next run re-reads the event and re-evaluates. The
+    /// resume time is domain knowledge (a retry schedule owned by the
+    /// consumer's entities) — the one fact obix cannot derive.
+    /// The token survives a pause: a pause is part of processing the event,
+    /// and landed-for-now is not the same as the cursor advancing. It can
+    /// therefore live for as long as the backoff does.
+    pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
+        *parts.op_slot = Some(op);
+        Handled {
+            outcome: Outcome::CommitAndPause(at),
+            _invocation: PhantomData,
+        }
+    }
+
+    /// [`pause_until`](Self::pause_until), and rewrite the resume token in the
+    /// same transaction as this stage's work — the runner folds the state
+    /// write into the op it lands.
+    pub fn pause_until_with<T: Serialize>(
+        self,
+        at: chrono::DateTime<chrono::Utc>,
+        token: &T,
+    ) -> Result<Handled<'inv>, HandlerError> {
+        let StagedOp {
+            op,
+            parts,
+            event_seq,
+        } = self;
+        parts.state.staged = Some(StagedState {
+            sequence: event_seq,
+            token: serde_json::to_value(token)?,
+        });
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
+        *parts.op_slot = Some(op);
+        Ok(Handled {
+            outcome: Outcome::CommitAndPause(at),
+            _invocation: PhantomData,
+        })
+    }
+
+    /// Processing of this event is done: the runner folds the checkpoint at
+    /// this event's sequence into the same transaction, so work and cursor
+    /// advance together — what [`IsolatedOp::commit`] does for a singleton.
+    ///
+    /// There is deliberately no `commit_with`: the token's lifetime *is*
+    /// the event's processing, so committing clears it — opportunistically,
+    /// since this path writes the state anyway.
+    pub fn commit(self) -> Handled<'inv> {
+        let StagedOp { op, parts, .. } = self;
+        parts.state.staged = None;
+        *parts.op_slot = Some(op);
+        Handled {
+            outcome: Outcome::Commit,
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl std::ops::Deref for StagedOp<'_> {
+    type Target = es_entity::DbOp<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.op
+    }
+}
+
+es_entity::delegate_atomic_operation!(StagedOp<'_>, { s => s.op });
+
+/// The gap between two stages of processing one event: **no transaction is
+/// open**, which is exactly the point — this is where a subscriber awaits
+/// external I/O.
+///
+/// [`resume`](Self::resume) opens the next stage's op (it comes from the
+/// job's pool and clock, and is traced like any other, which is why this is
+/// ctx-mediated rather than a side-op the consumer opens itself);
+/// [`pause_until`](Self::pause_until) pauses instead.
+///
+/// Sealed to its invocation, exactly as [`StagedOp`] is:
+///
+/// ```compile_fail
+/// use obix::Suspended;
+///
+/// struct Evil {
+///     stash: std::sync::Mutex<Option<Suspended<'static>>>,
+/// }
+///
+/// async fn stash_it(staged: Suspended<'_>, evil: &Evil) {
+///     // error[E0521]: borrowed data escapes outside of function
+///     *evil.stash.lock().unwrap() = Some(staged);
+/// }
+/// ```
+#[must_use = "continue with .resume() or pause with .pause_until()"]
+pub struct Suspended<'inv> {
+    parts: CtxParts<'inv>,
+    event_seq: EventSequence,
+}
+
+impl<'inv> Suspended<'inv> {
+    /// Processing of the event resumes: the next stage's op is opened.
+    pub async fn resume(self) -> Result<StagedOp<'inv>, HandlerError> {
+        let Suspended { parts, event_seq } = self;
+        let op =
+            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
+                .await?;
+        Ok(StagedOp {
+            op,
+            parts,
+            event_seq,
+        })
+    }
+
+    /// Pause with nothing further to record: the cursor stays *before* this
+    /// event until `at`, exactly as [`KeyedEventCtx::pause_until`] does. The
+    /// resume token (if any) is preserved.
+    pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
+        let Suspended { parts, event_seq } = self;
+        parts.state.paused = Some(PausedState {
+            sequence: event_seq,
+            until: at,
+        });
+        Handled {
+            outcome: Outcome::Pause(at),
+            _invocation: PhantomData,
+        }
+    }
+}
+
+/// Read path for [`KeyedEventCtx::token`]: the token is only visible to the
+/// event it was written for.
+fn staged_token<T: serde::de::DeserializeOwned>(
+    state: &OutboxEventJobState,
+    event_seq: EventSequence,
+) -> Result<Option<T>, serde_json::Error> {
+    match &state.staged {
+        Some(staged) if staged.sequence == event_seq => {
+            serde_json::from_value(staged.token.clone()).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Execution-state rows written before staged processing existed have no
+    /// `staged` field. They must still decode — a keyed subscriber upgrading
+    /// into this version resumes from its checkpoint rather than restarting.
+    #[test]
+    fn pre_staged_execution_state_still_decodes() {
+        let state: OutboxEventJobState =
+            serde_json::from_str(r#"{"sequence":42}"#).expect("legacy state must decode");
+        assert_eq!(u64::from(state.sequence), 42);
+        assert!(state.staged.is_none());
+    }
+
+    /// And a state with no token serializes back to exactly what a singleton
+    /// subscriber has always written — the new field adds no bytes.
+    #[test]
+    fn state_without_a_token_serializes_unchanged() {
+        let state = OutboxEventJobState {
+            sequence: EventSequence::from(7u64),
+            staged: None,
+            paused: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&state).expect("serializes"),
+            r#"{"sequence":7}"#
+        );
+    }
+
+    /// The token is only readable by the event it was written for: validity
+    /// is a sequence match, which is what makes stale-token clearing lazy.
+    #[test]
+    fn a_token_is_invisible_to_any_other_event() {
+        let state = OutboxEventJobState {
+            sequence: EventSequence::from(4u64),
+            staged: Some(StagedState {
+                sequence: EventSequence::from(5u64),
+                token: serde_json::json!({ "stage": 1 }),
+            }),
+            paused: None,
+        };
+
+        let mine: Option<serde_json::Value> =
+            staged_token(&state, EventSequence::from(5u64)).expect("reads");
+        assert_eq!(mine, Some(serde_json::json!({ "stage": 1 })));
+
+        let other: Option<serde_json::Value> =
+            staged_token(&state, EventSequence::from(6u64)).expect("reads");
+        assert!(other.is_none(), "a stale token must not be readable");
+    }
 }

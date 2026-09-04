@@ -79,3 +79,59 @@ CREATE TABLE inbox_events (
 
 CREATE INDEX idx_inbox_events_status ON inbox_events(status)
   WHERE status IN ('pending', 'processing', 'failed');
+
+-- Keyed-subscriber subscriptions: one row per (subscriber_type, key)
+-- identity.
+--
+-- Row presence IS the subscription: absence means cancelled. This table
+-- holds identity and terms only (key, wake keys, instance config, birth
+-- frontier); execution and progress (liveness, generations, attempts,
+-- watermark) live entirely in the job crate's own tables, addressed by
+-- (subscriber_type, key) through job's keyed-job machinery. Readers here
+-- must never join against job-crate tables to decide wakes (schema
+-- boundary).
+--
+-- `wake_keys` are a liveness signal, NOT a delivery filter: a live member
+-- reads the whole stream from its own cursor and decides per event in its
+-- own handler. These keys only decide whom to *wake* when a member has
+-- passivated. Matching is set-overlap on both sides — an event classifies
+-- to a set of wake keys, a subscription declares the set it watches, and an
+-- intersection respawns it. Never empty (rejected at subscribe time): an
+-- empty set overlaps nothing, so such a row could never be woken again once
+-- it passivated.
+--
+-- A set rather than a scalar because a subscription's identity is its
+-- `key`, so watching several partitions of the stream cannot be expressed
+-- as extra rows.
+-- `checkpoint` mirrors the member's durable cursor, written in the same
+-- transaction as the job's own checkpoint. The authoritative cursor still
+-- lives in the job crate's execution state; this is a copy obix owns so the
+-- waker can ask "who has fallen far enough behind the in-memory event cache
+-- that waking them now would save a paged cold read from disk" without
+-- joining across the schema boundary into job-crate tables.
+--
+-- It is a lower bound, never an over-estimate: a member that dies without
+-- passivating leaves it behind its true position, which costs at worst a
+-- spurious wake (idempotent, resolves to the live holder or an empty run).
+CREATE TABLE subscriptions (
+  subscriber_type  VARCHAR NOT NULL,
+  key              VARCHAR NOT NULL,
+  wake_keys        VARCHAR[] NOT NULL CHECK (cardinality(wake_keys) > 0),
+  instance_config  JSONB NOT NULL,
+  start_after      BIGINT NOT NULL,
+  checkpoint       BIGINT NOT NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (subscriber_type, key)
+);
+
+-- Backs the waker's catch-up scan: `WHERE checkpoint < $1 ORDER BY
+-- checkpoint ASC LIMIT $2` across every subscriber type, so the members
+-- nearest the eviction cliff are the ones woken first and the per-pass
+-- limit bounds the wake rate.
+CREATE INDEX idx_subscriptions_checkpoint ON subscriptions (checkpoint);
+
+-- Backs the waker's flush-time lookup: `WHERE subscriber_type = $1 AND
+-- wake_keys && $2::varchar[]`. The cast is load-bearing — Postgres has no
+-- implicit varchar[]/text[] cast for `&&`, and sqlx infers text[] for an
+-- untyped array parameter.
+CREATE INDEX idx_subscriptions_wake_keys ON subscriptions USING GIN (wake_keys);

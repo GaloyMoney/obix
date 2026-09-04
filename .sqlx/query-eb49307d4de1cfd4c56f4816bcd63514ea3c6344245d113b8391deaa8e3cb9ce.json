@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint, created_at)\n            VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6::timestamptz, NOW()))\n            ON CONFLICT (subscriber_type, key) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "VarcharArray",
+        "Jsonb",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eb49307d4de1cfd4c56f4816bcd63514ea3c6344245d113b8391deaa8e3cb9ce"
+}

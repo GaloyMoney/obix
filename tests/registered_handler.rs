@@ -1,5 +1,5 @@
-//! Contracts for [`obix::RegisteredEventHandler`] — the checkpoint read-back returned
-//! by `Outbox::register_event_handler` and the caught-up barrier built on it.
+//! Contracts for [`obix::Subscription`] — the checkpoint read-back returned
+//! by `Outbox::register_singleton_subscriber` and the caught-up barrier built on it.
 
 mod helpers;
 
@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obix::{
-    EventCtx, EventSequence, FlushOp, Handled, HandlerCheckpointError, HandlerSnapshot,
-    HandlerStreamStatus, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
-    RegisteredEventHandler, out::Outbox,
+    EventCtx, EventSequence, FlushOp, Handled, MailboxConfig, OutboxEventJobConfig,
+    SingletonSubscriber, Subscription, SubscriptionError, SubscriptionSnapshot,
+    SubscriptionStreamStatus, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -37,7 +37,7 @@ struct SkippingObserver {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for SkippingObserver {
+impl SingletonSubscriber<TestEvent> for SkippingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -58,7 +58,7 @@ struct PoisonHandler;
 
 const POISON_ERROR: &str = "poison-handler-always-fails";
 
-impl OutboxEventHandler<TestEvent> for PoisonHandler {
+impl SingletonSubscriber<TestEvent> for PoisonHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -79,7 +79,7 @@ struct RepublishingHandler {
     echoed: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for RepublishingHandler {
+impl SingletonSubscriber<TestEvent> for RepublishingHandler {
     type Batch = Vec<u64>;
 
     async fn handle_persistent<'inv>(
@@ -147,22 +147,22 @@ fn fast_retry_settings() -> job::RetrySettings {
     settings
 }
 
-async fn register<H: OutboxEventHandler<TestEvent>>(
+async fn register<H: SingletonSubscriber<TestEvent>>(
     outbox: &Outbox<TestEvent, TestTables>,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<RegisteredEventHandler<TestEvent, TestTables>> {
+) -> anyhow::Result<Subscription<TestEvent, TestTables>> {
     register_with(outbox, jobs, test_config(), handler).await
 }
 
-async fn register_with<H: OutboxEventHandler<TestEvent>>(
+async fn register_with<H: SingletonSubscriber<TestEvent>>(
     outbox: &Outbox<TestEvent, TestTables>,
     jobs: &mut job::Jobs,
     config: OutboxEventJobConfig,
     handler: H,
-) -> anyhow::Result<RegisteredEventHandler<TestEvent, TestTables>> {
+) -> anyhow::Result<Subscription<TestEvent, TestTables>> {
     outbox
-        .register_event_handler(jobs, config, handler)
+        .register_singleton_subscriber(jobs, config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -185,8 +185,8 @@ async fn publish_pings(
 /// free of borrows, which is what lets it cross a `tokio::spawn` boundary
 /// (an inline `async move` block hits rust-lang/rust#100013 here).
 async fn load_owned(
-    handle: RegisteredEventHandler<TestEvent, TestTables>,
-) -> Result<HandlerSnapshot, HandlerCheckpointError> {
+    handle: Subscription<TestEvent, TestTables>,
+) -> Result<SubscriptionSnapshot, SubscriptionError> {
     handle.load().await
 }
 
@@ -239,7 +239,7 @@ async fn checkpoint_reads_begin_before_the_handler_runs() -> anyhow::Result<()> 
     assert!(!snapshot.is_caught_up());
     assert_eq!(
         snapshot.stream_status(),
-        HandlerStreamStatus {
+        SubscriptionStreamStatus {
             checkpoint: EventSequence::BEGIN,
             frontier: EventSequence::from(3u64),
         }
@@ -371,7 +371,7 @@ async fn stream_status_never_understates_lag() -> anyhow::Result<()> {
 #[file_serial]
 async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     fn assert_portable<T: Send + Sync + Clone + 'static>() {}
-    assert_portable::<RegisteredEventHandler<TestEvent, TestTables>>();
+    assert_portable::<Subscription<TestEvent, TestTables>>();
 
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
@@ -502,7 +502,7 @@ async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<(
     // The barrier reports a plain timeout — identical in shape to a merely
     // backlogged handler — so the diagnosis has to come from the snapshot.
     match handle.await_caught_up(Duration::from_millis(200)).await {
-        Err(HandlerCheckpointError::CaughtUpTimeout { checkpoint, .. }) => {
+        Err(SubscriptionError::CaughtUpTimeout { checkpoint, .. }) => {
             assert_eq!(checkpoint, EventSequence::BEGIN);
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
@@ -543,7 +543,7 @@ async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()>
     // wait the handler cannot satisfy yet, and it times out honestly.
     let beyond = EventSequence::from(999u64);
     match handle.await_sequence(beyond, Duration::ZERO).await {
-        Err(HandlerCheckpointError::CaughtUpTimeout {
+        Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
             assert_eq!(target, beyond);
@@ -582,7 +582,7 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
     publish_pings(&outbox, 1..=3).await?;
 
     match handle.await_caught_up(Duration::ZERO).await {
-        Err(HandlerCheckpointError::CaughtUpTimeout {
+        Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
             assert_eq!(checkpoint, EventSequence::BEGIN);
@@ -595,7 +595,7 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
     let timeout = Duration::from_millis(300);
     let started = std::time::Instant::now();
     match handle.await_caught_up(timeout).await {
-        Err(HandlerCheckpointError::CaughtUpTimeout { waited, .. }) => {
+        Err(SubscriptionError::CaughtUpTimeout { waited, .. }) => {
             assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),

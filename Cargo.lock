@@ -480,9 +480,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "es-entity"
-version = "0.12.14"
+version = "0.12.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01763a0eade587e3661b5c62f07359a1b0c4e78e04ae59563a6a4e859e9887d8"
+checksum = "7e7eda8c5bc6f811fad5722d822e9131c438b870b4a8f4795d7fe31001ddddd2"
 dependencies = [
  "async-stream",
  "chrono",
@@ -507,9 +507,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.12.14"
+version = "0.12.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60e120de17396a3a74534e7cf103899a33d8eed6fb576497ebc4c2207e1ff665"
+checksum = "37ec505540ceee70b70d48033f347219fa53c78600c216855a1a85deca9070da"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -992,9 +992,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "job"
-version = "0.13.0"
+version = "0.13.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51598d3f10ae3b5dc1b5e002a37d7e5ab5f7510298fa96cdd83f694b11b50ea3"
+checksum = "97b6ac65c4a7208361e1f4ae45e481add19b62c10aa41ae8f5e2a520f49b02c3"
 dependencies = [
  "async-trait",
  "chrono",

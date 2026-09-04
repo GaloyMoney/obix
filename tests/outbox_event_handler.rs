@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use obix::{
-    EventCtx, EventSubscription, Handled, MailboxConfig, OutboxEventHandler, OutboxEventJobConfig,
+    EventCtx, Handled, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
     out::Outbox,
 };
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ struct SkippingObserver {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for SkippingObserver {
+impl SingletonSubscriber<TestEvent> for SkippingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -73,7 +73,7 @@ struct AckingObserver {
     acked: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for AckingObserver {
+impl SingletonSubscriber<TestEvent> for AckingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -101,7 +101,7 @@ struct CheckpointingObserver {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for CheckpointingObserver {
+impl SingletonSubscriber<TestEvent> for CheckpointingObserver {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -112,7 +112,7 @@ impl OutboxEventHandler<TestEvent> for CheckpointingObserver {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
         }
-        let op = ctx.consume_isolated().await?;
+        let op = ctx.consume().await?;
         Ok(op.commit())
     }
 }
@@ -121,7 +121,7 @@ struct TestEphemeralHandler {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestEphemeralHandler {
+impl SingletonSubscriber<TestEvent> for TestEphemeralHandler {
     type Batch = ();
 
     async fn handle_ephemeral(
@@ -139,7 +139,7 @@ struct TestBothHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for TestBothHandler {
+impl SingletonSubscriber<TestEvent> for TestBothHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -164,8 +164,9 @@ impl OutboxEventHandler<TestEvent> for TestBothHandler {
 }
 
 /// Generic `*_in_op`-style helper: takes any `AtomicOperation`, so handlers
-/// can pass `&mut op` (a `BatchOp`/`IsolatedOp`) directly — exercising the
-/// direct `AtomicOperation` impls instead of the `&mut *op` deref.
+/// can pass `&mut op` (an `IsolatedOp`, or the `FlushOp` handed to `flush`)
+/// directly — exercising the direct `AtomicOperation` impls instead of the
+/// `&mut *op` deref.
 async fn insert_effect_in_op(
     op: &mut impl es_entity::AtomicOperation,
     n: i64,
@@ -177,109 +178,88 @@ async fn insert_effect_in_op(
     Ok(())
 }
 
-/// Batch-safe worker: inserts one row per event inside the shared batch op
-/// and defers. Optionally fails the first time a given event value is seen.
-/// Sleeps briefly per event so the backfill keeps the ready backlog ahead of
-/// the handler (making batch composition deterministic in tests).
-struct DeferringEffectHandler {
+/// Batch-safe worker: collects one item per event and inserts the whole
+/// accumulator in `flush`. Optionally fails the first time a given event
+/// value is seen. Sleeps briefly per event so the backfill keeps the ready
+/// backlog ahead of the handler (making batch composition deterministic in
+/// tests).
+struct CollectingEffectHandler {
     deliveries: Arc<Mutex<Vec<u64>>>,
     fail_on_first: Option<u64>,
     failed: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for DeferringEffectHandler {
-    type Batch = ();
+impl SingletonSubscriber<TestEvent> for CollectingEffectHandler {
+    type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'inv>,
+        ctx: EventCtx<'inv, Self::Batch>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
         };
         self.deliveries.lock().await.push(*n);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let mut op = ctx.consume_in_batch().await?;
         if self.fail_on_first == Some(*n) && !self.failed.swap(true, Ordering::SeqCst) {
             return Err("injected mid-batch failure".into());
         }
+        Ok(ctx.collect(*n as i64))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut obix::FlushOp<'_>,
+        items: Self::Batch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use es_entity::AtomicOperation;
         // Provided-method delegation pinned: inheriting the trait default
         // would report false here (DbOp overrides it to true).
         if !op.supports_hooks() {
-            return Err("BatchOp must delegate supports_hooks to the inner DbOp".into());
+            return Err("FlushOp must delegate supports_hooks to the inner DbOp".into());
         }
-        insert_effect_in_op(&mut op, *n as i64).await?;
-        Ok(op.defer())
+        for n in items {
+            insert_effect_in_op(op, n).await?;
+        }
+        Ok(())
     }
 }
 
-/// Defers everything except one event value, which it handles isolated —
-/// fencing the pending batch — and fails on its first attempt.
-struct IsolatingEffectHandler {
-    deliveries: Arc<Mutex<Vec<u64>>>,
-    isolate_on: u64,
-    fail_isolated_once: Arc<AtomicBool>,
-}
-
-impl OutboxEventHandler<TestEvent> for IsolatingEffectHandler {
-    type Batch = ();
-
-    async fn handle_persistent<'inv>(
-        &self,
-        ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(TestEvent::Ping(n)) = &event.payload else {
-            return Ok(ctx.skip());
-        };
-        self.deliveries.lock().await.push(*n);
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        if *n == self.isolate_on {
-            let mut op = ctx.consume_isolated().await?;
-            insert_effect_in_op(&mut op, *n as i64).await?;
-            if !self.fail_isolated_once.swap(true, Ordering::SeqCst) {
-                return Err("injected isolated failure".into());
-            }
-            Ok(op.commit())
-        } else {
-            let mut op = ctx.consume_in_batch().await?;
-            insert_effect_in_op(&mut op, *n as i64).await?;
-            Ok(op.defer())
-        }
-    }
-}
-
-/// Slow deferring worker that also records ephemerals and snapshots the
+/// Slow collecting worker that also records ephemerals and snapshots the
 /// committed effect rows when an ephemeral runs — used to prove an
 /// ephemeral arriving mid-batch never interrupts the batch: it is handled
 /// at the batch boundary, after the full batch has landed.
-struct SlowDeferringHandler {
+struct SlowCollectingHandler {
     pool: sqlx::PgPool,
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
     rows_at_ephemeral: Arc<Mutex<usize>>,
 }
 
-impl OutboxEventHandler<TestEvent> for SlowDeferringHandler {
-    type Batch = ();
+impl SingletonSubscriber<TestEvent> for SlowCollectingHandler {
+    type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
         &self,
-        ctx: EventCtx<'inv>,
+        ctx: EventCtx<'inv, Self::Batch>,
         event: &obix::out::PersistentOutboxEvent<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        use es_entity::AtomicOperation;
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
         };
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut op = ctx.consume_in_batch().await?;
-        sqlx::query("INSERT INTO test_batch_effects (n) VALUES ($1)")
-            .bind(*n as i64)
-            .execute(op.as_executor())
-            .await?;
-        Ok(op.defer())
+        Ok(ctx.collect(*n as i64))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut obix::FlushOp<'_>,
+        items: Self::Batch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for n in items {
+            insert_effect_in_op(op, n).await?;
+        }
+        Ok(())
     }
 
     async fn handle_ephemeral(
@@ -308,7 +288,7 @@ struct CollectingHandler {
     fail_first_flush: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for CollectingHandler {
+impl SingletonSubscriber<TestEvent> for CollectingHandler {
     type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
@@ -352,7 +332,7 @@ struct CoalescingHandler {
     flush_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for CoalescingHandler {
+impl SingletonSubscriber<TestEvent> for CoalescingHandler {
     type Batch = std::collections::HashMap<i64, i64>;
 
     async fn handle_persistent<'inv>(
@@ -381,48 +361,6 @@ impl OutboxEventHandler<TestEvent> for CoalescingHandler {
     }
 }
 
-/// Mixes the two batching channels in one handler: odd events are collected
-/// (applied at flush), even events write directly into the shared batch op
-/// and defer — everything lands in the same transaction.
-struct MixedHandler {
-    flush_sizes: Arc<Mutex<Vec<usize>>>,
-}
-
-impl OutboxEventHandler<TestEvent> for MixedHandler {
-    type Batch = Vec<i64>;
-
-    async fn handle_persistent<'inv>(
-        &self,
-        ctx: EventCtx<'inv, Vec<i64>>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
-    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(TestEvent::Ping(n)) = &event.payload else {
-            return Ok(ctx.skip());
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let n = *n as i64;
-        if n % 2 == 1 {
-            Ok(ctx.collect(n))
-        } else {
-            let mut op = ctx.consume_in_batch().await?;
-            insert_effect_in_op(&mut op, n).await?;
-            Ok(op.defer())
-        }
-    }
-
-    async fn flush(
-        &self,
-        op: &mut obix::FlushOp<'_>,
-        items: Vec<i64>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.flush_sizes.lock().await.push(items.len());
-        for n in items {
-            insert_effect_in_op(op, n).await?;
-        }
-        Ok(())
-    }
-}
-
 /// Collects everything except one event value, which it handles isolated —
 /// the isolation fence must land the collected items (and their checkpoint)
 /// before the isolated op exists, so the isolated failure replays alone.
@@ -432,7 +370,7 @@ struct CollectThenIsolateHandler {
     fail_isolated_once: Arc<AtomicBool>,
 }
 
-impl OutboxEventHandler<TestEvent> for CollectThenIsolateHandler {
+impl SingletonSubscriber<TestEvent> for CollectThenIsolateHandler {
     type Batch = Vec<i64>;
 
     async fn handle_persistent<'inv>(
@@ -446,7 +384,7 @@ impl OutboxEventHandler<TestEvent> for CollectThenIsolateHandler {
         self.deliveries.lock().await.push(*n);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         if *n == self.isolate_on {
-            let mut op = ctx.consume_isolated().await?;
+            let mut op = ctx.consume().await?;
             insert_effect_in_op(&mut op, *n as i64).await?;
             if !self.fail_isolated_once.swap(true, Ordering::SeqCst) {
                 return Err("injected isolated failure".into());
@@ -477,7 +415,7 @@ struct FairnessProbeHandler {
     persistent_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for FairnessProbeHandler {
+impl SingletonSubscriber<TestEvent> for FairnessProbeHandler {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -509,8 +447,8 @@ struct PersistentOnlyHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for PersistentOnlyHandler {
-    const SUBSCRIPTION: EventSubscription = EventSubscription::PersistentOnly;
+impl SingletonSubscriber<TestEvent> for PersistentOnlyHandler {
+    const SUBSCRIPTION: StreamSelection = StreamSelection::PersistentOnly;
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -541,8 +479,8 @@ struct EphemeralOnlyHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl OutboxEventHandler<TestEvent> for EphemeralOnlyHandler {
-    const SUBSCRIPTION: EventSubscription = EventSubscription::EphemeralOnly;
+impl SingletonSubscriber<TestEvent> for EphemeralOnlyHandler {
+    const SUBSCRIPTION: StreamSelection = StreamSelection::EphemeralOnly;
     type Batch = ();
 
     async fn handle_persistent<'inv>(
@@ -566,7 +504,7 @@ impl OutboxEventHandler<TestEvent> for EphemeralOnlyHandler {
     }
 }
 
-async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
+async fn init_outbox_with_handler<H: SingletonSubscriber<TestEvent>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     handler: H,
@@ -580,7 +518,7 @@ async fn init_outbox_with_handler<H: OutboxEventHandler<TestEvent>>(
     .await
 }
 
-async fn init_outbox_with_handler_config<H: OutboxEventHandler<TestEvent>>(
+async fn init_outbox_with_handler_config<H: SingletonSubscriber<TestEvent>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     config: OutboxEventJobConfig,
@@ -598,7 +536,7 @@ async fn init_outbox_with_handler_config<H: OutboxEventHandler<TestEvent>>(
     .await?;
 
     outbox
-        .register_event_handler(jobs, config, handler)
+        .register_singleton_subscriber(jobs, config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -850,7 +788,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         .await?;
 
         outbox
-            .register_event_handler(
+            .register_singleton_subscriber(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 CheckpointingObserver {
@@ -956,7 +894,7 @@ async fn handler_receives_both_persistent_and_ephemeral() -> anyhow::Result<()> 
 
 #[tokio::test]
 #[file_serial]
-async fn deferred_batch_replays_wholesale_on_mid_batch_failure() -> anyhow::Result<()> {
+async fn collected_batch_replays_wholesale_on_mid_batch_failure() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     reset_batch_effects_table(&pool).await?;
 
@@ -973,7 +911,7 @@ async fn deferred_batch_replays_wholesale_on_mid_batch_failure() -> anyhow::Resu
         &pool,
         &mut jobs,
         config,
-        DeferringEffectHandler {
+        CollectingEffectHandler {
             deliveries: deliveries.clone(),
             fail_on_first: Some(2),
             failed: Arc::new(AtomicBool::new(false)),
@@ -998,7 +936,7 @@ async fn deferred_batch_replays_wholesale_on_mid_batch_failure() -> anyhow::Resu
     // Exactly-once DB effects despite the replay.
     assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4, 5]);
 
-    // Event 1 was deferred into the batch that event 2 poisoned, so the
+    // Event 1 was collected into the batch that event 2 poisoned, so the
     // whole batch rolled back and event 1 was delivered again on replay —
     // per-batch fate sharing, not per-event.
     let deliveries = deliveries.lock().await;
@@ -1006,71 +944,6 @@ async fn deferred_batch_replays_wholesale_on_mid_batch_failure() -> anyhow::Resu
     assert!(
         event_1_deliveries >= 2,
         "expected event 1 to replay with the poisoned batch, deliveries: {deliveries:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[file_serial]
-async fn isolated_event_fences_prior_batch_from_its_failure() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    reset_batch_effects_table(&pool).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let deliveries = Arc::new(Mutex::new(Vec::new()));
-    let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
-        .with_retry_settings(fast_retry_settings());
-    let outbox = init_outbox_with_handler_config(
-        &pool,
-        &mut jobs,
-        config,
-        IsolatingEffectHandler {
-            deliveries: deliveries.clone(),
-            isolate_on: 3,
-            fail_isolated_once: Arc::new(AtomicBool::new(false)),
-        },
-    )
-    .await?;
-
-    const N: u64 = 3;
-    let mut op = outbox.begin_op().await?;
-    for n in 1..=N {
-        outbox
-            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
-            .await?;
-    }
-    op.commit().await?;
-
-    jobs.start_poll().await?;
-
-    wait_for_effect_rows(&pool, N as usize).await?;
-    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3]);
-
-    // Events 1 and 2 were landed (batch flush at the isolation fence or
-    // earlier) before event 3's isolated op failed — so only event 3
-    // replays. With PR-#84-style runner batching, the whole batch would
-    // have rolled back and events 1 and 2 would replay too.
-    let deliveries = deliveries.lock().await;
-    let count = |v: u64| deliveries.iter().filter(|&&n| n == v).count();
-    assert_eq!(
-        count(1),
-        1,
-        "event 1 must not replay with the isolated failure, deliveries: {deliveries:?}"
-    );
-    assert_eq!(
-        count(2),
-        1,
-        "event 2 must not replay with the isolated failure, deliveries: {deliveries:?}"
-    );
-    assert!(
-        count(3) >= 2,
-        "event 3 must replay alone, deliveries: {deliveries:?}"
     );
 
     Ok(())
@@ -1137,7 +1010,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
-        SlowDeferringHandler {
+        SlowCollectingHandler {
             pool: pool.clone(),
             ephemeral_received: ephemeral_received.clone(),
             rows_at_ephemeral: rows_at_ephemeral.clone(),
@@ -1145,7 +1018,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Publish a backlog of slow (100ms each) deferring events, then publish
+    // Publish a backlog of slow (100ms each) collecting events, then publish
     // an ephemeral while the batch is guaranteed to still be open mid-drain.
     const N: u64 = 5;
     let mut op = outbox.begin_op().await?;
@@ -1186,7 +1059,7 @@ async fn ephemeral_never_interrupts_an_open_batch() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn single_deferred_event_commits_promptly_at_low_traffic() -> anyhow::Result<()> {
+async fn single_collected_event_commits_promptly_at_low_traffic() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     reset_batch_effects_table(&pool).await?;
 
@@ -1200,7 +1073,7 @@ async fn single_deferred_event_commits_promptly_at_low_traffic() -> anyhow::Resu
     let outbox = init_outbox_with_handler(
         &pool,
         &mut jobs,
-        DeferringEffectHandler {
+        CollectingEffectHandler {
             deliveries: deliveries.clone(),
             fail_on_first: None,
             failed: Arc::new(AtomicBool::new(false)),
@@ -1220,7 +1093,7 @@ async fn single_deferred_event_commits_promptly_at_low_traffic() -> anyhow::Resu
         .await?;
     op.commit().await?;
 
-    // A deferred op is never held open waiting for future events: the
+    // A pending batch is never held open waiting for future events: the
     // moment the backlog is drained the batch (of one) lands — work AND
     // checkpoint — with no configured wait.
     wait_for_effect_rows(&pool, 1).await?;
@@ -1228,7 +1101,7 @@ async fn single_deferred_event_commits_promptly_at_low_traffic() -> anyhow::Resu
     let latency = published_at.elapsed();
     assert!(
         latency < std::time::Duration::from_secs(2),
-        "single deferred event took {latency:?} to land"
+        "single collected event took {latency:?} to land"
     );
 
     Ok(())
@@ -1376,55 +1249,9 @@ async fn failed_flush_replays_and_recollects() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 #[tokio::test]
 #[file_serial]
-async fn mixed_collect_and_defer_land_in_one_batch() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    reset_batch_effects_table(&pool).await?;
-
-    let job_config = job::JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .unwrap();
-    let mut jobs = job::Jobs::init(job_config).await?;
-
-    let flush_sizes = Arc::new(Mutex::new(Vec::new()));
-    let outbox = init_outbox_with_handler(
-        &pool,
-        &mut jobs,
-        MixedHandler {
-            flush_sizes: flush_sizes.clone(),
-        },
-    )
-    .await?;
-
-    const N: u64 = 4;
-    let mut op = outbox.begin_op().await?;
-    for n in 1..=N {
-        outbox
-            .publish_persisted_in_op(&mut op, TestEvent::Ping(n))
-            .await?;
-    }
-    op.commit().await?;
-
-    jobs.start_poll().await?;
-
-    wait_for_effect_rows(&pool, N as usize).await?;
-    wait_for_checkpoint(&jobs, N as i64).await?;
-
-    // Odd events were collected (applied at flush), even events wrote into
-    // the shared op at handle time — one batch, one transaction, one
-    // checkpoint for all four.
-    assert_eq!(batch_effect_rows(&pool).await?, vec![1, 2, 3, 4]);
-    assert_eq!(*flush_sizes.lock().await, vec![2]);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[file_serial]
-async fn isolated_entry_flushes_collected_items_first() -> anyhow::Result<()> {
+async fn consume_entry_flushes_collected_items_first() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     reset_batch_effects_table(&pool).await?;
 
@@ -1836,7 +1663,7 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
         )
         .await?;
         outbox
-            .register_event_handler(
+            .register_singleton_subscriber(
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
                     .with_retry_settings(fast_retry_settings())
