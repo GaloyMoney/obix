@@ -403,7 +403,6 @@ pub struct Subscriptions<D, P, Tables = crate::tables::DefaultMailboxTables>
 where
     D: SubscriptionDef<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
 {
     pool: sqlx::PgPool,
     clock: es_entity::clock::ClockHandle,
