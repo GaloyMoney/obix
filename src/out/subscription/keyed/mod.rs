@@ -182,8 +182,8 @@ impl std::fmt::Display for WakeKey {
 /// a not-yet-subscribed key does not exist at all — so it cannot be offered
 /// unreplayable events. What it gets in exchange is everything presence
 /// forbids a [`SingletonSubscriber`](crate::out::SingletonSubscriber):
-/// [`pause_until`](KeyedEventCtx::pause_until), staged chains across external
-/// I/O, and the resume token.
+/// [`pause_until`](KeyedEventCtx::pause_until) and staged chains across
+/// external I/O.
 ///
 /// A single-instance flow that needs those is persistent-only by definition
 /// — host it here with one static key rather than reaching for a paused

@@ -36,7 +36,7 @@ pub enum StreamSelection {
 /// it is what licenses the ephemeral subscription below, since ephemeral
 /// events cannot be replayed and only an always-present consumer may hear
 /// them. It is also why a singleton subscriber has no way to pause — no
-/// `pause_until`, no staged chain, no resume token. For a single-instance
+/// `pause_until`, no staged chain. For a single-instance
 /// flow that does need to pause or stage, see
 /// [`KeyedSubscriber`](crate::out::KeyedSubscriber) with one static key.
 ///

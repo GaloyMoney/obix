@@ -213,7 +213,6 @@ where
             .execution_state::<OutboxEventJobState>()?
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
-                staged: None,
                 paused: None,
             });
 

@@ -1474,16 +1474,8 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
 }
 
 // === Staged processing: multi-transaction events with external I/O between
-// stages, and the opaque resume token that makes the interim stages
-// exactly-once on replay. ===
-
-/// The subscriber's own token schema. obix stores it as opaque JSON and never
-/// interprets it — this shape exists only so the test can prove round-trip.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct StageToken {
-    stage: u8,
-    n: u64,
-}
+// stages. Interim stages are durable but replayed: a crash or a hold in the
+// gap re-handles the event from its first stage. ===
 
 #[derive(Clone, Default)]
 struct StagedShared {
@@ -1565,42 +1557,26 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
             return Ok(ctx.collect(format!("collect:{n}")));
         }
 
-        let token = ctx.token::<StageToken>()?;
         let mut op = ctx.consume().await?;
-        let staged = match token {
-            // Stage 1 is already durable from an earlier attempt — skip it
-            // rather than relying on it being idempotent.
-            Some(token) => {
-                self.shared
-                    .trace
-                    .lock()
-                    .await
-                    .push(format!("resumed:{}", token.n));
-                op
-            }
-            None => {
-                insert_label(&mut op, &format!("stage1:{n}")).await?;
-                self.shared.trace.lock().await.push(format!("stage1:{n}"));
-                let gap = op.suspend_with(&StageToken { stage: 1, n: *n }).await?;
+        insert_label(&mut op, &format!("stage1:{n}")).await?;
+        self.shared.trace.lock().await.push(format!("stage1:{n}"));
+        let gap = op.suspend().await?;
 
-                // The external-I/O gap: no transaction is open here.
-                if self
-                    .shared
-                    .fail_after_stage_one
-                    .swap(false, Ordering::SeqCst)
-                {
-                    self.shared.trace.lock().await.push("crash".to_string());
-                    return Err("injected crash in the external-I/O gap".into());
-                }
-                if let Some(at) = self.shared.hold_in_gap.lock().await.take() {
-                    self.shared.trace.lock().await.push("hold".to_string());
-                    return Ok(gap.pause_until(at));
-                }
-                gap.resume().await?
-            }
-        };
+        // The external-I/O gap: no transaction is open here.
+        if self
+            .shared
+            .fail_after_stage_one
+            .swap(false, Ordering::SeqCst)
+        {
+            self.shared.trace.lock().await.push("crash".to_string());
+            return Err("injected crash in the external-I/O gap".into());
+        }
+        if let Some(at) = self.shared.hold_in_gap.lock().await.take() {
+            self.shared.trace.lock().await.push("hold".to_string());
+            return Ok(gap.pause_until(at));
+        }
 
-        let mut op = staged;
+        let mut op = gap.resume().await?;
         insert_label(&mut op, &format!("stage2:{n}")).await?;
         self.shared.trace.lock().await.push(format!("stage2:{n}"));
         Ok(op.commit())
@@ -1719,11 +1695,11 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
 
 /// Contract — interim durability and chain error: a failure in the gap
 /// between stages leaves stage 1's writes committed and the cursor unmoved,
-/// so the event is re-read; the resume token is what lets the retry skip the
-/// stage instead of redoing it. Stage 1 must appear exactly once.
+/// so the event is re-read and handled again from its first stage. Stage 1
+/// lands twice; nothing it landed is lost.
 #[tokio::test]
 #[file_serial]
-async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> anyhow::Result<()> {
+async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_staged_outbox(&pool).await?;
@@ -1756,31 +1732,29 @@ async fn a_crash_between_stages_keeps_stage_one_and_resumes_from_the_token() -> 
     publish_ping(&outbox, 1, 11).await?;
 
     eventually(Duration::from_secs(20), || async {
-        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage2:11"])
+        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage1:11", "stage2:11"])
     })
     .await?;
 
-    // Stage 1 ran once and survived the crash; the replay saw the token and
-    // went straight to stage 2 rather than re-running stage 1.
+    // Stage 1 landed before the crash and survived it; the replay handled
+    // the event from the start, landing stage 1 again before stage 2.
     let trace = trace_of(&shared).await;
     assert_eq!(
         trace,
-        vec!["stage1:11", "crash", "resumed:11", "stage2:11"],
-        "expected stage 1 to commit, crash, then resume from the token"
+        vec!["stage1:11", "crash", "stage1:11", "stage2:11"],
+        "expected stage 1 to commit, crash, then replay from the first stage"
     );
 
     jobs.shutdown().await?;
     Ok(())
 }
 
-/// Contract — token lifetime: a hold is part of processing the event, so the
-/// token survives it (the cursor is still parked before the event). Once
-/// `commit` advances the cursor the token is gone, and the next event
-/// starts fresh — proving the slot is scoped to one event, not to the
-/// subscription.
+/// Contract — a hold in the gap is part of processing the event: the cursor
+/// stays parked before it, and once the hold ends the event is handled again
+/// from its first stage. The next event is unaffected.
 #[tokio::test]
 #[file_serial]
-async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> anyhow::Result<()> {
+async fn a_hold_between_stages_replays_the_event_from_its_first_stage() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_staged_outbox(&pool).await?;
@@ -1814,37 +1788,42 @@ async fn the_resume_token_survives_a_hold_and_does_not_outlive_its_event() -> an
     publish_ping(&outbox, 1, 11).await?;
 
     eventually(Duration::from_secs(20), || async {
-        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage2:11"])
+        Ok(staged_effects(&pool).await? == vec!["stage1:11", "stage1:11", "stage2:11"])
     })
     .await?;
     assert_eq!(
         trace_of(&shared).await,
-        vec!["stage1:11", "hold", "resumed:11", "stage2:11"],
-        "the token must survive the hold and be readable when processing resumes"
+        vec!["stage1:11", "hold", "stage1:11", "stage2:11"],
+        "the hold must end with the event handled again from its first stage"
     );
 
-    // A second staged event: its own sequence, so the committed event's
-    // token is not visible to it — it must run stage 1 from scratch.
+    // A second staged event runs its own chain, unaffected by the first.
     publish_ping(&outbox, 1, 12).await?;
     eventually(Duration::from_secs(20), || async {
-        Ok(staged_effects(&pool).await?.len() == 4)
+        Ok(staged_effects(&pool).await?.len() == 5)
     })
     .await?;
     assert_eq!(
         staged_effects(&pool).await?,
-        vec!["stage1:11", "stage2:11", "stage1:12", "stage2:12"]
+        vec![
+            "stage1:11",
+            "stage1:11",
+            "stage2:11",
+            "stage1:12",
+            "stage2:12"
+        ]
     );
     assert_eq!(
         trace_of(&shared).await,
         vec![
             "stage1:11",
             "hold",
-            "resumed:11",
+            "stage1:11",
             "stage2:11",
             "stage1:12",
             "stage2:12"
         ],
-        "a committed event's token must not be visible to the next event"
+        "the second event must start its own chain from its first stage"
     );
 
     jobs.shutdown().await?;

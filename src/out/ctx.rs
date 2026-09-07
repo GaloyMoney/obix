@@ -44,7 +44,7 @@
 //! | capability | singleton | keyed |
 //! |------------|-----------|-------|
 //! | ephemeral delivery | yes — by presence | no, statically |
-//! | [`pause_until`](KeyedEventCtx::pause_until), staged chains, resume token | no — by presence | yes |
+//! | [`pause_until`](KeyedEventCtx::pause_until), staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
 //!
 //! The asymmetry is the **presence contract**, not scheduling mechanics. A
@@ -74,19 +74,18 @@ pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Persisted execution state of an outbox event-handler job: the sequence of
 /// the last fully handled persistent event, plus (keyed subscribers only)
-/// the resume token of the event currently being processed.
+/// where the member last paused.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEventJobState {
     pub(crate) sequence: EventSequence,
-    /// `serde(default)` so execution-state rows written before staged
-    /// processing existed still decode; `skip_serializing_if` so a singleton
-    /// subscriber's state stays byte-identical to what it always wrote.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) staged: Option<StagedState>,
     /// Where and until when the member last paused. Read at run start: a
     /// wake that finds nothing persisted beyond the paused event is answered
     /// by pausing again, without the subscriber being invoked. Stale by
     /// construction once the cursor is past `sequence`.
+    ///
+    /// `serde(default)` so execution-state rows written before pausing
+    /// existed still decode; `skip_serializing_if` so a singleton
+    /// subscriber's state stays byte-identical to what it always wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) paused: Option<PausedState>,
 }
@@ -97,19 +96,6 @@ pub(crate) struct OutboxEventJobState {
 pub(crate) struct PausedState {
     pub(crate) sequence: EventSequence,
     pub(crate) until: chrono::DateTime<chrono::Utc>,
-}
-
-/// The resume-token slot: an opaque JSON value scoped to one event.
-///
-/// obix owns the slot and its lifetime; the meaning of what is in it belongs
-/// entirely to the subscriber. obix never interprets the token.
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct StagedState {
-    /// The event the token belongs to. Validity is checked at read time
-    /// against the event being processed, which is what makes clearing lazy:
-    /// a stale token is unreadable by construction.
-    pub(crate) sequence: EventSequence,
-    pub(crate) token: serde_json::Value,
 }
 
 /// Book-keeping the runner shares with [`EventCtx`].
@@ -146,8 +132,9 @@ pub(crate) trait CheckpointMirror: Send + Sync {
 pub(crate) struct CtxParts<'inv> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
-    /// Mutable so the staged verbs can write the resume token into the state
-    /// the runner is about to persist. `sequence` remains the runner's alone.
+    /// Mutable so the pause verbs can record where the member paused in the
+    /// state the runner is about to persist. `sequence` remains the runner's
+    /// alone.
     pub(crate) state: &'inv mut OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
     /// `Some` for keyed members, `None` for singletons — see
@@ -218,7 +205,7 @@ pub(crate) enum Outcome {
 /// A singleton subscriber is **always on**, and that presence is what
 /// licenses its ephemeral subscription: ephemeral events cannot be replayed,
 /// so only an always-present consumer may hear them. This ctx therefore has
-/// no pausing verb — no `pause_until`, no staged chain, no resume token.
+/// no pausing verb — no `pause_until`, no staged chain.
 /// Their absence is semantic, not an omission: a verb that suspends
 /// consumption would contradict the property that defines the mode.
 ///
@@ -602,8 +589,8 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
     ///
     /// Interim stages are fenced before the cursor and replayed on crash:
     /// nothing a `suspend` landed is lost, but the event itself is re-read
-    /// and re-handled until a `commit` advances past it. Use
-    /// [`token`](Self::token) to skip stages already durable.
+    /// and re-handled from its first stage until a `commit` advances past
+    /// it, so what an interim stage lands must tolerate landing again.
     pub async fn consume(self) -> Result<StagedOp<'inv>, HandlerError>
     where
         B: Default,
@@ -623,27 +610,6 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
             parts,
             event_seq,
         })
-    }
-
-    /// The resume token, if one was written while processing *this* event
-    /// — what the last [`suspend_with`](StagedOp::suspend_with) or
-    /// [`pause_until_with`](StagedOp::pause_until_with) left. Readable
-    /// before [`consume`](Self::consume) because it is in-memory state the
-    /// runner already loaded: a subscriber decides where a run begins, or
-    /// that the event is not its to handle and [`skip`](Self::skip)s it,
-    /// before anything is opened.
-    ///
-    /// `None` when nothing was staged, and also when a token left over from
-    /// a different event is still in the slot: validity is checked against
-    /// the current event's sequence, which is why stale tokens never need
-    /// explicit clearing.
-    ///
-    /// A deserialization failure surfaces as `Err`; what to do about it is
-    /// the subscriber's call. Tokens survive pauses, so they can outlive a
-    /// deploy — schema-stamping them and treating a mismatch as "start
-    /// fresh" is the recommended consumer contract.
-    pub fn token<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
-        staged_token(self.parts.state, self.event_seq)
     }
 
     /// My cursor stays *before* this event until `at` — entry and exit in
@@ -765,34 +731,6 @@ impl<'inv> StagedOp<'inv> {
         Ok(Suspended { parts, event_seq })
     }
 
-    /// [`suspend`](Self::suspend), and rewrite the resume token in the same
-    /// transaction as this stage's work.
-    ///
-    /// That atomicity is the point: a crash after this returns leaves the
-    /// stage's writes *and* the token that records them durable together, so
-    /// the replay skips the stage via [`KeyedEventCtx::token`] rather than
-    /// relying on the work being idempotent.
-    pub async fn suspend_with<T: Serialize>(
-        self,
-        token: &T,
-    ) -> Result<Suspended<'inv>, HandlerError> {
-        let StagedOp {
-            mut op,
-            parts,
-            event_seq,
-        } = self;
-        parts.state.staged = Some(StagedState {
-            sequence: event_seq,
-            token: serde_json::to_value(token)?,
-        });
-        parts
-            .current_job
-            .update_execution_state_in_op(&mut op, &*parts.state)
-            .await?;
-        op.commit().await?;
-        Ok(Suspended { parts, event_seq })
-    }
-
     /// This stage is done and processing pauses, with the cursor still
     /// parked *before* this event, until `at`.
     ///
@@ -800,9 +738,6 @@ impl<'inv> StagedOp<'inv> {
     /// pre-this-event: the next run re-reads the event and re-evaluates. The
     /// resume time is domain knowledge (a retry schedule owned by the
     /// consumer's entities) — the one fact obix cannot derive.
-    /// The token survives a pause: a pause is part of processing the event,
-    /// and landed-for-now is not the same as the cursor advancing. It can
-    /// therefore live for as long as the backoff does.
     pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
         let StagedOp {
             op,
@@ -820,44 +755,11 @@ impl<'inv> StagedOp<'inv> {
         }
     }
 
-    /// [`pause_until`](Self::pause_until), and rewrite the resume token in the
-    /// same transaction as this stage's work — the runner folds the state
-    /// write into the op it lands.
-    pub fn pause_until_with<T: Serialize>(
-        self,
-        at: chrono::DateTime<chrono::Utc>,
-        token: &T,
-    ) -> Result<Handled<'inv>, HandlerError> {
-        let StagedOp {
-            op,
-            parts,
-            event_seq,
-        } = self;
-        parts.state.staged = Some(StagedState {
-            sequence: event_seq,
-            token: serde_json::to_value(token)?,
-        });
-        parts.state.paused = Some(PausedState {
-            sequence: event_seq,
-            until: at,
-        });
-        *parts.op_slot = Some(op);
-        Ok(Handled {
-            outcome: Outcome::CommitAndPause(at),
-            _invocation: PhantomData,
-        })
-    }
-
     /// Processing of this event is done: the runner folds the checkpoint at
     /// this event's sequence into the same transaction, so work and cursor
     /// advance together — what [`IsolatedOp::commit`] does for a singleton.
-    ///
-    /// There is deliberately no `commit_with`: the token's lifetime *is*
-    /// the event's processing, so committing clears it — opportunistically,
-    /// since this path writes the state anyway.
     pub fn commit(self) -> Handled<'inv> {
         let StagedOp { op, parts, .. } = self;
-        parts.state.staged = None;
         *parts.op_slot = Some(op);
         Handled {
             outcome: Outcome::Commit,
@@ -920,8 +822,7 @@ impl<'inv> Suspended<'inv> {
     }
 
     /// Pause with nothing further to record: the cursor stays *before* this
-    /// event until `at`, exactly as [`KeyedEventCtx::pause_until`] does. The
-    /// resume token (if any) is preserved.
+    /// event until `at`, exactly as [`KeyedEventCtx::pause_until`] does.
     pub fn pause_until(self, at: chrono::DateTime<chrono::Utc>) -> Handled<'inv> {
         let Suspended { parts, event_seq } = self;
         parts.state.paused = Some(PausedState {
@@ -935,69 +836,32 @@ impl<'inv> Suspended<'inv> {
     }
 }
 
-/// Read path for [`KeyedEventCtx::token`]: the token is only visible to the
-/// event it was written for.
-fn staged_token<T: serde::de::DeserializeOwned>(
-    state: &OutboxEventJobState,
-    event_seq: EventSequence,
-) -> Result<Option<T>, serde_json::Error> {
-    match &state.staged {
-        Some(staged) if staged.sequence == event_seq => {
-            serde_json::from_value(staged.token.clone()).map(Some)
-        }
-        _ => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Execution-state rows written before staged processing existed have no
-    /// `staged` field. They must still decode — a keyed subscriber upgrading
-    /// into this version resumes from its checkpoint rather than restarting.
+    /// Execution-state rows written before pausing existed have no `paused`
+    /// field. They must still decode — a keyed subscriber upgrading into
+    /// this version resumes from its checkpoint rather than restarting.
     #[test]
-    fn pre_staged_execution_state_still_decodes() {
+    fn pre_pause_execution_state_still_decodes() {
         let state: OutboxEventJobState =
             serde_json::from_str(r#"{"sequence":42}"#).expect("legacy state must decode");
         assert_eq!(u64::from(state.sequence), 42);
-        assert!(state.staged.is_none());
+        assert!(state.paused.is_none());
     }
 
-    /// And a state with no token serializes back to exactly what a singleton
+    /// And a state with no pause serializes back to exactly what a singleton
     /// subscriber has always written — the new field adds no bytes.
     #[test]
-    fn state_without_a_token_serializes_unchanged() {
+    fn state_without_a_pause_serializes_unchanged() {
         let state = OutboxEventJobState {
             sequence: EventSequence::from(7u64),
-            staged: None,
             paused: None,
         };
         assert_eq!(
             serde_json::to_string(&state).expect("serializes"),
             r#"{"sequence":7}"#
         );
-    }
-
-    /// The token is only readable by the event it was written for: validity
-    /// is a sequence match, which is what makes stale-token clearing lazy.
-    #[test]
-    fn a_token_is_invisible_to_any_other_event() {
-        let state = OutboxEventJobState {
-            sequence: EventSequence::from(4u64),
-            staged: Some(StagedState {
-                sequence: EventSequence::from(5u64),
-                token: serde_json::json!({ "stage": 1 }),
-            }),
-            paused: None,
-        };
-
-        let mine: Option<serde_json::Value> =
-            staged_token(&state, EventSequence::from(5u64)).expect("reads");
-        assert_eq!(mine, Some(serde_json::json!({ "stage": 1 })));
-
-        let other: Option<serde_json::Value> =
-            staged_token(&state, EventSequence::from(6u64)).expect("reads");
-        assert!(other.is_none(), "a stale token must not be readable");
     }
 }

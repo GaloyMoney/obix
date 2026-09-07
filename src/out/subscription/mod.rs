@@ -16,7 +16,7 @@
 //! | capability | singleton | keyed |
 //! |------------|-----------|-------|
 //! | ephemeral delivery | yes — by presence | no, statically |
-//! | `pause_until`, staged chains, resume token | no — by presence | yes |
+//! | `pause_until`, staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
 //!
 //! The two modes are not one mode with a flag, and the asymmetry is not
