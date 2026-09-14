@@ -238,15 +238,13 @@ impl SubscriptionSnapshot {
 ///    handler's `checkpoint_interval`). So `checkpoint >= S` implies
 ///    everything up to `S` is durably applied. A barrier may therefore wait
 ///    marginally longer than strictly necessary, but never returns early.
-/// 2. **The frontier is the sequence generator's `last_value`**, so it counts
-///    sequences already assigned to transactions that have not committed yet
-///    (or that aborted). That is what closes the straggler hole for
-///    close-books-style fences, and it holds under partition rotation and
-///    archival without scanning any table.
-/// 3. **Delivery is gapless.** The runner cannot advance past sequence `N`
-///    until `N` resolves; sequences belonging to aborted transactions become
-///    placeholder deliveries once the gap-fill grace elapses. An aborted
-///    sequence sitting at the frontier therefore cannot wedge the barrier.
+/// 2. **The frontier is the committed head.** It excludes unfinished source
+///    operations. Fencing business work still in flight requires producer
+///    coordination; a head snapshot does not quiesce producers.
+/// 3. **Delivery is gapless.** Position reservation rolls back with its
+///    publication; aborted operations leave no holes or placeholder deliveries.
+///    [`PublicationBatches`](singleton::StreamSelection::PublicationBatches)
+///    subscribers checkpoint only at complete publication boundaries.
 /// 4. **Missing reads as [`EventSequence::BEGIN`].** A handler with no
 ///    execution row, or one that has never persisted state, reports honest
 ///    full lag rather than a spurious "caught up", so a stopped or

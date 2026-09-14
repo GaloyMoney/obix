@@ -3,7 +3,6 @@ mod ctx;
 mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
-mod gap_fill;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -11,6 +10,7 @@ mod persist_events_hook;
 mod persistent;
 mod pg_notify;
 mod post_persist_hook;
+mod publication_batch;
 mod subscription;
 
 use es_entity::clock::ClockHandle;
@@ -43,6 +43,7 @@ pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
 pub use persistent::PersistentOutboxListener;
 pub use post_persist_hook::PostPersistHook;
+pub use publication_batch::PublicationBatch;
 
 #[allow(dead_code)]
 pub struct Outbox<P, Tables = DefaultMailboxTables>
@@ -63,10 +64,6 @@ where
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
-    /// Per-process gap filler — the only component that writes
-    /// placeholder rows (rollback compensation, stall episodes,
-    /// historical fills).
-    gap_filler: gap_fill::GapFiller,
     clock: ClockHandle,
     /// Registered [`PostPersistHook`]s, shared across clones. Copy-on-write:
     /// registration swaps in a rebuilt slice, publishes snapshot it with a
@@ -112,7 +109,6 @@ where
             ephemeral_cache: self.ephemeral_cache.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             notifier: self.notifier.clone(),
-            gap_filler: self.gap_filler.clone(),
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
             persist_after: self.persist_after.clone(),
@@ -142,29 +138,10 @@ where
 
         let notifier = PersistentNotifier::spawn::<Tables>(&pool, config.notify_debounce);
 
-        // The gap-fill channel exists before either side of it: the cache
-        // loop sends stall/historical requests, the GapFiller task (which
-        // needs the cache's fill sender) serves them.
-        let (gap_fill_tx, gap_fill_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let persistent_cache = PersistentOutboxEventCache::init(
-            &pool,
-            &config,
-            persistent_notification_rx,
-            gap_fill_tx.clone(),
-        )
-        .await?;
+        let persistent_cache =
+            PersistentOutboxEventCache::init(&pool, &config, persistent_notification_rx).await?;
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
-
-        let gap_filler = gap_fill::GapFiller::spawn::<P, Tables>(
-            &pool,
-            gap_fill_rx,
-            gap_fill_tx,
-            persistent_cache.cache_fill_sender(),
-            notifier.report_sender(),
-            &config,
-        );
 
         Ok(Self {
             pool,
@@ -177,7 +154,6 @@ where
             ephemeral_cache: Arc::new(ephemeral_cache),
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
-            gap_filler,
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
             persist_after: Arc::new(std::sync::RwLock::new(Vec::new().into())),
@@ -258,6 +234,11 @@ where
         op: &mut impl es_entity::AtomicOperation,
         events: impl IntoIterator<Item = impl Into<P>>,
     ) -> Result<(), sqlx::Error> {
+        if !op.supports_hooks() {
+            return Err(sqlx::Error::Protocol(
+                "persistent publications require commit hooks".into(),
+            ));
+        }
         let post_persist_hooks = self
             .post_persist_hooks
             .read()
@@ -271,17 +252,15 @@ where
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.cache_fill_sender(),
             self.notifier.report_sender(),
-            self.gap_filler.report_sender(),
             events,
             self.persist_events_batch_size,
             post_persist_hooks,
             persist_after,
         );
-        if let Err(hook) = op.add_commit_hook(hook) {
-            use es_entity::hooks::CommitHook;
-            hook.with_in_tx_notify()
-                .force_execute_pre_commit(op)
-                .await?;
+        if op.add_commit_hook(hook).is_err() {
+            return Err(sqlx::Error::Protocol(
+                "persistent publications require commit hooks".into(),
+            ));
         }
         Ok(())
     }
@@ -536,14 +515,8 @@ where
         ))
     }
 
-    /// The highest sequence the persistent outbox has handed out — the
-    /// stream frontier.
-    ///
-    /// Read from the sequence generator's `last_value`, so it includes
-    /// sequences already assigned to transactions that have not committed
-    /// yet, and needs no table scan. This is the same value
-    /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
-    /// against.
+    /// The committed stream frontier. The transactional head never exposes
+    /// unfinished publications and rolls back together with their events.
     pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
         subscription::read_frontier::<Tables>(&self.pool).await
     }

@@ -7,6 +7,7 @@ pub mod prelude {
     pub use serde;
     pub use serde_json;
     pub use sqlx;
+    pub use uuid;
 }
 
 mod config;
@@ -20,9 +21,9 @@ mod tables;
 pub mod test_utils;
 
 pub use config::{
-    DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_GAP_FILL_GRACE, DEFAULT_IDLE_RESYNC_INTERVAL,
-    DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
-    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
+    DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_IDLE_RESYNC_INTERVAL, DEFAULT_NOTIFY_DEBOUNCE,
+    DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE, DEFAULT_PARTITION_WIDTH,
+    DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
 };
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
@@ -32,8 +33,8 @@ pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
     KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
-    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
-    StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, PublicationBatch, SingletonSubscriber,
+    StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
     SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
     UndecodableEventError, WakeKey, WakeKeys,
 };

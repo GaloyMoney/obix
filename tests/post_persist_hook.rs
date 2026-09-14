@@ -268,33 +268,13 @@ async fn hook_error_aborts_commit() -> anyhow::Result<()> {
         op.commit().await.is_err(),
         "a hook error must fail the commit"
     );
-    let payload_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM persistent_outbox_events WHERE payload IS NOT NULL",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(
-        payload_rows, 0,
-        "the tx rolled back — no event payload survives the hook error"
-    );
-
-    // The burned sequence is compensated reactively: a NULL-payload
-    // placeholder appears without waiting for the gap-fill backstop.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let placeholders: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM persistent_outbox_events WHERE payload IS NULL",
-        )
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_outbox_events")
         .fetch_one(&pool)
         .await?;
-        if placeholders == 1 {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            anyhow::bail!("compensation placeholder for the aborted sequence never appeared");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        rows, 0,
+        "the tx rolled back — nothing survives a hook error, not even a reservation"
+    );
 
     Ok(())
 }
@@ -318,34 +298,6 @@ async fn rollback_never_invokes_hook() -> anyhow::Result<()> {
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(outbox_row_count(&pool).await?, 0);
-    Ok(())
-}
-
-/// Publishes on an op without commit-hook support (a bare `sqlx::Transaction`)
-/// insert immediately — post-persist hooks must fire on that path too, which
-/// is what makes "every persist path" literally true.
-#[tokio::test]
-#[file_serial]
-async fn force_path_fires_hooks() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    let outbox = init_outbox::<SourceEvent>(&pool, default_config()).await?;
-
-    let invocations = Arc::new(AtomicUsize::new(0));
-    outbox.add_post_persist_hook(CountingHook {
-        invocations: invocations.clone(),
-    });
-
-    let mut tx = pool.begin().await?;
-    outbox
-        .publish_persisted_in_op(&mut tx, SourceEvent::Source(1))
-        .await?;
-    assert_eq!(
-        invocations.load(Ordering::SeqCst),
-        1,
-        "on the force path the hook fires during the publish call itself"
-    );
-    tx.commit().await?;
-    assert_eq!(outbox_row_count(&pool).await?, 1);
     Ok(())
 }
 
@@ -429,100 +381,6 @@ async fn chained_reposts_compose() -> anyhow::Result<()> {
         ],
         "A→B→C: each hop persisted in the same tx, in causal order"
     );
-    Ok(())
-}
-
-/// The `on_rollback` tier reaches a repost that already joined the pass.
-/// `hop` — three hops deep — vetoes from its own post-persist hook, *after*
-/// `hop`'s own persist has already allocated its sequence: the whole
-/// transaction rolls back, including `source`'s and `dest`'s already-
-/// succeeded hooks earlier in the pass.
-///
-/// Because the repost joins `source`'s commit pass (GaloyMoney/es-entity#200),
-/// `dest`'s `PersistEvents` hook is tracked like a directly-registered one:
-/// its `on_rollback` fires once the deeper failure surfaces, and `dest`'s
-/// abandoned sequence is placeholder-filled reactively in milliseconds rather
-/// than waiting on the grace-gated backstop.
-#[tokio::test]
-#[file_serial]
-async fn repost_on_rollback_reaches_destination_reactively() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    let source = init_outbox::<SourceEvent>(&pool, default_config()).await?;
-    let dest = Outbox::<DestEvent, TestTables>::init(&pool, default_config()).await?;
-    let hop = Outbox::<HopEvent, TestTables>::init(&pool, default_config()).await?;
-
-    source.add_post_persist_hook(RepostHook { dest: dest.clone() });
-    dest.add_post_persist_hook(HopHook { next: hop.clone() });
-
-    /// Vetoes after `hop`'s own persist already ran — the failure that must
-    /// unwind the whole chain, including the hops that already succeeded
-    /// earlier in the same pass.
-    struct VetoHopHook;
-
-    impl PostPersistHook<HopEvent> for VetoHopHook {
-        fn on_persisted<'a>(
-            &'a self,
-            _op: &'a mut HookOperation<'_>,
-            _events: &'a [PersistentOutboxEvent<HopEvent>],
-        ) -> BoxFuture<'a, Result<(), sqlx::Error>> {
-            Box::pin(async { Err(sqlx::Error::Protocol("hop veto".into())) })
-        }
-    }
-    hop.add_post_persist_hook(VetoHopHook);
-
-    let mut dest_listener = dest.listen_persisted(None);
-
-    let mut op = source.begin_op().await?;
-    source
-        .publish_persisted_in_op(&mut op, SourceEvent::Source(11))
-        .await?;
-    assert!(
-        op.commit().await.is_err(),
-        "hop's veto, three hops deep, must fail the whole commit"
-    );
-
-    // Reactive compensation must reach `dest` specifically: its
-    // `PersistEvents` hook's `pre_commit` had already succeeded (staged
-    // earlier in the same pass, its own persist done) by the time hop's
-    // veto surfaced deeper in the queue — so es-entity fires its
-    // `on_rollback`, not its own-failure branch.
-    //
-    // `dest_listener` sees every row on the shared physical table (comment
-    // at the top of this file), including source's and hop's own
-    // compensation — and each of source/dest/hop has its *own* `GapFiller`
-    // task (one per `Outbox::init`), so the three placeholders can land in
-    // any order. We must therefore identify dest's placeholder by its
-    // sequence, not just take the first payload-less event we see.
-    //
-    // Sequences are deterministic here: this test's fresh table (truncated
-    // + identity-restarted by the `init_outbox::<SourceEvent>` call above)
-    // sees exactly one publish, so source's own persist is sequence 1 and
-    // dest's repost — persisted next in the same pass, before hop's — is
-    // sequence 2, regardless of which GapFiller physically writes first.
-    const DEST_SEQUENCE: u64 = 2;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    let dest_gap_event = loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("dest's compensation placeholder did not arrive reactively");
-        }
-        let event = tokio::time::timeout(remaining, dest_listener.next())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("dest's compensation placeholder did not arrive reactively")
-            })?
-            .expect("stream open")?;
-        if u64::from(event.sequence) == DEST_SEQUENCE {
-            break event;
-        }
-        // Not dest's row (source's or hop's own compensation, arrived
-        // first from their own independent GapFiller) — keep waiting.
-    };
-    assert!(
-        dest_gap_event.payload.is_none(),
-        "dest's abandoned sequence must resolve as a placeholder, not a real Mapped event"
-    );
-
     Ok(())
 }
 

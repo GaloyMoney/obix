@@ -23,7 +23,7 @@ const BOUNDARY: i64 = WIDTH as i64;
 //
 // The shipped migration gives every test `p0` ([0, WIDTH)) plus a DEFAULT
 // backstop. Driving the sequence up to (or past) the p0 boundary cheaply means
-// positioning the shared sequence just below WIDTH with `setval` (O(1)) rather
+// positioning the publication head just below WIDTH (O(1)) rather
 // than inserting millions of rows. Because partitions the maintainer/recovery
 // create persist across serial tests, each test first resets to the migration
 // baseline (p0 + DEFAULT only).
@@ -61,10 +61,12 @@ async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()>
 }
 
 async fn set_sequence(pool: &sqlx::PgPool, value: i64) -> anyhow::Result<()> {
-    sqlx::query("SELECT setval('persistent_outbox_events_sequence_seq', $1)")
-        .bind(value)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE persistent_outbox_events_batch_head SET last_sequence = $1 WHERE singleton",
+    )
+    .bind(value)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

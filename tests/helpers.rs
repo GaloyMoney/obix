@@ -46,12 +46,48 @@ pub async fn wipeout_inbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 }
 
 pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")
+    sqlx::query!("TRUNCATE persistent_outbox_events")
+        .execute(pool)
+        .await?;
+    sqlx::query("TRUNCATE persistent_outbox_events_batches")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE persistent_outbox_events_batch_head SET last_sequence = 0")
         .execute(pool)
         .await?;
     sqlx::query!("TRUNCATE ephemeral_outbox_events")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Write history directly, before any Outbox exists: reserves positions from
+/// the transactional head, inserts explicit sequences, and seals them as one
+/// publication — the committed shape any outbox publish would leave behind.
+pub async fn write_history_direct(pool: &sqlx::PgPool, payloads: &[&str]) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let count = payloads.len() as i64;
+    let start: i64 = sqlx::query_scalar(
+        "UPDATE persistent_outbox_events_batch_head SET last_sequence = last_sequence + $1 WHERE singleton RETURNING last_sequence - $1",
+    )
+    .bind(count)
+    .fetch_one(&mut *tx)
+    .await?;
+    for (i, payload) in payloads.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO persistent_outbox_events (sequence, payload) VALUES ($1, $2::jsonb)",
+        )
+        .bind(start + i as i64 + 1)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("INSERT INTO persistent_outbox_events_batches (first_sequence, last_sequence) VALUES ($1, $2)")
+        .bind(start + 1)
+        .bind(start + count)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

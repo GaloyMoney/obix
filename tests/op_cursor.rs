@@ -262,12 +262,15 @@ async fn cursor_errors_on_op_without_hook_support() -> anyhow::Result<()> {
         "a bare transaction supports no commit hooks — cursor() must fail loudly"
     );
 
-    // Publishing still works on a bare tx (written immediately), independent
-    // of cursors.
-    outbox
-        .publish_persisted_in_op(&mut tx, SourceEvent::Posted(1))
-        .await?;
-    tx.commit().await?;
-    assert_eq!(outbox_row_count(&pool).await?, 1);
+    // Persistent publishes need the commit-hook lifecycle; a bare tx is
+    // rejected instead of writing an unsealed row.
+    assert!(
+        outbox
+            .publish_persisted_in_op(&mut tx, SourceEvent::Posted(1))
+            .await
+            .is_err()
+    );
+    drop(tx);
+    assert_eq!(outbox_row_count(&pool).await?, 0);
     Ok(())
 }
