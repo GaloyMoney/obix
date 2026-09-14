@@ -30,13 +30,16 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    BatchOp, CursorError, DecodeFailure, EventCtx, EventSubscription, FlushError, FlushOp, Handled,
-    HandlerCheckpointError, HandlerSnapshot, HandlerStreamStatus, IsolatedOp, OpCursor, Outbox,
-    OutboxEventHandler, OutboxEventJobConfig, PartitionMaintainerConfig, Partitions,
-    PostPersistHook, RegisteredEventHandler, UndecodableEventError,
+    CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
+    KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
+    StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
+    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
+    UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::EventSequence;
 pub use tables::MailboxTables;
+pub use tables::SubscriptionRow;
 #[doc(hidden)]
 pub use tables::{
     decode_persistent_event, record_ephemeral_event_type_undecodable,

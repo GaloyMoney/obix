@@ -136,7 +136,7 @@ pub struct DecodeFailure {
 /// [`PersistentOutboxListener`](crate::out::PersistentOutboxListener) /
 /// [`AllOutboxListener`](crate::out::AllOutboxListener) stream items, and
 /// the error the default
-/// [`OutboxEventHandler::handle_undecodable`](crate::OutboxEventHandler::handle_undecodable)
+/// [`SingletonSubscriber::handle_undecodable`](crate::SingletonSubscriber::handle_undecodable)
 /// fails the handler job with.
 ///
 /// The `Err` item IS the delivery of that event — in order, in its sequence

@@ -108,6 +108,11 @@ impl ToTokens for MailboxTables {
         // (`{table}_sequence_seq`) from it.
         let persistent_outbox_events_table = format!("{}persistent_outbox_events", table_prefix);
 
+        // The keyed waker is one job per outbox, so its type is scoped to the
+        // persistent table rather than to any subscriber type. Composed here,
+        // at expansion time, so the generated const is a plain literal.
+        let keyed_waker_job_type = format!("{}.keyed-waker", persistent_outbox_events_table);
+
         let highest_known_query = format!(
             "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
 FROM {}persistent_outbox_events_sequence_seq",
@@ -362,6 +367,95 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        // === Keyed-subscriber subscription queries ===
+
+        // DO NOTHING, not DO UPDATE: re-subscribing an already-live key must
+        // resolve to the ORIGINAL row (identity + birth frontier), never
+        // rewrite it with a freshly-sampled `start_after` — the whole
+        // from-birth-delivery guarantee rests on `start_after` being sampled
+        // exactly once, at the subscription's true birth.
+        let insert_subscription_query = format!(
+            r#"
+            INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint, created_at)
+            VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6::timestamptz, NOW()))
+            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        // The mirrored cursor only ever moves forward: `GREATEST` makes a
+        // late-committing write from a superseded generation a no-op rather
+        // than a rewind that would re-select the row on every catch-up scan.
+        let update_subscription_checkpoint_query = format!(
+            r#"
+            UPDATE {tbl}subscriptions
+            SET checkpoint = GREATEST(checkpoint, $3)
+            WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        // The waker's catch-up scan: who has fallen far enough behind that
+        // waking them now serves them from the in-memory cache instead of a
+        // paged cold read. Ordered by lag so the limit sheds the
+        // least-endangered members, never the most.
+        //
+        // Restricted to the subscriber types this process actually
+        // registered, and restricted HERE rather than by discarding rows
+        // afterwards. Rows of a retired or not-yet-registered type have no
+        // runner to advance their checkpoint, so they are permanently the
+        // furthest behind: they would win every ordered scan, consume the
+        // whole per-pass limit, and starve the live members the scan exists
+        // to protect.
+        let subscriptions_behind_query = format!(
+            r#"
+            SELECT subscriber_type, key
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2
+            ORDER BY checkpoint ASC
+            LIMIT $3"#,
+            tbl = table_prefix
+        );
+
+        // Row absence IS the tombstone: no job-kill API exists or is needed.
+        let delete_subscription_query = format!(
+            r#"DELETE FROM {tbl}subscriptions WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        let find_subscription_query = format!(
+            r#"
+            SELECT wake_keys, instance_config, start_after AS "start_after!: i64", created_at
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        // The waker's flush-time lookup: liveness-only, so an
+        // over-approximating false positive here is a harmless empty wake,
+        // never a correctness gap.
+        //
+        // One query for every registered type at once. `$1`/`$2` are parallel
+        // arrays zipped by `unnest` into (subscriber_type, wake key) pairs, so
+        // batching costs no precision: a type only ever matches against its
+        // own keys, never against another type's that happens to collide.
+        //
+        // The `::varchar[]` casts are required, not decorative: Postgres has
+        // no `varchar[] @> text[]` operator (unlike scalar varchar/text, array
+        // element types do not implicitly cast for the containment operators),
+        // and sqlx's compile-time check does not catch it — DESCRIBE happily
+        // infers `text[]` for an untyped array parameter, so an uncast
+        // parameter compiles clean and fails at EXECUTE time on every call, on
+        // live data only. `@> ARRAY[...]` rather than `= ANY(...)` so the GIN
+        // index on `wake_keys` is usable for each zipped pair.
+        let subscriptions_for_wake_keys_query = format!(
+            r#"
+            SELECT DISTINCT s.subscriber_type AS "subscriber_type!", s.key AS "key!"
+            FROM {tbl}subscriptions s
+            JOIN unnest($1::varchar[], $2::varchar[]) AS q(subscriber_type, wake_key)
+              ON s.subscriber_type = q.subscriber_type
+             AND s.wake_keys @> ARRAY[q.wake_key]::varchar[]"#,
+            tbl = table_prefix
+        );
+
         tokens.append_all(quote! {
             impl #crate_name::MailboxTables for #ident {
                 // === Outbox channel names ===
@@ -377,6 +471,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn persistent_outbox_events_table() -> &'static str {
                     #persistent_outbox_events_table
                 }
+
+                const KEYED_WAKER_JOB_TYPE: &'static str = #keyed_waker_job_type;
 
                 // === Outbox methods ===
 
@@ -1040,6 +1136,162 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .execute(op.as_executor())
                         .await?;
                         Ok(())
+                    }
+                }
+
+                // === Keyed-subscriber subscription methods ===
+
+                fn insert_subscription_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    wake_keys: &[String],
+                    instance_config: #crate_name::prelude::serde_json::Value,
+                    start_after: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+                    let wake_keys = wake_keys.to_vec();
+                    let now = op.maybe_now();
+
+                    async move {
+                        sqlx::query!(
+                            #insert_subscription_query,
+                            subscriber_type,
+                            key,
+                            &wake_keys as _,
+                            instance_config,
+                            start_after as #crate_name::EventSequence,
+                            now
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn delete_subscription_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query!(#delete_subscription_query, subscriber_type, key)
+                            .execute(op.as_executor())
+                            .await?;
+                        Ok(())
+                    }
+                }
+
+                fn find_subscription(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::SubscriptionRow>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#find_subscription_query, subscriber_type, key)
+                            .fetch_optional(&pool)
+                            .await?;
+
+                        Ok(row.map(|row| #crate_name::SubscriptionRow {
+                            wake_keys: row.wake_keys,
+                            instance_config: row.instance_config,
+                            start_after: #crate_name::EventSequence::from(row.start_after as u64),
+                            created_at: row.created_at,
+                        }))
+                    }
+                }
+
+                fn update_subscription_checkpoint_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    checkpoint: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #update_subscription_checkpoint_query,
+                            subscriber_type,
+                            key,
+                            checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn subscriptions_behind(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_types: &[String],
+                    below: #crate_name::EventSequence,
+                    limit: i64,
+                ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_types = subscriber_types.to_vec();
+
+                    async move {
+                        if subscriber_types.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let rows = sqlx::query!(
+                            #subscriptions_behind_query,
+                            &subscriber_types as _,
+                            below as #crate_name::EventSequence,
+                            limit,
+                        )
+                        .fetch_all(op.as_executor())
+                        .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| (row.subscriber_type, row.key))
+                            .collect())
+                    }
+                }
+
+                fn subscriptions_for_wake_keys(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_types: &[String],
+                    wake_keys: &[String],
+                ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_types = subscriber_types.to_vec();
+                    let wake_keys = wake_keys.to_vec();
+
+                    async move {
+                        debug_assert_eq!(subscriber_types.len(), wake_keys.len());
+                        if wake_keys.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let rows = sqlx::query!(
+                            #subscriptions_for_wake_keys_query,
+                            &subscriber_types as _,
+                            &wake_keys as _,
+                        )
+                        .fetch_all(op.as_executor())
+                        .await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| (row.subscriber_type, row.key))
+                            .collect())
                     }
                 }
             }

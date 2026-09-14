@@ -4,7 +4,6 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
-mod job;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -12,7 +11,7 @@ mod persist_events_hook;
 mod persistent;
 mod pg_notify;
 mod post_persist_hook;
-mod registered_handler;
+mod subscription;
 
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
@@ -20,10 +19,18 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::any::TypeId;
 use std::sync::Arc;
 
-pub use self::ctx::{BatchOp, EventCtx, FlushError, FlushOp, Handled, IsolatedOp};
-pub use self::job::{EventSubscription, OutboxEventHandler, OutboxEventJobConfig};
-pub use self::registered_handler::{
-    HandlerCheckpointError, HandlerSnapshot, HandlerStreamStatus, RegisteredEventHandler,
+pub use self::ctx::{
+    EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
+};
+pub use self::subscription::keyed::{
+    KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,
+    WakeKey, WakeKeys,
+};
+pub use self::subscription::singleton::{
+    OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
+};
+pub use self::subscription::{
+    Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
 use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
 pub use all_listener::AllOutboxListener;
@@ -44,6 +51,10 @@ where
 {
     pool: sqlx::PgPool,
     event_buffer_size: usize,
+    /// Configured depth of the in-memory persistent cache. Read by the waker
+    /// to decide how far a Dormant member may drift before a catch-up wake
+    /// saves it a cold read.
+    event_cache_size: usize,
     persist_events_batch_size: usize,
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
@@ -66,6 +77,10 @@ where
     /// Copy-on-write; snapshotted into each constructed hook at publish,
     /// like `post_persist_hooks`.
     persist_after: Arc<std::sync::RwLock<Arc<[TypeId]>>>,
+    /// One erased route per keyed-subscriber type registered on this outbox,
+    /// shared with the single waker job. Registration pushes here; the first
+    /// push is what registers the waker (see `register_keyed_subscriber`).
+    keyed_routes: subscription::keyed::WakeRoutes<P>,
 }
 
 impl<P, Tables> std::fmt::Debug for Outbox<P, Tables>
@@ -89,6 +104,7 @@ where
         Self {
             pool: self.pool.clone(),
             event_buffer_size: self.event_buffer_size,
+            event_cache_size: self.event_cache_size,
             persist_events_batch_size: self.persist_events_batch_size,
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
@@ -100,6 +116,7 @@ where
             clock: self.clock.clone(),
             post_persist_hooks: self.post_persist_hooks.clone(),
             persist_after: self.persist_after.clone(),
+            keyed_routes: self.keyed_routes.clone(),
         }
     }
 }
@@ -152,6 +169,7 @@ where
         Ok(Self {
             pool,
             event_buffer_size: config.event_buffer_size,
+            event_cache_size: config.event_cache_size,
             persist_events_batch_size: config.persist_events_batch_size,
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
@@ -163,6 +181,7 @@ where
             clock: config.clock.clone(),
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
             persist_after: Arc::new(std::sync::RwLock::new(Vec::new().into())),
+            keyed_routes: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -413,30 +432,108 @@ where
         )
     }
 
-    /// Register `handler` as a resident job consuming this outbox.
+    /// Register `handler` as a resident job consuming this outbox — a
+    /// singleton subscriber: one instance, permanent, subscribed from
+    /// registration (its subscription is implicit).
     ///
-    /// Returns a [`RegisteredEventHandler`]: the handler's committed checkpoint, its
+    /// Returns a [`Subscription`]: the handler's committed checkpoint, its
     /// position against the stream frontier, and the
-    /// [`await_caught_up`](RegisteredEventHandler::await_caught_up) barrier. Callers
+    /// [`await_caught_up`](Subscription::await_caught_up) barrier. Callers
     /// that only want the handler running can discard it with `.await?;`.
     ///
     /// Registration is idempotent per job type: registering the same job type
     /// twice resolves to the already-persisted job, so both calls hand back
-    /// handles with the same [`job_id`](RegisteredEventHandler::job_id).
-    pub async fn register_event_handler<H>(
+    /// handles with the same [`job_id`](Subscription::job_id).
+    pub async fn register_singleton_subscriber<H>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<RegisteredEventHandler<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
     where
-        H: OutboxEventHandler<P>,
+        H: SingletonSubscriber<P>,
     {
-        let initializer =
-            job::OutboxEventJobInitializer::<H, P, Tables>::new(self.clone(), handler, &config);
+        let initializer = subscription::singleton::OutboxEventJobInitializer::<H, P, Tables>::new(
+            self.clone(),
+            handler,
+            &config,
+        );
         let spawner = jobs.add_resident_initializer(initializer);
-        let handle = spawner.spawn(job::OutboxEventJobData::default()).await?;
-        Ok(RegisteredEventHandler::new(handle, self.pool.clone()))
+        let handle = spawner
+            .spawn(subscription::singleton::OutboxEventJobData::default())
+            .await?;
+        Ok(Subscription::new(handle, self.pool.clone()))
+    }
+
+    /// Register a keyed subscriber type: per-entity consumers, created and
+    /// destroyed transactionally with the entity via the returned
+    /// [`Subscriptions`] capability's `subscribe_in_op`/`cancel_in_op`, each
+    /// with its own durable cursor, costing nothing while idle.
+    ///
+    /// A passivated member is revived by the waker, which matches each
+    /// event's [`wake_keys`](subscription::keyed::SubscriptionDef::wake_keys)
+    /// against the sets subscriptions declared, and additionally wakes
+    /// members drifting toward the bottom of the in-memory event cache so
+    /// they catch up from memory rather than from a paged cold read. Both
+    /// are driven by the stream; there is no periodic reconciler and no
+    /// timer. A fresh subscription is Active from birth, so neither is on
+    /// the critical path for first delivery — they govern re-wake latency
+    /// after a member has gone Dormant.
+    ///
+    /// The waker is one job for the whole outbox no matter how many types
+    /// are registered here; the per-key runner is per type.
+    ///
+    /// Must be called **before** [`::job::Jobs::start_poll`].
+    pub async fn register_keyed_subscriber<D: subscription::keyed::SubscriptionDef<P>>(
+        &self,
+        jobs: &mut ::job::Jobs,
+        config: subscription::keyed::KeyedSubscriberConfig,
+        def: D,
+    ) -> Result<Subscriptions<D, P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
+        let def = Arc::new(def);
+        let initializer = subscription::keyed::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
+            self.clone(),
+            def.clone(),
+            &config,
+        );
+        let spawner = jobs.add_keyed_initializer(initializer);
+
+        // Wake plane. The waker is ONE singleton subscriber for the whole
+        // outbox, holding one erased route per registered type — registering
+        // one per type would re-read, re-decode and re-checkpoint the entire
+        // stream once per type to answer a question that is one cheap
+        // synchronous classification per type over a single pass. The first
+        // registration is what creates it; later ones only add a route.
+        let first_route = {
+            let mut routes = self.keyed_routes.write().expect("wake routes poisoned");
+            let first = routes.is_empty();
+            routes.push(subscription::keyed::wake_route::<D, P>(
+                def,
+                config.job_type.clone(),
+                spawner.clone(),
+            ));
+            first
+        };
+        if first_route {
+            let waker = subscription::keyed::waker_handler::<P, Tables>(
+                self.keyed_routes.clone(),
+                self.event_cache_size,
+            );
+            self.register_singleton_subscriber(
+                jobs,
+                OutboxEventJobConfig::new(subscription::keyed::waker_job_type::<Tables>()),
+                waker,
+            )
+            .await?;
+        }
+
+        Ok(Subscriptions::new(
+            self.pool.clone(),
+            self.clock.clone(),
+            config.job_type,
+            jobs.clone(),
+            spawner,
+        ))
     }
 
     /// The highest sequence the persistent outbox has handed out — the
@@ -445,10 +542,10 @@ where
     /// Read from the sequence generator's `last_value`, so it includes
     /// sequences already assigned to transactions that have not committed
     /// yet, and needs no table scan. This is the same value
-    /// [`HandlerSnapshot::stream_status`] compares a handler's checkpoint
+    /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
     pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        registered_handler::read_frontier::<Tables>(&self.pool).await
+        subscription::read_frontier::<Tables>(&self.pool).await
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a

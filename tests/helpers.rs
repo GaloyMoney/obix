@@ -88,6 +88,39 @@ where
     Ok(inbox)
 }
 
+/// Wipe every subscription row for one keyed subscriber type.
+pub async fn wipeout_subscriptions(
+    pool: &sqlx::PgPool,
+    subscriber_type: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM subscriptions WHERE subscriber_type = $1")
+        .bind(subscriber_type)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The waker's job type: one per outbox rather than one per subscriber
+/// type, derived from the persistent table name.
+pub const KEYED_WAKER_JOB_TYPE: &str = "persistent_outbox_events.keyed-waker";
+
+/// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
+/// registration touches: the per-key job type itself, its derived
+/// and the outbox-wide waker.
+///
+/// The waker must be wiped along with the outbox tables it tracks — it is
+/// shared across subscriber types and holds a durable checkpoint, so a
+/// surviving one would sit past the sequences a truncated stream reissues
+/// and silently stop waking anything.
+pub async fn wipeout_keyed_subscriber_job_tables(
+    pool: &sqlx::PgPool,
+    job_type: &str,
+) -> anyhow::Result<()> {
+    wipeout_outbox_job_tables(pool, job_type).await?;
+    wipeout_outbox_job_tables(pool, KEYED_WAKER_JOB_TYPE).await?;
+    Ok(())
+}
+
 pub async fn wipeout_outbox_job_tables(pool: &sqlx::PgPool, job_type: &str) -> anyhow::Result<()> {
     sqlx::query(&format!(
         "DELETE FROM job_events WHERE id IN (SELECT id FROM jobs WHERE job_type = '{job_type}')"
