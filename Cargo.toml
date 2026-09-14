@@ -35,6 +35,7 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 im = { workspace = true }
 job = { workspace = true }
+uuid = { workspace = true }
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
 tracing = { workspace = true }
@@ -65,6 +66,12 @@ tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
 job = { version = "0.13.16", features = ["es-entity"] }
+uuid = { version = "1.23", features = ["serde"] }
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
+
+# Commit finalizers for operation-wide publications; see PUBLICATION_BATCHES_POC.md.
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "8676402d25d1e01264925e312bbe487b7bb1def0" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "8676402d25d1e01264925e312bbe487b7bb1def0" }

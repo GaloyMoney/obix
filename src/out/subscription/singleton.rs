@@ -22,11 +22,16 @@ use crate::tables::MailboxTables;
 ///   No persistent deliveries, and none of the checkpoint/batch machinery —
 ///   the job never reads or writes execution state.
 /// - [`All`](Self::All): both streams, raced fairly between batches.
+/// - [`PublicationBatches`](Self::PublicationBatches): whole sealed source
+///   publications, never individual events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamSelection {
     All,
     PersistentOnly,
     EphemeralOnly,
+    /// Complete sealed publications. The subscriber's checkpoint only ever
+    /// lands on publication boundaries.
+    PublicationBatches,
 }
 
 /// Handles the events of one outbox listener job.
@@ -98,6 +103,23 @@ where
     > + Send {
         let _ = event;
         async move { Ok(ctx.skip()) }
+    }
+
+    /// Apply one complete operation-wide publication. Only called in
+    /// [`PublicationBatches`](StreamSelection::PublicationBatches) mode;
+    /// event-level handlers and flush policies are not consulted. The job
+    /// commits its publication cursor after this returns successfully.
+    /// Foreign sinks must commit the whole publication atomically and
+    /// tolerate replay if that commit succeeds but the source checkpoint
+    /// fails.
+    fn handle_publication_batch(
+        &self,
+        op: &mut FlushOp<'_>,
+        batch: &crate::out::PublicationBatch<P>,
+    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
+        let _ = (op, batch);
+        async { Err("PublicationBatches requires handle_publication_batch".into()) }
     }
 
     /// Handle a persistent event whose stored payload could not be decoded
@@ -351,6 +373,7 @@ where
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         match H::SUBSCRIPTION {
             StreamSelection::EphemeralOnly => self.run_ephemeral_only(current_job).await,
+            StreamSelection::PublicationBatches => self.run_publication_batches(current_job).await,
             StreamSelection::All | StreamSelection::PersistentOnly => {
                 self.run_with_persistent(current_job).await
             }
@@ -364,6 +387,43 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
+    /// [`PublicationBatches`](StreamSelection::PublicationBatches): apply
+    /// one complete publication per source operation. The checkpoint
+    /// advances only after the callback's transaction commits.
+    async fn run_publication_batches(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+        let mut state = current_job
+            .execution_state::<OutboxEventJobState>()?
+            .unwrap_or_default();
+        loop {
+            let mut batches = tokio::select! {
+                biased;
+                _ = current_job.shutdown_requested() => return Ok(ResidentJobCompletion::RescheduleNow),
+                result = self.outbox.load_publication_batches(state.sequence, 1) => result?,
+            };
+            let Some(batch) = batches.pop() else {
+                tokio::select! {
+                    _ = current_job.shutdown_requested() => return Ok(ResidentJobCompletion::RescheduleNow),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                }
+                continue;
+            };
+            let mut op =
+                es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+            self.handler
+                .handle_publication_batch(&mut FlushOp::new(&mut op), &batch)
+                .await
+                .map_err(|e| e as Box<dyn std::error::Error>)?;
+            state.sequence = batch.last_sequence();
+            current_job
+                .update_execution_state_in_op(&mut op, &state)
+                .await?;
+            op.commit().await?;
+        }
+    }
+
     /// [`EphemeralOnly`](StreamSelection::EphemeralOnly): a bare dispatch
     /// loop — no persistent subscription, no execution state, no batch or
     /// checkpoint machinery.

@@ -7,7 +7,7 @@
 -- `src/out/partition`.
 CREATE TABLE persistent_outbox_events (
   id UUID NOT NULL DEFAULT gen_random_uuid(),
-  sequence BIGSERIAL,
+  sequence BIGINT NOT NULL,
   payload JSONB,
   tracing_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -30,55 +30,18 @@ CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 
--- Ephemeral outbox events
-CREATE TABLE ephemeral_outbox_events (
-  event_type VARCHAR NOT NULL UNIQUE,
-  payload JSONB NOT NULL,
-  tracing_context JSONB,
-  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- One transactional head and sealed source-operation boundaries.
+-- Event payloads are stored only in persistent_outbox_events.
+CREATE TABLE persistent_outbox_events_batch_head (
+  singleton BOOLEAN PRIMARY KEY CHECK (singleton),
+  last_sequence BIGINT NOT NULL CHECK (last_sequence >= 0)
 );
+INSERT INTO persistent_outbox_events_batch_head VALUES (TRUE, 0);
 
--- SECURITY: the ephemeral notification is a hint, not a transport.
---
--- PostgreSQL performs no authorization on LISTEN/NOTIFY channels: any role
--- able to connect to the database could LISTEN and harvest payloads with no
--- table grant, or pg_notify a forged event consumers would accept. The
--- notification therefore carries only {event_type, recorded_at}; listeners
--- always fetch the payload from the table with their own credentials
--- (recorded_at lets them skip the fetch when their cache is already current).
-CREATE FUNCTION notify_ephemeral_outbox_events() RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify(
-    'ephemeral_outbox_events',
-    json_build_object('event_type', NEW.event_type, 'recorded_at', NEW.recorded_at)::TEXT
-  );
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER ephemeral_outbox_events_notify
-  AFTER INSERT OR UPDATE ON ephemeral_outbox_events
-  FOR EACH ROW EXECUTE FUNCTION notify_ephemeral_outbox_events();
-
--- Inbox events
-DO $$ BEGIN
-    CREATE TYPE InboxEventStatus AS ENUM ('pending', 'processing', 'completed', 'failed');
-EXCEPTION
-    WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE inbox_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  idempotency_key VARCHAR UNIQUE,
-  payload JSONB NOT NULL,
-  status InboxEventStatus NOT NULL DEFAULT 'pending',
-  error VARCHAR,
-  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  processed_at TIMESTAMPTZ
+CREATE TABLE persistent_outbox_events_batches (
+  first_sequence BIGINT NOT NULL CHECK (first_sequence > 0),
+  last_sequence BIGINT PRIMARY KEY CHECK (last_sequence >= first_sequence)
 );
-
-CREATE INDEX idx_inbox_events_status ON inbox_events(status)
-  WHERE status IN ('pending', 'processing', 'failed');
 
 -- Keyed-subscriber subscriptions: one row per (subscriber_type, key)
 -- identity.
@@ -135,3 +98,53 @@ CREATE INDEX idx_subscriptions_checkpoint ON subscriptions (checkpoint);
 -- implicit varchar[]/text[] cast for `&&`, and sqlx infers text[] for an
 -- untyped array parameter.
 CREATE INDEX idx_subscriptions_wake_keys ON subscriptions USING GIN (wake_keys);
+
+-- Ephemeral outbox events
+CREATE TABLE ephemeral_outbox_events (
+  event_type VARCHAR NOT NULL UNIQUE,
+  payload JSONB NOT NULL,
+  tracing_context JSONB,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- SECURITY: the ephemeral notification is a hint, not a transport.
+--
+-- PostgreSQL performs no authorization on LISTEN/NOTIFY channels: any role
+-- able to connect to the database could LISTEN and harvest payloads with no
+-- table grant, or pg_notify a forged event consumers would accept. The
+-- notification therefore carries only {event_type, recorded_at}; listeners
+-- always fetch the payload from the table with their own credentials
+-- (recorded_at lets them skip the fetch when their cache is already current).
+CREATE FUNCTION notify_ephemeral_outbox_events() RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM pg_notify(
+    'ephemeral_outbox_events',
+    json_build_object('event_type', NEW.event_type, 'recorded_at', NEW.recorded_at)::TEXT
+  );
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER ephemeral_outbox_events_notify
+  AFTER INSERT OR UPDATE ON ephemeral_outbox_events
+  FOR EACH ROW EXECUTE FUNCTION notify_ephemeral_outbox_events();
+
+-- Inbox events
+DO $$ BEGIN
+    CREATE TYPE InboxEventStatus AS ENUM ('pending', 'processing', 'completed', 'failed');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+CREATE TABLE inbox_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key VARCHAR UNIQUE,
+  payload JSONB NOT NULL,
+  status InboxEventStatus NOT NULL DEFAULT 'pending',
+  error VARCHAR,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_inbox_events_status ON inbox_events(status)
+  WHERE status IN ('pending', 'processing', 'failed');

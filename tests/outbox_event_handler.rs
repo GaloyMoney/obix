@@ -57,7 +57,7 @@ async fn publish_foreign_poison(pool: &sqlx::PgPool) -> anyhow::Result<()> {
             .expect("Couldn't build MailboxConfig"),
     )
     .await?;
-    let mut op = pool.begin().await?;
+    let mut op = foreign.begin_op().await?;
     foreign
         .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
         .await?;

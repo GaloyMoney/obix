@@ -114,8 +114,8 @@ impl ToTokens for MailboxTables {
         let keyed_waker_job_type = format!("{}.keyed-waker", persistent_outbox_events_table);
 
         let highest_known_query = format!(
-            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS \"last_returned!: i64\"
-FROM {}persistent_outbox_events_sequence_seq",
+            "SELECT last_sequence AS \"last_returned!: i64\"
+FROM {}persistent_outbox_events_batch_head WHERE singleton",
             table_prefix
         );
 
@@ -123,45 +123,21 @@ FROM {}persistent_outbox_events_sequence_seq",
         // cluster-wide lock, so cross-process wake-up moved to the
         // per-process debounced notifier (`src/out/notifier.rs`).
         let persist_events_query = format!(
-            r#"WITH new_events AS (
-                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
-                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
+            r#"WITH reserved AS (
+                   UPDATE {tbl}persistent_outbox_events_batch_head
+                   SET last_sequence = last_sequence + cardinality($1::jsonb[])
+                   WHERE singleton
+                   RETURNING last_sequence - cardinality($1::jsonb[]) AS start_sequence
+               ), new_events AS (
+                   INSERT INTO {tbl}persistent_outbox_events (sequence, payload, tracing_context, recorded_at)
+                   SELECT r.start_sequence + e.ordinality, e.payload, $2::jsonb, COALESCE($3::timestamptz, NOW())
+                   FROM reserved r CROSS JOIN unnest($1::jsonb[]) WITH ORDINALITY AS e(payload, ordinality)
                    RETURNING id, sequence, recorded_at
                )
                SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
                FROM new_events ne
                ORDER BY ne.sequence"#,
             tbl = table_prefix,
-        );
-
-        // Kept only for publishes onto operations without commit-hook
-        // support (bare `sqlx::Transaction`): post_commit never runs there,
-        // so the insert statement itself must carry the {min, max} hint.
-        //
-        // INVARIANT: `notified` must remain referenced by the outer query
-        // (the LEFT JOIN below) — Postgres never executes an unreferenced
-        // SELECT CTE (events_via_pg_notify hangs if this regresses).
-        // HAVING COUNT(*) > 0 keeps an empty insert from notifying.
-        let persist_events_notifying_query = format!(
-            r#"WITH new_events AS (
-                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
-                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
-                   RETURNING id, sequence, recorded_at
-               ),
-               notified AS (
-                   SELECT pg_notify(
-                       '{channel}',
-                       json_build_object('min_sequence', MIN(sequence), 'max_sequence', MAX(sequence))::TEXT
-                   )
-                   FROM new_events
-                   HAVING COUNT(*) > 0
-               )
-               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
-               FROM new_events ne
-               LEFT JOIN notified ON TRUE
-               ORDER BY ne.sequence"#,
-            tbl = table_prefix,
-            channel = persistent_outbox_events_channel,
         );
 
         let persist_ephemeral_events_query = format!(
@@ -176,13 +152,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             table_prefix
         );
 
-        // Bounded range scan over the `sequence` index: O(page), SELECT-only.
-        // Deliberately NO MAX(sequence) anchor and NO placeholder writes: the
-        // previous anchor was a Merge Append over every partition's index with
-        // visibility checks on the never-all-visible tail (hundreds of ms on a
-        // large table, on every page read), and it only existed to serve the
-        // in-query gap fill that has moved to `fill_gaps_query` — age-gated
-        // and batch-capped caller-side (`out::persistent::cache`).
+        // Bounded, read-only range scan over the canonical event sequence.
         let load_next_page_query = format!(
             r#"
             SELECT sequence AS "sequence!: i64", id AS "id!", payload, tracing_context, recorded_at AS "recorded_at!"
@@ -192,66 +162,6 @@ FROM {}persistent_outbox_events_sequence_seq",
             ORDER BY sequence ASC
             LIMIT $2"#,
             table_prefix
-        );
-
-        // The contiguous run above `$1`, cut at the first gap. `win` finds the
-        // cut index-only: in a contiguous run `sequence = $1 + rn` exactly, so
-        // the first row failing that is the first gap.
-        //
-        // The cut MUST stay a scalar subquery. As an InitPlan it is evaluated
-        // once and usable as an index bound, so the payload scan stops at the
-        // gap; written as a joined CTE (`FROM t e, stop WHERE ...`) the planner
-        // demotes it to a Join Filter and walks the whole tail of the table —
-        // 5,327 buffers / 24.6 ms against 43 / 0.3 ms here. The redundant
-        // `sequence <= $1 + $2` bounds the scan and prunes partitions
-        // independently of the InitPlan. Re-check the plan (including the
-        // generic one) if you touch this.
-        let load_next_contiguous_page_query = format!(
-            r#"
-            WITH win AS (
-                SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence) AS rn
-                FROM {tbl}persistent_outbox_events
-                WHERE sequence > $1
-                  AND sequence <= $1 + $2
-            )
-            SELECT e.sequence AS "sequence!: i64", e.id AS "id!", e.payload,
-                   e.tracing_context, e.recorded_at AS "recorded_at!"
-            FROM {tbl}persistent_outbox_events e
-            WHERE e.sequence > $1
-              AND e.sequence <= $1 + $2
-              AND e.sequence < (
-                  SELECT COALESCE(MIN(sequence), $1 + $2 + 1)
-                  FROM win
-                  WHERE sequence <> $1 + rn
-              )
-            ORDER BY e.sequence ASC"#,
-            tbl = table_prefix,
-        );
-
-        // Single index probe for a parked reader: has the sequence it is
-        // blocked on landed yet?
-        let sequence_present_query = format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM {tbl}persistent_outbox_events WHERE sequence = $1
-            ) AS "present!""#,
-            tbl = table_prefix,
-        );
-
-        // The holes in `(after, up_to]`, without fetching payloads.
-        //
-        // Must stay `EXCEPT`, not `WHERE NOT EXISTS (...)`: the anti-join form
-        // plans as a Nested Loop Anti Join paying an index probe per generated
-        // sequence — 4,501 buffers on a 1,500-wide range against 8 here.
-        let missing_sequences_query = format!(
-            r#"
-            SELECT g AS "sequence!: i64"
-            FROM generate_series($1::bigint + 1, $2::bigint) g
-            EXCEPT
-            SELECT sequence FROM {tbl}persistent_outbox_events
-            WHERE sequence > $1 AND sequence <= $2
-            ORDER BY 1"#,
-            tbl = table_prefix,
         );
 
         let load_events_in_range_query = format!(
@@ -278,58 +188,6 @@ FROM {}persistent_outbox_events_sequence_seq",
             FROM {}ephemeral_outbox_events
             WHERE event_type = $1
             ORDER BY recorded_at"#,
-            table_prefix
-        );
-
-        // DO NOTHING, not DO UPDATE: a conflict means the sequence already
-        // has a committed row (real event or earlier placeholder) and must
-        // not be rewritten — the old upsert-to-return-rows trick generated a
-        // dead tuple per already-committed sequence per fill. RETURNING
-        // therefore yields only the placeholders actually inserted; rows
-        // that committed concurrently reach consumers through the normal
-        // post-commit broadcast/notification path or the next page read.
-        let fill_gaps_query = format!(
-            r#"
-            INSERT INTO {}persistent_outbox_events (sequence)
-            SELECT unnest($1::bigint[]) AS sequence
-            ON CONFLICT (sequence) DO NOTHING
-            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at"#,
-            table_prefix
-        );
-
-        // One statement, one round trip, auto-commit: assigns this
-        // connection a real xid (the abandonment marker — every write
-        // transaction that had begun before this statement holds a smaller
-        // xid) and reads the sequence's allocation head alongside it. The
-        // deliberate xid burn is negligible: markers are taken once per
-        // gap-fill episode, and episodes only exist while a stall persists.
-        let abandonment_marker_query = format!(
-            r#"
-            SELECT pg_current_xact_id()::text AS "marker!",
-                   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END
-                    FROM {}persistent_outbox_events_sequence_seq) AS "head!: i64""#,
-            table_prefix
-        );
-
-        // The xmin horizon has passed the marker once every transaction
-        // with an older xid has ended — at that point a sequence known to
-        // be allocated before the marker, and still absent from the table,
-        // is provably abandoned. (Deliberately NOT the snapshot-xmax
-        // variant: snapshot xmax is one past the highest *completed* xid,
-        // and a transaction active at marker time can hold an xid at or
-        // above it — that check can pass while the gap's writer still
-        // runs.)
-        let abandonment_proof_query =
-            r#"SELECT pg_snapshot_xmin(pg_current_snapshot()) > $1::text::xid8 AS "passed!""#
-                .to_string();
-
-        // Cluster-wide dedup of backstop fills: losers of the try-lock skip
-        // entirely (the winner's rows are committed by the time the lock
-        // releases, so a later page read delivers them). The key is derived
-        // from the (prefixed) table name so co-hosted outboxes never
-        // contend with each other.
-        let fill_gaps_lock_query = format!(
-            r#"SELECT pg_try_advisory_xact_lock(hashtextextended('{}persistent_outbox_events_gap_fill', 0)) AS "locked!""#,
             table_prefix
         );
 
@@ -423,7 +281,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let find_subscription_query = format!(
             r#"
-            SELECT wake_keys, instance_config, start_after AS "start_after!: i64", created_at
+            SELECT wake_keys, instance_config, start_after, created_at
             FROM {tbl}subscriptions
             WHERE subscriber_type = $1 AND key = $2"#,
             tbl = table_prefix
@@ -448,7 +306,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         // index on `wake_keys` is usable for each zipped pair.
         let subscriptions_for_wake_keys_query = format!(
             r#"
-            SELECT DISTINCT s.subscriber_type AS "subscriber_type!", s.key AS "key!"
+            SELECT DISTINCT s.subscriber_type, s.key
             FROM {tbl}subscriptions s
             JOIN unnest($1::varchar[], $2::varchar[]) AS q(subscriber_type, wake_key)
               ON s.subscriber_type = q.subscriber_type
@@ -481,10 +339,19 @@ FROM {}persistent_outbox_events_sequence_seq",
                 ) -> impl std::future::Future<Output = Result<#crate_name::EventSequence, #crate_name::prelude::sqlx::Error>> + Send {
                     let executor = op.into_executor();
                     async {
-                        let row = executor
-                            .fetch_one(sqlx::query!(#highest_known_query))
+                        // Runtime-checked on purpose: downstream crates ship their
+                        // own offline caches, which cannot know this schema.
+                        use #crate_name::prelude::sqlx::Row;
+                        let head: i64 = executor
+                            .fetch_one(
+                                sqlx::query(#highest_known_query).map(
+                                    |row: #crate_name::prelude::es_entity::db::Row| {
+                                        row.get::<i64, _>(0)
+                                    },
+                                ),
+                            )
                             .await?;
-                        Ok(#crate_name::EventSequence::from(row.last_returned as u64))
+                        Ok(#crate_name::EventSequence::from(head as u64))
                     }
                 }
 
@@ -515,73 +382,36 @@ FROM {}persistent_outbox_events_sequence_seq",
                         if payloads.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let rows = sqlx::query!(
-                            #persist_events_query,
-                            &serialized_events as _,
-                            tracing_json,
-                            now
-                        ).fetch_all(op.as_executor()).await?;
-
-                        let events = rows
-                            .into_iter()
-                            .zip(payloads.into_iter())
-                            .map(|(row, payload)| #crate_name::out::PersistentOutboxEvent {
-                                id: #crate_name::out::OutboxEventId::from(row.id),
-                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                recorded_at: row.recorded_at,
-                                payload: Some(payload),
-                                #set_context
-                            })
-                            .collect::<Vec<_>>();
-                        Ok(events)
-                    }
-                }
-
-                fn persist_events_notifying<'a, P>(
-                    op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
-                    events: impl Iterator<Item = P>,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
-                {
-                    use #crate_name::prelude::es_entity::AtomicOperation;
-
-                    let now = op.maybe_now();
-
-                    let mut payloads = Vec::new();
-                    let serialized_events = events
-                        .map(|e| {
-                            let serialized_event =
-                                #crate_name::prelude::serde_json::to_value(&e).expect("Could not serialize payload");
-                            payloads.push(e);
-                            serialized_event
-                        })
-                        .collect::<Vec<_>>();
-
-                    #extract_tracing
-
-                    async move {
-                        if payloads.is_empty() {
-                            return Ok(Vec::new());
+                        // Runtime-checked on purpose: downstream crates ship
+                        // their own offline caches, which cannot know this schema.
+                        let rows = sqlx::query(&#persist_events_query)
+                            .bind(&serialized_events as &[#crate_name::prelude::serde_json::Value])
+                            .bind(&tracing_json)
+                            .bind(&now)
+                            .fetch_all(op.as_executor()).await?;
+                        if rows.len() != payloads.len() {
+                            return Err(sqlx::Error::Protocol("publication head is missing".into()));
                         }
-                        let rows = sqlx::query!(
-                            #persist_events_notifying_query,
-                            &serialized_events as _,
-                            tracing_json,
-                            now
-                        ).fetch_all(op.as_executor()).await?;
 
                         let events = rows
                             .into_iter()
                             .zip(payloads.into_iter())
-                            .map(|(row, payload)| #crate_name::out::PersistentOutboxEvent {
-                                id: #crate_name::out::OutboxEventId::from(row.id),
-                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                recorded_at: row.recorded_at,
-                                payload: Some(payload),
-                                #set_context
+                            .map(|(row, payload)| {
+                                use #crate_name::prelude::sqlx::Row;
+                                Ok(#crate_name::out::PersistentOutboxEvent {
+                                    id: #crate_name::out::OutboxEventId::from(
+                                        row.try_get::<#crate_name::prelude::uuid::Uuid, _>(0)?,
+                                    ),
+                                    sequence: #crate_name::EventSequence::from(
+                                        row.try_get::<i64, _>(1)? as u64,
+                                    ),
+                                    recorded_at: row
+                                        .try_get::<chrono::DateTime<chrono::Utc>, _>(2)?,
+                                    payload: Some(payload),
+                                    #set_context
+                                })
                             })
-                            .collect::<Vec<_>>();
+                            .collect::<Result<Vec<_>, #crate_name::prelude::sqlx::Error>>()?;
                         Ok(events)
                     }
                 }
@@ -683,197 +513,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
                         Ok(events)
-                    }
-                }
-
-                fn load_next_contiguous_page<P>(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    from_sequence: #crate_name::EventSequence,
-                    buffer_size: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        let rows = sqlx::query!(
-                            #load_next_contiguous_page_query,
-                            from_sequence as #crate_name::EventSequence,
-                            buffer_size as i64,
-                        ).fetch_all(&pool).await?;
-
-                        let events = rows
-                            .into_iter()
-                            .map(|row| {
-                                #deserialize_context
-                                #crate_name::decode_persistent_event(
-                                    #crate_name::out::OutboxEventId::from(row.id),
-                                    row.sequence as u64,
-                                    row.recorded_at,
-                                    tracing_context,
-                                    row.payload,
-                                )
-                            })
-                            .collect();
-                        Ok(events)
-                    }
-                }
-
-                fn sequence_present(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    sequence: #crate_name::EventSequence,
-                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        let row = sqlx::query!(
-                            #sequence_present_query,
-                            sequence as #crate_name::EventSequence,
-                        ).fetch_one(&pool).await?;
-                        Ok(row.present)
-                    }
-                }
-
-                fn missing_sequences(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    after_sequence: #crate_name::EventSequence,
-                    up_to_sequence: #crate_name::EventSequence,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        let rows = sqlx::query!(
-                            #missing_sequences_query,
-                            after_sequence as #crate_name::EventSequence,
-                            up_to_sequence as #crate_name::EventSequence,
-                        ).fetch_all(&pool).await?;
-
-                        Ok(rows
-                            .into_iter()
-                            .map(|row| #crate_name::EventSequence::from(row.sequence as u64))
-                            .collect())
-                    }
-                }
-
-                fn fill_gaps<P>(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    sequences: Vec<#crate_name::EventSequence>,
-                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        if sequences.is_empty() {
-                            return Ok(Vec::new());
-                        }
-                        let sequences = sequences
-                            .into_iter()
-                            .map(|s| u64::from(s) as i64)
-                            .collect::<Vec<_>>();
-                        let rows = sqlx::query!(
-                            #fill_gaps_query,
-                            &sequences as _
-                        ).fetch_all(&pool).await?;
-
-                        let events = rows
-                            .into_iter()
-                            .map(|row| {
-                                #deserialize_context
-                                #crate_name::decode_persistent_event(
-                                    #crate_name::out::OutboxEventId::from(row.id),
-                                    row.sequence as u64,
-                                    row.recorded_at,
-                                    tracing_context,
-                                    row.payload,
-                                )
-                            })
-                            .collect();
-                        Ok(events)
-                    }
-                }
-
-                fn fill_gaps_deduped<P>(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    sequences: Vec<#crate_name::EventSequence>,
-                ) -> impl std::future::Future<Output = Result<Option<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>>, sqlx::Error>> + Send
-                where
-                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        if sequences.is_empty() {
-                            return Ok(Some(Vec::new()));
-                        }
-                        let sequences = sequences
-                            .into_iter()
-                            .map(|s| u64::from(s) as i64)
-                            .collect::<Vec<_>>();
-
-                        let mut tx = pool.begin().await?;
-                        let locked = sqlx::query!(#fill_gaps_lock_query)
-                            .fetch_one(&mut *tx)
-                            .await?
-                            .locked;
-                        if !locked {
-                            tx.rollback().await?;
-                            return Ok(None);
-                        }
-                        let rows = sqlx::query!(
-                            #fill_gaps_query,
-                            &sequences as _
-                        ).fetch_all(&mut *tx).await?;
-                        tx.commit().await?;
-
-                        let events = rows
-                            .into_iter()
-                            .map(|row| {
-                                #deserialize_context
-                                #crate_name::decode_persistent_event(
-                                    #crate_name::out::OutboxEventId::from(row.id),
-                                    row.sequence as u64,
-                                    row.recorded_at,
-                                    tracing_context,
-                                    row.payload,
-                                )
-                            })
-                            .collect();
-                        Ok(Some(events))
-                    }
-                }
-
-                fn abandonment_marker(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                ) -> impl std::future::Future<Output = Result<(String, #crate_name::EventSequence), #crate_name::prelude::sqlx::Error>> + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        let row = sqlx::query!(#abandonment_marker_query)
-                            .fetch_one(&pool)
-                            .await?;
-                        Ok((row.marker, #crate_name::EventSequence::from(row.head as u64)))
-                    }
-                }
-
-                fn abandonment_proof_passed(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    marker: &str,
-                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send
-                {
-                    let pool = pool.clone();
-                    let marker = marker.to_string();
-
-                    async move {
-                        let row = sqlx::query!(#abandonment_proof_query, marker)
-                            .fetch_one(&pool)
-                            .await?;
-                        Ok(row.passed)
                     }
                 }
 
@@ -1157,17 +796,15 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let now = op.maybe_now();
 
                     async move {
-                        sqlx::query!(
-                            #insert_subscription_query,
-                            subscriber_type,
-                            key,
-                            &wake_keys as _,
-                            instance_config,
-                            start_after as #crate_name::EventSequence,
-                            now
-                        )
-                        .execute(op.as_executor())
-                        .await?;
+                        sqlx::query(&#insert_subscription_query)
+                            .bind(&subscriber_type)
+                            .bind(&key)
+                            .bind(&wake_keys as &[String])
+                            .bind(&instance_config)
+                            .bind(start_after as #crate_name::EventSequence)
+                            .bind(&now)
+                            .execute(op.as_executor())
+                            .await?;
                         Ok(())
                     }
                 }
@@ -1183,7 +820,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let key = key.to_string();
 
                     async move {
-                        sqlx::query!(#delete_subscription_query, subscriber_type, key)
+                        sqlx::query(&#delete_subscription_query)
+                            .bind(&subscriber_type)
+                            .bind(&key)
                             .execute(op.as_executor())
                             .await?;
                         Ok(())
@@ -1200,16 +839,31 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let key = key.to_string();
 
                     async move {
-                        let row = sqlx::query!(#find_subscription_query, subscriber_type, key)
+                        use #crate_name::prelude::sqlx::Row;
+                        let row = sqlx::query(&#find_subscription_query)
+                            .bind(&subscriber_type)
+                            .bind(&key)
                             .fetch_optional(&pool)
                             .await?;
 
-                        Ok(row.map(|row| #crate_name::SubscriptionRow {
-                            wake_keys: row.wake_keys,
-                            instance_config: row.instance_config,
-                            start_after: #crate_name::EventSequence::from(row.start_after as u64),
-                            created_at: row.created_at,
-                        }))
+                        if let Some(row) = row {
+                            use #crate_name::prelude::sqlx::Row;
+                            let subscription = #crate_name::SubscriptionRow {
+                                wake_keys: row.try_get::<Vec<String>, _>("wake_keys")?,
+                                instance_config: row
+                                    .try_get::<#crate_name::prelude::serde_json::Value, _>(
+                                        "instance_config",
+                                    )?,
+                                start_after: #crate_name::EventSequence::from(
+                                    row.try_get::<i64, _>("start_after")? as u64,
+                                ),
+                                created_at: row
+                                    .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?,
+                            };
+                            Ok(Some(subscription))
+                        } else {
+                            Ok(None)
+                        }
                     }
                 }
 
@@ -1225,14 +879,12 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let key = key.to_string();
 
                     async move {
-                        sqlx::query!(
-                            #update_subscription_checkpoint_query,
-                            subscriber_type,
-                            key,
-                            checkpoint as #crate_name::EventSequence,
-                        )
-                        .execute(op.as_executor())
-                        .await?;
+                        sqlx::query(&#update_subscription_checkpoint_query)
+                            .bind(&subscriber_type)
+                            .bind(&key)
+                            .bind(checkpoint as #crate_name::EventSequence)
+                            .execute(op.as_executor())
+                            .await?;
                         Ok(())
                     }
                 }
@@ -1248,21 +900,26 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let subscriber_types = subscriber_types.to_vec();
 
                     async move {
+                        use #crate_name::prelude::sqlx::Row;
                         if subscriber_types.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let rows = sqlx::query!(
-                            #subscriptions_behind_query,
-                            &subscriber_types as _,
-                            below as #crate_name::EventSequence,
-                            limit,
-                        )
-                        .fetch_all(op.as_executor())
-                        .await?;
-                        Ok(rows
+                        let rows = sqlx::query(&#subscriptions_behind_query)
+                            .bind(&subscriber_types as &[String])
+                            .bind(below as #crate_name::EventSequence)
+                            .bind(limit)
+                            .fetch_all(op.as_executor())
+                            .await?;
+                        let pairs = rows
                             .into_iter()
-                            .map(|row| (row.subscriber_type, row.key))
-                            .collect())
+                            .map(|row| {
+                                Ok((
+                                    row.try_get::<String, _>("subscriber_type")?,
+                                    row.try_get::<String, _>("key")?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, #crate_name::prelude::sqlx::Error>>()?;
+                        Ok(pairs)
                     }
                 }
 
@@ -1277,21 +934,26 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let wake_keys = wake_keys.to_vec();
 
                     async move {
+                        use #crate_name::prelude::sqlx::Row;
                         debug_assert_eq!(subscriber_types.len(), wake_keys.len());
                         if wake_keys.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let rows = sqlx::query!(
-                            #subscriptions_for_wake_keys_query,
-                            &subscriber_types as _,
-                            &wake_keys as _,
-                        )
-                        .fetch_all(op.as_executor())
-                        .await?;
-                        Ok(rows
+                        let rows = sqlx::query(&#subscriptions_for_wake_keys_query)
+                            .bind(&subscriber_types as &[String])
+                            .bind(&wake_keys as &[String])
+                            .fetch_all(op.as_executor())
+                            .await?;
+                        let pairs = rows
                             .into_iter()
-                            .map(|row| (row.subscriber_type, row.key))
-                            .collect())
+                            .map(|row| {
+                                Ok((
+                                    row.try_get::<String, _>("subscriber_type")?,
+                                    row.try_get::<String, _>("key")?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, #crate_name::prelude::sqlx::Error>>()?;
+                        Ok(pairs)
                     }
                 }
             }
