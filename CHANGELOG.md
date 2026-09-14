@@ -1,3 +1,15 @@
+# [obix release v0.10.0](https://github.com/GaloyMoney/obix/releases/tag/0.10.0)
+
+
+
+### Features
+
+- [**breaking**] Keyed subscribers — per-entity outbox consumers with wake-on-demand (#144)
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group across 1 directory with 4 updates (#148)
+
 # [obix release v0.9.1](https://github.com/GaloyMoney/obix/releases/tag/0.9.1)
 
 
