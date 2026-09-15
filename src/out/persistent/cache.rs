@@ -108,7 +108,6 @@ where
         let highest_known_sequence = Arc::new(AtomicU64::from(
             Tables::highest_known_persistent_sequence(pool).await?,
         ));
-
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
             config,
@@ -177,11 +176,10 @@ where
                 );
                 break;
             }
+            last_broadcast_sequence = *seq;
             if persistent_event_sender.send(evt.clone()).is_err() {
                 record_no_receivers(u64::from(*seq));
-                break;
             }
-            last_broadcast_sequence = *seq;
         }
 
         (cache, last_broadcast_sequence)

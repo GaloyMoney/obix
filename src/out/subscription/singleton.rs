@@ -10,6 +10,7 @@ use job::{
 
 use crate::out::ctx::*;
 use crate::out::{EphemeralOutboxListener, Outbox, event::*};
+use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
 /// Which delivery streams an event-handler job subscribes to — see
@@ -89,10 +90,15 @@ where
     /// `Default` container. Handlers that never collect use `()`.
     type Batch: Default + Send + 'static;
 
+    /// The event arrives as the shared [`Arc`] the outbox decoded once and
+    /// broadcast to every subscriber, so a handler that needs to retain it
+    /// past the call — any [`collect_with`](EventCtx::collect_with) fold —
+    /// clones a refcount rather than the payload, and `P` need not be
+    /// `Clone`. Reading through it is unchanged: `Arc<T>` derefs to `T`.
     fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &PersistentOutboxEvent<P>,
+        event: &Arc<PersistentOutboxEvent<P>>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send {
@@ -156,9 +162,13 @@ where
         async { Ok(()) }
     }
 
+    /// Handed the shared [`Arc`] for the same reason as
+    /// [`handle_persistent`](Self::handle_persistent), though an ephemeral
+    /// event carries no sequence and belongs to no batch, so there is rarely
+    /// anything to retain.
     fn handle_ephemeral(
         &self,
-        event: &EphemeralOutboxEvent<P>,
+        event: &Arc<EphemeralOutboxEvent<P>>,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
         let _ = event;
@@ -198,7 +208,7 @@ enum NextDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    Persistent(Option<Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>>),
+    Persistent(Option<LaneItem<P>>),
     Ephemeral(Arc<EphemeralOutboxEvent<P>>),
 }
 
@@ -217,8 +227,103 @@ where
     }
 }
 
+/// One delivery from whichever lane the runner is on: the event, plus the
+/// commit position when the commit lane supplied one.
+struct LaneItem<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    event: Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>,
+    commit: Option<(CommitSequence, bool)>,
+}
+
+/// The persistent stream the runner consumes, on whichever lane is
+/// configured.
+enum PersistentLane<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+{
+    Insert(crate::out::PersistentOutboxListener<P>),
+    Commit(crate::out::CommitOrderedListener<P>),
+}
+
+impl<P> PersistentLane<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+{
+    async fn next(&mut self) -> Option<LaneItem<P>> {
+        match self {
+            Self::Insert(listener) => listener.next().await.map(|event| LaneItem {
+                event,
+                commit: None,
+            }),
+            Self::Commit(listener) => listener.next().await.map(|item| LaneItem {
+                event: item.event,
+                commit: Some((item.commit_sequence, item.commit_boundary)),
+            }),
+        }
+    }
+}
+
+/// What `select_lane` decided, before any I/O happens.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LaneChoice {
+    /// Stay on the insert lane from the stored insert cursor.
+    Insert(EventSequence),
+    /// Continue on the commit lane from the stored commit cursor.
+    Commit(CommitSequence),
+}
+
+/// Decide the lane from stored state and configuration.
+///
+/// Pure, so the rules — in particular the two refusals — are testable without
+/// a job, a pool or a running runner.
+pub(crate) fn decide_lane(
+    stored_commit: Option<CommitSequence>,
+    stored_insert: EventSequence,
+    configured: Ordering,
+) -> Result<LaneChoice, String> {
+    match (stored_commit, configured) {
+        (None, Ordering::Insert) => Ok(LaneChoice::Insert(stored_insert)),
+        (Some(commit_sequence), Ordering::Commit) => Ok(LaneChoice::Commit(commit_sequence)),
+        (None, Ordering::Commit) => {
+            if stored_insert == EventSequence::BEGIN {
+                Ok(LaneChoice::Commit(CommitSequence::BEGIN))
+            } else {
+                Err(format!(
+                    "subscription is checkpointed on the insert lane at sequence \
+                     {stored_insert}; switching lanes is unsupported — register a new job \
+                     type instead"
+                ))
+            }
+        }
+        (Some(_), Ordering::Insert) => Err(
+            "subscription was checkpointed under Ordering::Commit; switching back to \
+             Ordering::Insert is unsupported — register a new job type instead"
+                .to_string(),
+        ),
+    }
+}
+
 const DEFAULT_MAX_BATCH_SIZE: usize = 100;
 const DEFAULT_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Which order a subscriber receives persistent events in.
+///
+/// Name-clashes with [`std::cmp::Ordering`]; import or path-qualify
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ordering {
+    /// Insert order: a contiguous [`EventSequence`](crate::EventSequence),
+    /// gap-filled. The default, and unchanged by the commit lane's existence.
+    #[default]
+    Insert,
+    /// Commit order: a dense [`CommitSequence`](crate::CommitSequence). A
+    /// source transaction's events are contiguous and a batch flush never
+    /// splits one.
+    Commit,
+}
 
 #[derive(Clone)]
 pub struct OutboxEventJobConfig {
@@ -226,6 +331,7 @@ pub struct OutboxEventJobConfig {
     pub retry_settings: RetrySettings,
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
+    pub ordering: Ordering,
 }
 
 impl OutboxEventJobConfig {
@@ -235,7 +341,18 @@ impl OutboxEventJobConfig {
             retry_settings: RetrySettings::repeat_indefinitely(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            ordering: Ordering::Insert,
         }
+    }
+
+    /// Choose the delivery lane. See [`Ordering`].
+    ///
+    /// Settled when the subscription first checkpoints: a subscription
+    /// already running on one lane cannot move to the other, because the two
+    /// cursors count different things. Register a new job type instead.
+    pub fn ordering(mut self, ordering: Ordering) -> Self {
+        self.ordering = ordering;
+        self
     }
 
     pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
@@ -280,6 +397,7 @@ where
     retry_settings: RetrySettings,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
+    ordering: Ordering,
 }
 
 impl<H, P, Tables> OutboxEventJobInitializer<H, P, Tables>
@@ -296,6 +414,7 @@ where
             retry_settings: config.retry_settings.clone(),
             max_batch_size: config.max_batch_size,
             checkpoint_interval: config.checkpoint_interval,
+            ordering: config.ordering,
         }
     }
 }
@@ -322,6 +441,7 @@ where
             handler: self.handler.clone(),
             max_batch_size: self.max_batch_size,
             checkpoint_interval: self.checkpoint_interval,
+            ordering: self.ordering,
         }))
     }
 }
@@ -336,6 +456,7 @@ where
     handler: Arc<H>,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
+    ordering: Ordering,
 }
 
 #[async_trait]
@@ -391,6 +512,21 @@ where
         }
     }
 
+    /// Build the configured lane's stream from the stored cursor.
+    fn select_lane(
+        &self,
+        state: &OutboxEventJobState,
+    ) -> Result<PersistentLane<P>, Box<dyn std::error::Error>> {
+        match decide_lane(state.commit_sequence, state.sequence, self.ordering)? {
+            LaneChoice::Insert(sequence) => Ok(PersistentLane::Insert(
+                self.outbox.listen_persisted(Some(sequence)),
+            )),
+            LaneChoice::Commit(commit_sequence) => Ok(PersistentLane::Commit(
+                self.outbox.listen_commit_ordered(Some(commit_sequence)),
+            )),
+        }
+    }
+
     async fn run_with_persistent(
         &self,
         mut current_job: CurrentJob,
@@ -404,16 +540,18 @@ where
         // and ephemerals are only handled while nothing is pending. A
         // `PersistentOnly` handler never subscribes the ephemeral stream at
         // all.
-        let mut persistent = self.outbox.listen_persisted(Some(state.sequence));
+        let mut persistent = self.select_lane(&state)?;
         let mut ephemeral =
             (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
             collected: 0,
-            persisted_seq: state.sequence,
+            persisted_seq: state.position(),
+            persisted_insert_seq: state.sequence,
             last_persist: tokio::time::Instant::now(),
         };
+        let mut in_group = false;
         let mut batch = H::Batch::default();
         let flusher = SubscriberFlusher::<H, P> {
             handler: self.handler.clone(),
@@ -441,6 +579,22 @@ where
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
+                    None if in_group => match persistent.next().await {
+                        Some(item) => item,
+                        None => {
+                            let mut parts = CtxParts {
+                                op_slot: &mut op_slot,
+                                current_job: &mut current_job,
+                                state: &mut state,
+                                tracker: &mut tracker,
+                                mirror: None,
+                            };
+                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
+                                .await
+                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            return Ok(ResidentJobCompletion::RescheduleNow);
+                        }
+                    },
                     None => {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
@@ -459,7 +613,7 @@ where
                 let next = tokio::select! {
                     biased;
                     _ = current_job.shutdown_requested() => {
-                        if tracker.persisted_seq < state.sequence {
+                        if tracker.persisted_seq < state.position() {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -467,11 +621,12 @@ where
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
-                        if tracker.persisted_seq < state.sequence => {
+                        if tracker.persisted_seq < state.position() => {
                         persist_checkpoint(&mut current_job, &state, None)
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
-                        tracker.persisted_seq = state.sequence;
+                        tracker.persisted_seq = state.position();
+                        tracker.persisted_insert_seq = state.sequence;
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
                     }
@@ -504,7 +659,7 @@ where
                     }
                     NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
-                        if tracker.persisted_seq < state.sequence {
+                        if tracker.persisted_seq < state.position() {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -524,7 +679,8 @@ where
             // (the checkpoint advances over it like a skip); any `Err` — the
             // default — fails the job with the checkpoint parked before the
             // event, so every retry re-reads it and nothing is ever skipped.
-            let event = match item {
+            let commit = item.commit;
+            let event = match item.event {
                 Ok(event) => event,
                 Err(undecodable) => {
                     let mut parts = CtxParts {
@@ -539,11 +695,17 @@ where
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     match self.handler.handle_undecodable(&undecodable).await {
                         Ok(()) => {
+                            // INVARIANT: both cursors advance. Leaving
+                            // `commit_sequence` behind redelivers the event
+                            // after every restart.
                             state.sequence = undecodable.sequence;
+                            if let Some((commit_sequence, _)) = commit {
+                                state.commit_sequence = Some(commit_sequence);
+                            }
                             continue;
                         }
                         Err(error) => {
-                            if tracker.persisted_seq < state.sequence {
+                            if tracker.persisted_seq < state.position() {
                                 persist_checkpoint(&mut current_job, &state, None)
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -577,6 +739,10 @@ where
                 .map_err(|e| e as Box<dyn std::error::Error>)?
                 .outcome;
             state.sequence = event.sequence;
+            if let Some((commit_sequence, _)) = commit {
+                state.commit_sequence = Some(commit_sequence);
+            }
+            in_group = matches!(commit, Some((_, boundary)) if !boundary);
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {
@@ -592,7 +758,7 @@ where
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                 }
                 Outcome::Collect => {
-                    if tracker.collected >= self.max_batch_size {
+                    if tracker.collected >= self.max_batch_size && !in_group {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
@@ -616,5 +782,54 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_lane_stays_on_the_insert_cursor() {
+        let choice = decide_lane(None, EventSequence::from(7u64), Ordering::Insert);
+        assert_eq!(choice, Ok(LaneChoice::Insert(EventSequence::from(7u64))));
+    }
+
+    #[test]
+    fn commit_lane_continues_from_the_commit_cursor() {
+        let choice = decide_lane(
+            Some(CommitSequence::from(4u64)),
+            EventSequence::from(9u64),
+            Ordering::Commit,
+        );
+        assert_eq!(choice, Ok(LaneChoice::Commit(CommitSequence::from(4u64))));
+    }
+
+    /// A subscription that has never checkpointed is on no lane yet, so it
+    /// starts on the configured one from the beginning of that lane.
+    #[test]
+    fn a_fresh_subscription_starts_at_the_beginning_of_the_commit_lane() {
+        let choice = decide_lane(None, EventSequence::BEGIN, Ordering::Commit);
+        assert_eq!(choice, Ok(LaneChoice::Commit(CommitSequence::BEGIN)));
+    }
+
+    /// The two cursors count different things, so an established
+    /// subscription cannot be moved by flipping one enum value.
+    #[test]
+    fn switching_an_established_subscription_to_commit_is_refused() {
+        let error =
+            decide_lane(None, EventSequence::from(12u64), Ordering::Commit).expect_err("refuses");
+        assert!(error.contains("register a new job type"), "{error}");
+    }
+
+    #[test]
+    fn switching_back_to_the_insert_lane_is_refused() {
+        let error = decide_lane(
+            Some(CommitSequence::from(3u64)),
+            EventSequence::from(9u64),
+            Ordering::Insert,
+        )
+        .expect_err("refuses");
+        assert!(error.contains("register a new job type"), "{error}");
     }
 }

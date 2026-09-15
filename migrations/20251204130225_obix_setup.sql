@@ -5,14 +5,25 @@
 -- table's PK must include the partition key); `id` is a plain column.
 -- Partitions are pre-created ahead of the head by the maintainer job in
 -- `src/out/partition`.
+-- `commit_xid` holds the writer's top-level transaction id. Rows sharing one
+-- value committed together. `pg_current_xact_id()` returns `xid8`, which is
+-- 64-bit and does not wrap; there is no direct cast to bigint, hence the text
+-- hop.
 CREATE TABLE persistent_outbox_events (
   id UUID NOT NULL DEFAULT gen_random_uuid(),
   sequence BIGSERIAL,
   payload JSONB,
   tracing_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  commit_xid BIGINT NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
   PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
+
+-- Backs the sequencer's per-group lookup: every row of one `commit_xid`.
+-- Created on the parent; Postgres cascades it to existing and future
+-- partitions.
+CREATE INDEX idx_persistent_outbox_events_commit_xid
+  ON persistent_outbox_events (commit_xid);
 
 -- Initial partition. Its range MUST equal DEFAULT_PARTITION_WIDTH (a fixed
 -- constant) so maintainer-created partitions tile onto it without overlapping.
@@ -29,6 +40,63 @@ CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
 -- repair (`Partitions::recover_default`), not a correctness failure.
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
+
+-- Commit-ordered delivery lane: the materialised commit order, appended by
+-- the sequencer (`src/out/persistent/sequencer.rs`). A group is appended
+-- whole when its lowest member is reached in insert order, members by
+-- `sequence` within it, and the resulting `commit_seq` is dense.
+--
+-- Positions only; payloads are reached by joining on `sequence`. Retention
+-- must therefore drop log partitions before or with the event partitions
+-- they reference, never after.
+CREATE TABLE persistent_outbox_commit_log (
+  commit_seq BIGINT NOT NULL,
+  sequence   BIGINT NOT NULL,
+  group_last BOOLEAN NOT NULL,
+  PRIMARY KEY (commit_seq)
+) PARTITION BY RANGE (commit_seq);
+
+-- Range equal to DEFAULT_PARTITION_WIDTH, as for the events table, so
+-- maintainer-created partitions tile onto it without overlapping.
+CREATE TABLE persistent_outbox_commit_log_p0 PARTITION OF persistent_outbox_commit_log
+  FOR VALUES FROM (0) TO (2000000)
+  WITH (autovacuum_vacuum_insert_scale_factor = 0.0,
+        autovacuum_vacuum_insert_threshold = 50000,
+        autovacuum_freeze_min_age = 0,
+        fillfactor = 100);
+
+CREATE TABLE persistent_outbox_commit_log_default
+  PARTITION OF persistent_outbox_commit_log DEFAULT;
+
+-- Backs the sequencer's restart read: the sequences above
+-- `logged_through_sequence` that are already logged. Not UNIQUE — a
+-- partitioned table's UNIQUE must include the partition key, which here is
+-- `commit_seq`.
+CREATE INDEX idx_persistent_outbox_commit_log_sequence
+  ON persistent_outbox_commit_log (sequence);
+
+-- Sequencer state. The two watermarks count different things:
+-- `last_commit_seq` is a `commit_seq` (a position in the commit log),
+-- `logged_through_sequence` is an insert `sequence` (a position in
+-- `persistent_outbox_events`). Appending a group of three advances the
+-- first by three and sets the second to that group's lowest member, so
+-- neither tracks the other.
+--
+-- Every payload-bearing event at or below `logged_through_sequence` is in
+-- the log; events above it may be too, when a group straddles it. An append
+-- locks this row and is conditional on `logged_through_sequence` being below
+-- the appending sequence, which is what makes concurrent sequencers append
+-- each group once.
+--
+-- `singleton` admits one row and no other: the CHECK allows only TRUE and
+-- the primary key allows only one of it.
+CREATE TABLE persistent_outbox_commit_log_state (
+  singleton               BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  last_commit_seq         BIGINT NOT NULL,
+  logged_through_sequence BIGINT NOT NULL
+);
+INSERT INTO persistent_outbox_commit_log_state (last_commit_seq, logged_through_sequence)
+VALUES (0, 0) ON CONFLICT (singleton) DO NOTHING;
 
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (

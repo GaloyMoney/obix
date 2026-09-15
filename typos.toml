@@ -1,2 +1,6 @@
 [files]
 extend-exclude = ["CHANGELOG.md"]
+
+[default.extend-words]
+# PostgreSQL's Block Range INdex access method, not a misspelling of "bring".
+BRIN = "BRIN"

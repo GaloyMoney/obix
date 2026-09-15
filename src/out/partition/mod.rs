@@ -1,5 +1,11 @@
 //! Partition maintenance for the RANGE-partitioned `persistent_outbox_events`
-//! table (Stage 1 of the partitioning plan).
+//! table and the commit log that indexes it (Stage 1 of the partitioning
+//! plan).
+//!
+//! Both are maintained in lock-step, in one transaction under one lock.
+//! Retention must drop commit-log partitions before or together with the
+//! event partitions they reference: a log row whose event row is gone fails
+//! the join in `load_commit_ordered_page`.
 //!
 //! The table is partitioned `BY RANGE (sequence)` with a `DEFAULT` backstop.
 //! Two independent guarantees keep the synchronous write path total:
@@ -114,6 +120,11 @@ where
     /// is named `{table}_p{k}`, tiling seamlessly onto the migration's
     /// `{table}_p0` (`[0, width)`).
     ///
+    /// Covers the commit log in the same transaction and over the same `k`
+    /// range: the log holds at most one row per event, so `commit_seq` never
+    /// runs ahead of `sequence` and the events table's runway always covers
+    /// the log's.
+    ///
     /// If rows have already spilled into `DEFAULT` (the maintainer fell behind),
     /// the `CREATE` for that range **fails** — Postgres validates that `DEFAULT`
     /// holds no rows in the new range and errors. `IF NOT EXISTS` does not help
@@ -122,19 +133,19 @@ where
     /// alert) rather than being silently absorbed. Run
     /// [`recover_default`](Self::recover_default) to repair.
     pub async fn ensure(&self) -> Result<(), sqlx::Error> {
-        let table = Tables::persistent_outbox_events_table();
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
         let first = head / DEFAULT_PARTITION_WIDTH;
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
-        for k in first..=first + self.premake {
-            let lo = k * DEFAULT_PARTITION_WIDTH;
-            let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
-            let ddl = format!(
-                "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
-                 FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",
-            );
-            sqlx::query(&ddl).execute(&mut *tx).await?;
+        for table in [
+            Tables::persistent_outbox_events_table(),
+            Tables::persistent_outbox_commit_log_table(),
+        ] {
+            for k in first..=first + self.premake {
+                sqlx::query(&create_partition(table, k))
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await
     }
@@ -156,80 +167,100 @@ where
     /// decision: runbook + alert first, automate only if it recurs). It is
     /// exposed for operators and exercised by the test suite. Idempotent: a
     /// no-op when `DEFAULT` is already empty.
+    ///
+    /// Repairs the events table and the commit log together, in one
+    /// transaction, so the two stay in lock-step.
     pub async fn recover_default(&self) -> Result<(), sqlx::Error> {
-        let table = Tables::persistent_outbox_events_table();
+        let mut tx = self.pool.begin().await?;
+        self.ddl_lock(&mut tx).await?;
+        for (table, key) in [
+            (Tables::persistent_outbox_events_table(), "sequence"),
+            (Tables::persistent_outbox_commit_log_table(), "commit_seq"),
+        ] {
+            self.recover_one(&mut tx, table, key).await?;
+        }
+        tx.commit().await
+    }
+
+    /// One table's DEFAULT repair, inside the caller's locked transaction.
+    ///
+    /// Detaching DEFAULT first leaves the explicit CREATEs with no default to
+    /// validate against and no overlap; moving the rows back through the
+    /// parent in the same transaction is what keeps `MAX(key)` from
+    /// regressing (a two-phase repair would leave the top-of-log rows
+    /// detached while the move ran).
+    async fn recover_one(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        table: &str,
+        key: &str,
+    ) -> Result<(), sqlx::Error> {
         let default_child = format!("{table}_default");
         let default_old = format!("{table}_default_old");
 
-        // Range of stranded sequences. `MIN`/`MAX` are NULL when DEFAULT is
-        // empty — nothing to repair.
+        // `MIN`/`MAX` are NULL when DEFAULT is empty — nothing to repair.
         let bounds = sqlx::query(&format!(
-            "SELECT MIN(sequence) AS lo, MAX(sequence) AS hi FROM {default_child}"
+            "SELECT MIN({key}) AS lo, MAX({key}) AS hi FROM {default_child}"
         ))
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await?;
         use sqlx::Row;
-        let (Some(min_seq), Some(max_seq)) = (
+        let (Some(min_key), Some(max_key)) = (
             bounds.try_get::<Option<i64>, _>("lo")?,
             bounds.try_get::<Option<i64>, _>("hi")?,
         ) else {
             return Ok(());
         };
-        let min_k = (min_seq as u64) / DEFAULT_PARTITION_WIDTH;
+        let min_k = (min_key as u64) / DEFAULT_PARTITION_WIDTH;
         // Cover the stranded rows AND stay `premake` partitions ahead of the
         // head (the top of the strand is the head), so the maintainer's next
         // tick has nothing to do and steady state resumes immediately.
-        let max_k = (max_seq as u64) / DEFAULT_PARTITION_WIDTH + self.premake;
+        let max_k = (max_key as u64) / DEFAULT_PARTITION_WIDTH + self.premake;
 
-        // One transaction: detach DEFAULT (so the explicit CREATEs have no
-        // default to validate against and no overlap), create the covering
-        // partitions and a fresh DEFAULT, then move the stranded rows back into
-        // the parent — where they route into the new explicit partitions. A
-        // two-phase (detach, then move online) would leave the top-of-log rows
-        // detached during the move and MAX(sequence) would regress. The
-        // advisory lock serializes the CREATEs against concurrent `ensure`
-        // ticks (see [`ddl_lock`](Self::ddl_lock)).
-        let mut tx = self.pool.begin().await?;
-        self.ddl_lock(&mut tx).await?;
         sqlx::query(&format!(
             "ALTER TABLE {table} DETACH PARTITION {default_child}"
         ))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(&format!(
             "ALTER TABLE {default_child} RENAME TO {table}_default_old"
         ))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         for k in min_k..=max_k {
-            let lo = k * DEFAULT_PARTITION_WIDTH;
-            let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
-            sqlx::query(&format!(
-                "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
-                 FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",
-            ))
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query(&create_partition(table, k))
+                .execute(&mut **tx)
+                .await?;
         }
         sqlx::query(&format!(
             "CREATE TABLE {table}_default PARTITION OF {table} DEFAULT"
         ))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        // `SELECT *` supplies `sequence` explicitly (no nextval), preserving
-        // every stranded row's position.
+        // `SELECT *` supplies the partition key explicitly (no nextval),
+        // preserving every stranded row's position.
         sqlx::query(&format!(
             "WITH moved AS (DELETE FROM {default_old} RETURNING *) \
              INSERT INTO {table} SELECT * FROM moved"
         ))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         // Drop the drained artifact in the same transaction: atomic with the
         // repair, so a crash can never leave `{table}_default_old` behind to
         // collide with the next repair's RENAME.
         sqlx::query(&format!("DROP TABLE {default_old}"))
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await
+        Ok(())
     }
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for the partition covering index `k`.
+fn create_partition(table: &str, k: u64) -> String {
+    let lo = k * DEFAULT_PARTITION_WIDTH;
+    let hi = (k + 1) * DEFAULT_PARTITION_WIDTH;
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table}_p{k} PARTITION OF {table} \
+         FOR VALUES FROM ({lo}) TO ({hi}) WITH ({PARTITION_STORAGE_PARAMS})",
+    )
 }

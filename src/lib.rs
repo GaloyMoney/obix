@@ -24,22 +24,25 @@ pub use config::{
     DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
     DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
 };
+
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
-    KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
-    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
-    StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
-    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
+    CommitOrderedEnvelope, CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled,
+    IsolatedOp, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Ordering, Outbox,
+    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
+    SingletonSubscriber, StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
+    SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
     UndecodableEventError, WakeKey, WakeKeys,
 };
-pub use sequence::EventSequence;
+pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;
-pub use tables::SubscriptionRow;
+#[doc(hidden)]
+pub use tables::{CommitGroupAppend, CommitLogRow};
+pub use tables::{CommitRestartState, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
     decode_persistent_event, record_ephemeral_event_type_undecodable,
