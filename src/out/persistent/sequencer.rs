@@ -275,22 +275,20 @@ where
     Tables: MailboxTables,
 {
     let page = page.max(1);
-    let (head, cursor) = Tables::commit_log_state(pool).await?;
-    let logged_ahead: BTreeSet<EventSequence> = Tables::commit_logged_above(pool, cursor)
-        .await?
-        .into_iter()
-        .collect();
+    let restart = Tables::commit_log_restart_state(pool).await?;
+    let logged_ahead: BTreeSet<EventSequence> = restart.logged_ahead.into_iter().collect();
 
     let (commit_sender, _) = broadcast::channel(buffer_size);
-    let commit_head = Arc::new(AtomicU64::new(u64::from(head)));
+    let commit_head = Arc::new(AtomicU64::new(u64::from(restart.head)));
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
     let backfill_pool = pool.clone();
 
-    let mut listener = PersistentOutboxListener::deliveries(cache, Some(cursor), buffer_size);
+    let mut listener =
+        PersistentOutboxListener::deliveries(cache, Some(restart.cursor), buffer_size);
     let mut sequencer = Sequencer::<P, Tables> {
         pool: pool.clone(),
         page,
-        head,
+        head: restart.head,
         commit_head: commit_head.clone(),
         commit_sender: commit_sender.clone(),
         seen: HashMap::new(),
@@ -299,6 +297,12 @@ where
     };
 
     let task = spawn_supervised("obix::commit_sequencer", async move {
+        // INVARIANT: the published head is reconciled against the log before
+        // the fold runs. The seeded sequences are skipped without appending,
+        // so nothing else in the loop would correct a head that a peer has
+        // already moved past, and a listener trusting it would never backfill.
+        sequencer.deliver_tail().await;
+
         loop {
             tokio::select! {
                 request = backfill_rx.recv() => {

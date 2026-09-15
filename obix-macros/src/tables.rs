@@ -516,12 +516,19 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        let commit_logged_above_query = format!(
+        // INVARIANT: one statement, so `head` and the seed share a snapshot.
+        // Split into two reads, a peer appending between them yields a `head`
+        // that does not account for rows the seed skips. LEFT JOIN so the
+        // state row is returned even when nothing is logged ahead.
+        let commit_log_restart_state_query = format!(
             r#"
-            SELECT sequence AS "sequence!: i64"
-            FROM {tbl}persistent_outbox_commit_log
-            WHERE sequence > $1::bigint
-            ORDER BY sequence"#,
+            SELECT s.head AS "head!: i64",
+                   s.cursor AS "cursor!: i64",
+                   l.sequence AS "logged_ahead?: i64"
+            FROM {tbl}persistent_outbox_commit_log_state s
+            LEFT JOIN {tbl}persistent_outbox_commit_log l ON l.sequence > s.cursor
+            WHERE s.id = 1
+            ORDER BY l.sequence"#,
             tbl = table_prefix,
         );
 
@@ -619,23 +626,34 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn commit_logged_above(
+                fn commit_log_restart_state(
                     pool: &#crate_name::prelude::sqlx::PgPool,
-                    cursor: #crate_name::EventSequence,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send
+                ) -> impl std::future::Future<Output = Result<#crate_name::CommitRestartState, #crate_name::prelude::sqlx::Error>> + Send
                 {
                     let pool = pool.clone();
 
                     async move {
-                        let rows = sqlx::query!(
-                            #commit_logged_above_query,
-                            cursor as #crate_name::EventSequence,
-                        ).fetch_all(&pool).await?;
+                        let rows = sqlx::query!(#commit_log_restart_state_query)
+                            .fetch_all(&pool)
+                            .await?;
 
-                        Ok(rows
+                        let head = rows
+                            .first()
+                            .map(|row| #crate_name::CommitSequence::from(row.head as u64))
+                            .unwrap_or_default();
+                        let cursor = rows
+                            .first()
+                            .map(|row| #crate_name::EventSequence::from(row.cursor as u64))
+                            .unwrap_or_default();
+                        let logged_ahead = rows
                             .into_iter()
-                            .map(|row| #crate_name::EventSequence::from(row.sequence as u64))
-                            .collect())
+                            .filter_map(|row| {
+                                row.logged_ahead
+                                    .map(|s| #crate_name::EventSequence::from(s as u64))
+                            })
+                            .collect();
+
+                        Ok(#crate_name::CommitRestartState { head, cursor, logged_ahead })
                     }
                 }
 

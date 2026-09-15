@@ -316,15 +316,16 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// The insert sequences above `cursor` that are already in the log.
+    /// Everything the sequencer needs to resume, read in **one statement**.
     ///
-    /// The sequencer's restart seed: a group appended before a crash may
-    /// have members above the stored cursor, and re-appending it would
-    /// duplicate them.
-    fn commit_logged_above(
+    /// `head` and `logged_ahead` must come from a single snapshot. Read
+    /// separately, a peer appending between them returns a `head` that does
+    /// not account for rows the seed then tells the fold to skip, and the
+    /// fold has no other occasion to reconcile it — leaving this process's
+    /// published head behind the log for as long as the stream stays quiet.
+    fn commit_log_restart_state(
         pool: &sqlx::PgPool,
-        cursor: EventSequence,
-    ) -> impl Future<Output = Result<Vec<EventSequence>, sqlx::Error>> + Send;
+    ) -> impl Future<Output = Result<CommitRestartState, sqlx::Error>> + Send;
 
     /// Load the commit-ordered page `(after, after + limit]`, joined to the
     /// events table for payloads. Dense by construction, so a short page
@@ -477,6 +478,16 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_types: &[String],
         wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+}
+
+/// The sequencer's resume point: the log head, the insert sequence the last
+/// group was appended at, and the sequences above it that are already
+/// logged. All three from one snapshot.
+#[derive(Debug, Clone)]
+pub struct CommitRestartState {
+    pub head: CommitSequence,
+    pub cursor: EventSequence,
+    pub logged_ahead: Vec<EventSequence>,
 }
 
 /// One subscription's identity and terms, as stored — everything but the

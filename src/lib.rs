@@ -42,7 +42,7 @@ pub use out::{
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;
-pub use tables::{PersistentEventRows, SubscriptionRow};
+pub use tables::{CommitRestartState, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
     decode_persistent_event, record_ephemeral_event_type_undecodable,
