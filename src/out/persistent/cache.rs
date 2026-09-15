@@ -1,5 +1,5 @@
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::Instrument;
 
@@ -8,12 +8,51 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use super::sequencer::{self, SequencerHandle};
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
     out::{event::*, gap_fill::GapFillRequest, pg_notify::NotifyMessage},
-    sequence::EventSequence,
+    sequence::{CommitSequence, EventSequence},
 };
+
+/// What a [`CommitOrderedListener`](super::CommitOrderedListener) needs from
+/// the commit lane.
+pub struct CommitLaneHandle<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    commit_head: Arc<AtomicU64>,
+    commit_event_receiver: Option<broadcast::Receiver<PersistentDelivery<P>>>,
+    backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<PersistentDelivery<P>>)>,
+    backfill_buffer_size: usize,
+}
+
+impl<P> CommitLaneHandle<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pub fn head(&self) -> CommitSequence {
+        CommitSequence::from(self.commit_head.load(Ordering::Relaxed))
+    }
+
+    pub fn commit_event_stream(&mut self) -> BroadcastStream<PersistentDelivery<P>> {
+        BroadcastStream::new(
+            self.commit_event_receiver
+                .take()
+                .expect("receiver already taken"),
+        )
+    }
+
+    pub fn request_commit_backfill(
+        &self,
+        start_after: CommitSequence,
+    ) -> ReceiverStream<PersistentDelivery<P>> {
+        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
+        let _ = self.backfill_request.send((start_after, tx));
+        ReceiverStream::new(rx)
+    }
+}
 
 pub struct CacheHandle<P>
 where
@@ -74,7 +113,27 @@ where
     backfill_buffer_size: usize,
     cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
     _cache_loop_handle: OwnedTaskHandle,
+    /// The commit-ordered lane, started on first use. A process with no
+    /// commit-ordered listener never runs a sequencer and never writes the
+    /// commit log.
+    commit_lane: tokio::sync::OnceCell<SequencerHandle<P>>,
+    /// Inputs the sequencer needs, held until it is started.
+    commit_lane_setup: std::sync::Mutex<Option<CommitLaneSetup>>,
+    frontier_rx: watch::Receiver<EventSequence>,
     _phantom: std::marker::PhantomData<Tables>,
+}
+
+/// Held from `init` until the first commit-ordered listener starts the
+/// sequencer.
+#[derive(Debug)]
+struct CommitLaneSetup {
+    pool: sqlx::PgPool,
+    page: usize,
+    buffer_size: usize,
+    init_head: u64,
+    commit_notification_rx: mpsc::Receiver<NotifyMessage>,
+    gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
+    idle_resync_interval: std::time::Duration,
 }
 
 impl<P, Tables> PersistentOutboxEventCache<P, Tables>
@@ -99,6 +158,7 @@ where
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
         persistent_notification_rx: mpsc::Receiver<NotifyMessage>,
+        commit_notification_rx: mpsc::Receiver<NotifyMessage>,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
@@ -108,6 +168,9 @@ where
         let highest_known_sequence = Arc::new(AtomicU64::from(
             Tables::highest_known_persistent_sequence(pool).await?,
         ));
+        let init_head = highest_known_sequence.load(Ordering::Relaxed);
+
+        let (frontier_tx, frontier_rx) = watch::channel(EventSequence::from(init_head));
 
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
@@ -118,7 +181,8 @@ where
             cache_fill_recv,
             cache_fill_send.clone(),
             persistent_notification_rx,
-            gap_fill_tx,
+            gap_fill_tx.clone(),
+            frontier_tx,
         )
         .await?;
 
@@ -129,9 +193,60 @@ where
             backfill_buffer_size: config.backfill_page_size.max(1),
             cache_fill_sender: cache_fill_send,
             _cache_loop_handle: cache_loop_handle,
+            commit_lane: tokio::sync::OnceCell::new(),
+            commit_lane_setup: std::sync::Mutex::new(Some(CommitLaneSetup {
+                pool: pool.clone(),
+                page: config.sequencer_page_size,
+                buffer_size: config.event_buffer_size,
+                init_head,
+                commit_notification_rx,
+                gap_fill_tx,
+                idle_resync_interval: config.idle_resync_interval,
+            })),
+            frontier_rx,
             _phantom: std::marker::PhantomData,
         };
         Ok(ret)
+    }
+
+    /// Start the sequencer if it is not already running, and hand back a
+    /// commit-lane handle. The first commit-ordered listener in a process is
+    /// what makes that process write the commit log.
+    pub async fn ensure_commit_lane(
+        &self,
+        pool: &sqlx::PgPool,
+    ) -> Result<CommitLaneHandle<P>, sqlx::Error> {
+        let backfill_buffer_size = self.backfill_buffer_size;
+        let handle = self
+            .commit_lane
+            .get_or_try_init(|| async {
+                let setup = self
+                    .commit_lane_setup
+                    .lock()
+                    .expect("commit lane setup poisoned")
+                    .take()
+                    .expect("commit lane setup already taken");
+                let (head, _) = Tables::commit_log_state(pool).await?;
+                Ok::<_, sqlx::Error>(sequencer::spawn::<P, Tables>(
+                    &setup.pool,
+                    setup.page,
+                    setup.buffer_size,
+                    setup.init_head,
+                    self.frontier_rx.clone(),
+                    setup.commit_notification_rx,
+                    setup.gap_fill_tx,
+                    setup.idle_resync_interval,
+                    head,
+                ))
+            })
+            .await?;
+
+        Ok(CommitLaneHandle {
+            commit_head: handle.commit_head.clone(),
+            commit_event_receiver: Some(handle.commit_sender.subscribe()),
+            backfill_request: handle.backfill_request.clone(),
+            backfill_buffer_size,
+        })
     }
 
     fn insert_into_cache_and_maybe_broadcast(
@@ -177,11 +292,15 @@ where
                 );
                 break;
             }
+            // INVARIANT: the cursor advances before the send is attempted.
+            // `send` fails only when there are no receivers, and stopping
+            // there pins the cursor — and with it stall reporting and the
+            // commit lane's frontier — in any process with no insert-lane
+            // listener.
+            last_broadcast_sequence = *seq;
             if persistent_event_sender.send(evt.clone()).is_err() {
                 record_no_receivers(u64::from(*seq));
-                break;
             }
-            last_broadcast_sequence = *seq;
         }
 
         (cache, last_broadcast_sequence)
@@ -477,6 +596,7 @@ where
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
+        frontier_tx: watch::Sender<EventSequence>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -738,6 +858,11 @@ where
                 } else if reported_stall.take().is_some() {
                     let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
                 }
+
+                // INVARIANT: always `send_modify`, never a conditional send —
+                // a placeholder arrival that does not move the frontier still
+                // changes what the sequencer can pass.
+                frontier_tx.send_modify(|frontier| *frontier = last_broadcast_sequence);
 
                 if persistent_cache.len() > high_water {
                     let to_remove = persistent_cache.len() - low_water;

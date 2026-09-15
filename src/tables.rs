@@ -26,18 +26,36 @@ pub struct DefaultMailboxTables;
 /// ([`UndecodableEventError`]), still occupying its sequence position, and
 /// its fate is decided by consumer policy (see
 /// [`SingletonSubscriber::handle_undecodable`](crate::SingletonSubscriber::handle_undecodable)).
+/// The commit-lane metadata of one stored row, as the loading queries report
+/// it. `sequence` and `boundary` are only populated by commit-lane reads.
 #[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitPosition {
+    pub xid: Option<i64>,
+    pub sequence: Option<CommitSequence>,
+    pub boundary: bool,
+}
+
+/// The `Err` arm is the delivery of an undecodable event rather than a
+/// failure path, so boxing it to shrink the `Result` would change the public
+/// stream item type for every consumer.
+#[doc(hidden)]
+#[allow(clippy::result_large_err)]
 pub fn decode_persistent_event<P>(
     id: OutboxEventId,
     sequence: u64,
     recorded_at: chrono::DateTime<chrono::Utc>,
     tracing_context: Option<es_entity::context::TracingContext>,
     payload: Option<serde_json::Value>,
+    commit: CommitPosition,
 ) -> Result<PersistentOutboxEvent<P>, UndecodableEventError>
 where
     P: Serialize + DeserializeOwned + Send,
 {
     let sequence = EventSequence::from(sequence);
+    let commit_group = commit.xid.map(CommitGroupId::from);
+    let commit_sequence = commit.sequence;
+    let commit_boundary = commit.boundary;
     let payload = match payload {
         None => None,
         Some(raw) => match P::deserialize(&raw) {
@@ -52,6 +70,9 @@ where
                         error: error.to_string(),
                         raw,
                     },
+                    commit_group,
+                    commit_sequence,
+                    commit_boundary,
                 });
             }
         },
@@ -62,6 +83,9 @@ where
         payload,
         tracing_context,
         recorded_at,
+        commit_group,
+        commit_sequence,
+        commit_boundary,
     })
 }
 
@@ -115,6 +139,33 @@ pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 /// sequence position — `Ok` for a decoded event or a placeholder, `Err`
 /// for a stored payload that does not decode into `P`.
 pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>;
+
+/// Outcome of one sequencer tick — an attempt to extend the commit log.
+///
+/// Returned only by the process that won the state-row lock; a loser gets
+/// `None` and skips its tick.
+pub struct SequenceTick<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    /// Highest `commit_seq` in the log after this tick.
+    pub head: CommitSequence,
+    /// Watermark below which every real row is logged, after this tick.
+    pub low_water: EventSequence,
+    /// How far the sequencer has examined, after this tick. Advances past
+    /// logged rows even while a group is open, so the window can widen to
+    /// reach that group's highest member; `low_water` cannot do this job.
+    pub scan_water: EventSequence,
+    /// Where this tick stopped: one below the first hole in the examined
+    /// window, or the window's end.
+    pub f_stop: EventSequence,
+    /// The window's end this tick asked for. `f_stop < f_eff` means a hole
+    /// blocked the scan short of it.
+    pub f_eff: EventSequence,
+    /// The rows appended, in commit order, with `commit_sequence` and
+    /// `commit_boundary` set. Empty when the tick found nothing to append.
+    pub appended: PersistentEventRows<P>,
+}
 
 pub trait MailboxTables: Send + Sync + 'static {
     fn highest_known_persistent_sequence<'a>(
@@ -287,8 +338,65 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// Run one sequencer tick: append every closed group in `(low_water,
+    /// f_stop]` to the commit log, in commit order, and advance the state
+    /// row — all in one statement, so the append and the head advance share
+    /// a fate.
+    ///
+    /// `frontier` is the caller's contiguity frontier: the tick never looks
+    /// above it, and never past a hole below it, so a group is logged only
+    /// once every one of its members is visible and nothing between them can
+    /// still commit. `page` bounds the window.
+    ///
+    /// `None` means the state-row lock was not obtained — another process is
+    /// ticking. The caller skips rather than waits; no user transaction ever
+    /// blocks on this lock.
+    fn sequence_tick<P>(
+        pool: &sqlx::PgPool,
+        frontier: EventSequence,
+        page: usize,
+    ) -> impl Future<Output = Result<Option<SequenceTick<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// Load the commit-ordered page `(after, after + limit]`, joined to the
+    /// events table for payloads. Dense by construction, so a short page
+    /// means the reader has reached the head — never a gap to wait on.
+    fn load_commit_ordered_page<P>(
+        pool: &sqlx::PgPool,
+        after: CommitSequence,
+        limit: usize,
+    ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// The sequencer's `(head, low_water)`.
+    fn commit_log_state(
+        pool: &sqlx::PgPool,
+    ) -> impl Future<Output = Result<(CommitSequence, EventSequence), sqlx::Error>> + Send;
+
+    /// Translate an insert-lane cursor into the commit-lane cursor that
+    /// delivers everything not yet seen.
+    ///
+    /// Resolves to one below the lowest `commit_seq` of any row above
+    /// `after`, so no unseen event is skipped. Rows at or below `after`
+    /// whose group straddles it are therefore **redelivered** — the price of
+    /// switching lanes, and why the switch requires an explicit
+    /// acknowledgement that the handler is idempotent.
+    fn translate_insert_cursor(
+        pool: &sqlx::PgPool,
+        after: EventSequence,
+    ) -> impl Future<Output = Result<CommitSequence, sqlx::Error>> + Send;
+
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
+
+    /// NOTIFY channel the sequencer signals after extending the log, so
+    /// processes that lost the tick learn to read the tail.
+    fn persistent_outbox_commit_log_channel() -> &'static str;
+
+    /// Base name of the commit log table, for the partition maintainer.
+    fn persistent_outbox_commit_log_table() -> &'static str;
 
     /// Base name of the persistent outbox events table (honouring any table
     /// prefix). The partition maintainer derives child partition names

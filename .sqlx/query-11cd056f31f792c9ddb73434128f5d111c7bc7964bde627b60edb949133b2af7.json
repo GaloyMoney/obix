@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT head AS \"head!: i64\", low_water AS \"low_water!: i64\"\n            FROM persistent_outbox_commit_log_state\n            WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "head!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "low_water!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "11cd056f31f792c9ddb73434128f5d111c7bc7964bde627b60edb949133b2af7"
+}

@@ -126,9 +126,9 @@ FROM {}persistent_outbox_events_sequence_seq",
             r#"WITH new_events AS (
                    INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
                    SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
-                   RETURNING id, sequence, recorded_at
+                   RETURNING id, sequence, recorded_at, commit_xid
                )
-               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
+               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!", ne.commit_xid
                FROM new_events ne
                ORDER BY ne.sequence"#,
             tbl = table_prefix,
@@ -146,7 +146,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             r#"WITH new_events AS (
                    INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
                    SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
-                   RETURNING id, sequence, recorded_at
+                   RETURNING id, sequence, recorded_at, commit_xid
                ),
                notified AS (
                    SELECT pg_notify(
@@ -156,7 +156,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                    FROM new_events
                    HAVING COUNT(*) > 0
                )
-               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!"
+               SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!", ne.commit_xid
                FROM new_events ne
                LEFT JOIN notified ON TRUE
                ORDER BY ne.sequence"#,
@@ -185,7 +185,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         // and batch-capped caller-side (`out::persistent::cache`).
         let load_next_page_query = format!(
             r#"
-            SELECT sequence AS "sequence!: i64", id AS "id!", payload, tracing_context, recorded_at AS "recorded_at!"
+            SELECT sequence AS "sequence!: i64", id AS "id!", payload, tracing_context, recorded_at AS "recorded_at!", commit_xid
             FROM {}persistent_outbox_events
             WHERE sequence > $1
               AND sequence <= $1 + $2
@@ -215,7 +215,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                   AND sequence <= $1 + $2
             )
             SELECT e.sequence AS "sequence!: i64", e.id AS "id!", e.payload,
-                   e.tracing_context, e.recorded_at AS "recorded_at!"
+                   e.tracing_context, e.recorded_at AS "recorded_at!", e.commit_xid
             FROM {tbl}persistent_outbox_events e
             WHERE e.sequence > $1
               AND e.sequence <= $1 + $2
@@ -256,7 +256,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let load_events_in_range_query = format!(
             r#"
-            SELECT id, sequence, payload, tracing_context, recorded_at
+            SELECT id, sequence, payload, tracing_context, recorded_at, commit_xid
             FROM {}persistent_outbox_events
             WHERE sequence > $1
               AND sequence <= $2
@@ -290,10 +290,10 @@ FROM {}persistent_outbox_events_sequence_seq",
         // post-commit broadcast/notification path or the next page read.
         let fill_gaps_query = format!(
             r#"
-            INSERT INTO {}persistent_outbox_events (sequence)
-            SELECT unnest($1::bigint[]) AS sequence
+            INSERT INTO {}persistent_outbox_events (sequence, commit_xid)
+            SELECT unnest($1::bigint[]) AS sequence, NULL::bigint AS commit_xid
             ON CONFLICT (sequence) DO NOTHING
-            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at"#,
+            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at, commit_xid"#,
             table_prefix
         );
 
@@ -456,6 +456,147 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        // === Commit-ordered lane queries ===
+
+        let commit_log_channel = format!("{}persistent_outbox_commit_log", table_prefix);
+        let commit_log_table = format!("{}persistent_outbox_commit_log", table_prefix);
+
+        // INVARIANTS: `holes` must stay `EXCEPT`, not `NOT EXISTS` (see
+        // `missing_sequences_query`). `note` is a SELECT CTE and must remain
+        // referenced by the final query or Postgres never executes it.
+        // `head + ROW_NUMBER()` under the row lock is what keeps `commit_seq`
+        // dense.
+        let sequence_tick_query = format!(
+            r#"
+            WITH st AS (
+                SELECT head, low_water, scan_water
+                FROM {tbl}persistent_outbox_commit_log_state
+                WHERE id = 1
+                FOR UPDATE SKIP LOCKED
+            ),
+            bounds AS (
+                SELECT low_water, LEAST($1::bigint, GREATEST(low_water, scan_water) + $2::bigint) AS f_eff
+                FROM st
+            ),
+            holes AS (
+                SELECT g FROM bounds, generate_series(bounds.low_water + 1, bounds.f_eff) AS g
+                EXCEPT
+                SELECT e.sequence
+                FROM {tbl}persistent_outbox_events e, bounds
+                WHERE e.sequence > bounds.low_water AND e.sequence <= bounds.f_eff
+            ),
+            stop AS (
+                SELECT COALESCE((SELECT MIN(g) - 1 FROM holes), bounds.f_eff) AS f_stop
+                FROM bounds
+            ),
+            cand AS (
+                SELECT e.sequence, e.commit_xid
+                FROM {tbl}persistent_outbox_events e, bounds, stop
+                WHERE e.sequence > bounds.low_water
+                  AND e.sequence <= stop.f_stop
+                  AND e.payload IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {tbl}persistent_outbox_commit_log l WHERE l.sequence = e.sequence)
+            ),
+            ext AS (
+                SELECT e.commit_xid, MAX(e.sequence) AS group_max
+                FROM {tbl}persistent_outbox_events e
+                WHERE e.commit_xid IN (SELECT DISTINCT c.commit_xid FROM cand c WHERE c.commit_xid IS NOT NULL)
+                GROUP BY e.commit_xid
+            ),
+            keyed AS (
+                SELECT c.sequence, c.commit_xid, COALESCE(x.group_max, c.sequence) AS group_max
+                FROM cand c LEFT JOIN ext x ON x.commit_xid = c.commit_xid
+            ),
+            closed AS (
+                SELECT k.sequence, k.commit_xid, k.group_max
+                FROM keyed k, stop
+                WHERE k.group_max <= stop.f_stop
+            ),
+            numbered AS (
+                SELECT k.sequence,
+                       st.head + ROW_NUMBER() OVER (ORDER BY k.group_max, k.sequence) AS commit_seq,
+                       (k.sequence = k.group_max) AS group_last
+                FROM closed k, st
+            ),
+            ins AS (
+                INSERT INTO {tbl}persistent_outbox_commit_log (commit_seq, sequence, group_last)
+                SELECT commit_seq, sequence, group_last FROM numbered
+                RETURNING commit_seq, sequence, group_last
+            ),
+            new_low AS (
+                SELECT COALESCE(
+                         (SELECT MIN(k.sequence) - 1 FROM keyed k, stop WHERE k.group_max > stop.f_stop),
+                         stop.f_stop) AS low
+                FROM stop
+            ),
+            upd AS (
+                UPDATE {tbl}persistent_outbox_commit_log_state s
+                SET head       = s.head + (SELECT COUNT(*) FROM ins),
+                    low_water  = GREATEST(s.low_water, (SELECT low FROM new_low)),
+                    scan_water = GREATEST(s.scan_water, (SELECT f_stop FROM stop))
+                WHERE s.id = 1 AND EXISTS (SELECT 1 FROM st)
+                RETURNING s.head, s.low_water, s.scan_water
+            ),
+            note AS (
+                SELECT pg_notify('{channel}', json_build_object('head', (SELECT head FROM upd))::text) AS n
+                WHERE (SELECT COUNT(*) FROM ins) > 0
+            )
+            SELECT u.head       AS "head!: i64",
+                   u.low_water  AS "low_water!: i64",
+                   u.scan_water AS "scan_water!: i64",
+                   (SELECT f_stop FROM stop) AS "f_stop!: i64",
+                   (SELECT f_eff FROM bounds) AS "f_eff!: i64",
+                   i.commit_seq AS "commit_seq?: i64",
+                   i.group_last AS "group_last?",
+                   e.id AS "id?",
+                   e.sequence AS "sequence?: i64",
+                   e.payload,
+                   e.tracing_context,
+                   e.recorded_at AS "recorded_at?",
+                   e.commit_xid
+            FROM upd u
+            LEFT JOIN ins i ON TRUE
+            LEFT JOIN {tbl}persistent_outbox_events e ON e.sequence = i.sequence
+            LEFT JOIN note ON TRUE
+            ORDER BY i.commit_seq NULLS FIRST"#,
+            tbl = table_prefix,
+            channel = commit_log_channel,
+        );
+
+        // The `commit_seq <= $1 + $2` bound is load-bearing for partition
+        // pruning, the same reasoning as `load_next_page_query`.
+        let load_commit_ordered_page_query = format!(
+            r#"
+            SELECT l.commit_seq AS "commit_seq!: i64", l.group_last AS "group_last!",
+                   e.id AS "id!", e.sequence AS "sequence!: i64", e.payload,
+                   e.tracing_context, e.recorded_at AS "recorded_at!", e.commit_xid
+            FROM {tbl}persistent_outbox_commit_log l
+            JOIN {tbl}persistent_outbox_events e ON e.sequence = l.sequence
+            WHERE l.commit_seq > $1 AND l.commit_seq <= $1 + $2
+            ORDER BY l.commit_seq"#,
+            tbl = table_prefix,
+        );
+
+        let commit_log_state_query = format!(
+            r#"
+            SELECT head AS "head!: i64", low_water AS "low_water!: i64"
+            FROM {tbl}persistent_outbox_commit_log_state
+            WHERE id = 1"#,
+            tbl = table_prefix,
+        );
+
+        let translate_insert_cursor_query = format!(
+            r#"
+            SELECT COALESCE(
+                     (SELECT MIN(l.commit_seq) - 1
+                      FROM {tbl}persistent_outbox_commit_log l
+                      WHERE l.sequence > $1),
+                     (SELECT head FROM {tbl}persistent_outbox_commit_log_state WHERE id = 1)
+                   ) AS "cursor!: i64""#,
+            tbl = table_prefix,
+        );
+
         tokens.append_all(quote! {
             impl #crate_name::MailboxTables for #ident {
                 // === Outbox channel names ===
@@ -470,6 +611,152 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn persistent_outbox_events_table() -> &'static str {
                     #persistent_outbox_events_table
+                }
+
+                fn persistent_outbox_commit_log_channel() -> &'static str {
+                    #commit_log_channel
+                }
+
+                fn persistent_outbox_commit_log_table() -> &'static str {
+                    #commit_log_table
+                }
+
+                fn sequence_tick<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    frontier: #crate_name::EventSequence,
+                    page: usize,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::SequenceTick<P>>, #crate_name::prelude::sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #sequence_tick_query,
+                            frontier as #crate_name::EventSequence,
+                            page as i64,
+                        ).fetch_all(&pool).await?;
+
+                        // Zero rows means the state-row lock was not obtained.
+                        let Some(first) = rows.first() else {
+                            return Ok(None);
+                        };
+                        let head = #crate_name::CommitSequence::from(first.head as u64);
+                        let low_water = #crate_name::EventSequence::from(first.low_water as u64);
+                        let scan_water = #crate_name::EventSequence::from(first.scan_water as u64);
+                        let f_stop = #crate_name::EventSequence::from(first.f_stop as u64);
+                        let f_eff = #crate_name::EventSequence::from(first.f_eff as u64);
+
+                        let appended = rows
+                            .into_iter()
+                            .filter_map(|row| {
+                                let commit_seq = row.commit_seq?;
+                                let group_last = row.group_last?;
+                                let id = row.id?;
+                                let sequence = row.sequence?;
+                                let recorded_at = row.recorded_at?;
+                                let payload = row.payload;
+                                let commit_xid = row.commit_xid;
+                                #deserialize_context
+                                Some(#crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(id),
+                                    sequence as u64,
+                                    recorded_at,
+                                    tracing_context,
+                                    payload,
+                                    #crate_name::CommitPosition {
+                                        xid: commit_xid,
+                                        sequence: Some(#crate_name::CommitSequence::from(commit_seq as u64)),
+                                        boundary: group_last,
+                                    },
+                                ))
+                            })
+                            .collect();
+
+                        Ok(Some(#crate_name::SequenceTick {
+                            head,
+                            low_water,
+                            scan_water,
+                            f_stop,
+                            f_eff,
+                            appended,
+                        }))
+                    }
+                }
+
+                fn load_commit_ordered_page<P>(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after: #crate_name::CommitSequence,
+                    limit: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, #crate_name::prelude::sqlx::Error>> + Send
+                where
+                    P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_commit_ordered_page_query,
+                            after as #crate_name::CommitSequence,
+                            limit as i64,
+                        ).fetch_all(&pool).await?;
+
+                        let events = rows
+                            .into_iter()
+                            .map(|row| {
+                                let commit_seq = row.commit_seq;
+                                let group_last = row.group_last;
+                                #deserialize_context
+                                #crate_name::decode_persistent_event(
+                                    #crate_name::out::OutboxEventId::from(row.id),
+                                    row.sequence as u64,
+                                    row.recorded_at,
+                                    tracing_context,
+                                    row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        sequence: Some(#crate_name::CommitSequence::from(commit_seq as u64)),
+                                        boundary: group_last,
+                                    },
+                                )
+                            })
+                            .collect();
+                        Ok(events)
+                    }
+                }
+
+                fn commit_log_state(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                ) -> impl std::future::Future<Output = Result<(#crate_name::CommitSequence, #crate_name::EventSequence), #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(#commit_log_state_query)
+                            .fetch_one(&pool)
+                            .await?;
+                        Ok((
+                            #crate_name::CommitSequence::from(row.head as u64),
+                            #crate_name::EventSequence::from(row.low_water as u64),
+                        ))
+                    }
+                }
+
+                fn translate_insert_cursor(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<#crate_name::CommitSequence, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let row = sqlx::query!(
+                            #translate_insert_cursor_query,
+                            after as #crate_name::EventSequence,
+                        ).fetch_one(&pool).await?;
+                        Ok(#crate_name::CommitSequence::from(row.cursor as u64))
+                    }
                 }
 
                 const KEYED_WAKER_JOB_TYPE: &'static str = #keyed_waker_job_type;
@@ -530,6 +817,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
                                 recorded_at: row.recorded_at,
                                 payload: Some(payload),
+                                commit_group: row.commit_xid.map(#crate_name::CommitGroupId::from),
+                                commit_sequence: None,
+                                commit_boundary: false,
                                 #set_context
                             })
                             .collect::<Vec<_>>();
@@ -579,6 +869,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 sequence: #crate_name::EventSequence::from(row.sequence as u64),
                                 recorded_at: row.recorded_at,
                                 payload: Some(payload),
+                                commit_group: row.commit_xid.map(#crate_name::CommitGroupId::from),
+                                commit_sequence: None,
+                                commit_boundary: false,
                                 #set_context
                             })
                             .collect::<Vec<_>>();
@@ -679,6 +972,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.recorded_at,
                                     tracing_context,
                                     row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .collect();
@@ -713,6 +1010,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.recorded_at,
                                     tracing_context,
                                     row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .collect();
@@ -790,6 +1091,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.recorded_at,
                                     tracing_context,
                                     row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .collect();
@@ -840,6 +1145,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.recorded_at,
                                     tracing_context,
                                     row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .collect();
@@ -904,6 +1213,10 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.recorded_at,
                                     tracing_context,
                                     row.payload,
+                                    #crate_name::CommitPosition {
+                                        xid: row.commit_xid,
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .collect();

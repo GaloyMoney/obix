@@ -155,6 +155,15 @@ pub struct UndecodableEventError {
     pub recorded_at: chrono::DateTime<chrono::Utc>,
     /// The raw payload and the serde error.
     pub failure: DecodeFailure,
+    /// The source transaction this event committed in; `None` on rows
+    /// written before the column existed.
+    pub commit_group: Option<CommitGroupId>,
+    /// Position in the commit-ordered lane; `Some` only when delivered on
+    /// that lane.
+    pub commit_sequence: Option<CommitSequence>,
+    /// On the commit lane, whether this is the last event of its group.
+    /// Always `false` on the insert lane.
+    pub commit_boundary: bool,
 }
 
 /// Internal transport for the persistent delivery plumbing (cache,
@@ -181,8 +190,22 @@ where
         }
     }
 
+    /// The commit-lane position this delivery occupies, whichever arm it
+    /// is. `None` on an insert-lane delivery.
+    pub(crate) fn commit_sequence(&self) -> Option<CommitSequence> {
+        match &self.0 {
+            Ok(event) => event.commit_sequence,
+            Err(error) => error.commit_sequence,
+        }
+    }
+
     /// Unwrap into the public listener stream item, cloning the `Err` arm
     /// out of its transport `Arc`.
+    ///
+    /// The `Err` arm is the delivery of an undecodable event rather than a
+    /// failure path, so boxing it to shrink the `Result` would change the
+    /// public stream item type for every consumer.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn into_item(self) -> Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError> {
         match self.0 {
             Ok(event) => Ok(event),
@@ -229,6 +252,20 @@ where
     pub payload: Option<T>,
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
+    /// The source transaction this event committed in. Events sharing one
+    /// value committed together, on both lanes; `None` on rows written
+    /// before the column existed and on gap-fill placeholders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_group: Option<CommitGroupId>,
+    /// Position in the commit-ordered lane; `Some` only when delivered on
+    /// that lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sequence: Option<CommitSequence>,
+    /// On the commit lane, whether this is the last event of its group —
+    /// the point at which a batch may be flushed without splitting a source
+    /// transaction. Always `false` on the insert lane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub commit_boundary: bool,
 }
 
 impl<T> Clone for PersistentOutboxEvent<T>
@@ -242,6 +279,9 @@ where
             payload: self.payload.clone(),
             tracing_context: self.tracing_context.clone(),
             recorded_at: self.recorded_at,
+            commit_group: self.commit_group,
+            commit_sequence: self.commit_sequence,
+            commit_boundary: self.commit_boundary,
         }
     }
 }

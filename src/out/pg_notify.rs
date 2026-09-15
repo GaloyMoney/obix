@@ -24,6 +24,7 @@ pub async fn spawn_pg_listener<Tables>(
     pool: &sqlx::PgPool,
     persistent_notification_tx: mpsc::Sender<NotifyMessage>,
     ephemeral_notification_tx: mpsc::Sender<NotifyMessage>,
+    commit_log_notification_tx: mpsc::Sender<NotifyMessage>,
 ) -> Result<OwnedTaskHandle, sqlx::Error>
 where
     Tables: MailboxTables,
@@ -31,10 +32,17 @@ where
     let pool = pool.clone();
     let persistent_channel = Tables::persistent_outbox_events_channel();
     let ephemeral_channel = Tables::ephemeral_outbox_events_channel();
+    let commit_log_channel = Tables::persistent_outbox_commit_log_channel();
 
     // The initial connection stays fail-fast: a broken setup should surface
     // at init, not as an endlessly-retrying background task.
-    let mut listener = connect_and_listen(&pool, persistent_channel, ephemeral_channel).await?;
+    let mut listener = connect_and_listen(
+        &pool,
+        persistent_channel,
+        ephemeral_channel,
+        commit_log_channel,
+    )
+    .await?;
 
     let handle = spawn_supervised("obix::pg_listener", async move {
         loop {
@@ -54,6 +62,10 @@ where
                         ephemeral_notification_tx
                             .send(NotifyMessage::Notification(notification))
                             .await
+                    } else if notification.channel() == commit_log_channel {
+                        commit_log_notification_tx
+                            .send(NotifyMessage::Notification(notification))
+                            .await
                     } else {
                         // Unknown channel, skip
                         continue;
@@ -70,9 +82,13 @@ where
                     // re-issued LISTEN. Tell both caches to resync for
                     // whatever was notified during the gap.
                     record_connection_lost();
-                    if send_resync(&persistent_notification_tx, &ephemeral_notification_tx)
-                        .await
-                        .is_err()
+                    if send_resync(
+                        &persistent_notification_tx,
+                        &ephemeral_notification_tx,
+                        &commit_log_notification_tx,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
@@ -89,7 +105,13 @@ where
                     let mut backoff = INITIAL_RECONNECT_BACKOFF;
                     listener = loop {
                         tokio::time::sleep(backoff).await;
-                        match connect_and_listen(&pool, persistent_channel, ephemeral_channel).await
+                        match connect_and_listen(
+                            &pool,
+                            persistent_channel,
+                            ephemeral_channel,
+                            commit_log_channel,
+                        )
+                        .await
                         {
                             Ok(listener) => break listener,
                             Err(error) => {
@@ -103,9 +125,13 @@ where
                     // published before this point is covered by the resync
                     // (the head re-read happens after), anything after by
                     // regular notifications.
-                    if send_resync(&persistent_notification_tx, &ephemeral_notification_tx)
-                        .await
-                        .is_err()
+                    if send_resync(
+                        &persistent_notification_tx,
+                        &ephemeral_notification_tx,
+                        &commit_log_notification_tx,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
@@ -121,10 +147,11 @@ async fn connect_and_listen(
     pool: &sqlx::PgPool,
     persistent_channel: &'static str,
     ephemeral_channel: &'static str,
+    commit_log_channel: &'static str,
 ) -> Result<sqlx::postgres::PgListener, sqlx::Error> {
     let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
     listener
-        .listen_all([persistent_channel, ephemeral_channel])
+        .listen_all([persistent_channel, ephemeral_channel, commit_log_channel])
         .await?;
     Ok(listener)
 }
@@ -132,8 +159,13 @@ async fn connect_and_listen(
 async fn send_resync(
     persistent_notification_tx: &mpsc::Sender<NotifyMessage>,
     ephemeral_notification_tx: &mpsc::Sender<NotifyMessage>,
+    commit_log_notification_tx: &mpsc::Sender<NotifyMessage>,
 ) -> Result<(), ()> {
-    for tx in [persistent_notification_tx, ephemeral_notification_tx] {
+    for tx in [
+        persistent_notification_tx,
+        ephemeral_notification_tx,
+        commit_log_notification_tx,
+    ] {
         if let Err(e) = tx.send(NotifyMessage::Resync).await {
             record_forward_failed(&e);
             return Err(());

@@ -27,12 +27,17 @@ pub use self::subscription::keyed::{
     WakeKey, WakeKeys,
 };
 pub use self::subscription::singleton::{
-    OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
+    Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
     Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
-use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+use crate::{
+    config::*,
+    handle::OwnedTaskHandle,
+    sequence::{CommitSequence, EventSequence},
+    tables::*,
+};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
@@ -41,7 +46,7 @@ use notifier::PersistentNotifier;
 pub use op_cursor::{CursorError, OpCursor};
 pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
-pub use persistent::PersistentOutboxListener;
+pub use persistent::{CommitOrderedListener, PersistentOutboxListener};
 pub use post_persist_hook::PostPersistHook;
 
 #[allow(dead_code)]
@@ -133,10 +138,13 @@ where
             tokio::sync::mpsc::channel(config.event_buffer_size);
         let (ephemeral_notification_tx, ephemeral_notification_rx) =
             tokio::sync::mpsc::channel(config.event_buffer_size);
+        let (commit_notification_tx, commit_notification_rx) =
+            tokio::sync::mpsc::channel(config.event_buffer_size);
         let pg_listener_handle = pg_notify::spawn_pg_listener::<Tables>(
             &pool,
             persistent_notification_tx,
             ephemeral_notification_tx,
+            commit_notification_tx,
         )
         .await?;
 
@@ -151,6 +159,7 @@ where
             &pool,
             &config,
             persistent_notification_rx,
+            commit_notification_rx,
             gap_fill_tx.clone(),
         )
         .await?;
@@ -405,6 +414,10 @@ where
         &events[cursor.pos.min(events.len())..]
     }
 
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
     pub fn listen_persisted(
         &self,
         start_after: impl Into<Option<EventSequence>>,
@@ -414,6 +427,24 @@ where
             start_after,
             self.event_buffer_size,
         )
+    }
+
+    /// Listen in commit order rather than insert order: a source
+    /// transaction's events arrive contiguously and are never split, and the
+    /// cursor is a dense [`CommitSequence`].
+    ///
+    /// The first such listener in a process starts that process's sequencer,
+    /// which is what writes the commit log.
+    pub async fn listen_commit_ordered(
+        &self,
+        start_after: impl Into<Option<CommitSequence>>,
+    ) -> Result<CommitOrderedListener<P>, sqlx::Error> {
+        let handle = self.persistent_cache.ensure_commit_lane(&self.pool).await?;
+        Ok(CommitOrderedListener::new(
+            handle,
+            start_after,
+            self.event_buffer_size,
+        ))
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {

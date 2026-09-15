@@ -67,7 +67,7 @@ use std::marker::PhantomData;
 
 use job::CurrentJob;
 
-use crate::sequence::EventSequence;
+use crate::sequence::{CommitSequence, EventSequence};
 
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
@@ -78,6 +78,14 @@ pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEventJobState {
     pub(crate) sequence: EventSequence,
+    /// The cursor on the commit-ordered lane. Its presence is what marks a
+    /// subscription as checkpointed under `Ordering::Commit`; on the insert
+    /// lane it stays `None` and `sequence` is the cursor.
+    ///
+    /// `skip_serializing_if` keeps an insert-lane subscriber's state
+    /// byte-identical to what it has always written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) commit_sequence: Option<CommitSequence>,
     /// Where and until when the member last paused. Read at run start: a
     /// wake that finds nothing persisted beyond the paused event is answered
     /// by pausing again, without the subscriber being invoked. Stale by
@@ -88,6 +96,17 @@ pub(crate) struct OutboxEventJobState {
     /// subscriber's state stays byte-identical to what it always wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) paused: Option<PausedState>,
+}
+
+impl OutboxEventJobState {
+    /// The position the runner compares and persists: the commit cursor when
+    /// the subscription is on the commit lane, else the insert cursor.
+    pub(crate) fn position(&self) -> i64 {
+        match self.commit_sequence {
+            Some(commit_sequence) => i64::from(commit_sequence),
+            None => u64::from(self.sequence) as i64,
+        }
+    }
 }
 
 /// The pause slot: the event the cursor is parked before, and the instant
@@ -106,8 +125,14 @@ pub(crate) struct BatchTracker {
     /// `max_batch_size` bounds — with no deferred ops, the pending batch is
     /// exactly its collected events.
     pub(crate) collected: usize,
-    /// Highest sequence whose checkpoint has been persisted to the database.
-    pub(crate) persisted_seq: EventSequence,
+    /// Highest position whose checkpoint has been persisted to the database.
+    /// Lane-agnostic, so it holds whichever cursor
+    /// [`OutboxEventJobState::position`] reports.
+    pub(crate) persisted_seq: i64,
+    /// The same checkpoint expressed as an insert sequence, for
+    /// [`FlushError`] attribution only — that range is reported in insert
+    /// sequences on both lanes.
+    pub(crate) persisted_insert_seq: EventSequence,
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
 }
@@ -469,7 +494,7 @@ pub(crate) async fn flush_batch<B: Default>(
         if let Err(source) = flusher.flush_items(op, items).await {
             return Err(Box::new(FlushError {
                 reason,
-                after: parts.tracker.persisted_seq,
+                after: parts.tracker.persisted_insert_seq,
                 through: parts.state.sequence,
                 source,
             }));
@@ -487,7 +512,8 @@ pub(crate) async fn flush_batch<B: Default>(
         mirror.mirror(&mut op, parts.state.sequence).await?;
     }
     op.commit().await?;
-    parts.tracker.persisted_seq = parts.state.sequence;
+    parts.tracker.persisted_seq = parts.state.position();
+    parts.tracker.persisted_insert_seq = parts.state.sequence;
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
 }
@@ -857,6 +883,7 @@ mod tests {
     fn state_without_a_pause_serializes_unchanged() {
         let state = OutboxEventJobState {
             sequence: EventSequence::from(7u64),
+            commit_sequence: None,
             paused: None,
         };
         assert_eq!(

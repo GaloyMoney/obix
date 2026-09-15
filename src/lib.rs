@@ -31,17 +31,17 @@ pub use inbox::{
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
     CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx,
-    KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Outbox, OutboxEventJobConfig,
+    KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Ordering, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
     StreamSelection, SubscribeError, Subscription, SubscriptionDef, SubscriptionError,
     SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
     UndecodableEventError, WakeKey, WakeKeys,
 };
-pub use sequence::EventSequence;
+pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;
-pub use tables::SubscriptionRow;
 #[doc(hidden)]
 pub use tables::{
-    decode_persistent_event, record_ephemeral_event_type_undecodable,
+    CommitPosition, decode_persistent_event, record_ephemeral_event_type_undecodable,
     record_ephemeral_payload_undecodable, record_tracing_context_undecodable,
 };
+pub use tables::{PersistentEventRows, SequenceTick, SubscriptionRow};
