@@ -466,14 +466,14 @@ FROM {}persistent_outbox_events_sequence_seq",
         // A `NOT EXISTS` against the log is evaluated on this statement's
         // snapshot, which predates the winner's commit, and would append the
         // group twice. `grp` must not depend on `st`, so `group_max` is
-        // reported on rejection. `head + ROW_NUMBER()` under the lock is what
-        // keeps `commit_seq` dense.
+        // reported on rejection. `last_commit_seq + ROW_NUMBER()` under the
+        // lock is what keeps `commit_seq` dense.
         let append_commit_group_query = format!(
             r#"
             WITH st AS (
-                SELECT head
+                SELECT last_commit_seq
                 FROM {tbl}persistent_outbox_commit_log_state
-                WHERE id = 1 AND cursor < $2::bigint
+                WHERE singleton AND logged_through_sequence < $2::bigint
                 FOR UPDATE
             ),
             grp AS (
@@ -483,7 +483,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             ),
             numbered AS (
                 SELECT g.sequence,
-                       st.head + ROW_NUMBER() OVER (ORDER BY g.sequence) AS commit_seq,
+                       st.last_commit_seq + ROW_NUMBER() OVER (ORDER BY g.sequence) AS commit_seq,
                        (g.sequence = MAX(g.sequence) OVER ()) AS group_last
                 FROM grp g, st
             ),
@@ -494,10 +494,10 @@ FROM {}persistent_outbox_events_sequence_seq",
             ),
             upd AS (
                 UPDATE {tbl}persistent_outbox_commit_log_state s
-                SET head   = s.head + (SELECT COUNT(*) FROM ins),
-                    cursor = $2::bigint
-                WHERE s.id = 1 AND EXISTS (SELECT 1 FROM st)
-                RETURNING s.head
+                SET last_commit_seq         = s.last_commit_seq + (SELECT COUNT(*) FROM ins),
+                    logged_through_sequence = $2::bigint
+                WHERE s.singleton AND EXISTS (SELECT 1 FROM st)
+                RETURNING s.last_commit_seq
             )
             SELECT (SELECT COALESCE(MAX(sequence), $2::bigint) FROM grp) AS "group_max!: i64",
                    i.commit_seq AS "commit_seq?: i64",
@@ -516,18 +516,20 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // INVARIANT: one statement, so `head` and the seed share a snapshot.
-        // Split into two reads, a peer appending between them yields a `head`
-        // that does not account for rows the seed skips. LEFT JOIN so the
-        // state row is returned even when nothing is logged ahead.
+        // INVARIANT: one statement, so `last_commit_seq` and the seed share a
+        // snapshot. Split into two reads, a peer appending between them
+        // yields a `last_commit_seq` that does not account for rows the seed
+        // skips. LEFT JOIN so the state row is returned even when nothing is
+        // logged ahead.
         let commit_log_restart_state_query = format!(
             r#"
-            SELECT s.head AS "head!: i64",
-                   s.cursor AS "cursor!: i64",
+            SELECT s.last_commit_seq AS "last_commit_seq!: i64",
+                   s.logged_through_sequence AS "logged_through_sequence!: i64",
                    l.sequence AS "logged_ahead?: i64"
             FROM {tbl}persistent_outbox_commit_log_state s
-            LEFT JOIN {tbl}persistent_outbox_commit_log l ON l.sequence > s.cursor
-            WHERE s.id = 1
+            LEFT JOIN {tbl}persistent_outbox_commit_log l
+              ON l.sequence > s.logged_through_sequence
+            WHERE s.singleton
             ORDER BY l.sequence"#,
             tbl = table_prefix,
         );
@@ -548,9 +550,10 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let commit_log_state_query = format!(
             r#"
-            SELECT head AS "head!: i64", cursor AS "cursor!: i64"
+            SELECT last_commit_seq AS "last_commit_seq!: i64",
+                   logged_through_sequence AS "logged_through_sequence!: i64"
             FROM {tbl}persistent_outbox_commit_log_state
-            WHERE id = 1"#,
+            WHERE singleton"#,
             tbl = table_prefix,
         );
 
@@ -637,13 +640,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .fetch_all(&pool)
                             .await?;
 
-                        let head = rows
+                        let last_commit_seq = rows
                             .first()
-                            .map(|row| #crate_name::CommitSequence::from(row.head as u64))
+                            .map(|row| #crate_name::CommitSequence::from(row.last_commit_seq as u64))
                             .unwrap_or_default();
-                        let cursor = rows
+                        let logged_through = rows
                             .first()
-                            .map(|row| #crate_name::EventSequence::from(row.cursor as u64))
+                            .map(|row| #crate_name::EventSequence::from(row.logged_through_sequence as u64))
                             .unwrap_or_default();
                         let logged_ahead = rows
                             .into_iter()
@@ -653,7 +656,11 @@ FROM {}persistent_outbox_events_sequence_seq",
                             })
                             .collect();
 
-                        Ok(#crate_name::CommitRestartState { head, cursor, logged_ahead })
+                        Ok(#crate_name::CommitRestartState {
+                            last_commit_seq,
+                            logged_through,
+                            logged_ahead,
+                        })
                     }
                 }
 
@@ -709,8 +716,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .fetch_one(&pool)
                             .await?;
                         Ok((
-                            #crate_name::CommitSequence::from(row.head as u64),
-                            #crate_name::EventSequence::from(row.cursor as u64),
+                            #crate_name::CommitSequence::from(row.last_commit_seq as u64),
+                            #crate_name::EventSequence::from(row.logged_through_sequence as u64),
                         ))
                     }
                 }

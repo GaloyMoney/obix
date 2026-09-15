@@ -279,16 +279,16 @@ where
     let logged_ahead: BTreeSet<EventSequence> = restart.logged_ahead.into_iter().collect();
 
     let (commit_sender, _) = broadcast::channel(buffer_size);
-    let commit_head = Arc::new(AtomicU64::new(u64::from(restart.head)));
+    let commit_head = Arc::new(AtomicU64::new(u64::from(restart.last_commit_seq)));
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
     let backfill_pool = pool.clone();
 
     let mut listener =
-        PersistentOutboxListener::deliveries(cache, Some(restart.cursor), buffer_size);
+        PersistentOutboxListener::deliveries(cache, Some(restart.logged_through), buffer_size);
     let mut sequencer = Sequencer::<P, Tables> {
         pool: pool.clone(),
         page,
-        head: restart.head,
+        head: restart.last_commit_seq,
         commit_head: commit_head.clone(),
         commit_sender: commit_sender.clone(),
         seen: HashMap::new(),

@@ -318,11 +318,12 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     /// Everything the sequencer needs to resume, read in **one statement**.
     ///
-    /// `head` and `logged_ahead` must come from a single snapshot. Read
-    /// separately, a peer appending between them returns a `head` that does
-    /// not account for rows the seed then tells the fold to skip, and the
-    /// fold has no other occasion to reconcile it — leaving this process's
-    /// published head behind the log for as long as the stream stays quiet.
+    /// `last_commit_seq` and `logged_ahead` must come from a single
+    /// snapshot. Read separately, a peer appending between them returns a
+    /// `last_commit_seq` that does not account for rows the seed then tells
+    /// the fold to skip, and the fold has no other occasion to reconcile it
+    /// — leaving this process's published head behind the log for as long as
+    /// the stream stays quiet.
     fn commit_log_restart_state(
         pool: &sqlx::PgPool,
     ) -> impl Future<Output = Result<CommitRestartState, sqlx::Error>> + Send;
@@ -338,7 +339,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// The sequencer's `(head, cursor)`.
+    /// The sequencer's `(last_commit_seq, logged_through)`.
     fn commit_log_state(
         pool: &sqlx::PgPool,
     ) -> impl Future<Output = Result<(CommitSequence, EventSequence), sqlx::Error>> + Send;
@@ -480,13 +481,17 @@ pub trait MailboxTables: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
 }
 
-/// The sequencer's resume point: the log head, the insert sequence the last
-/// group was appended at, and the sequences above it that are already
-/// logged. All three from one snapshot.
+/// The sequencer's resume point, all three values from one snapshot.
 #[derive(Debug, Clone)]
 pub struct CommitRestartState {
-    pub head: CommitSequence,
-    pub cursor: EventSequence,
+    /// Highest position handed out on the commit lane. The log is dense, so
+    /// this is also how many rows it holds.
+    pub last_commit_seq: CommitSequence,
+    /// Every payload-bearing event at or below this insert sequence is in
+    /// the log.
+    pub logged_through: EventSequence,
+    /// Insert sequences above `logged_through` that are already logged,
+    /// which happens when a group straddles it.
     pub logged_ahead: Vec<EventSequence>,
 }
 

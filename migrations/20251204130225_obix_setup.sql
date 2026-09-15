@@ -68,24 +68,35 @@ CREATE TABLE persistent_outbox_commit_log_p0 PARTITION OF persistent_outbox_comm
 CREATE TABLE persistent_outbox_commit_log_default
   PARTITION OF persistent_outbox_commit_log DEFAULT;
 
--- Backs the sequencer's restart read: the sequences above its cursor that
--- are already logged. Not UNIQUE — a partitioned table's UNIQUE must include
--- the partition key, which here is `commit_seq`.
+-- Backs the sequencer's restart read: the sequences above
+-- `logged_through_sequence` that are already logged. Not UNIQUE — a
+-- partitioned table's UNIQUE must include the partition key, which here is
+-- `commit_seq`.
 CREATE INDEX idx_persistent_outbox_commit_log_sequence
   ON persistent_outbox_commit_log (sequence);
 
--- Sequencer state: exactly one row. `head` is the highest `commit_seq`
--- appended; `cursor` is the insert sequence at which the last group was
--- appended. An append locks this row and is conditional on `cursor` being
--- below the appending sequence, which is what makes concurrent sequencers
--- append each group once.
+-- Sequencer state. The two watermarks count different things:
+-- `last_commit_seq` is a `commit_seq` (a position in the commit log),
+-- `logged_through_sequence` is an insert `sequence` (a position in
+-- `persistent_outbox_events`). Appending a group of three advances the
+-- first by three and sets the second to that group's lowest member, so
+-- neither tracks the other.
+--
+-- Every payload-bearing event at or below `logged_through_sequence` is in
+-- the log; events above it may be too, when a group straddles it. An append
+-- locks this row and is conditional on `logged_through_sequence` being below
+-- the appending sequence, which is what makes concurrent sequencers append
+-- each group once.
+--
+-- `singleton` admits one row and no other: the CHECK allows only TRUE and
+-- the primary key allows only one of it.
 CREATE TABLE persistent_outbox_commit_log_state (
-  id     SMALLINT PRIMARY KEY,
-  head   BIGINT NOT NULL,
-  cursor BIGINT NOT NULL
+  singleton               BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  last_commit_seq         BIGINT NOT NULL,
+  logged_through_sequence BIGINT NOT NULL
 );
-INSERT INTO persistent_outbox_commit_log_state (id, head, cursor)
-VALUES (1, 0, 0) ON CONFLICT (id) DO NOTHING;
+INSERT INTO persistent_outbox_commit_log_state (last_commit_seq, logged_through_sequence)
+VALUES (0, 0) ON CONFLICT (singleton) DO NOTHING;
 
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (

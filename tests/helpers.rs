@@ -66,7 +66,7 @@ pub async fn wipeout_commit_log(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .await?;
     sqlx::query!(
         "UPDATE persistent_outbox_commit_log_state
-         SET head = 0, cursor = 0 WHERE id = 1"
+         SET last_commit_seq = 0, logged_through_sequence = 0 WHERE singleton"
     )
     .execute(pool)
     .await?;

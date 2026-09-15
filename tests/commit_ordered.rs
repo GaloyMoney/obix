@@ -70,7 +70,8 @@ async fn log_rows(pool: &sqlx::PgPool) -> anyhow::Result<Vec<(i64, i64, bool)>> 
 
 async fn state(pool: &sqlx::PgPool) -> anyhow::Result<(i64, i64)> {
     let row = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT head, cursor FROM persistent_outbox_commit_log_state WHERE id = 1",
+        "SELECT last_commit_seq, logged_through_sequence
+         FROM persistent_outbox_commit_log_state WHERE singleton",
     )
     .fetch_one(pool)
     .await?;
@@ -166,15 +167,18 @@ async fn fold_tracking_head(
         restart.logged_ahead.into_iter().collect();
     let mut seen: std::collections::HashMap<CommitGroupId, EventSequence> =
         std::collections::HashMap::new();
-    let mut head = i64::from(restart.head);
+    let mut head = i64::from(restart.last_commit_seq);
 
     // The startup reconcile.
-    for row in TestTables::load_commit_ordered_page::<TestEvent>(pool, restart.head, 1000).await? {
+    for row in
+        TestTables::load_commit_ordered_page::<TestEvent>(pool, restart.last_commit_seq, 1000)
+            .await?
+    {
         head = head.max(i64::from(row.commit_sequence));
     }
 
     for (sequence, group, has_payload) in stream(pool).await? {
-        if sequence <= restart.cursor {
+        if sequence <= restart.logged_through {
             continue;
         }
         if logged_ahead.remove(&sequence) {
@@ -425,16 +429,19 @@ async fn restart_seed_prevents_double_append() -> anyhow::Result<()> {
         EventSequence::from(1u64),
     )
     .await?;
-    let (_, cursor) = state(&pool).await?;
-    assert_eq!(cursor, 1);
+    let (_, logged_through) = state(&pool).await?;
+    assert_eq!(logged_through, 1);
 
     let restart = TestTables::commit_log_restart_state(&pool).await?;
     assert_eq!(
         restart.logged_ahead,
         vec![EventSequence::from(5u64)],
-        "sequence 5 is logged but sits above the cursor",
+        "sequence 5 is logged but sits above the watermark",
     );
-    assert_eq!(restart.cursor, EventSequence::from(cursor as u64));
+    assert_eq!(
+        restart.logged_through,
+        EventSequence::from(logged_through as u64)
+    );
 
     fold(&pool, true).await?;
 
@@ -499,10 +506,10 @@ async fn restart_state_head_and_seed_share_one_snapshot() -> anyhow::Result<()> 
     while !peer.is_finished() {
         let restart = TestTables::commit_log_restart_state(&pool).await?;
         assert!(
-            u64::from(restart.head) >= restart.logged_ahead.len() as u64,
-            "head {} is behind a seed of {} sequences — the two reads did not \
-             share a snapshot",
-            restart.head,
+            u64::from(restart.last_commit_seq) >= restart.logged_ahead.len() as u64,
+            "last_commit_seq {} is behind a seed of {} sequences — the two \
+             reads did not share a snapshot",
+            restart.last_commit_seq,
             restart.logged_ahead.len(),
         );
         observations += 1;
@@ -512,7 +519,7 @@ async fn restart_state_head_and_seed_share_one_snapshot() -> anyhow::Result<()> 
     assert!(observations > 0, "the invariant was never sampled");
     let restart = TestTables::commit_log_restart_state(&pool).await?;
     assert_eq!(
-        u64::from(restart.head),
+        u64::from(restart.last_commit_seq),
         (SPAN * 2) as u64,
         "the peer logged every event",
     );
@@ -532,7 +539,7 @@ async fn head_is_reconciled_when_a_peer_fills_the_log_after_the_snapshot() -> an
 
     // Snapshot first: nothing is logged yet, so the seed is empty.
     let restart = TestTables::commit_log_restart_state(&pool).await?;
-    assert_eq!(u64::from(restart.head), 0);
+    assert_eq!(u64::from(restart.last_commit_seq), 0);
     assert!(restart.logged_ahead.is_empty());
 
     // The peer then logs everything.
@@ -586,8 +593,8 @@ async fn a_head_behind_the_log_is_reconciled_before_folding() -> anyhow::Result<
     // The pair split reads would have produced: a head from before the peer
     // ran, a seed listing everything it logged.
     let stale = obix::CommitRestartState {
-        head: CommitSequence::BEGIN,
-        cursor: EventSequence::BEGIN,
+        last_commit_seq: CommitSequence::BEGIN,
+        logged_through: EventSequence::BEGIN,
         logged_ahead: (1..=4).map(|s| EventSequence::from(s as u64)).collect(),
     };
 

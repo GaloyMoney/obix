@@ -270,7 +270,8 @@ async fn commit_log_default_fill_then_recover() -> anyhow::Result<()> {
     // the jumped-forward sequence rather than replaying from zero; `head`
     // past the log's p0 range is what strands the appends in DEFAULT.
     sqlx::query(
-        "UPDATE persistent_outbox_commit_log_state SET head = $1, cursor = $2 WHERE id = 1",
+        "UPDATE persistent_outbox_commit_log_state
+         SET last_commit_seq = $1, logged_through_sequence = $2 WHERE singleton",
     )
     .bind(BOUNDARY)
     .bind(BOUNDARY - 2)

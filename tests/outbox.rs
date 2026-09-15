@@ -2359,10 +2359,13 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
     // it counts every reader of `persistent_outbox_events`; leaving the
     // sequencer to replay this history would put a second reader's one-time
     // catch-up inside a budget that is about this listener's paging.
-    sqlx::query("UPDATE persistent_outbox_commit_log_state SET cursor = $1 WHERE id = 1")
-        .bind(HISTORY as i64)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "UPDATE persistent_outbox_commit_log_state
+         SET logged_through_sequence = $1 WHERE singleton",
+    )
+    .bind(HISTORY as i64)
+    .execute(&pool)
+    .await?;
 
     let before = rows_read_by_index(&pool).await?;
 
