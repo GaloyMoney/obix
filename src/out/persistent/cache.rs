@@ -117,7 +117,7 @@ where
             cache_fill_recv,
             cache_fill_send.clone(),
             persistent_notification_rx,
-            gap_fill_tx.clone(),
+            gap_fill_tx,
         )
         .await?;
 
@@ -176,10 +176,6 @@ where
                 );
                 break;
             }
-            // INVARIANT: the cursor advances before the send is attempted.
-            // `send` fails only when there are no receivers, and stopping
-            // there pins the cursor — and with it stall reporting — in any
-            // process with no insert-lane listener.
             last_broadcast_sequence = *seq;
             if persistent_event_sender.send(evt.clone()).is_err() {
                 record_no_receivers(u64::from(*seq));
