@@ -43,7 +43,7 @@ impl SingletonSubscriber<TestEvent> for SkippingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -64,7 +64,7 @@ impl SingletonSubscriber<TestEvent> for PoisonHandler {
     async fn handle_persistent<'inv>(
         &self,
         _ctx: EventCtx<'inv>,
-        _event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        _event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         Err(POISON_ERROR.into())
     }
@@ -85,7 +85,7 @@ impl SingletonSubscriber<TestEvent> for RepublishingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<u64>>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         match &event.payload {
             Some(TestEvent::Ping(n)) => {

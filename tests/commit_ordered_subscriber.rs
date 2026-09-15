@@ -36,7 +36,7 @@ impl SingletonSubscriber<TestEvent> for FlushRecorder {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<u64>>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         match &event.payload {
             Some(TestEvent::Ping(n)) => {
@@ -254,7 +254,7 @@ impl SingletonSubscriber<TestEvent> for UndecodableAcker {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, ()>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.seen.lock().await.push(*n);

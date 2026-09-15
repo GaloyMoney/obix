@@ -90,10 +90,15 @@ where
     /// `Default` container. Handlers that never collect use `()`.
     type Batch: Default + Send + 'static;
 
+    /// The event arrives as the shared [`Arc`] the outbox decoded once and
+    /// broadcast to every subscriber, so a handler that needs to retain it
+    /// past the call — any [`collect_with`](EventCtx::collect_with) fold —
+    /// clones a refcount rather than the payload, and `P` need not be
+    /// `Clone`. Reading through it is unchanged: `Arc<T>` derefs to `T`.
     fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &PersistentOutboxEvent<P>,
+        event: &Arc<PersistentOutboxEvent<P>>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send {
@@ -157,9 +162,13 @@ where
         async { Ok(()) }
     }
 
+    /// Handed the shared [`Arc`] for the same reason as
+    /// [`handle_persistent`](Self::handle_persistent), though an ephemeral
+    /// event carries no sequence and belongs to no batch, so there is rarely
+    /// anything to retain.
     fn handle_ephemeral(
         &self,
-        event: &EphemeralOutboxEvent<P>,
+        event: &Arc<EphemeralOutboxEvent<P>>,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
         let _ = event;
