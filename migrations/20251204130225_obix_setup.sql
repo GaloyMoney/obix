@@ -6,25 +6,24 @@
 -- Partitions are pre-created ahead of the head by the maintainer job in
 -- `src/out/partition`.
 -- `commit_xid` holds the writer's top-level transaction id. Rows sharing one
--- value committed together; NULL is a singleton group (rows predating the
--- column, and gap-fill placeholders, which pass NULL explicitly).
--- `pg_current_xact_id()` returns `xid8`, which is 64-bit and does not wrap;
--- there is no direct cast to bigint, hence the text hop.
+-- value committed together. `pg_current_xact_id()` returns `xid8`, which is
+-- 64-bit and does not wrap; there is no direct cast to bigint, hence the text
+-- hop.
 CREATE TABLE persistent_outbox_events (
   id UUID NOT NULL DEFAULT gen_random_uuid(),
   sequence BIGSERIAL,
   payload JSONB,
   tracing_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  commit_xid BIGINT DEFAULT pg_current_xact_id()::text::bigint,
+  commit_xid BIGINT NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
   PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
 
--- `commit_xid` is near-monotone in `sequence`, so BRIN suits the sequencer's
--- "every row of these xids" lookup. Created on the parent; Postgres cascades
--- it to existing and future partitions.
+-- Backs the sequencer's per-group lookup: every row of one `commit_xid`.
+-- Created on the parent; Postgres cascades it to existing and future
+-- partitions.
 CREATE INDEX idx_persistent_outbox_events_commit_xid
-  ON persistent_outbox_events USING BRIN (commit_xid);
+  ON persistent_outbox_events (commit_xid);
 
 -- Initial partition. Its range MUST equal DEFAULT_PARTITION_WIDTH (a fixed
 -- constant) so maintainer-created partitions tile onto it without overlapping.
@@ -43,9 +42,9 @@ CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 
 -- Commit-ordered delivery lane: the materialised commit order, appended by
--- the sequencer (`src/out/persistent/sequencer.rs`). Groups are ordered by
--- their highest insert sequence, members by `sequence` within a group, and
--- the resulting `commit_seq` is dense.
+-- the sequencer (`src/out/persistent/sequencer.rs`). A group is appended
+-- whole when its lowest member is reached in insert order, members by
+-- `sequence` within it, and the resulting `commit_seq` is dense.
 --
 -- Positions only; payloads are reached by joining on `sequence`. Retention
 -- must therefore drop log partitions before or with the event partitions
@@ -69,34 +68,24 @@ CREATE TABLE persistent_outbox_commit_log_p0 PARTITION OF persistent_outbox_comm
 CREATE TABLE persistent_outbox_commit_log_default
   PARTITION OF persistent_outbox_commit_log DEFAULT;
 
--- Backs the tick's anti-join: rows above `low_water` may already be logged,
--- because `low_water` stops just below the lowest member of any still-open
--- group. Not UNIQUE — a partitioned table's UNIQUE must include the
--- partition key, which here is `commit_seq`; single-logging comes from the
--- anti-join under the state-row lock.
+-- Backs the sequencer's restart read: the sequences above its cursor that
+-- are already logged. Not UNIQUE — a partitioned table's UNIQUE must include
+-- the partition key, which here is `commit_seq`.
 CREATE INDEX idx_persistent_outbox_commit_log_sequence
   ON persistent_outbox_commit_log (sequence);
 
--- Sequencer state: exactly one row.
---
--- `head` is the highest `commit_seq` appended. `low_water` is the watermark
--- below which every real row is logged; it advances only past rows whose
--- whole group is logged. Ticks serialize on this row via FOR UPDATE SKIP
--- LOCKED, so a loser skips its tick instead of blocking.
---
--- `scan_water` is how far the sequencer has examined, and must stay separate
--- from `low_water`: an open group pins `low_water` at its lowest member, so
--- a scan window anchored there can never widen to reach that group's highest
--- member. `low_water` bounds the candidate scan below; `scan_water` carries
--- the window's upper bound forward. Neither advances past a hole.
+-- Sequencer state: exactly one row. `head` is the highest `commit_seq`
+-- appended; `cursor` is the insert sequence at which the last group was
+-- appended. An append locks this row and is conditional on `cursor` being
+-- below the appending sequence, which is what makes concurrent sequencers
+-- append each group once.
 CREATE TABLE persistent_outbox_commit_log_state (
-  id         SMALLINT PRIMARY KEY,
-  head       BIGINT NOT NULL,
-  low_water  BIGINT NOT NULL,
-  scan_water BIGINT NOT NULL
+  id     SMALLINT PRIMARY KEY,
+  head   BIGINT NOT NULL,
+  cursor BIGINT NOT NULL
 );
-INSERT INTO persistent_outbox_commit_log_state (id, head, low_water, scan_water)
-VALUES (1, 0, 0, 0) ON CONFLICT (id) DO NOTHING;
+INSERT INTO persistent_outbox_commit_log_state (id, head, cursor)
+VALUES (1, 0, 0) ON CONFLICT (id) DO NOTHING;
 
 -- Ephemeral outbox events
 CREATE TABLE ephemeral_outbox_events (

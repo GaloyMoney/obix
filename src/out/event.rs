@@ -155,15 +155,8 @@ pub struct UndecodableEventError {
     pub recorded_at: chrono::DateTime<chrono::Utc>,
     /// The raw payload and the serde error.
     pub failure: DecodeFailure,
-    /// The source transaction this event committed in; `None` on rows
-    /// written before the column existed.
-    pub commit_group: Option<CommitGroupId>,
-    /// Position in the commit-ordered lane; `Some` only when delivered on
-    /// that lane.
-    pub commit_sequence: Option<CommitSequence>,
-    /// On the commit lane, whether this is the last event of its group.
-    /// Always `false` on the insert lane.
-    pub commit_boundary: bool,
+    /// The source transaction this event committed in.
+    pub commit_group: CommitGroupId,
 }
 
 /// Internal transport for the persistent delivery plumbing (cache,
@@ -190,12 +183,20 @@ where
         }
     }
 
-    /// The commit-lane position this delivery occupies, whichever arm it
-    /// is. `None` on an insert-lane delivery.
-    pub(crate) fn commit_sequence(&self) -> Option<CommitSequence> {
+    /// The source transaction this delivery belongs to, whichever arm it is.
+    pub(crate) fn commit_group(&self) -> CommitGroupId {
         match &self.0 {
-            Ok(event) => event.commit_sequence,
-            Err(error) => error.commit_sequence,
+            Ok(event) => event.commit_group,
+            Err(error) => error.commit_group,
+        }
+    }
+
+    /// Whether this delivery carries a payload — a placeholder does not, and
+    /// never reaches the commit lane.
+    pub(crate) fn has_payload(&self) -> bool {
+        match &self.0 {
+            Ok(event) => event.payload.is_some(),
+            Err(_) => true,
         }
     }
 
@@ -253,19 +254,8 @@ where
     pub tracing_context: Option<es_entity::context::TracingContext>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
     /// The source transaction this event committed in. Events sharing one
-    /// value committed together, on both lanes; `None` on rows written
-    /// before the column existed and on gap-fill placeholders.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit_group: Option<CommitGroupId>,
-    /// Position in the commit-ordered lane; `Some` only when delivered on
-    /// that lane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit_sequence: Option<CommitSequence>,
-    /// On the commit lane, whether this is the last event of its group —
-    /// the point at which a batch may be flushed without splitting a source
-    /// transaction. Always `false` on the insert lane.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub commit_boundary: bool,
+    /// value committed together; reported on both lanes.
+    pub commit_group: CommitGroupId,
 }
 
 impl<T> Clone for PersistentOutboxEvent<T>
@@ -280,10 +270,100 @@ where
             tracing_context: self.tracing_context.clone(),
             recorded_at: self.recorded_at,
             commit_group: self.commit_group,
-            commit_sequence: self.commit_sequence,
-            commit_boundary: self.commit_boundary,
         }
     }
+}
+
+/// One position on the commit-ordered lane: the event, plus where it sits in
+/// commit order.
+///
+/// The position belongs to the lane rather than to the event, so it is
+/// carried here and not on [`PersistentOutboxEvent`].
+pub struct CommitOrderedEvent<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub commit_sequence: CommitSequence,
+    /// The last event of its group — the point at which a batch may be
+    /// flushed without splitting a source transaction.
+    pub commit_boundary: bool,
+    pub event: Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>,
+}
+
+/// Internal transport for the commit lane's fan-out and backfill, mirroring
+/// [`PersistentDelivery`] with the lane position attached.
+pub(crate) struct CommitDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub(crate) commit_sequence: CommitSequence,
+    pub(crate) commit_boundary: bool,
+    pub(crate) delivery: PersistentDelivery<P>,
+}
+
+impl<P> CommitDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub(crate) fn into_item(self) -> CommitOrderedEvent<P> {
+        CommitOrderedEvent {
+            commit_sequence: self.commit_sequence,
+            commit_boundary: self.commit_boundary,
+            event: self.delivery.into_item(),
+        }
+    }
+}
+
+impl<P> Clone for CommitDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    fn clone(&self) -> Self {
+        Self {
+            commit_sequence: self.commit_sequence,
+            commit_boundary: self.commit_boundary,
+            delivery: self.delivery.clone(),
+        }
+    }
+}
+
+impl<P> From<CommitLogRow<P>> for CommitDelivery<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    fn from(row: CommitLogRow<P>) -> Self {
+        Self {
+            commit_sequence: row.commit_sequence,
+            commit_boundary: row.commit_boundary,
+            delivery: PersistentDelivery::from(row.event),
+        }
+    }
+}
+
+/// One commit-log row as the loading queries report it: the lane position
+/// plus the decoded event it points at.
+#[doc(hidden)]
+pub struct CommitLogRow<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub commit_sequence: CommitSequence,
+    pub commit_boundary: bool,
+    pub event: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
+}
+
+/// Outcome of one [`append_commit_group`](crate::MailboxTables::append_commit_group).
+#[doc(hidden)]
+pub struct CommitGroupAppend<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    /// The group's highest insert sequence, reported whether or not the
+    /// append was taken.
+    pub group_max: EventSequence,
+    /// The rows appended, in commit order. Empty when another process had
+    /// already advanced the cursor past this group.
+    pub appended: Vec<CommitLogRow<P>>,
 }
 
 impl<P> From<PersistentOutboxEvent<P>> for OutboxEvent<P>

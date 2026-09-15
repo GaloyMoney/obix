@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT head AS \"head!: i64\", low_water AS \"low_water!: i64\"\n            FROM persistent_outbox_commit_log_state\n            WHERE id = 1",
+  "query": "\n            SELECT head AS \"head!: i64\", cursor AS \"cursor!: i64\"\n            FROM persistent_outbox_commit_log_state\n            WHERE id = 1",
   "describe": {
     "columns": [
       {
@@ -10,7 +10,7 @@
       },
       {
         "ordinal": 1,
-        "name": "low_water!: i64",
+        "name": "cursor!: i64",
         "type_info": "Int8"
       }
     ],
@@ -22,5 +22,5 @@
       false
     ]
   },
-  "hash": "11cd056f31f792c9ddb73434128f5d111c7bc7964bde627b60edb949133b2af7"
+  "hash": "8c96048461e0f7f84076159d05a308f8dd6aa1b102e3d023e105128801f755f8"
 }

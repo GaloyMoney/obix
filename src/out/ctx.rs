@@ -81,9 +81,6 @@ pub(crate) struct OutboxEventJobState {
     /// The cursor on the commit-ordered lane. Its presence is what marks a
     /// subscription as checkpointed under `Ordering::Commit`; on the insert
     /// lane it stays `None` and `sequence` is the cursor.
-    ///
-    /// `skip_serializing_if` keeps an insert-lane subscriber's state
-    /// byte-identical to what it has always written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) commit_sequence: Option<CommitSequence>,
     /// Where and until when the member last paused. Read at run start: a

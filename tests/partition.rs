@@ -29,34 +29,40 @@ const BOUNDARY: i64 = WIDTH as i64;
 // baseline (p0 + DEFAULT only).
 
 async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    // A prior recovery may have left a detached DEFAULT copy.
-    sqlx::query("DROP TABLE IF EXISTS persistent_outbox_events_default_old")
-        .execute(pool)
-        .await?;
-    // Drop every partition the maintainer / recovery created, keeping only the
-    // migration baseline (p0 + DEFAULT). Their count varies with `premake`, so
-    // enumerate them from the catalog rather than hard-coding names.
-    let children = sqlx::query(
-        "SELECT c.relname FROM pg_inherits i \
-         JOIN pg_class c ON c.oid = i.inhrelid \
-         WHERE i.inhparent = 'persistent_outbox_events'::regclass \
-           AND c.relname NOT IN ('persistent_outbox_events_p0', 'persistent_outbox_events_default')",
-    )
-    .fetch_all(pool)
-    .await?;
-    for row in children {
-        let name: String = row.get("relname");
-        sqlx::query(&format!("DROP TABLE IF EXISTS {name}"))
+    for table in ["persistent_outbox_events", "persistent_outbox_commit_log"] {
+        // A prior recovery may have left a detached DEFAULT copy.
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}_default_old"))
             .execute(pool)
             .await?;
+        // Drop every partition the maintainer / recovery created, keeping only
+        // the migration baseline (p0 + DEFAULT). Their count varies with
+        // `premake`, so enumerate them from the catalog rather than hard-coding
+        // names.
+        let children = sqlx::query(
+            "SELECT c.relname FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE i.inhparent = $1::regclass \
+               AND c.relname NOT IN ($2, $3)",
+        )
+        .bind(table)
+        .bind(format!("{table}_p0"))
+        .bind(format!("{table}_default"))
+        .fetch_all(pool)
+        .await?;
+        for row in children {
+            let name: String = row.get("relname");
+            sqlx::query(&format!("DROP TABLE IF EXISTS {name}"))
+                .execute(pool)
+                .await?;
+        }
+        // Recovery recreates DEFAULT, but guard against a half-run leaving it
+        // gone.
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {table}_default PARTITION OF {table} DEFAULT"
+        ))
+        .execute(pool)
+        .await?;
     }
-    // Recovery recreates DEFAULT, but guard against a half-run leaving it gone.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS persistent_outbox_events_default \
-         PARTITION OF persistent_outbox_events DEFAULT",
-    )
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -164,27 +170,31 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Both the next partition AND the full premake runway exist.
-    assert!(
-        relation_exists(&pool, "persistent_outbox_events_p1").await?,
-        "p1 pre-created before the head reaches the boundary"
-    );
-    let deepest = format!("persistent_outbox_events_p{PREMAKE}");
-    assert!(
-        relation_exists(&pool, &deepest).await?,
-        "premake keeps {PREMAKE} partitions ahead ({deepest})"
-    );
+    // Both the next partition AND the full premake runway exist, on the
+    // events table and on the commit log that indexes it.
+    for table in ["persistent_outbox_events", "persistent_outbox_commit_log"] {
+        assert!(
+            relation_exists(&pool, &format!("{table}_p1")).await?,
+            "{table}_p1 pre-created before the head reaches the boundary"
+        );
+        let deepest = format!("{table}_p{PREMAKE}");
+        assert!(
+            relation_exists(&pool, &deepest).await?,
+            "premake keeps {PREMAKE} partitions ahead ({deepest})"
+        );
 
-    // Per-partition storage params present on a maintainer-created partition.
-    let opts = reloptions(&pool, "persistent_outbox_events_p1").await?;
-    assert!(
-        opts.contains("autovacuum_freeze_min_age=0"),
-        "freeze param present: {opts}"
-    );
-    assert!(
-        opts.contains("autovacuum_vacuum_insert_scale_factor=0"),
-        "insert-vacuum param present: {opts}"
-    );
+        // Per-partition storage params present on a maintainer-created
+        // partition.
+        let opts = reloptions(&pool, &format!("{table}_p1")).await?;
+        assert!(
+            opts.contains("autovacuum_freeze_min_age=0"),
+            "freeze param present on {table}_p1: {opts}"
+        );
+        assert!(
+            opts.contains("autovacuum_vacuum_insert_scale_factor=0"),
+            "insert-vacuum param present on {table}_p1: {opts}"
+        );
+    }
 
     let _ = jobs.shutdown().await;
     Ok(())
@@ -244,6 +254,75 @@ async fn default_fill_then_recover() -> anyhow::Result<()> {
 
     // The recovered rows are still readable, in order, with their payloads.
     assert_replayable(&pool).await?;
+    Ok(())
+}
+
+/// The commit log strands rows in its own DEFAULT partition the same way,
+/// and is recovered in the same pass as the events table.
+#[tokio::test]
+#[file_serial]
+async fn commit_log_default_fill_then_recover() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipeout_outbox_tables(&pool).await?;
+    reset_partitions_to_baseline(&pool).await?;
+    set_sequence(&pool, BOUNDARY - 2).await?;
+    // The sequencer resumes at the stored cursor, so it must start next to
+    // the jumped-forward sequence rather than replaying from zero; `head`
+    // past the log's p0 range is what strands the appends in DEFAULT.
+    sqlx::query(
+        "UPDATE persistent_outbox_commit_log_state SET head = $1, cursor = $2 WHERE id = 1",
+    )
+    .bind(BOUNDARY)
+    .bind(BOUNDARY - 2)
+    .execute(&pool)
+    .await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(&mut op, [TestEvent::Ping(0), TestEvent::Ping(1)])
+        .await?;
+    op.commit().await?;
+
+    // The always-on sequencer appends them past the log's p0 boundary.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let stranded: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log_default")
+                .fetch_one(&pool)
+                .await?
+                .get("n");
+        if stranded == 2 {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the log rows never reached DEFAULT (stranded: {stranded})",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    obix::out::Partitions::<TestTables>::new(&pool, PREMAKE)
+        .recover_default()
+        .await?;
+
+    let drained: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log_default")
+            .fetch_one(&pool)
+            .await?
+            .get("n");
+    assert_eq!(drained, 0, "the log's DEFAULT drained");
+    let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log")
+        .fetch_one(&pool)
+        .await?
+        .get("n");
+    assert_eq!(total, 2, "the log rows survived the move");
     Ok(())
 }
 

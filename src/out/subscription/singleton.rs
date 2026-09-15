@@ -199,7 +199,7 @@ enum NextDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    Persistent(Option<Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>>),
+    Persistent(Option<LaneItem<P>>),
     Ephemeral(Arc<EphemeralOutboxEvent<P>>),
 }
 
@@ -218,8 +218,18 @@ where
     }
 }
 
+/// One delivery from whichever lane the runner is on: the event, plus the
+/// commit position when the commit lane supplied one.
+struct LaneItem<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    event: Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>,
+    commit: Option<(CommitSequence, bool)>,
+}
+
 /// The persistent stream the runner consumes, on whichever lane is
-/// configured. Both lanes yield the same item type; only the cursor differs.
+/// configured.
 enum PersistentLane<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -232,18 +242,19 @@ impl<P> PersistentLane<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    async fn next(
-        &mut self,
-    ) -> Option<Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>> {
+    async fn next(&mut self) -> Option<LaneItem<P>> {
         match self {
-            Self::Insert(listener) => listener.next().await,
-            Self::Commit(listener) => listener.next().await,
+            Self::Insert(listener) => listener.next().await.map(|event| LaneItem {
+                event,
+                commit: None,
+            }),
+            Self::Commit(listener) => listener.next().await.map(|item| LaneItem {
+                event: item.event,
+                commit: Some((item.commit_sequence, item.commit_boundary)),
+            }),
         }
     }
 }
-
-#[tracing::instrument(name = "obix.subscriber.lane_switch", level = "warn")]
-fn record_lane_switch(insert_sequence: u64, commit_sequence: u64) {}
 
 /// What `select_lane` decided, before any I/O happens.
 #[derive(Debug, PartialEq, Eq)]
@@ -252,8 +263,6 @@ pub(crate) enum LaneChoice {
     Insert(EventSequence),
     /// Continue on the commit lane from the stored commit cursor.
     Commit(CommitSequence),
-    /// Move onto the commit lane, translating the stored insert cursor first.
-    SwitchToCommit(EventSequence),
 }
 
 /// Decide the lane from stored state and configuration.
@@ -264,20 +273,18 @@ pub(crate) fn decide_lane(
     stored_commit: Option<CommitSequence>,
     stored_insert: EventSequence,
     configured: Ordering,
-    allow_lane_switch_redelivery: bool,
 ) -> Result<LaneChoice, String> {
     match (stored_commit, configured) {
         (None, Ordering::Insert) => Ok(LaneChoice::Insert(stored_insert)),
         (Some(commit_sequence), Ordering::Commit) => Ok(LaneChoice::Commit(commit_sequence)),
         (None, Ordering::Commit) => {
-            if stored_insert == EventSequence::BEGIN || allow_lane_switch_redelivery {
-                Ok(LaneChoice::SwitchToCommit(stored_insert))
+            if stored_insert == EventSequence::BEGIN {
+                Ok(LaneChoice::Commit(CommitSequence::BEGIN))
             } else {
                 Err(format!(
                     "subscription is checkpointed on the insert lane at sequence \
-                     {stored_insert}; switching to Ordering::Commit redelivers every event \
-                     whose source transaction straddles that cursor. Confirm the handler is \
-                     idempotent and call .allow_lane_switch_redelivery() to proceed."
+                     {stored_insert}; switching lanes is unsupported — register a new job \
+                     type instead"
                 ))
             }
         }
@@ -316,7 +323,6 @@ pub struct OutboxEventJobConfig {
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
     pub ordering: Ordering,
-    pub allow_lane_switch_redelivery: bool,
 }
 
 impl OutboxEventJobConfig {
@@ -327,32 +333,16 @@ impl OutboxEventJobConfig {
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             ordering: Ordering::Insert,
-            allow_lane_switch_redelivery: false,
         }
     }
 
     /// Choose the delivery lane. See [`Ordering`].
     ///
-    /// Moving an *already-checkpointed* subscription from
-    /// [`Insert`](Ordering::Insert) to [`Commit`](Ordering::Commit) redelivers
-    /// the events of any group straddling its cursor, so it is refused unless
-    /// [`allow_lane_switch_redelivery`](Self::allow_lane_switch_redelivery) is
-    /// also set. A subscription with no checkpoint yet switches freely.
+    /// Settled when the subscription first checkpoints: a subscription
+    /// already running on one lane cannot move to the other, because the two
+    /// cursors count different things. Register a new job type instead.
     pub fn ordering(mut self, ordering: Ordering) -> Self {
         self.ordering = ordering;
-        self
-    }
-
-    /// Acknowledge that switching an existing subscription from the insert
-    /// lane to the commit lane will redeliver some already-handled events,
-    /// and that this handler is idempotent.
-    ///
-    /// Separate from [`ordering`](Self::ordering) so the duplicate window
-    /// cannot be opened by changing one enum value: the redelivery is a
-    /// property of the *migration*, not of the lane, and a subscriber that
-    /// starts on the commit lane never needs this.
-    pub fn allow_lane_switch_redelivery(mut self) -> Self {
-        self.allow_lane_switch_redelivery = true;
         self
     }
 
@@ -399,7 +389,6 @@ where
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
     ordering: Ordering,
-    allow_lane_switch_redelivery: bool,
 }
 
 impl<H, P, Tables> OutboxEventJobInitializer<H, P, Tables>
@@ -417,7 +406,6 @@ where
             max_batch_size: config.max_batch_size,
             checkpoint_interval: config.checkpoint_interval,
             ordering: config.ordering,
-            allow_lane_switch_redelivery: config.allow_lane_switch_redelivery,
         }
     }
 }
@@ -445,7 +433,6 @@ where
             max_batch_size: self.max_batch_size,
             checkpoint_interval: self.checkpoint_interval,
             ordering: self.ordering,
-            allow_lane_switch_redelivery: self.allow_lane_switch_redelivery,
         }))
     }
 }
@@ -461,7 +448,6 @@ where
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
     ordering: Ordering,
-    allow_lane_switch_redelivery: bool,
 }
 
 #[async_trait]
@@ -517,47 +503,18 @@ where
         }
     }
 
-    /// Build the configured lane's stream, translating the cursor if the
-    /// subscription is moving from the insert lane to the commit lane.
-    ///
-    /// A translation redelivers the events of any group straddling the old
-    /// cursor, so it requires explicit acknowledgement and is checkpointed
-    /// before a single event is consumed. Moving back is refused outright:
-    /// the insert cursor has no meaning once a commit cursor is authoritative.
-    async fn select_lane(
+    /// Build the configured lane's stream from the stored cursor.
+    fn select_lane(
         &self,
-        current_job: &mut CurrentJob,
-        state: &mut OutboxEventJobState,
+        state: &OutboxEventJobState,
     ) -> Result<PersistentLane<P>, Box<dyn std::error::Error>> {
-        match decide_lane(
-            state.commit_sequence,
-            state.sequence,
-            self.ordering,
-            self.allow_lane_switch_redelivery,
-        )? {
+        match decide_lane(state.commit_sequence, state.sequence, self.ordering)? {
             LaneChoice::Insert(sequence) => Ok(PersistentLane::Insert(
                 self.outbox.listen_persisted(Some(sequence)),
             )),
             LaneChoice::Commit(commit_sequence) => Ok(PersistentLane::Commit(
-                self.outbox
-                    .listen_commit_ordered(Some(commit_sequence))
-                    .await?,
+                self.outbox.listen_commit_ordered(Some(commit_sequence)),
             )),
-            LaneChoice::SwitchToCommit(sequence) => {
-                let translated =
-                    Tables::translate_insert_cursor(self.outbox.pool(), sequence).await?;
-                state.commit_sequence = Some(translated);
-                // INVARIANT: checkpoint the translation before consuming
-                // anything, so a crash mid-switch cannot re-translate from a
-                // cursor that has already moved.
-                persist_checkpoint(current_job, state, None)
-                    .await
-                    .map_err(|e| e as Box<dyn std::error::Error>)?;
-                record_lane_switch(u64::from(sequence), u64::from(translated));
-                Ok(PersistentLane::Commit(
-                    self.outbox.listen_commit_ordered(Some(translated)).await?,
-                ))
-            }
         }
     }
 
@@ -574,7 +531,7 @@ where
         // and ephemerals are only handled while nothing is pending. A
         // `PersistentOnly` handler never subscribes the ephemeral stream at
         // all.
-        let mut persistent = self.select_lane(&mut current_job, &mut state).await?;
+        let mut persistent = self.select_lane(&state)?;
         let mut ephemeral =
             (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 
@@ -713,7 +670,8 @@ where
             // (the checkpoint advances over it like a skip); any `Err` — the
             // default — fails the job with the checkpoint parked before the
             // event, so every retry re-reads it and nothing is ever skipped.
-            let event = match item {
+            let commit = item.commit;
+            let event = match item.event {
                 Ok(event) => event,
                 Err(undecodable) => {
                     let mut parts = CtxParts {
@@ -728,7 +686,13 @@ where
                         .map_err(|e| e as Box<dyn std::error::Error>)?;
                     match self.handler.handle_undecodable(&undecodable).await {
                         Ok(()) => {
+                            // INVARIANT: both cursors advance. Leaving
+                            // `commit_sequence` behind redelivers the event
+                            // after every restart.
                             state.sequence = undecodable.sequence;
+                            if let Some((commit_sequence, _)) = commit {
+                                state.commit_sequence = Some(commit_sequence);
+                            }
                             continue;
                         }
                         Err(error) => {
@@ -766,10 +730,10 @@ where
                 .map_err(|e| e as Box<dyn std::error::Error>)?
                 .outcome;
             state.sequence = event.sequence;
-            if let Some(commit_sequence) = event.commit_sequence {
+            if let Some((commit_sequence, _)) = commit {
                 state.commit_sequence = Some(commit_sequence);
             }
-            in_group = event.commit_sequence.is_some() && !event.commit_boundary;
+            in_group = matches!(commit, Some((_, boundary)) if !boundary);
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {
@@ -818,7 +782,7 @@ mod tests {
 
     #[test]
     fn insert_lane_stays_on_the_insert_cursor() {
-        let choice = decide_lane(None, EventSequence::from(7u64), Ordering::Insert, false);
+        let choice = decide_lane(None, EventSequence::from(7u64), Ordering::Insert);
         assert_eq!(choice, Ok(LaneChoice::Insert(EventSequence::from(7u64))));
     }
 
@@ -828,54 +792,35 @@ mod tests {
             Some(CommitSequence::from(4u64)),
             EventSequence::from(9u64),
             Ordering::Commit,
-            false,
         );
         assert_eq!(choice, Ok(LaneChoice::Commit(CommitSequence::from(4u64))));
     }
 
-    /// A subscription that has never checkpointed has nothing to redeliver,
-    /// so starting on the commit lane needs no acknowledgement.
+    /// A subscription that has never checkpointed is on no lane yet, so it
+    /// starts on the configured one from the beginning of that lane.
     #[test]
-    fn a_fresh_subscription_starts_on_the_commit_lane_freely() {
-        let choice = decide_lane(None, EventSequence::BEGIN, Ordering::Commit, false);
-        assert_eq!(choice, Ok(LaneChoice::SwitchToCommit(EventSequence::BEGIN)));
+    fn a_fresh_subscription_starts_at_the_beginning_of_the_commit_lane() {
+        let choice = decide_lane(None, EventSequence::BEGIN, Ordering::Commit);
+        assert_eq!(choice, Ok(LaneChoice::Commit(CommitSequence::BEGIN)));
     }
 
-    /// The duplicate window must not open by flipping one enum value.
+    /// The two cursors count different things, so an established
+    /// subscription cannot be moved by flipping one enum value.
     #[test]
-    fn switching_an_established_subscription_is_refused_without_acknowledgement() {
-        let error = decide_lane(None, EventSequence::from(12u64), Ordering::Commit, false)
-            .expect_err("must refuse");
-        assert!(
-            error.contains("allow_lane_switch_redelivery"),
-            "the refusal must name the opt-in: {error}",
-        );
-        assert!(
-            error.contains("redeliver"),
-            "the refusal must say what the cost is: {error}",
-        );
+    fn switching_an_established_subscription_to_commit_is_refused() {
+        let error =
+            decide_lane(None, EventSequence::from(12u64), Ordering::Commit).expect_err("refuses");
+        assert!(error.contains("register a new job type"), "{error}");
     }
 
     #[test]
-    fn switching_is_allowed_once_acknowledged() {
-        let choice = decide_lane(None, EventSequence::from(12u64), Ordering::Commit, true);
-        assert_eq!(
-            choice,
-            Ok(LaneChoice::SwitchToCommit(EventSequence::from(12u64))),
-        );
-    }
-
-    /// The insert cursor is not authoritative once a commit cursor exists,
-    /// so there is no safe way back.
-    #[test]
-    fn switching_back_to_the_insert_lane_is_refused_even_with_acknowledgement() {
+    fn switching_back_to_the_insert_lane_is_refused() {
         let error = decide_lane(
             Some(CommitSequence::from(3u64)),
             EventSequence::from(9u64),
             Ordering::Insert,
-            true,
         )
-        .expect_err("must refuse");
+        .expect_err("refuses");
         assert!(error.contains("register a new job type"), "{error}");
     }
 }

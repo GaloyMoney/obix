@@ -77,22 +77,49 @@ where
             );
         }
     }
+
+    /// The same contiguous stream this listener delivers, as the internal
+    /// transport rather than the public item.
+    ///
+    /// For the sequencer, which reads each delivery's group and payload
+    /// presence and must not pay the `Err`-arm clone `into_item` does.
+    pub(crate) fn deliveries(
+        cache_handle: CacheHandle<P>,
+        start_after: impl Into<Option<EventSequence>>,
+        buffer: usize,
+    ) -> DeliveryStream<P> {
+        DeliveryStream(Self::new(cache_handle, start_after, buffer))
+    }
 }
 
-impl<P> Stream for PersistentOutboxListener<P>
+/// [`PersistentOutboxListener`] yielding the internal transport; see
+/// [`deliveries`](PersistentOutboxListener::deliveries).
+pub(crate) struct DeliveryStream<P>(PersistentOutboxListener<P>)
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static;
+
+impl<P> Stream for DeliveryStream<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    /// An undecodable event is yielded as the `Err` arm, in its sequence
-    /// position — the delivery of that event in degraded form. The stream
-    /// continues past it; whether the *consumer* moves past it is the
-    /// consumer's explicit decision (`?` fails loudly).
-    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
+    type Item = PersistentDelivery<P>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0).poll_delivery(cx)
+    }
+}
+
+impl<P> PersistentOutboxListener<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+{
+    fn poll_delivery(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<PersistentDelivery<P>>> {
         let this = self.as_mut().get_mut();
 
         // Backfill first: it carries the lowest outstanding sequences, so a
@@ -170,7 +197,7 @@ where
             }
             if seq == this.last_returned_sequence.next() {
                 this.last_returned_sequence = seq;
-                return Poll::Ready(Some(event.into_item()));
+                return Poll::Ready(Some(event));
             }
             this.local_cache.insert(seq, event);
             break;
@@ -179,10 +206,29 @@ where
         if this.last_returned_sequence < this.latest_known && this.backfill_receiver.is_none() {
             this.request_backfill();
             // need to register the cx with the backfill_receiver to get woken up
-            return self.poll_next(cx);
+            return self.poll_delivery(cx);
         }
 
         Poll::Pending
+    }
+}
+
+impl<P> Stream for PersistentOutboxListener<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+{
+    /// An undecodable event is yielded as the `Err` arm, in its sequence
+    /// position — the delivery of that event in degraded form. The stream
+    /// continues past it; whether the *consumer* moves past it is the
+    /// consumer's explicit decision (`?` fails loudly).
+    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.poll_delivery(cx)
+            .map(|delivery| delivery.map(PersistentDelivery::into_item))
     }
 }
 

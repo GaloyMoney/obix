@@ -1,10 +1,10 @@
 use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
+use std::{collections::BTreeMap, pin::Pin, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
-use super::cache::CommitLaneHandle;
-use crate::out::event::{PersistentDelivery, PersistentOutboxEvent, UndecodableEventError};
+use super::sequencer::CommitLaneHandle;
+use crate::out::event::{CommitDelivery, CommitOrderedEvent};
 use crate::sequence::CommitSequence;
 
 /// Delivers events in commit order: a source transaction's events arrive
@@ -19,11 +19,11 @@ where
 {
     last_returned: CommitSequence,
     latest_known: CommitSequence,
-    event_receiver: BroadcastStream<PersistentDelivery<P>>,
+    event_receiver: BroadcastStream<CommitDelivery<P>>,
     buffer_size: usize,
-    local_cache: BTreeMap<CommitSequence, PersistentDelivery<P>>,
+    local_cache: BTreeMap<CommitSequence, CommitDelivery<P>>,
     handle: CommitLaneHandle<P>,
-    backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
+    backfill_receiver: Option<ReceiverStream<CommitDelivery<P>>>,
 }
 
 impl<P> CommitOrderedListener<P>
@@ -50,10 +50,8 @@ where
 
     /// Take a delivery into the local view, dropping the highest on overflow:
     /// the least urgent held, never the one blocking the cursor.
-    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
-        let Some(commit_sequence) = delivery.commit_sequence() else {
-            return;
-        };
+    fn maybe_add_to_cache(&mut self, delivery: CommitDelivery<P>) {
+        let commit_sequence = delivery.commit_sequence;
         self.latest_known = self.latest_known.max(commit_sequence);
         if commit_sequence > self.last_returned
             && self.local_cache.insert(commit_sequence, delivery).is_none()
@@ -74,7 +72,7 @@ impl<P> Stream for CommitOrderedListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
+    type Item = CommitOrderedEvent<P>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -92,7 +90,7 @@ where
             }
             match Pin::new(backfill_receiver).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
-                    can_deliver |= event.commit_sequence() == Some(needed);
+                    can_deliver |= event.commit_sequence == needed;
                     backfill_events.push(event);
                 }
                 Poll::Ready(None) => {

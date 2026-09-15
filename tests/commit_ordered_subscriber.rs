@@ -1,5 +1,5 @@
 //! The singleton runner on the commit-ordered lane: group-safe flushing and
-//! the guarded lane switch.
+//! cursor handling across restarts.
 
 mod helpers;
 
@@ -205,6 +205,9 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
             "first run delivered its events",
         )
         .await?;
+        // The first instance must stop competing for the job before the
+        // second registers, or the restart is not a restart.
+        let _ = jobs.shutdown().await;
     }
 
     // A fresh Jobs instance re-runs the same job type against the stored
@@ -234,6 +237,116 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
     assert!(
         replayed.iter().all(|n| *n >= 100),
         "the second run must resume from its commit cursor, not replay: {replayed:?}",
+    );
+    Ok(())
+}
+
+/// Counts deliveries and acknowledges undecodable payloads, so a test can
+/// see whether an acknowledged one comes back after a restart.
+struct UndecodableAcker {
+    seen: Arc<Mutex<Vec<u64>>>,
+    undecodable: Arc<Mutex<usize>>,
+}
+
+impl SingletonSubscriber<TestEvent> for UndecodableAcker {
+    type Batch = ();
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, ()>,
+        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(TestEvent::Ping(n)) = &event.payload {
+            self.seen.lock().await.push(*n);
+        }
+        Ok(ctx.skip())
+    }
+
+    async fn handle_undecodable(
+        &self,
+        _error: &obix::UndecodableEventError,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self.undecodable.lock().await += 1;
+        Ok(())
+    }
+}
+
+/// Acknowledging an undecodable payload must advance the *commit* cursor,
+/// not only the insert one: leaving it behind redelivers the event after
+/// every restart.
+#[tokio::test]
+#[file_serial]
+async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool).await?;
+
+    // A group whose middle member cannot decode into TestEvent.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+    sqlx::query(
+        "UPDATE persistent_outbox_events SET payload = '{\"NotAVariant\":true}'::jsonb
+         WHERE sequence = 1",
+    )
+    .execute(&pool)
+    .await?;
+
+    let undecodable = Arc::new(Mutex::new(0usize));
+    {
+        let mut jobs = init_jobs(&pool).await?;
+        outbox
+            .register_singleton_subscriber(
+                &mut jobs,
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+                UndecodableAcker {
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                    undecodable: undecodable.clone(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        jobs.start_poll().await?;
+
+        until(
+            async || *undecodable.lock().await >= 1,
+            "the undecodable event was acknowledged",
+        )
+        .await?;
+        let _ = jobs.shutdown().await;
+    }
+
+    // A fresh run against the stored checkpoint must not see it again.
+    let after_restart = Arc::new(Mutex::new(0usize));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut jobs = init_jobs(&pool).await?;
+    outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+            UndecodableAcker {
+                seen: seen.clone(),
+                undecodable: after_restart.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    // Publish past it and wait for that to arrive, so the restarted run has
+    // demonstrably reached the stream rather than merely not started.
+    publish_group(&outbox, 100, 1).await?;
+    until(
+        async || seen.lock().await.contains(&100),
+        "the restarted run reached the new event",
+    )
+    .await?;
+
+    assert_eq!(
+        *after_restart.lock().await,
+        0,
+        "an acknowledged undecodable event must not be redelivered after a restart",
     );
     Ok(())
 }

@@ -95,8 +95,8 @@ impl std::fmt::Display for CommitSequence {
 /// PostgreSQL top-level transaction id, stamped by a column DEFAULT.
 ///
 /// Events sharing one of these committed together. Deliberately not ordered:
-/// commit order is derived from each group's highest
-/// [`EventSequence`], never from comparing these ids.
+/// commit order comes from the sequence of a group's first member, never
+/// from comparing these ids.
 #[derive(sqlx::Type, PartialEq, Eq, Hash, Debug, Copy, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 #[sqlx(transparent)]

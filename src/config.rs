@@ -94,14 +94,6 @@ pub const DEFAULT_PARTITION_PREMAKE: u64 = 5;
 pub const DEFAULT_PARTITION_MAINTAINER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(3600);
 
-/// How many insert sequences one sequencer tick may examine.
-///
-/// Bounds the tick statement's hole check and candidate scan. A group whose
-/// span exceeds this is still logged whole — the scan watermark widens the
-/// window across successive ticks until the group's highest member is inside
-/// it — so this is a statement-size knob, not a correctness limit.
-pub const DEFAULT_SEQUENCER_PAGE_SIZE: usize = 1000;
-
 #[derive(Clone, Builder)]
 pub struct MailboxConfig {
     #[builder(default = "100")]
@@ -136,11 +128,6 @@ pub struct MailboxConfig {
     /// sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
     #[builder(default = "DEFAULT_IDLE_RESYNC_INTERVAL")]
     pub idle_resync_interval: std::time::Duration,
-    /// Insert sequences one sequencer tick may examine; see
-    /// [`DEFAULT_SEQUENCER_PAGE_SIZE`]. Only consulted in a process hosting
-    /// a commit-ordered listener.
-    #[builder(default = "DEFAULT_SEQUENCER_PAGE_SIZE")]
-    pub sequencer_page_size: usize,
     /// How many partitions ahead of the head the maintainer keeps created;
     /// see [`DEFAULT_PARTITION_PREMAKE`]. (Partition *width* is the fixed
     /// [`DEFAULT_PARTITION_WIDTH`] constant, not configurable — it is coupled to
