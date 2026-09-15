@@ -15,7 +15,7 @@ use crate::{
     handle::{OwnedTaskHandle, spawn_supervised},
     out::event::*,
     sequence::{CommitGroupId, CommitSequence, EventSequence},
-    tables::MailboxTables,
+    tables::{CommitGroupAppend, MailboxTables},
 };
 
 /// How long a failed append waits before retrying the same group.

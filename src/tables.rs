@@ -5,8 +5,8 @@ use es_entity::hooks::HookOperation;
 use crate::{
     inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{
-        CommitGroupAppend, CommitLogRow, DecodeFailure, EphemeralEventType, EphemeralOutboxEvent,
-        OutboxEventId, PersistentOutboxEvent, UndecodableEventError,
+        DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
+        PersistentOutboxEvent, UndecodableEventError,
     },
     sequence::*,
 };
@@ -479,6 +479,32 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_types: &[String],
         wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+}
+
+/// One commit-log row as the loading queries report it: the lane position
+/// plus the decoded event it points at.
+#[doc(hidden)]
+pub struct CommitLogRow<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub commit_sequence: CommitSequence,
+    pub commit_boundary: bool,
+    pub event: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
+}
+
+/// Outcome of one [`append_commit_group`](MailboxTables::append_commit_group).
+#[doc(hidden)]
+pub struct CommitGroupAppend<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    /// The group's highest insert sequence, reported whether or not the
+    /// append was taken.
+    pub group_max: EventSequence,
+    /// The rows appended, in commit order. Empty when another process had
+    /// already advanced the cursor past this group.
+    pub appended: Vec<CommitLogRow<P>>,
 }
 
 /// The sequencer's resume point, all three values from one snapshot.

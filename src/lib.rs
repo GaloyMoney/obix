@@ -30,10 +30,8 @@ pub use inbox::{
     InboxIdempotencyKey, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
-#[doc(hidden)]
-pub use out::{CommitGroupAppend, CommitLogRow};
 pub use out::{
-    CommitOrderedEvent, CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled,
+    CommitOrderedEnvelope, CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled,
     IsolatedOp, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Ordering, Outbox,
     OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
     SingletonSubscriber, StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
@@ -42,6 +40,8 @@ pub use out::{
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;
+#[doc(hidden)]
+pub use tables::{CommitGroupAppend, CommitLogRow};
 pub use tables::{CommitRestartState, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{

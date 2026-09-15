@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, pin::Pin, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::sequencer::CommitLaneHandle;
-use crate::out::event::{CommitDelivery, CommitOrderedEvent};
+use crate::out::event::{CommitDelivery, CommitOrderedEnvelope};
 use crate::sequence::CommitSequence;
 
 /// Delivers events in commit order: a source transaction's events arrive
@@ -72,7 +72,7 @@ impl<P> Stream for CommitOrderedListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = CommitOrderedEvent<P>;
+    type Item = CommitOrderedEnvelope<P>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,

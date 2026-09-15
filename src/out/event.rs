@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{borrow::Cow, sync::Arc};
 
 use crate::sequence::*;
+use crate::tables::CommitLogRow;
 
 es_entity::entity_id! { OutboxEventId }
 
@@ -274,12 +275,13 @@ where
     }
 }
 
-/// One position on the commit-ordered lane: the event, plus where it sits in
-/// commit order.
+/// What the commit-ordered lane yields: one [`PersistentOutboxEvent`] plus
+/// where it sits in commit order.
 ///
-/// The position belongs to the lane rather than to the event, so it is
-/// carried here and not on [`PersistentOutboxEvent`].
-pub struct CommitOrderedEvent<P>
+/// The position is a property of the lane, not of the event — the same event
+/// on the insert lane has no commit sequence — so it is carried around the
+/// event rather than on it.
+pub struct CommitOrderedEnvelope<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
@@ -305,8 +307,8 @@ impl<P> CommitDelivery<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    pub(crate) fn into_item(self) -> CommitOrderedEvent<P> {
-        CommitOrderedEvent {
+    pub(crate) fn into_item(self) -> CommitOrderedEnvelope<P> {
+        CommitOrderedEnvelope {
             commit_sequence: self.commit_sequence,
             commit_boundary: self.commit_boundary,
             event: self.delivery.into_item(),
@@ -338,32 +340,6 @@ where
             delivery: PersistentDelivery::from(row.event),
         }
     }
-}
-
-/// One commit-log row as the loading queries report it: the lane position
-/// plus the decoded event it points at.
-#[doc(hidden)]
-pub struct CommitLogRow<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    pub commit_sequence: CommitSequence,
-    pub commit_boundary: bool,
-    pub event: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
-}
-
-/// Outcome of one [`append_commit_group`](crate::MailboxTables::append_commit_group).
-#[doc(hidden)]
-pub struct CommitGroupAppend<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    /// The group's highest insert sequence, reported whether or not the
-    /// append was taken.
-    pub group_max: EventSequence,
-    /// The rows appended, in commit order. Empty when another process had
-    /// already advanced the cursor past this group.
-    pub appended: Vec<CommitLogRow<P>>,
 }
 
 impl<P> From<PersistentOutboxEvent<P>> for OutboxEvent<P>
