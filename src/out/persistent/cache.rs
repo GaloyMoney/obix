@@ -1,5 +1,16 @@
+//! **Behind vs. hole.** The cursor (`last_broadcast_sequence`) can be behind
+//! the head for two different reasons, and the loop's stall-reporting block
+//! (bottom of [`PersistentOutboxEventCache::spawn_cache_loop`]) tells them
+//! apart: *behind* just means `cursor + 1` is uncached — it could be a
+//! committed backlog (a bulk commit larger than the broadcast buffer) or an
+//! in-flight/abandoned writer (a *hole*). A catch-up task drains the former
+//! at DB speed by paging [`MailboxTables::load_next_contiguous_page`]; only
+//! when a page comes back empty does the position get treated as a hole and
+//! handed to the GapFiller's grace-gated episode, exactly as before this
+//! distinction existed. See [`decide_stall_action`] for the rule.
+
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::Instrument;
 
@@ -53,6 +64,10 @@ where
 
 /// Outcome of parsing a `{min_sequence, max_sequence}` notification.
 struct NotifiedRange {
+    /// Lowest sequence the notification proves committed — its own writer's
+    /// claim that this sequence landed, which re-arms a stale
+    /// `catch_up_exhausted_at` at or above it (see `decide_stall_action`).
+    min_sequence: EventSequence,
     /// Highest sequence the notification proves committed.
     max_sequence: EventSequence,
     /// Sub-range of the notified sequences missing from the cache as
@@ -60,6 +75,64 @@ struct NotifiedRange {
     /// `None` when every notified sequence is already cached (the warm
     /// in-process path: the post-commit broadcast beat the NOTIFY).
     missing: Option<(EventSequence, EventSequence)>,
+}
+
+/// Outcome of one catch-up task run, reported to the cache loop over its
+/// done channel.
+enum CatchUpOutcome {
+    /// The cursor reached the head with no gap — nothing left to catch up.
+    AtHead,
+    /// The catch-up stopped at `pos` because `pos + 1` is missing from the
+    /// table: a hole, not a backlog of committed rows. Handed to the same
+    /// grace-gated stall path a stall has always used.
+    HoleAfter(EventSequence),
+}
+
+/// What the stall-reporting block at the bottom of the cache loop does this
+/// iteration.
+#[derive(Debug, PartialEq, Eq)]
+enum StallAction {
+    Nothing,
+    ClearStall,
+    StartCatchUp,
+    ReportStall,
+}
+
+/// The behind-vs-hole decision rule (module doc), extracted pure so its
+/// branches are unit-testable without a database.
+///
+/// `distance` is `highest_known - cursor`; `threshold` is
+/// `backfill_page_size`. `catch_up_active` and `exhausted_at` are the loop's
+/// own state (whether a catch-up task is currently running, and the
+/// position the last one ended a hole at).
+#[allow(clippy::too_many_arguments)]
+fn decide_stall_action(
+    behind: bool,
+    catch_up_active: bool,
+    exhausted_at: Option<EventSequence>,
+    cursor: EventSequence,
+    distance: u64,
+    threshold: u64,
+    reported_stall: Option<EventSequence>,
+) -> StallAction {
+    if !behind {
+        return if reported_stall.is_some() {
+            StallAction::ClearStall
+        } else {
+            StallAction::Nothing
+        };
+    }
+    if catch_up_active {
+        return StallAction::Nothing;
+    }
+    if exhausted_at != Some(cursor) && distance >= threshold {
+        return StallAction::StartCatchUp;
+    }
+    if reported_stall != Some(cursor) {
+        StallAction::ReportStall
+    } else {
+        StallAction::Nothing
+    }
 }
 
 #[derive(Debug)]
@@ -93,6 +166,14 @@ where
 
     pub fn cache_fill_sender(&self) -> broadcast::Sender<PersistentDelivery<P>> {
         self.cache_fill_sender.clone()
+    }
+
+    /// The cache loop's head watermark, shared so `PersistEvents::post_commit`
+    /// can advance it directly when it truncates a batch too large for the
+    /// cache-fill broadcast — before the loop would otherwise discover the
+    /// batch's tail from the (budgeted) sends it does receive.
+    pub(crate) fn highest_known_sequence(&self) -> Arc<AtomicU64> {
+        self.highest_known_sequence.clone()
     }
 
     pub async fn init(
@@ -414,6 +495,102 @@ where
         }
     }
 
+    /// How long the catch-up task waits for the cache loop to consume a
+    /// delivered page (observed via the cursor watch) before re-reading from
+    /// wherever the real cursor has reached. A hint only — a timeout just
+    /// means the loop is slower than expected, not that anything is wrong.
+    const CATCH_UP_CONSUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Drain the cursor's backlog against *committed* rows at DB speed: page
+    /// [`MailboxTables::load_next_contiguous_page`] from wherever the cursor
+    /// actually is, one page in flight, until a page is empty (a hole — the
+    /// cache loop's stall reporting takes over) or the cursor reaches the
+    /// head (nothing left to catch up on). Never writes anything; the
+    /// GapFiller remains the only writer of placeholder rows.
+    ///
+    /// Paced by the cursor itself — read from `cursor_rx.borrow()` fresh on
+    /// every iteration, not from a locally tracked position — because the
+    /// contiguous run this task delivers is exactly what lets the cursor
+    /// move at all, so re-reading it is how this task discovers its own
+    /// progress.
+    async fn run_catch_up(
+        pool: sqlx::PgPool,
+        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+        mut cursor_rx: watch::Receiver<u64>,
+        highest_known_sequence: Arc<AtomicU64>,
+        page_size: usize,
+        done_tx: mpsc::UnboundedSender<CatchUpOutcome>,
+    ) {
+        let catch_up_span = tracing::info_span!(
+            "obix.persistent_cache.catch_up",
+            from = *cursor_rx.borrow(),
+            to = tracing::field::Empty,
+            pages = tracing::field::Empty,
+            rows = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let mut pages: u64 = 0;
+        let mut rows: u64 = 0;
+        let outcome = async {
+            loop {
+                let from = EventSequence::from(*cursor_rx.borrow());
+                let head = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
+                if from >= head {
+                    break CatchUpOutcome::AtHead;
+                }
+
+                let events =
+                    match Tables::load_next_contiguous_page::<P>(&pool, from, page_size).await {
+                        Ok(events) => events,
+                        Err(e) => {
+                            record_catch_up_failed(&e, u64::from(from));
+                            tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
+                            continue;
+                        }
+                    };
+                pages += 1;
+
+                let deliveries: Vec<PersistentDelivery<P>> =
+                    events.into_iter().map(PersistentDelivery::from).collect();
+                let Some(first) = deliveries.first() else {
+                    break CatchUpOutcome::HoleAfter(from);
+                };
+                if first.sequence() != from.next() {
+                    break CatchUpOutcome::HoleAfter(from);
+                }
+                rows += deliveries.len() as u64;
+                let last = deliveries
+                    .last()
+                    .expect("checked non-empty above")
+                    .sequence();
+                for delivery in &deliveries {
+                    let _ = cache_fill_sender.send(delivery.clone());
+                }
+
+                // One page in flight: wait for the cache loop to have
+                // consumed it before reading the next. A timeout just means
+                // the loop is behind — re-read from wherever it actually is.
+                let _ = tokio::time::timeout(
+                    Self::CATCH_UP_CONSUME_TIMEOUT,
+                    cursor_rx.wait_for(|c| *c >= u64::from(last)),
+                )
+                .await;
+            }
+        }
+        .instrument(catch_up_span.clone())
+        .await;
+
+        catch_up_span.record("to", *cursor_rx.borrow());
+        catch_up_span.record("pages", pages);
+        catch_up_span.record("rows", rows);
+        let outcome_label = match &outcome {
+            CatchUpOutcome::AtHead => "at_head",
+            CatchUpOutcome::HoleAfter(_) => "hole",
+        };
+        catch_up_span.record("outcome", outcome_label);
+        let _ = done_tx.send(outcome);
+    }
+
     /// Authoritative head read (the O(1) sequence `last_value` query).
     /// Logs and returns `None` on failure so callers skip their advance.
     async fn read_confirmed_head(pool: &sqlx::PgPool) -> Option<EventSequence> {
@@ -456,6 +633,7 @@ where
         });
 
         Some(NotifiedRange {
+            min_sequence: header.min_sequence,
             max_sequence: header.max_sequence,
             missing,
         })
@@ -480,6 +658,12 @@ where
 
         let cache_size = config.event_cache_size;
         let backfill_page_size = config.backfill_page_size.max(1);
+        // Bounds a catch-up page: it is sent into the cache-fill broadcast,
+        // so a page wider than that channel would lag the very channel it
+        // is trying to refill.
+        let catch_up_page_size = backfill_page_size
+            .min((config.event_buffer_size / 2).max(1))
+            .max(1);
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let idle_resync_interval = config.idle_resync_interval;
@@ -500,6 +684,18 @@ where
             // loop started.
             let init_head = u64::from(initial_sequence);
             let mut last_progress_at = tokio::time::Instant::now();
+
+            // The cursor, observable so a catch-up task can pace itself off
+            // it. `send_replace` never errors regardless of receiver count,
+            // so no receiver needs to exist yet.
+            let (cursor_tx, _) = watch::channel(u64::from(initial_sequence));
+            let mut catch_up: Option<OwnedTaskHandle> = None;
+            // The position the last catch-up run ended a hole at — prevents
+            // re-probing the same hole every loop iteration. See
+            // `decide_stall_action` for the re-arm points.
+            let mut catch_up_exhausted_at: Option<EventSequence> = None;
+            let (catch_up_done_tx, mut catch_up_done_rx) =
+                mpsc::unbounded_channel::<CatchUpOutcome>();
 
             loop {
                 tokio::select! {
@@ -533,6 +729,21 @@ where
                         continue;
                     }
 
+                    result = catch_up_done_rx.recv() => {
+                        // No `continue`: falls through to the stall-reporting
+                        // block below, which reports the hole (or moves on)
+                        // exactly as it would for an ordinary stall.
+                        if let Some(outcome) = result {
+                            catch_up = None;
+                            match outcome {
+                                CatchUpOutcome::AtHead => catch_up_exhausted_at = None,
+                                CatchUpOutcome::HoleAfter(pos) => {
+                                    catch_up_exhausted_at = Some(pos);
+                                }
+                            }
+                        }
+                    }
+
                     result = cache_fill_receiver.recv() => {
                         match result {
                             Ok(event) => {
@@ -561,6 +772,11 @@ where
                                         );
                                 }
 
+                                // Once per drain, not per event: lets a
+                                // parked catch-up task observe how far the
+                                // cursor actually moved.
+                                cursor_tx.send_replace(u64::from(last_broadcast_sequence));
+
                                 if highest_known_sequence.load(Ordering::Relaxed)
                                     > watermark_before
                                 {
@@ -576,7 +792,11 @@ where
                                 // Dropped deliveries may include a fill that
                                 // would have resolved the reported stall —
                                 // re-arm so it is re-reported if it persists.
+                                // The drop may also have carried committed
+                                // rows past a previously exhausted catch-up
+                                // position — re-arm that too.
                                 reported_stall = None;
+                                catch_up_exhausted_at = None;
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -603,6 +823,16 @@ where
                                                 notification.payload(),
                                                 &persistent_cache,
                                             ) {
+                                                // The notification's own writer
+                                                // claims a sequence at or past
+                                                // the cursor's hole landed —
+                                                // re-arm so a stale exhausted
+                                                // catch-up is retried.
+                                                if u64::from(notified.min_sequence)
+                                                    <= u64::from(last_broadcast_sequence.next())
+                                                {
+                                                    catch_up_exhausted_at = None;
+                                                }
                                                 // NOT applied to
                                                 // highest_known_sequence yet —
                                                 // see the clamp below.
@@ -622,6 +852,7 @@ where
                                         }
                                         NotifyMessage::Resync => {
                                             resync_needed = true;
+                                            catch_up_exhausted_at = None;
                                         }
                                     }
                                 }
@@ -683,12 +914,23 @@ where
                                         if u64::from(after)
                                             < u64::from(clamped_up_to)
                                         {
-                                            tokio::spawn(Self::fetch_notified_range(
-                                                pool.clone(),
-                                                after,
-                                                clamped_up_to,
-                                                cache_fill_sender.clone(),
-                                            ));
+                                            let width = u64::from(clamped_up_to)
+                                                - u64::from(after);
+                                            if width <= backfill_page_size as u64 {
+                                                tokio::spawn(Self::fetch_notified_range(
+                                                    pool.clone(),
+                                                    after,
+                                                    clamped_up_to,
+                                                    cache_fill_sender.clone(),
+                                                ));
+                                            } else {
+                                                // Wider than one page: not
+                                                // this task's job — the
+                                                // decision rule's catch-up
+                                                // reads it contiguously once
+                                                // the cursor reaches it.
+                                                catch_up_exhausted_at = None;
+                                            }
                                         }
                                     }
                                 }
@@ -710,31 +952,61 @@ where
                         // Re-arm the stall report as a lost-signal backstop:
                         // if the GapFiller's episode ended believing the
                         // stall resolved but the resolving delivery was
-                        // lost, the re-report below restarts it.
+                        // lost, the re-report below restarts it. Same
+                        // backstop for a stale exhausted catch-up position.
                         reported_stall = None;
+                        catch_up_exhausted_at = None;
                         last_progress_at = tokio::time::Instant::now();
                     }
                 }
 
-                // Stall reporting: when broadcasting is stuck waiting for a
-                // missing sequence, tell the GapFiller — once per stall
-                // position, cleared when the cursor moves. All fill policy
-                // (grace, abandonment proof, batching, cluster dedup)
-                // lives in the GapFiller; this loop only observes its own
-                // cursor. This process's commit-failed allocations are
-                // compensated reactively without ever stalling here, and a
-                // stall that resolves within its grace period costs the
-                // GapFiller zero DB work.
+                // Behind vs. hole (module doc): tell the GapFiller about a
+                // stall, or start a catch-up task, or do nothing — see
+                // `decide_stall_action`. All fill policy (grace, abandonment
+                // proof, batching, cluster dedup) lives in the GapFiller;
+                // this loop only observes its own cursor and, now, whether a
+                // catch-up owns progress toward it.
                 let next_needed = last_broadcast_sequence.next();
                 let highest = highest_known_sequence.load(Ordering::Relaxed);
-                if u64::from(next_needed) <= highest && !persistent_cache.contains_key(&next_needed)
-                {
-                    if reported_stall != Some(last_broadcast_sequence) {
+                let behind = u64::from(next_needed) <= highest
+                    && !persistent_cache.contains_key(&next_needed);
+                let distance = highest.saturating_sub(u64::from(last_broadcast_sequence));
+
+                match decide_stall_action(
+                    behind,
+                    catch_up.is_some(),
+                    catch_up_exhausted_at,
+                    last_broadcast_sequence,
+                    distance,
+                    backfill_page_size as u64,
+                    reported_stall,
+                ) {
+                    StallAction::Nothing => {}
+                    StallAction::ClearStall => {
+                        reported_stall = None;
+                        let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
+                    }
+                    StallAction::StartCatchUp => {
+                        if reported_stall.take().is_some() {
+                            let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
+                        }
+                        let task_handle = spawn_supervised(
+                            "obix::persistent_cache_catch_up",
+                            Self::run_catch_up(
+                                pool.clone(),
+                                cache_fill_sender.clone(),
+                                cursor_tx.subscribe(),
+                                highest_known_sequence.clone(),
+                                catch_up_page_size,
+                                catch_up_done_tx.clone(),
+                            ),
+                        );
+                        catch_up = Some(OwnedTaskHandle::new(task_handle));
+                    }
+                    StallAction::ReportStall => {
                         let _ = gap_fill_tx.send(GapFillRequest::Stalled(last_broadcast_sequence));
                         reported_stall = Some(last_broadcast_sequence);
                     }
-                } else if reported_stall.take().is_some() {
-                    let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
                 }
 
                 if persistent_cache.len() > high_water {
@@ -763,6 +1035,14 @@ fn record_no_receivers(sequence: u64) {}
     fields(error = %error, current_sequence = current_sequence),
 )]
 fn record_backfill_failed(error: &sqlx::Error, current_sequence: u64) {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.catch_up_failed",
+    level = "warn",
+    skip_all,
+    fields(error = %error, from = from),
+)]
+fn record_catch_up_failed(error: &sqlx::Error, from: u64) {}
 
 #[tracing::instrument(
     name = "obix.persistent_cache.backfill_channel_closed",
@@ -799,3 +1079,118 @@ fn record_notification_channel_closed() {}
     fields(otel.status_code = "ERROR", error = %error),
 )]
 fn record_resync_failed(error: &sqlx::Error) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THRESHOLD: u64 = 1000;
+
+    fn seq(n: u64) -> EventSequence {
+        EventSequence::from(n)
+    }
+
+    /// Not behind, no stall previously reported: nothing to do.
+    #[test]
+    fn not_behind_and_clean_does_nothing() {
+        assert_eq!(
+            decide_stall_action(false, false, None, seq(10), 0, THRESHOLD, None),
+            StallAction::Nothing
+        );
+    }
+
+    /// Not behind, but a stall was reported (the cursor just caught up to
+    /// it): clear it.
+    #[test]
+    fn not_behind_with_reported_stall_clears_it() {
+        assert_eq!(
+            decide_stall_action(false, false, None, seq(10), 0, THRESHOLD, Some(seq(10))),
+            StallAction::ClearStall
+        );
+    }
+
+    /// A catch-up is already running: it owns progress, never report a
+    /// stall out from under it.
+    #[test]
+    fn behind_with_catch_up_active_does_nothing() {
+        assert_eq!(
+            decide_stall_action(true, true, None, seq(10), THRESHOLD * 5, THRESHOLD, None),
+            StallAction::Nothing
+        );
+    }
+
+    /// Distance at the threshold starts a catch-up rather than reporting a
+    /// stall — the boundary is inclusive.
+    #[test]
+    fn distance_at_threshold_starts_catch_up() {
+        assert_eq!(
+            decide_stall_action(true, false, None, seq(10), THRESHOLD, THRESHOLD, None),
+            StallAction::StartCatchUp
+        );
+    }
+
+    /// One below the threshold reports a stall instead — the boundary the
+    /// test above pins is exact, not "roughly there".
+    #[test]
+    fn distance_below_threshold_reports_stall() {
+        assert_eq!(
+            decide_stall_action(true, false, None, seq(10), THRESHOLD - 1, THRESHOLD, None),
+            StallAction::ReportStall
+        );
+    }
+
+    /// Already reported at this exact cursor: don't resend every iteration.
+    #[test]
+    fn distance_below_threshold_already_reported_does_nothing() {
+        assert_eq!(
+            decide_stall_action(
+                true,
+                false,
+                None,
+                seq(10),
+                THRESHOLD - 1,
+                THRESHOLD,
+                Some(seq(10))
+            ),
+            StallAction::Nothing
+        );
+    }
+
+    /// A catch-up already proved this exact position a hole: past-threshold
+    /// distance does not re-probe it every iteration, it falls back to the
+    /// (unchanged) stall path.
+    #[test]
+    fn exhausted_at_cursor_falls_back_to_stall_report() {
+        assert_eq!(
+            decide_stall_action(
+                true,
+                false,
+                Some(seq(10)),
+                seq(10),
+                THRESHOLD * 5,
+                THRESHOLD,
+                None
+            ),
+            StallAction::ReportStall
+        );
+    }
+
+    /// The cursor moved past the position a prior catch-up exhausted: the
+    /// stale exhaustion no longer applies to the new cursor, so a
+    /// far-enough distance starts a fresh catch-up.
+    #[test]
+    fn exhausted_at_stale_position_starts_catch_up() {
+        assert_eq!(
+            decide_stall_action(
+                true,
+                false,
+                Some(seq(3)),
+                seq(10),
+                THRESHOLD * 5,
+                THRESHOLD,
+                None
+            ),
+            StallAction::StartCatchUp
+        );
+    }
+}

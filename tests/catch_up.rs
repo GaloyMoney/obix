@@ -1,0 +1,328 @@
+mod helpers;
+
+use futures::stream::StreamExt;
+use obix::{EventSequence, MailboxConfig, out::Outbox};
+use serde::{Deserialize, Serialize};
+use serial_test::file_serial;
+
+use helpers::{init_outbox, init_pool};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum TestEvent {
+    Ping(u64),
+}
+
+/// The headline case: a single commit larger than the cache-fill broadcast
+/// must drain at DB speed, not at the gap-fill-grace cadence
+/// (`backfill_page_size / gap_fill_grace`, ~500/s on `main`). On unfixed
+/// code this test does not merely run slowly — it fails outright, because
+/// 200,000 / 500/s = 400s blows the 60s budget by 6x.
+#[tokio::test]
+#[file_serial]
+async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result<()> {
+    const TOTAL: u64 = 200_000;
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(1_000)
+            .event_cache_size(1_000)
+            .backfill_page_size(1_000)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..TOTAL).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let start = std::time::Instant::now();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = listener
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not drain {TOTAL} events within 60s"))?;
+    let elapsed = start.elapsed();
+    eprintln!("bulk_commit_larger_than_buffer_drains_at_page_speed: {TOTAL} events in {elapsed:?}");
+
+    assert_eq!(received.len(), TOTAL as usize);
+    let mut last_sequence = None;
+    for (i, event) in received.iter().enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+        if let Some(last) = last_sequence {
+            assert!(
+                u64::from(event.sequence) > last,
+                "sequences must be strictly increasing"
+            );
+        }
+        last_sequence = Some(u64::from(event.sequence));
+    }
+
+    Ok(())
+}
+
+/// The notified path: a bulk commit on one outbox instance must be caught up
+/// by a second instance listening on the same table without an unbounded
+/// `fetch_notified_range` materialising the whole range.
+#[tokio::test]
+#[file_serial]
+async fn remote_bulk_commit_is_caught_up_without_whole_range_fetch() -> anyhow::Result<()> {
+    const TOTAL: u64 = 20_000;
+
+    let pool = init_pool().await?;
+    let config = MailboxConfig::builder()
+        .event_buffer_size(1_000)
+        .event_cache_size(1_000)
+        .backfill_page_size(1_000)
+        .build()
+        .expect("Couldn't build MailboxConfig");
+
+    let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
+    let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
+
+    let mut listener_b = outbox_b.listen_persisted(None);
+
+    let mut op = outbox_a.begin_op().await?;
+    outbox_a
+        .publish_all_persisted(&mut op, (0..TOTAL).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = listener_b
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not catch up {TOTAL} events within 20s"))?;
+
+    assert_eq!(received.len(), TOTAL as usize);
+    for (i, event) in received.iter().enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+    }
+
+    Ok(())
+}
+
+/// The budget: a `post_commit` truncated to `broadcast_budget` events must
+/// still deliver every event — the remainder is the catch-up task's job,
+/// not a loss.
+#[tokio::test]
+#[file_serial]
+async fn truncated_post_commit_still_delivers_everything() -> anyhow::Result<()> {
+    const TOTAL: u64 = 5_000;
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(200)
+            .backfill_page_size(100)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..TOTAL).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = listener
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not deliver {TOTAL} events within 10s"))?;
+
+    assert_eq!(received.len(), TOTAL as usize);
+    for (i, event) in received.iter().enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+    }
+
+    // Independently confirm nothing is missing from persistent storage: a
+    // fresh listener from the very beginning must also see everything, in
+    // order — the backfill path, unaffected by this change.
+    let mut replay = outbox.listen_persisted(Some(EventSequence::BEGIN));
+    let replayed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = replay
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("replay from BEGIN did not see {TOTAL} events within 10s"))?;
+    assert_eq!(replayed.len(), TOTAL as usize);
+
+    Ok(())
+}
+
+/// Trim safety: a catch-up page delivered in order must be fully consumed
+/// by the contiguity walk (and broadcast) before the cache trim can evict
+/// it, even when the configured cache is much smaller than one page.
+#[tokio::test]
+#[file_serial]
+async fn catch_up_page_survives_a_cache_smaller_than_the_page() -> anyhow::Result<()> {
+    const TOTAL: u64 = 20_000;
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(1_000)
+            .event_cache_size(50)
+            .event_cache_trim_percent(50)
+            .backfill_page_size(500)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_all_persisted(&mut op, (0..TOTAL).map(TestEvent::Ping))
+        .await?;
+    op.commit().await?;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = listener
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not deliver {TOTAL} events within 20s"))?;
+
+    assert_eq!(received.len(), TOTAL as usize);
+    for (i, event) in received.iter().enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+    }
+
+    Ok(())
+}
+
+/// A bulk insert still in flight is a hole, not a catch-up loop: the
+/// catch-up's empty first read must hand over to the existing grace-gated
+/// stall path rather than spinning, and no placeholder may be written while
+/// the writer that owns the gap is still live.
+#[tokio::test]
+#[file_serial]
+async fn in_flight_bulk_insert_costs_one_probe_then_waits() -> anyhow::Result<()> {
+    const BURNED: u64 = 3_000;
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // A raw writer burns BURNED sequences and stays in flight.
+    let mut tx = pool.begin().await?;
+    for n in 0..BURNED {
+        sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+            .bind(format!(r#"{{"Ping": {n}}}"#))
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // …while sequence BURNED + 1 commits through the outbox, landing well
+    // past the catch-up threshold.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(BURNED))
+        .await?;
+    op.commit().await?;
+
+    // Nothing may be delivered while the writer holding the gap is live —
+    // neither a real event (contiguity-gated behind the gap) nor a
+    // placeholder (the gap is unproven while the writer runs).
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), listener.next())
+            .await
+            .is_err(),
+        "no delivery may occur while the in-flight writer still holds the gap"
+    );
+
+    // The writer commits for real: its rows are now visible, and the
+    // existing grace-gated stall path (or, if re-armed in time, the
+    // catch-up) drains them without ever needing an abandonment proof.
+    tx.commit().await?;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut events = Vec::with_capacity((BURNED + 1) as usize);
+        for _ in 0..=BURNED {
+            let event = listener
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not deliver the burned range after the writer committed"))?;
+
+    assert_eq!(received.len(), (BURNED + 1) as usize);
+    for (i, event) in received.iter().take(BURNED as usize).enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+        assert_eq!(u64::from(event.sequence), (i + 1) as u64);
+    }
+    let last = received.last().expect("checked len above");
+    assert_eq!(last.payload, Some(TestEvent::Ping(BURNED)));
+    assert_eq!(u64::from(last.sequence), BURNED + 1);
+
+    Ok(())
+}
