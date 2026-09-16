@@ -235,16 +235,6 @@ where
             Err(error) => Err((*error).clone()),
         }
     }
-
-    /// The insert lane's public stream item: the same two arms, each carrying
-    /// the sequence it occupies.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn into_insert_item(
-        self,
-    ) -> Result<EventDelivery<P, InsertOrder>, UndecodableDelivery<InsertOrder>> {
-        let sequence = self.sequence();
-        Delivery::new(sequence, true, self.into_item()).transpose()
-    }
 }
 
 /// Wrap a freshly loaded item into the internal delivery transport.
@@ -362,8 +352,22 @@ where
         self.inner
     }
 
-    pub(crate) fn boundary(&self) -> bool {
+    /// Whether a flush may land after this delivery without splitting a
+    /// unit. Total across lanes: the insert lane promises no atomic groups,
+    /// so every point is a legal flush point and this is always `true`; the
+    /// commit lane sets it on a group's last member. The public accessor
+    /// stays [`is_commit_boundary`](Delivery::is_commit_boundary), which
+    /// exists only where a reader could act on it.
+    pub(crate) fn is_boundary(&self) -> bool {
         self.boundary
+    }
+
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Delivery<L, U> {
+        Delivery {
+            position: self.position,
+            boundary: self.boundary,
+            inner: f(self.inner),
+        }
     }
 }
 
@@ -471,56 +475,50 @@ where
     }
 }
 
-/// Internal transport for the commit lane's fan-out and backfill, mirroring
-/// [`PersistentDelivery`] with the lane position attached.
-pub(crate) struct CommitDelivery<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    pub(crate) commit_sequence: CommitSequence,
-    pub(crate) commit_boundary: bool,
-    pub(crate) delivery: PersistentDelivery<P>,
-}
+/// What every lane's fan-out, backfill and in-memory window carry: the public
+/// [`Delivery`] shape wrapped around the payload carrier.
+///
+/// There is no third envelope type — the internal item *is* the public one,
+/// minus the `Result` transpose the listeners do at their yield boundary. On
+/// [`InsertOrder`] the position is the inner delivery's own sequence by
+/// construction, the same redundancy that lets code be written once over `L`.
+pub(crate) type Transport<L, P> = Delivery<L, PersistentDelivery<P>>;
 
-impl<P> CommitDelivery<P>
+impl<P> Transport<InsertOrder, P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    pub(crate) fn into_item(
-        self,
-    ) -> Result<EventDelivery<P, CommitOrder>, UndecodableDelivery<CommitOrder>> {
-        Delivery::new(
-            self.commit_sequence,
-            self.commit_boundary,
-            self.delivery.into_item(),
-        )
-        .transpose()
+    /// Position an insert-lane delivery from the sequence it already carries.
+    /// Every insert-lane delivery is its own flush boundary — the lane
+    /// promises no atomic groups.
+    pub(crate) fn insert(inner: PersistentDelivery<P>) -> Self {
+        Delivery::new(inner.sequence(), true, inner)
     }
 }
 
-impl<P> Clone for CommitDelivery<P>
+impl<L, P> Transport<L, P>
 where
+    L: Lane,
     P: Serialize + DeserializeOwned + Send,
 {
-    fn clone(&self) -> Self {
-        Self {
-            commit_sequence: self.commit_sequence,
-            commit_boundary: self.commit_boundary,
-            delivery: self.delivery.clone(),
-        }
+    /// The public stream item: the same position, with the `Result` moved to
+    /// the outside so both arms keep it.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn into_item(self) -> Result<EventDelivery<P, L>, UndecodableDelivery<L>> {
+        self.map(PersistentDelivery::into_item).transpose()
     }
 }
 
-impl<P> From<CommitLogRow<P>> for CommitDelivery<P>
+impl<P> From<CommitLogRow<P>> for Transport<CommitOrder, P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
     fn from(row: CommitLogRow<P>) -> Self {
-        Self {
-            commit_sequence: row.commit_sequence,
-            commit_boundary: row.commit_boundary,
-            delivery: PersistentDelivery::from(row.event),
-        }
+        Delivery::new(
+            row.commit_sequence,
+            row.commit_boundary,
+            PersistentDelivery::from(row.event),
+        )
     }
 }
 

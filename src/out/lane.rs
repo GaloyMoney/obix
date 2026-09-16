@@ -24,10 +24,16 @@
 //! handler on the insert lane.
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
+use std::sync::{
+    Arc,
+    atomic::{self, AtomicU64},
+};
 use std::time::Duration;
 
-use super::event::{EventDelivery, UndecodableDelivery};
+use super::event::{EventDelivery, Transport, UndecodableDelivery};
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
     StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
@@ -57,6 +63,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
         + Into<StreamPosition>
         + Send
         + Sync
+        + Unpin
         + 'static;
 
     /// The dynamic name of this lane, as stored state and read-outs report it.
@@ -83,6 +90,18 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
+
+    #[doc(hidden)]
+    fn begin() -> Self::Position;
+
+    #[doc(hidden)]
+    fn next(position: Self::Position) -> Self::Position;
+
+    #[doc(hidden)]
+    fn position_to_u64(position: Self::Position) -> u64;
+
+    #[doc(hidden)]
+    fn position_from_u64(value: u64) -> Self::Position;
 
     #[doc(hidden)]
     fn checkpoint(sequence: EventSequence, commit: Option<CommitSequence>) -> Self::Position;
@@ -155,6 +174,22 @@ impl Lane for InsertOrder {
         Ok(outbox.listen_persisted(Some(start_after)))
     }
 
+    fn begin() -> EventSequence {
+        EventSequence::BEGIN
+    }
+
+    fn next(position: EventSequence) -> EventSequence {
+        position.next()
+    }
+
+    fn position_to_u64(position: EventSequence) -> u64 {
+        u64::from(position)
+    }
+
+    fn position_from_u64(value: u64) -> EventSequence {
+        EventSequence::from(value)
+    }
+
     fn checkpoint(sequence: EventSequence, _commit: Option<CommitSequence>) -> EventSequence {
         sequence
     }
@@ -217,6 +252,22 @@ impl Lane for CommitOrder {
         outbox.listen_commit_ordered(Some(start_after))
     }
 
+    fn begin() -> CommitSequence {
+        CommitSequence::BEGIN
+    }
+
+    fn next(position: CommitSequence) -> CommitSequence {
+        position.next()
+    }
+
+    fn position_to_u64(position: CommitSequence) -> u64 {
+        u64::from(position)
+    }
+
+    fn position_from_u64(value: u64) -> CommitSequence {
+        CommitSequence::from(value)
+    }
+
     fn checkpoint(_sequence: EventSequence, commit: Option<CommitSequence>) -> CommitSequence {
         commit.unwrap_or_default()
     }
@@ -249,6 +300,70 @@ impl Lane for CommitOrder {
         Tables: MailboxTables,
     {
         await_caught_up_commit_lane(subscription, timeout)
+    }
+}
+
+/// What a listener needs from whichever source produces its lane: the head,
+/// the live fan-out, and a way to ask for what it missed.
+///
+/// The two sources differ only in how a position is *assigned* — Postgres
+/// allocates the insert position inside the writer's transaction, the
+/// sequencer assigns the commit position at read time by a CAS append — and
+/// that difference lives entirely on the producing side. Everything from
+/// "a stream of positioned deliveries, a head, and a backfill channel"
+/// downwards is lane-agnostic, so the lane type reaches exactly this far.
+pub(crate) struct LaneHandle<L, P>
+where
+    L: Lane,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    head: Arc<AtomicU64>,
+    receiver: Option<broadcast::Receiver<Transport<L, P>>>,
+    backfill_request: BackfillRequests<L, P>,
+    backfill_buffer_size: usize,
+}
+
+/// A listener's "serve me everything after this position" channel: the
+/// cursor it is stuck at, and where to deliver the range.
+pub(crate) type BackfillRequests<L, P> =
+    mpsc::UnboundedSender<(<L as Lane>::Position, mpsc::Sender<Transport<L, P>>)>;
+
+impl<L, P> LaneHandle<L, P>
+where
+    L: Lane,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pub(crate) fn new(
+        head: Arc<AtomicU64>,
+        receiver: broadcast::Receiver<Transport<L, P>>,
+        backfill_request: BackfillRequests<L, P>,
+        backfill_buffer_size: usize,
+    ) -> Self {
+        Self {
+            head,
+            receiver: Some(receiver),
+            backfill_request,
+            backfill_buffer_size,
+        }
+    }
+
+    /// The highest position this source has handed out.
+    pub(crate) fn head(&self) -> L::Position {
+        L::position_from_u64(self.head.load(atomic::Ordering::Relaxed))
+    }
+
+    /// Take the live fan-out. Once per handle — a listener owns its receiver.
+    pub(crate) fn event_stream(&mut self) -> BroadcastStream<Transport<L, P>> {
+        BroadcastStream::new(self.receiver.take().expect("receiver already taken"))
+    }
+
+    pub(crate) fn request_backfill(
+        &self,
+        start_after: L::Position,
+    ) -> ReceiverStream<Transport<L, P>> {
+        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
+        let _ = self.backfill_request.send((start_after, tx));
+        ReceiverStream::new(rx)
     }
 }
 

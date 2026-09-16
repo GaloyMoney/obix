@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::{
     config::MailboxConfig,
     handle::{OwnedTaskHandle, spawn_supervised},
-    out::event::PersistentDelivery,
+    out::event::{PersistentDelivery, Transport},
+    out::lane::InsertOrder,
     sequence::EventSequence,
     tables::{MailboxTables, PersistentEventRows},
 };
@@ -88,7 +89,7 @@ impl GapFiller {
         pool: &sqlx::PgPool,
         requests: mpsc::UnboundedReceiver<GapFillRequest>,
         tx: mpsc::UnboundedSender<GapFillRequest>,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+        cache_fill_sender: broadcast::Sender<Transport<InsertOrder, P>>,
         notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
         config: &MailboxConfig,
     ) -> Self
@@ -146,7 +147,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+    cache_fill_sender: broadcast::Sender<Transport<InsertOrder, P>>,
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     grace: std::time::Duration,
     batch_limit: usize,
@@ -395,7 +396,7 @@ where
         page_span.record("rows", events.len());
         let mut present = std::collections::HashSet::new();
         for item in events {
-            let delivery = PersistentDelivery::from(item);
+            let delivery = Transport::insert(PersistentDelivery::from(item));
             present.insert(u64::from(delivery.sequence()));
             let _ = self.cache_fill_sender.send(delivery);
         }
@@ -522,7 +523,7 @@ where
                     stall_batch.iter().map(|s| u64::from(*s)).collect();
                 let mut stall_range: Option<(EventSequence, EventSequence)> = None;
                 for item in placeholders {
-                    let delivery = PersistentDelivery::from(item);
+                    let delivery = Transport::insert(PersistentDelivery::from(item));
                     let sequence = delivery.sequence();
                     if stall_set.contains(&u64::from(sequence)) {
                         stall_range = Some(match stall_range {
@@ -558,7 +559,7 @@ where
 /// parked backfills) and report their `(min, max)` range to the debounced
 /// notifier so other processes resume reactively.
 fn deliver_and_notify<P>(
-    cache_fill_sender: &broadcast::Sender<PersistentDelivery<P>>,
+    cache_fill_sender: &broadcast::Sender<Transport<InsertOrder, P>>,
     notifier_tx: &mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     rows: PersistentEventRows<P>,
 ) where
@@ -566,7 +567,7 @@ fn deliver_and_notify<P>(
 {
     let mut range: Option<(EventSequence, EventSequence)> = None;
     for item in rows {
-        let delivery = PersistentDelivery::from(item);
+        let delivery = Transport::insert(PersistentDelivery::from(item));
         let sequence = delivery.sequence();
         range = Some(match range {
             Some((lo, hi)) => (lo.min(sequence), hi.max(sequence)),

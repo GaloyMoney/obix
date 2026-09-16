@@ -458,7 +458,7 @@ where
         start_after: impl Into<Option<CommitSequence>>,
     ) -> Result<CommitOrderedListener<P>, CommitLaneDisabled> {
         Ok(CommitOrderedListener::new(
-            self.commit_lane()?.lane(),
+            self.commit_lane()?.handle(),
             start_after,
             self.event_buffer_size,
         ))

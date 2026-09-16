@@ -1,7 +1,6 @@
 use futures::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{
@@ -14,6 +13,7 @@ use super::listener::PersistentOutboxListener;
 use crate::{
     handle::{OwnedTaskHandle, spawn_supervised},
     out::event::*,
+    out::lane::{CommitOrder, InsertOrder, LaneHandle},
     sequence::{CommitGroupId, CommitSequence, EventSequence},
     tables::{CommitGroupAppend, MailboxTables},
 };
@@ -48,12 +48,17 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     commit_head: Arc<AtomicU64>,
-    commit_sender: broadcast::Sender<CommitDelivery<P>>,
-    backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitDelivery<P>>)>,
+    commit_sender: broadcast::Sender<CommitTransport<P>>,
+    backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitTransport<P>>)>,
     backfill_buffer_size: usize,
     positions: SequencerPositions,
     _task: OwnedTaskHandle,
 }
+
+/// The commit lane's internal transport: a [`PersistentDelivery`] positioned
+/// at the slot the sequencer placed it in, and flagged when it closes its
+/// source transaction.
+type CommitTransport<P> = Transport<CommitOrder, P>;
 
 impl<P> std::fmt::Debug for SequencerHandle<P>
 where
@@ -74,51 +79,16 @@ where
         self.positions.clone()
     }
 
-    pub(crate) fn lane(&self) -> CommitLaneHandle<P> {
-        CommitLaneHandle {
-            commit_head: self.commit_head.clone(),
-            commit_event_receiver: Some(self.commit_sender.subscribe()),
-            backfill_request: self.backfill_request.clone(),
-            backfill_buffer_size: self.backfill_buffer_size,
-        }
-    }
-}
-
-/// What a [`CommitOrderedListener`](super::CommitOrderedListener) needs from
-/// the commit lane.
-pub struct CommitLaneHandle<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    commit_head: Arc<AtomicU64>,
-    commit_event_receiver: Option<broadcast::Receiver<CommitDelivery<P>>>,
-    backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitDelivery<P>>)>,
-    backfill_buffer_size: usize,
-}
-
-impl<P> CommitLaneHandle<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    pub fn head(&self) -> CommitSequence {
-        CommitSequence::from(self.commit_head.load(Ordering::Relaxed))
-    }
-
-    pub fn commit_event_stream(&mut self) -> BroadcastStream<CommitDelivery<P>> {
-        BroadcastStream::new(
-            self.commit_event_receiver
-                .take()
-                .expect("receiver already taken"),
+    /// What a commit-ordered listener consumes: the same
+    /// [`LaneHandle`](crate::out::lane::LaneHandle) shape the insert cache
+    /// hands out, over this lane's positions.
+    pub(crate) fn handle(&self) -> LaneHandle<CommitOrder, P> {
+        LaneHandle::new(
+            self.commit_head.clone(),
+            self.commit_sender.subscribe(),
+            self.backfill_request.clone(),
+            self.backfill_buffer_size,
         )
-    }
-
-    pub fn request_commit_backfill(
-        &self,
-        start_after: CommitSequence,
-    ) -> ReceiverStream<CommitDelivery<P>> {
-        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
-        let _ = self.backfill_request.send((start_after, tx));
-        ReceiverStream::new(rx)
     }
 }
 
@@ -140,7 +110,7 @@ where
     head: CommitSequence,
     commit_head: Arc<AtomicU64>,
     fold_position: Arc<AtomicU64>,
-    commit_sender: broadcast::Sender<CommitDelivery<P>>,
+    commit_sender: broadcast::Sender<CommitTransport<P>>,
     /// Groups appended but whose later members the fold has not reached yet,
     /// mapped to their highest member. Dropped as the stream passes them.
     seen: HashMap<CommitGroupId, EventSequence>,
@@ -159,7 +129,7 @@ where
     Tables: MailboxTables,
 {
     /// Fold one insert-lane delivery.
-    async fn fold(&mut self, delivery: PersistentDelivery<P>) {
+    async fn fold(&mut self, delivery: Transport<InsertOrder, P>) {
         let sequence = delivery.sequence();
         // INVARIANT: published before every branch below, including the
         // skips — fold_position must advance on placeholders and on
@@ -190,8 +160,8 @@ where
             return;
         }
         for row in append.appended {
-            let delivery = CommitDelivery::from(row);
-            self.head = self.head.max(delivery.commit_sequence);
+            let delivery = CommitTransport::from(row);
+            self.head = self.head.max(delivery.position());
             let _ = self.commit_sender.send(delivery);
         }
         self.commit_head
@@ -236,8 +206,8 @@ where
             }
             let returned = rows.len();
             for row in rows {
-                let delivery = CommitDelivery::from(row);
-                self.head = self.head.max(delivery.commit_sequence);
+                let delivery = CommitTransport::from(row);
+                self.head = self.head.max(delivery.position());
                 let _ = self.commit_sender.send(delivery);
             }
             self.commit_head
@@ -258,7 +228,7 @@ async fn serve_commit_backfill<P, Tables>(
     pool: sqlx::PgPool,
     page: usize,
     mut after: CommitSequence,
-    sender: mpsc::Sender<CommitDelivery<P>>,
+    sender: mpsc::Sender<CommitTransport<P>>,
 ) where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
@@ -281,8 +251,8 @@ async fn serve_commit_backfill<P, Tables>(
         }
         let returned = rows.len();
         for row in rows {
-            let delivery = CommitDelivery::from(row);
-            after = after.max(delivery.commit_sequence);
+            let delivery = CommitTransport::from(row);
+            after = after.max(delivery.position());
             if sender.send(delivery).await.is_err() {
                 return;
             }
@@ -329,8 +299,11 @@ where
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
     let backfill_pool = pool.clone();
 
-    let mut listener =
-        PersistentOutboxListener::deliveries(cache, Some(restart.logged_through), buffer_size);
+    let mut listener = PersistentOutboxListener::transport_stream(
+        cache,
+        Some(restart.logged_through),
+        buffer_size,
+    );
     let mut sequencer = Sequencer::<P, Tables> {
         pool: pool.clone(),
         page,

@@ -728,7 +728,7 @@ where
                 .outcome;
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
-            in_group = !event.boundary();
+            in_group = !event.is_boundary();
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {
