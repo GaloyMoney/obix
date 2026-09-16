@@ -54,7 +54,8 @@ use es_entity::AtomicOperation as _;
 
 use crate::out::StreamSelection;
 use crate::out::ctx::{EventCtx, FlushOp, Handled};
-use crate::out::event::PersistentOutboxEvent;
+use crate::out::event::{EventDelivery, PersistentOutboxEvent};
+use crate::out::lane::InsertOrder;
 use crate::out::subscription::singleton::SingletonSubscriber;
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
@@ -225,7 +226,7 @@ where
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Arc<PersistentOutboxEvent<P>>,
+        event: &EventDelivery<P>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         // Scoped so the guard cannot be held across the return: classifying
         // is synchronous by `SubscriptionDef`'s contract, and a lock guard
@@ -264,7 +265,7 @@ where
 
     async fn flush(
         &self,
-        op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let WakeBatch {
@@ -398,7 +399,7 @@ where
 
     async fn spawn_all(
         &self,
-        op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, InsertOrder>,
         route: &Arc<dyn WakeRoute<P>>,
         keys: Vec<(String, bool)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

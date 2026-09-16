@@ -20,9 +20,10 @@ mod tables;
 pub mod test_utils;
 
 pub use config::{
-    DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_GAP_FILL_GRACE, DEFAULT_IDLE_RESYNC_INTERVAL,
-    DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
-    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
+    CommitLane, CommitLaneDisabled, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_GAP_FILL_GRACE,
+    DEFAULT_IDLE_RESYNC_INTERVAL, DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL,
+    DEFAULT_PARTITION_PREMAKE, DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE,
+    MailboxConfig,
 };
 
 pub use inbox::{
@@ -31,12 +32,13 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    CommitOrderedEnvelope, CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled,
-    IsolatedOp, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Ordering, Outbox,
-    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
-    SingletonSubscriber, StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
+    CommitOrder, CursorError, DecodeFailure, Delivery, EventCtx, EventDelivery, FlushError,
+    FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx, KeyedSubscriber,
+    KeyedSubscriberConfig, Lane, OpCursor, Ordering, Outbox, OutboxEventJobConfig,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
+    StreamPosition, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
     SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
-    UndecodableEventError, WakeKey, WakeKeys,
+    UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;

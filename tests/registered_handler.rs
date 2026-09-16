@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obix::{
-    EventCtx, EventSequence, FlushOp, Handled, MailboxConfig, OutboxEventJobConfig,
-    SingletonSubscriber, Subscription, SubscriptionError, SubscriptionSnapshot,
+    EventCtx, EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, OutboxEventJobConfig,
+    SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot,
     SubscriptionStreamStatus, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl SingletonSubscriber<TestEvent> for SkippingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -64,7 +64,7 @@ impl SingletonSubscriber<TestEvent> for PoisonHandler {
     async fn handle_persistent<'inv>(
         &self,
         _ctx: EventCtx<'inv>,
-        _event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        _event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         Err(POISON_ERROR.into())
     }
@@ -85,7 +85,7 @@ impl SingletonSubscriber<TestEvent> for RepublishingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<u64>>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         match &event.payload {
             Some(TestEvent::Ping(n)) => {
@@ -98,7 +98,7 @@ impl SingletonSubscriber<TestEvent> for RepublishingHandler {
 
     async fn flush(
         &self,
-        op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, InsertOrder>,
         items: Vec<u64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for n in items {
@@ -240,8 +240,8 @@ async fn checkpoint_reads_begin_before_the_handler_runs() -> anyhow::Result<()> 
     assert_eq!(
         snapshot.stream_status(),
         SubscriptionStreamStatus {
-            checkpoint: EventSequence::BEGIN,
-            frontier: EventSequence::from(3u64),
+            checkpoint: StreamPosition::Insert(EventSequence::BEGIN),
+            frontier: StreamPosition::Insert(EventSequence::from(3u64)),
         }
     );
 
@@ -503,7 +503,7 @@ async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<(
     // backlogged handler — so the diagnosis has to come from the snapshot.
     match handle.await_caught_up(Duration::from_millis(200)).await {
         Err(SubscriptionError::CaughtUpTimeout { checkpoint, .. }) => {
-            assert_eq!(checkpoint, EventSequence::BEGIN);
+            assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }
@@ -512,11 +512,11 @@ async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<(
     Ok(())
 }
 
-/// Contract 9 — `await_sequence` fences on a caller-chosen target, and
+/// Contract 9 — `await_position` fences on a caller-chosen target, and
 /// `await_caught_up` is its special case over the call-time frontier.
 #[tokio::test]
 #[file_serial]
-async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()> {
+async fn await_position_fences_on_a_caller_chosen_target() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool).await?;
@@ -535,26 +535,26 @@ async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()>
 
     let target = EventSequence::from(3u64);
     handle
-        .await_sequence(target, Duration::from_secs(60))
+        .await_position(target, Duration::from_secs(60))
         .await?;
     assert!(handle.load().await?.checkpoint() >= target);
 
     // A target the stream has not reached is not an error — it is simply a
     // wait the handler cannot satisfy yet, and it times out honestly.
     let beyond = EventSequence::from(999u64);
-    match handle.await_sequence(beyond, Duration::ZERO).await {
+    match handle.await_position(beyond, Duration::ZERO).await {
         Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
-            assert_eq!(target, beyond);
-            assert!(checkpoint < beyond);
+            assert_eq!(target, StreamPosition::Insert(beyond));
+            assert!(checkpoint < StreamPosition::Insert(beyond));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }
 
     // Already-satisfied targets return without waiting.
     handle
-        .await_sequence(EventSequence::BEGIN, Duration::ZERO)
+        .await_position(EventSequence::BEGIN, Duration::ZERO)
         .await?;
 
     Ok(())
@@ -585,9 +585,9 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
         Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
-            assert_eq!(checkpoint, EventSequence::BEGIN);
+            assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
             // `await_caught_up`'s target is the call-time frontier.
-            assert_eq!(target, EventSequence::from(3u64));
+            assert_eq!(target, StreamPosition::Insert(EventSequence::from(3u64)));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }

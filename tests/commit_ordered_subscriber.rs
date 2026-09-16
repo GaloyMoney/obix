@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obix::{
-    EventCtx, FlushOp, Handled, MailboxConfig, Ordering, OutboxEventJobConfig, SingletonSubscriber,
-    out::Outbox,
+    CommitLane, CommitOrder, CommitSequence, EventCtx, EventDelivery, FlushOp, Handled,
+    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, UndecodableDelivery, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -25,18 +25,28 @@ enum TestEvent {
 
 /// Collects every event and records each flush as the group of payloads it
 /// landed, so a test can assert on batch composition rather than just on
-/// delivery.
+/// delivery — plus the commit position each flush reported.
 struct FlushRecorder {
     flushes: Arc<Mutex<Vec<Vec<u64>>>>,
+    flush_positions: Arc<Mutex<Vec<CommitSequence>>>,
 }
 
-impl SingletonSubscriber<TestEvent> for FlushRecorder {
+impl FlushRecorder {
+    fn new(flushes: Arc<Mutex<Vec<Vec<u64>>>>) -> Self {
+        Self {
+            flushes,
+            flush_positions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl SingletonSubscriber<TestEvent, CommitOrder> for FlushRecorder {
     type Batch = Vec<u64>;
 
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<u64>>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         match &event.payload {
             Some(TestEvent::Ping(n)) => {
@@ -49,10 +59,11 @@ impl SingletonSubscriber<TestEvent> for FlushRecorder {
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, CommitOrder>,
         items: Vec<u64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !items.is_empty() {
+            self.flush_positions.lock().await.push(op.position());
             self.flushes.lock().await.push(items);
         }
         Ok(())
@@ -73,6 +84,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     Ok(Outbox::<TestEvent, TestTables>::init(
         pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -127,12 +139,8 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
-                .ordering(Ordering::Commit)
-                .with_max_batch_size(2),
-            FlushRecorder {
-                flushes: flushes.clone(),
-            },
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).with_max_batch_size(2),
+            FlushRecorder::new(flushes.clone()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -190,10 +198,8 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
         outbox
             .register_singleton_subscriber(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
-                FlushRecorder {
-                    flushes: first.clone(),
-                },
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+                FlushRecorder::new(first.clone()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -217,10 +223,8 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
-            FlushRecorder {
-                flushes: second.clone(),
-            },
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+            FlushRecorder::new(second.clone()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -246,15 +250,18 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
 struct UndecodableAcker {
     seen: Arc<Mutex<Vec<u64>>>,
     undecodable: Arc<Mutex<usize>>,
+    /// The commit position each undecodable delivery reported — the slot it
+    /// occupies on the lane, which the insert-lane `sequence` is not.
+    undecodable_at: Arc<Mutex<Vec<CommitSequence>>>,
 }
 
-impl SingletonSubscriber<TestEvent> for UndecodableAcker {
+impl SingletonSubscriber<TestEvent, CommitOrder> for UndecodableAcker {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, ()>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.seen.lock().await.push(*n);
@@ -264,8 +271,9 @@ impl SingletonSubscriber<TestEvent> for UndecodableAcker {
 
     async fn handle_undecodable(
         &self,
-        _error: &obix::UndecodableEventError,
+        error: &UndecodableDelivery<CommitOrder>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.undecodable_at.lock().await.push(error.position());
         *self.undecodable.lock().await += 1;
         Ok(())
     }
@@ -294,15 +302,17 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
     .await?;
 
     let undecodable = Arc::new(Mutex::new(0usize));
+    let undecodable_at = Arc::new(Mutex::new(Vec::new()));
     {
         let mut jobs = init_jobs(&pool).await?;
         outbox
             .register_singleton_subscriber(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 UndecodableAcker {
                     seen: Arc::new(Mutex::new(Vec::new())),
                     undecodable: undecodable.clone(),
+                    undecodable_at: undecodable_at.clone(),
                 },
             )
             .await
@@ -317,6 +327,14 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
         let _ = jobs.shutdown().await;
     }
 
+    // The delivery carried its commit position, not its insert sequence: the
+    // lone event occupies commit slot 1.
+    assert_eq!(
+        *undecodable_at.lock().await,
+        vec![CommitSequence::from(1u64)],
+        "an undecodable delivery must report the position it occupies on its lane",
+    );
+
     // A fresh run against the stored checkpoint must not see it again.
     let after_restart = Arc::new(Mutex::new(0usize));
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -324,10 +342,11 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             UndecodableAcker {
                 seen: seen.clone(),
                 undecodable: after_restart.clone(),
+                undecodable_at: Arc::new(Mutex::new(Vec::new())),
             },
         )
         .await

@@ -11,8 +11,9 @@ mod helpers;
 use std::sync::Arc;
 
 use obix::{
-    EventCtx, FlushOp, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
-    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, SubscriptionDef, WakeKey,
+    EventCtx, EventDelivery, FlushOp, Handled, InsertOrder, KeyedEventCtx, KeyedSubscriber,
+    KeyedSubscriberConfig, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber,
+    SubscriptionDef, WakeKey,
     out::{Outbox, OutboxEventMarker, PersistentOutboxEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -93,15 +94,20 @@ impl SingletonSubscriber<NonCloneEvent> for RetainingSubscriber {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Retained,
+        event: &EventDelivery<NonCloneEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        self.observed.handled.lock().await.push(identity(event));
-        Ok(ctx.collect(Arc::clone(event)))
+        assert_eq!(event.position(), event.sequence);
+        self.observed
+            .handled
+            .lock()
+            .await
+            .push(identity(event.inner()));
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed.record_flush(items).await;
@@ -109,8 +115,8 @@ impl SingletonSubscriber<NonCloneEvent> for RetainingSubscriber {
     }
 }
 
-/// Reads the event through the `Arc` without retaining it — the deref path
-/// every existing handler body takes unchanged.
+/// Reads the event through the delivery without retaining it — the deref path
+/// every existing handler body takes unchanged, now through two hops.
 struct EphemeralReader {
     received: Arc<Mutex<Vec<u64>>>,
 }
@@ -147,9 +153,9 @@ enum ClassifiedEvent {
 
 type ClassifiedRetained = Arc<PersistentOutboxEvent<ClassifiedEvent>>;
 
-/// Classifies through the `Arc` (`event.as_event::<PingPayload>()`) and
-/// retains the same `Arc` in the batch, in the same `handle_persistent`
-/// body.
+/// Classifies through the delivery (`event.as_event::<PingPayload>()`, which
+/// must keep resolving through `Delivery` → `Arc` → event) and retains the
+/// same `Arc` in the batch, in the same `handle_persistent` body.
 struct ClassifyingSubscriber {
     /// `n` of every `Ping` the handler classified and retained.
     classified: Arc<Mutex<Vec<u64>>>,
@@ -161,18 +167,18 @@ impl SingletonSubscriber<ClassifiedEvent> for ClassifyingSubscriber {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &ClassifiedRetained,
+        event: &EventDelivery<ClassifiedEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(ping) = event.as_event::<PingPayload>() else {
             return Ok(ctx.skip());
         };
         self.classified.lock().await.push(ping.n);
-        Ok(ctx.collect(Arc::clone(event)))
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for event in items {
@@ -240,15 +246,19 @@ impl KeyedSubscriber<NonCloneEvent> for RetainingKeyedSubscriber {
     async fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,
-        event: &Retained,
+        event: &EventDelivery<NonCloneEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        self.observed.handled.lock().await.push(identity(event));
-        Ok(ctx.collect(Arc::clone(event)))
+        self.observed
+            .handled
+            .lock()
+            .await
+            .push(identity(event.inner()));
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed.record_flush(items).await;

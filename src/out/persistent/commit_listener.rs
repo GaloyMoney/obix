@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, pin::Pin, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::sequencer::CommitLaneHandle;
-use crate::out::event::{CommitDelivery, CommitOrderedEnvelope};
+use crate::out::event::{CommitDelivery, EventDelivery, UndecodableDelivery};
+use crate::out::lane::CommitOrder;
 use crate::sequence::CommitSequence;
 
 /// Delivers events in commit order: a source transaction's events arrive
@@ -72,7 +73,10 @@ impl<P> Stream for CommitOrderedListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    type Item = CommitOrderedEnvelope<P>;
+    /// The same two arms the insert lane yields, positioned in commit order:
+    /// `try_next()?` fails on an undecodable payload identically on both
+    /// lanes, and the error carries the commit position it occupied.
+    type Item = Result<EventDelivery<P, CommitOrder>, UndecodableDelivery<CommitOrder>>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,

@@ -67,6 +67,7 @@ use std::marker::PhantomData;
 
 use job::CurrentJob;
 
+use crate::out::lane::{InsertOrder, Lane};
 use crate::sequence::{CommitSequence, EventSequence};
 
 /// Error type shared with the handler trait methods.
@@ -385,31 +386,61 @@ pub(crate) type BoxFuture<'a, T> =
 /// entry fence) to the handler's typed
 /// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
 /// [`EventCtx`] only needs to know the accumulator `B`.
+///
+/// The whole [`OutboxEventJobState`] is passed rather than a position because
+/// the lane is the *handler*'s, not the ctx's: the erased implementor knows
+/// its `L` and reads the cursor `L` checkpoints, which is what keeps
+/// [`EventCtx`] free of a lane parameter.
 pub(crate) trait ItemFlush<B>: Send + Sync {
     fn flush_items<'a>(
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: B,
+        state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
 }
 
 /// Restricted view of the batch op handed to
 /// [`flush`](super::SingletonSubscriber::flush) — everything an
-/// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else.
+/// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else —
+/// plus the lane position this batch lands at.
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the
 /// checkpoint is written and the transaction commits — items, work and
 /// pointer land atomically. There is no access to the raw
 /// [`es_entity::DbOp`], mirroring [`IsolatedOp`]'s sealing.
-pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
+pub struct FlushOp<'a, L = InsertOrder>
+where
+    L: Lane,
+{
+    op: &'a mut es_entity::DbOp<'static>,
+    position: L::Position,
+}
 
-impl<'a> FlushOp<'a> {
-    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>) -> Self {
-        Self(op)
+impl<'a, L> FlushOp<'a, L>
+where
+    L: Lane,
+{
+    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>, position: L::Position) -> Self {
+        Self { op, position }
+    }
+
+    /// Where this batch lands: the position of the last *fully handled*
+    /// event on this lane.
+    ///
+    /// Every event at or below it has been collected or skipped, so it is the
+    /// exact watermark for the batch — and it is the checkpoint this very
+    /// transaction is about to commit. Folding `max` over the flushed items
+    /// instead understates it whenever the batch ended on skipped events.
+    ///
+    /// On [`CommitOrder`](crate::out::CommitOrder) this is a group boundary
+    /// unless a handler entered [`consume`](EventCtx::consume) mid-group.
+    pub fn position(&self) -> L::Position {
+        self.position
     }
 }
 
-es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
+es_entity::delegate_atomic_operation!([<L: Lane>] FlushOp<'_, L>, { s => s.op });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
@@ -487,8 +518,9 @@ pub(crate) async fn flush_batch<B: Default>(
         // leaks stale state into a retry.
         let items = std::mem::take(batch);
         parts.tracker.collected = 0;
+        let state = &*parts.state;
         let op = parts.op_slot.as_mut().expect("op was materialized above");
-        if let Err(source) = flusher.flush_items(op, items).await {
+        if let Err(source) = flusher.flush_items(op, items, state).await {
             return Err(Box::new(FlushError {
                 reason,
                 after: parts.tracker.persisted_insert_seq,

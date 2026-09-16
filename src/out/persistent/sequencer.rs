@@ -21,6 +21,26 @@ use crate::{
 /// How long a failed append waits before retrying the same group.
 const APPEND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How far this process's sequencer has folded the insert-ordered stream.
+///
+/// Distinct from `persistent_outbox_commit_log_state.logged_through_sequence`,
+/// which advances only when a group is *appended*: this advances over every
+/// delivery the fold has seen, placeholders and already-logged members
+/// included, which is what the commit lane's caught-up barrier needs to know.
+#[derive(Clone)]
+pub(crate) struct SequencerPositions {
+    fold_position: Arc<AtomicU64>,
+}
+
+impl SequencerPositions {
+    /// The highest insert sequence this process's fold has passed. Every
+    /// sequence at or below it has been placed into the commit log (with its
+    /// whole group) or skipped.
+    pub(crate) fn fold_position(&self) -> EventSequence {
+        EventSequence::from(self.fold_position.load(Ordering::Acquire))
+    }
+}
+
 /// What a commit-ordered listener needs from the sequencer: the lane's
 /// fan-out and its head.
 pub(crate) struct SequencerHandle<P>
@@ -31,6 +51,7 @@ where
     commit_sender: broadcast::Sender<CommitDelivery<P>>,
     backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitDelivery<P>>)>,
     backfill_buffer_size: usize,
+    positions: SequencerPositions,
     _task: OwnedTaskHandle,
 }
 
@@ -49,6 +70,10 @@ impl<P> SequencerHandle<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    pub(crate) fn positions(&self) -> SequencerPositions {
+        self.positions.clone()
+    }
+
     pub(crate) fn lane(&self) -> CommitLaneHandle<P> {
         CommitLaneHandle {
             commit_head: self.commit_head.clone(),
@@ -114,6 +139,7 @@ where
     page: usize,
     head: CommitSequence,
     commit_head: Arc<AtomicU64>,
+    fold_position: Arc<AtomicU64>,
     commit_sender: broadcast::Sender<CommitDelivery<P>>,
     /// Groups appended but whose later members the fold has not reached yet,
     /// mapped to their highest member. Dropped as the stream passes them.
@@ -135,6 +161,12 @@ where
     /// Fold one insert-lane delivery.
     async fn fold(&mut self, delivery: PersistentDelivery<P>) {
         let sequence = delivery.sequence();
+        // INVARIANT: published before every branch below, including the
+        // skips — fold_position must advance on placeholders and on
+        // already-logged members too, or the commit-lane fence stalls on an
+        // aborted tail.
+        self.fold_position
+            .store(u64::from(sequence), Ordering::Release);
         if self.logged_ahead.remove(&sequence) {
             return;
         }
@@ -261,9 +293,16 @@ async fn serve_commit_backfill<P, Tables>(
     }
 }
 
-/// Start this process's sequencer. Always called from `Outbox::init`: a
-/// process with no commit-ordered listener still folds and still appends,
-/// so the log never lags a live process.
+/// Start this process's sequencer. Called from `Outbox::init` when the commit
+/// lane is [`Enabled`](crate::CommitLane::Enabled): a process with no
+/// commit-ordered listener still folds and still appends, so the log never
+/// lags a live process.
+///
+/// The fold resumes from `logged_through_sequence`, which is `0` on a
+/// database where the lane has never run — so enabling the lane late is the
+/// same code path as a restart after downtime, only longer. Placement is a
+/// pure function of the persisted table, so the log it produces is the one a
+/// sequencer running from day one would have produced.
 pub(crate) async fn spawn<P, Tables>(
     pool: &sqlx::PgPool,
     cache: CacheHandle<P>,
@@ -277,9 +316,16 @@ where
     let page = page.max(1);
     let restart = Tables::commit_log_restart_state(pool).await?;
     let logged_ahead: BTreeSet<EventSequence> = restart.logged_ahead.into_iter().collect();
+    let frontier = Tables::highest_known_persistent_sequence(pool).await?;
+    record_started(
+        u64::from(restart.logged_through),
+        u64::from(frontier),
+        u64::from(frontier).saturating_sub(u64::from(restart.logged_through)),
+    );
 
     let (commit_sender, _) = broadcast::channel(buffer_size);
     let commit_head = Arc::new(AtomicU64::new(u64::from(restart.last_commit_seq)));
+    let fold_position = Arc::new(AtomicU64::new(u64::from(restart.logged_through)));
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
     let backfill_pool = pool.clone();
 
@@ -290,6 +336,7 @@ where
         page,
         head: restart.last_commit_seq,
         commit_head: commit_head.clone(),
+        fold_position: fold_position.clone(),
         commit_sender: commit_sender.clone(),
         seen: HashMap::new(),
         logged_ahead,
@@ -337,9 +384,21 @@ where
         commit_sender,
         backfill_request,
         backfill_buffer_size: page,
+        positions: SequencerPositions { fold_position },
         _task: OwnedTaskHandle::new(task),
     })
 }
+
+/// Where the fold is resuming from and how far it has to go — so that
+/// enabling the commit lane on a database with history is visible as a
+/// backfill in the logs rather than as unexplained load.
+#[tracing::instrument(
+    name = "obix.sequencer.started",
+    level = "info",
+    skip_all,
+    fields(logged_through = logged_through, insert_frontier = insert_frontier, behind = behind),
+)]
+fn record_started(logged_through: u64, insert_frontier: u64, behind: u64) {}
 
 #[tracing::instrument(
     name = "obix.sequencer.append_failed",

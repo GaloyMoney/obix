@@ -32,7 +32,7 @@ impl SingletonSubscriber<TestEvent> for SkippingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -79,7 +79,7 @@ impl SingletonSubscriber<TestEvent> for AckingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -89,9 +89,9 @@ impl SingletonSubscriber<TestEvent> for AckingObserver {
 
     async fn handle_undecodable(
         &self,
-        error: &obix::UndecodableEventError,
+        error: &obix::UndecodableDelivery,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.acked.lock().await.push(u64::from(error.sequence));
+        self.acked.lock().await.push(u64::from(error.position()));
         Ok(())
     }
 }
@@ -107,7 +107,7 @@ impl SingletonSubscriber<TestEvent> for CheckpointingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -145,7 +145,7 @@ impl SingletonSubscriber<TestEvent> for TestBothHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -195,7 +195,7 @@ impl SingletonSubscriber<TestEvent> for CollectingEffectHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -210,7 +210,7 @@ impl SingletonSubscriber<TestEvent> for CollectingEffectHandler {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use es_entity::AtomicOperation;
@@ -242,7 +242,7 @@ impl SingletonSubscriber<TestEvent> for SlowCollectingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -253,7 +253,7 @@ impl SingletonSubscriber<TestEvent> for SlowCollectingHandler {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for n in items {
@@ -294,7 +294,7 @@ impl SingletonSubscriber<TestEvent> for CollectingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<i64>>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -305,7 +305,7 @@ impl SingletonSubscriber<TestEvent> for CollectingHandler {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Vec<i64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use es_entity::AtomicOperation;
@@ -338,7 +338,7 @@ impl SingletonSubscriber<TestEvent> for CoalescingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -350,7 +350,7 @@ impl SingletonSubscriber<TestEvent> for CoalescingHandler {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_sizes.lock().await.push(items.len());
@@ -376,7 +376,7 @@ impl SingletonSubscriber<TestEvent> for CollectThenIsolateHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<i64>>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -397,7 +397,7 @@ impl SingletonSubscriber<TestEvent> for CollectThenIsolateHandler {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Vec<i64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for n in items {
@@ -421,7 +421,7 @@ impl SingletonSubscriber<TestEvent> for FairnessProbeHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -454,7 +454,7 @@ impl SingletonSubscriber<TestEvent> for PersistentOnlyHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -486,7 +486,7 @@ impl SingletonSubscriber<TestEvent> for EphemeralOnlyHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);

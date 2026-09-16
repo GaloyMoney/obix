@@ -4,6 +4,7 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
+pub mod lane;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 pub use self::ctx::{
     EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
 };
+pub use self::lane::{CommitOrder, InsertOrder, Lane};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,
     WakeKey, WakeKeys,
@@ -30,7 +32,7 @@ pub use self::subscription::singleton::{
     Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
-    Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
 use crate::{
     config::*,
@@ -65,8 +67,12 @@ where
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
-    /// This process's commit-order sequencer, and the commit lane's fan-out.
-    sequencer: Arc<persistent::SequencerHandle<P>>,
+    /// This process's commit-order sequencer, and the commit lane's fan-out —
+    /// `None` when [`MailboxConfig::commit_lane`] leaves the lane
+    /// [`Disabled`](CommitLane::Disabled), which is the default. Nothing
+    /// folds, nothing is appended, and the lane's consumers are refused at
+    /// registration.
+    sequencer: Option<Arc<persistent::SequencerHandle<P>>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
@@ -165,13 +171,18 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
-        let sequencer = persistent::spawn_sequencer::<P, Tables>(
-            &pool,
-            persistent_cache.handle(),
-            config.event_buffer_size,
-            config.backfill_page_size,
-        )
-        .await?;
+        let sequencer = match config.commit_lane {
+            CommitLane::Disabled => None,
+            CommitLane::Enabled => Some(Arc::new(
+                persistent::spawn_sequencer::<P, Tables>(
+                    &pool,
+                    persistent_cache.handle(),
+                    config.event_buffer_size,
+                    config.backfill_page_size,
+                )
+                .await?,
+            )),
+        };
 
         let gap_filler = gap_fill::GapFiller::spawn::<P, Tables>(
             &pool,
@@ -191,7 +202,7 @@ where
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
-            sequencer: Arc::new(sequencer),
+            sequencer,
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
             gap_filler,
@@ -436,11 +447,28 @@ where
     /// Listen in commit order rather than insert order: a source
     /// transaction's events arrive contiguously and are never split, and the
     /// cursor is a dense [`CommitSequence`].
+    ///
+    /// # Errors
+    ///
+    /// [`CommitLaneDisabled`] when this outbox was initialised with
+    /// [`CommitLane::Disabled`] (the default) — there is no sequencer in this
+    /// process, so the lane would never advance.
     pub fn listen_commit_ordered(
         &self,
         start_after: impl Into<Option<CommitSequence>>,
-    ) -> CommitOrderedListener<P> {
-        CommitOrderedListener::new(self.sequencer.lane(), start_after, self.event_buffer_size)
+    ) -> Result<CommitOrderedListener<P>, CommitLaneDisabled> {
+        Ok(CommitOrderedListener::new(
+            self.commit_lane()?.lane(),
+            start_after,
+            self.event_buffer_size,
+        ))
+    }
+
+    /// This outbox's sequencer, or the refusal to report when the lane is off.
+    pub(crate) fn commit_lane(
+        &self,
+    ) -> Result<&persistent::SequencerHandle<P>, CommitLaneDisabled> {
+        self.sequencer.as_deref().ok_or(CommitLaneDisabled)
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
@@ -471,25 +499,44 @@ where
     /// Registration is idempotent per job type: registering the same job type
     /// twice resolves to the already-persisted job, so both calls hand back
     /// handles with the same [`job_id`](Subscription::job_id).
-    pub async fn register_singleton_subscriber<H>(
+    ///
+    /// The lane comes from the handler's impl, and the returned
+    /// [`Subscription`] is typed by it — so the checkpoint, the frontier and
+    /// the caught-up barrier all speak that lane's positions. `L` infers from
+    /// `H` whenever the handler has a single `SingletonSubscriber` impl,
+    /// which is the normal case.
+    ///
+    /// # Errors
+    ///
+    /// [`CommitLaneDisabled`] — **before any job is spawned** — when `H` is a
+    /// [`CommitOrder`] handler and this outbox leaves the lane
+    /// [`Disabled`](CommitLane::Disabled).
+    pub async fn register_singleton_subscriber<H, L>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Subscription<P, Tables, L>, Box<dyn std::error::Error + Send + Sync>>
     where
-        H: SingletonSubscriber<P>,
+        H: SingletonSubscriber<P, L>,
+        L: Lane,
     {
-        let initializer = subscription::singleton::OutboxEventJobInitializer::<H, P, Tables>::new(
-            self.clone(),
-            handler,
-            &config,
-        );
+        L::require(self)?;
+        let initializer =
+            subscription::singleton::OutboxEventJobInitializer::<H, P, Tables, L>::new(
+                self.clone(),
+                handler,
+                &config,
+            );
         let spawner = jobs.add_resident_initializer(initializer);
         let handle = spawner
             .spawn(subscription::singleton::OutboxEventJobData::default())
             .await?;
-        Ok(Subscription::new(handle, self.pool.clone()))
+        Ok(Subscription::new(
+            handle,
+            self.pool.clone(),
+            self.sequencer.as_ref().map(|s| s.positions()),
+        ))
     }
 
     /// Register a keyed subscriber type: per-entity consumers, created and

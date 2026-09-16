@@ -163,7 +163,7 @@ impl KeyedSubscriber<TestEvent> for RecordingSubscriber {
     async fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, ()>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping { owner, n }) = &event.payload else {
             return Ok(ctx.skip());
@@ -1544,7 +1544,7 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
     async fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping { owner, n }) = &event.payload else {
             return Ok(ctx.skip());
@@ -1584,7 +1584,7 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
 
     async fn flush(
         &self,
-        op: &mut obix::FlushOp<'_>,
+        op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for label in items {

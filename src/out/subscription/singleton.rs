@@ -9,6 +9,7 @@ use job::{
 };
 
 use crate::out::ctx::*;
+use crate::out::lane::{InsertOrder, Lane};
 use crate::out::{EphemeralOutboxListener, Outbox, event::*};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
@@ -69,9 +70,25 @@ pub enum StreamSelection {
 /// handlers only consume one of the two streams — declare it via
 /// [`SUBSCRIPTION`](Self::SUBSCRIPTION) and the other stream is never even
 /// subscribed.
-pub trait SingletonSubscriber<P>: Send + Sync + 'static
+///
+/// # The lane
+///
+/// `L` is the delivery lane, and it decides what a position is — for the
+/// event, for the batch flush, and for the durable checkpoint. It defaults to
+/// [`InsertOrder`](crate::out::InsertOrder), so `impl SingletonSubscriber<P>
+/// for X` is an insert-lane handler; `impl SingletonSubscriber<P,
+/// CommitOrder> for X` is the same code reading `CommitSequence`s, and the
+/// two cannot be confused because the compiler will not let a commit-lane
+/// handler run on the insert lane.
+///
+/// The lane is settled by the impl, not by configuration: it is a semantic
+/// contract (what a flush boundary is, what the checkpoint counts), and a
+/// subscription already checkpointed on one lane cannot move to the other —
+/// registration refuses it.
+pub trait SingletonSubscriber<P, L = InsertOrder>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    L: Lane,
 {
     /// Which delivery streams this handler's job subscribes to. Defaults to
     /// [`All`](StreamSelection::All).
@@ -90,15 +107,24 @@ where
     /// `Default` container. Handlers that never collect use `()`.
     type Batch: Default + Send + 'static;
 
-    /// The event arrives as the shared [`Arc`] the outbox decoded once and
-    /// broadcast to every subscriber, so a handler that needs to retain it
-    /// past the call — any [`collect_with`](EventCtx::collect_with) fold —
-    /// clones a refcount rather than the payload, and `P` need not be
-    /// `Clone`. Reading through it is unchanged: `Arc<T>` derefs to `T`.
+    /// The event, plus where it sits on `L`
+    /// ([`position`](crate::out::Delivery::position) — an `EventSequence` on
+    /// the insert lane, a `CommitSequence` on the commit lane, readable at
+    /// any point in the invocation).
+    ///
+    /// Reading through the delivery is unchanged: it derefs to the shared
+    /// [`Arc`] the outbox decoded once and broadcast to every subscriber,
+    /// which in turn derefs to the event — so `event.payload`,
+    /// `event.as_event::<E>()` and passing `event` where a
+    /// `&PersistentOutboxEvent<P>` is expected all work. A handler that
+    /// retains the event past the call — any
+    /// [`collect_with`](EventCtx::collect_with) fold — clones the refcount
+    /// via [`inner`](crate::out::Delivery::inner), not the payload, so `P`
+    /// need not be `Clone`.
     fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Arc<PersistentOutboxEvent<P>>,
+        event: &EventDelivery<P, L>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send {
@@ -109,8 +135,10 @@ where
     /// Handle a persistent event whose stored payload could not be decoded
     /// into `P` — delivered as the persistent stream's `Err` arm and never
     /// as an ordinary event, so it cannot reach
-    /// [`handle_persistent`](Self::handle_persistent). The
-    /// [`UndecodableEventError`] carries the event's identity and the raw
+    /// [`handle_persistent`](Self::handle_persistent). It arrives with the
+    /// same [`position`](crate::out::Delivery::position) an ordinary event
+    /// would have had (the slot it occupies on `L`), and derefs to the
+    /// [`UndecodableEventError`] carrying the event's identity and the raw
     /// payload + serde error (`error.failure`).
     ///
     /// The runner lands the pending batch *before* invoking this — like
@@ -136,10 +164,10 @@ where
     /// not yet persisted at a crash).
     fn handle_undecodable(
         &self,
-        error: &UndecodableEventError,
+        error: &UndecodableDelivery<L>,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
-        let error = error.clone();
+        let error = error.inner().clone();
         async move { Err(error.into()) }
     }
 
@@ -151,10 +179,12 @@ where
     /// statements or register commit hooks on it for work that must share
     /// the checkpoint's fate; ignore it when flushing to a foreign database
     /// (then make the writes idempotent — the checkpoint only advances after
-    /// `Ok`, and a failure replays and re-collects the whole batch).
+    /// `Ok`, and a failure replays and re-collects the whole batch). It also
+    /// carries [`position`](FlushOp::position): exactly where this batch
+    /// lands on `L`, which is the watermark to record downstream.
     fn flush(
         &self,
-        op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, L>,
         items: Self::Batch,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
@@ -181,34 +211,38 @@ where
 /// handler type erased.
 ///
 /// [`flush`]: SingletonSubscriber::flush
-struct SubscriberFlusher<H, P> {
+struct SubscriberFlusher<H, P, L> {
     handler: Arc<H>,
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: std::marker::PhantomData<fn() -> (P, L)>,
 }
 
-impl<H, P> ItemFlush<H::Batch> for SubscriberFlusher<H, P>
+impl<H, P, L> ItemFlush<H::Batch> for SubscriberFlusher<H, P, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    L: Lane,
 {
     fn flush_items<'a>(
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: H::Batch,
+        state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
-            let mut op = FlushOp::new(op);
+            let mut op =
+                FlushOp::<L>::new(op, L::checkpoint(state.sequence, state.commit_sequence));
             self.handler.flush(&mut op, items).await
         })
     }
 }
 
 /// What the fair two-stream race yielded while no batch was pending.
-enum NextDelivery<P>
+enum NextDelivery<P, L>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    L: Lane,
 {
-    Persistent(Option<LaneItem<P>>),
+    Persistent(Option<Result<EventDelivery<P, L>, UndecodableDelivery<L>>>),
     Ephemeral(Arc<EphemeralOutboxEvent<P>>),
 }
 
@@ -227,46 +261,8 @@ where
     }
 }
 
-/// One delivery from whichever lane the runner is on: the event, plus the
-/// commit position when the commit lane supplied one.
-struct LaneItem<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    event: Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>,
-    commit: Option<(CommitSequence, bool)>,
-}
-
-/// The persistent stream the runner consumes, on whichever lane is
-/// configured.
-enum PersistentLane<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
-    Insert(crate::out::PersistentOutboxListener<P>),
-    Commit(crate::out::CommitOrderedListener<P>),
-}
-
-impl<P> PersistentLane<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
-    async fn next(&mut self) -> Option<LaneItem<P>> {
-        match self {
-            Self::Insert(listener) => listener.next().await.map(|event| LaneItem {
-                event,
-                commit: None,
-            }),
-            Self::Commit(listener) => listener.next().await.map(|item| LaneItem {
-                event: item.event,
-                commit: Some((item.commit_sequence, item.commit_boundary)),
-            }),
-        }
-    }
-}
-
-/// What `select_lane` decided, before any I/O happens.
-#[derive(Debug, PartialEq, Eq)]
+/// What [`decide_lane`] decided, before any I/O happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneChoice {
     /// Stay on the insert lane from the stored insert cursor.
     Insert(EventSequence),
@@ -308,7 +304,13 @@ pub(crate) fn decide_lane(
 const DEFAULT_MAX_BATCH_SIZE: usize = 100;
 const DEFAULT_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Which order a subscriber receives persistent events in.
+/// Which order a subscriber receives persistent events in — the dynamic form
+/// of the lane, as stored state and read-outs report it.
+///
+/// A subscriber declares its lane in the *type* system instead, by which
+/// [`Lane`](crate::out::Lane) it implements
+/// [`SingletonSubscriber`] for; this is what that
+/// choice is called when it has to be a value.
 ///
 /// Name-clashes with [`std::cmp::Ordering`]; import or path-qualify
 /// explicitly.
@@ -331,7 +333,6 @@ pub struct OutboxEventJobConfig {
     pub retry_settings: RetrySettings,
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
-    pub ordering: Ordering,
 }
 
 impl OutboxEventJobConfig {
@@ -341,18 +342,7 @@ impl OutboxEventJobConfig {
             retry_settings: RetrySettings::repeat_indefinitely(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-            ordering: Ordering::Insert,
         }
-    }
-
-    /// Choose the delivery lane. See [`Ordering`].
-    ///
-    /// Settled when the subscription first checkpoints: a subscription
-    /// already running on one lane cannot move to the other, because the two
-    /// cursors count different things. Register a new job type instead.
-    pub fn ordering(mut self, ordering: Ordering) -> Self {
-        self.ordering = ordering;
-        self
     }
 
     pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
@@ -385,11 +375,12 @@ impl OutboxEventJobConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(in crate::out) struct OutboxEventJobData {}
 
-pub(in crate::out) struct OutboxEventJobInitializer<H, P, Tables>
+pub(in crate::out) struct OutboxEventJobInitializer<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     outbox: Outbox<P, Tables>,
     handler: Arc<H>,
@@ -397,14 +388,15 @@ where
     retry_settings: RetrySettings,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
-    ordering: Ordering,
+    _lane: std::marker::PhantomData<fn() -> L>,
 }
 
-impl<H, P, Tables> OutboxEventJobInitializer<H, P, Tables>
+impl<H, P, Tables, L> OutboxEventJobInitializer<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
         Self {
@@ -414,16 +406,17 @@ where
             retry_settings: config.retry_settings.clone(),
             max_batch_size: config.max_batch_size,
             checkpoint_interval: config.checkpoint_interval,
-            ordering: config.ordering,
+            _lane: std::marker::PhantomData,
         }
     }
 }
 
-impl<H, P, Tables> ResidentJobInitializer for OutboxEventJobInitializer<H, P, Tables>
+impl<H, P, Tables, L> ResidentJobInitializer for OutboxEventJobInitializer<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     type Config = OutboxEventJobData;
 
@@ -436,35 +429,37 @@ where
     }
 
     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(OutboxEventJobRunner::<H, P, Tables> {
+        Ok(Box::new(OutboxEventJobRunner::<H, P, Tables, L> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
             max_batch_size: self.max_batch_size,
             checkpoint_interval: self.checkpoint_interval,
-            ordering: self.ordering,
+            _lane: std::marker::PhantomData,
         }))
     }
 }
 
-struct OutboxEventJobRunner<H, P, Tables>
+struct OutboxEventJobRunner<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     outbox: Outbox<P, Tables>,
     handler: Arc<H>,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
-    ordering: Ordering,
+    _lane: std::marker::PhantomData<fn() -> L>,
 }
 
 #[async_trait]
-impl<H, P, Tables> ResidentJobRunner for OutboxEventJobRunner<H, P, Tables>
+impl<H, P, Tables, L> ResidentJobRunner for OutboxEventJobRunner<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     async fn run(
         &self,
@@ -479,11 +474,12 @@ where
     }
 }
 
-impl<H, P, Tables> OutboxEventJobRunner<H, P, Tables>
+impl<H, P, Tables, L> OutboxEventJobRunner<H, P, Tables, L>
 where
-    H: SingletonSubscriber<P>,
+    H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
+    L: Lane,
 {
     /// [`EphemeralOnly`](StreamSelection::EphemeralOnly): a bare dispatch
     /// loop — no persistent subscription, no execution state, no batch or
@@ -512,19 +508,14 @@ where
         }
     }
 
-    /// Build the configured lane's stream from the stored cursor.
+    /// Open `L`'s stream at the subscription's stored cursor — refusing, as
+    /// [`decide_lane`] does, a subscription established on the other lane.
     fn select_lane(
         &self,
         state: &OutboxEventJobState,
-    ) -> Result<PersistentLane<P>, Box<dyn std::error::Error>> {
-        match decide_lane(state.commit_sequence, state.sequence, self.ordering)? {
-            LaneChoice::Insert(sequence) => Ok(PersistentLane::Insert(
-                self.outbox.listen_persisted(Some(sequence)),
-            )),
-            LaneChoice::Commit(commit_sequence) => Ok(PersistentLane::Commit(
-                self.outbox.listen_commit_ordered(Some(commit_sequence)),
-            )),
-        }
+    ) -> Result<L::Listener<P>, Box<dyn std::error::Error>> {
+        let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
+        Ok(L::listen(&self.outbox, start_after)?)
     }
 
     async fn run_with_persistent(
@@ -553,7 +544,7 @@ where
         };
         let mut in_group = false;
         let mut batch = H::Batch::default();
-        let flusher = SubscriberFlusher::<H, P> {
+        let flusher = SubscriberFlusher::<H, P, L> {
             handler: self.handler.clone(),
             _payload: std::marker::PhantomData,
         };
@@ -679,8 +670,7 @@ where
             // (the checkpoint advances over it like a skip); any `Err` — the
             // default — fails the job with the checkpoint parked before the
             // event, so every retry re-reads it and nothing is ever skipped.
-            let commit = item.commit;
-            let event = match item.event {
+            let event = match item {
                 Ok(event) => event,
                 Err(undecodable) => {
                     let mut parts = CtxParts {
@@ -699,9 +689,7 @@ where
                             // `commit_sequence` behind redelivers the event
                             // after every restart.
                             state.sequence = undecodable.sequence;
-                            if let Some((commit_sequence, _)) = commit {
-                                state.commit_sequence = Some(commit_sequence);
-                            }
+                            L::record(&mut state.commit_sequence, undecodable.position());
                             continue;
                         }
                         Err(error) => {
@@ -739,10 +727,8 @@ where
                 .map_err(|e| e as Box<dyn std::error::Error>)?
                 .outcome;
             state.sequence = event.sequence;
-            if let Some((commit_sequence, _)) = commit {
-                state.commit_sequence = Some(commit_sequence);
-            }
-            in_group = matches!(commit, Some((_, boundary)) if !boundary);
+            L::record(&mut state.commit_sequence, event.position());
+            in_group = !event.boundary();
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {

@@ -19,6 +19,7 @@ use job::{CurrentJob, Job, JobType, RetrySettings};
 use super::{KeyMsg, KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef};
 use crate::out::Outbox;
 use crate::out::ctx::*;
+use crate::out::lane::InsertOrder;
 use crate::tables::MailboxTables;
 
 // === Object-safe flush bridge ===
@@ -37,9 +38,10 @@ where
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: S::Batch,
+        state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
-            let mut op = FlushOp::new(op);
+            let mut op = FlushOp::<InsertOrder>::new(op, state.sequence);
             self.subscriber.flush(&mut op, items).await
         })
     }

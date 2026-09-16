@@ -1,7 +1,7 @@
 mod helpers;
 
 use futures::stream::StreamExt;
-use obix::{EventSequence, MailboxConfig, PartitionMaintainerConfig, out::Outbox};
+use obix::{CommitLane, EventSequence, MailboxConfig, PartitionMaintainerConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use sqlx::Row;
@@ -280,6 +280,7 @@ async fn commit_log_default_fill_then_recover() -> anyhow::Result<()> {
     let outbox = Outbox::<TestEvent, TestTables>::init(
         &pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -291,7 +292,7 @@ async fn commit_log_default_fill_then_recover() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // The always-on sequencer appends them past the log's p0 boundary.
+    // The sequencer appends them past the log's p0 boundary.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let stranded: i64 =

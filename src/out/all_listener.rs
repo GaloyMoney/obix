@@ -4,7 +4,8 @@ use std::{pin::Pin, task::Poll};
 
 use super::{
     ephemeral::{CacheHandle as EphemeralCacheHandle, EphemeralOutboxListener},
-    event::{OutboxEvent, UndecodableEventError},
+    event::{OutboxEvent, UndecodableDelivery},
+    lane::InsertOrder,
     persistent::{CacheHandle as PersistentCacheHandle, PersistentOutboxListener},
 };
 use crate::sequence::EventSequence;
@@ -48,7 +49,7 @@ where
 {
     /// Undecodable persistent events surface as the `Err` arm (see
     /// [`PersistentOutboxListener`]); ephemeral events are always `Ok`.
-    type Item = Result<OutboxEvent<P>, UndecodableEventError>;
+    type Item = Result<OutboxEvent<P>, UndecodableDelivery<InsertOrder>>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,

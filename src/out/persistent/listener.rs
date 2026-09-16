@@ -1,10 +1,11 @@
 use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
+use std::{collections::BTreeMap, pin::Pin, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
 use super::cache::CacheHandle;
-use crate::out::event::{PersistentDelivery, PersistentOutboxEvent, UndecodableEventError};
+use crate::out::event::{EventDelivery, PersistentDelivery, UndecodableDelivery};
+use crate::out::lane::InsertOrder;
 use crate::sequence::EventSequence;
 
 pub struct PersistentOutboxListener<P>
@@ -220,15 +221,16 @@ where
     /// An undecodable event is yielded as the `Err` arm, in its sequence
     /// position — the delivery of that event in degraded form. The stream
     /// continues past it; whether the *consumer* moves past it is the
-    /// consumer's explicit decision (`?` fails loudly).
-    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
+    /// consumer's explicit decision (`?` fails loudly). Both arms carry the
+    /// position they occupy.
+    type Item = Result<EventDelivery<P, InsertOrder>, UndecodableDelivery<InsertOrder>>;
 
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         self.poll_delivery(cx)
-            .map(|delivery| delivery.map(PersistentDelivery::into_item))
+            .map(|delivery| delivery.map(PersistentDelivery::into_insert_item))
     }
 }
 

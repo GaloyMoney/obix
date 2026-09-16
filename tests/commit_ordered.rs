@@ -1,7 +1,9 @@
 mod helpers;
 
 use futures::stream::StreamExt;
-use obix::{CommitGroupId, CommitSequence, EventSequence, MailboxConfig, MailboxTables};
+use obix::{
+    CommitGroupId, CommitLane, CommitSequence, EventSequence, MailboxConfig, MailboxTables,
+};
 
 use helpers::{TestTables, init_outbox, init_pool, wipeout_outbox_tables};
 
@@ -615,12 +617,13 @@ async fn commit_lane_delivers_published_events_end_to_end() -> anyhow::Result<()
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
     .await?;
 
-    let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN);
+    let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
 
     // Two events in one transaction: one group, so the second closes it.
     let mut op = outbox.begin_op().await?;
@@ -632,21 +635,19 @@ async fn commit_lane_delivers_published_events_end_to_end() -> anyhow::Result<()
         .await?;
     op.commit().await?;
 
-    let first = listener.next().await.expect("first event");
-    let second = listener.next().await.expect("second event");
+    let first = listener.next().await.expect("first event")?;
+    let second = listener.next().await.expect("second event")?;
 
-    assert_eq!(first.commit_sequence, CommitSequence::from(1u64));
-    assert_eq!(second.commit_sequence, CommitSequence::from(2u64));
+    assert_eq!(first.position(), CommitSequence::from(1u64));
+    assert_eq!(second.position(), CommitSequence::from(2u64));
     assert!(
-        !first.commit_boundary,
+        !first.is_commit_boundary(),
         "the first of two events in a transaction does not close its group",
     );
     assert!(
-        second.commit_boundary,
+        second.is_commit_boundary(),
         "the last event of a transaction closes its group",
     );
-    let first = first.event?;
-    let second = second.event?;
     assert_eq!(
         first.commit_group, second.commit_group,
         "events of one transaction share a group",
@@ -663,6 +664,7 @@ async fn commit_lane_backfills_existing_log() -> anyhow::Result<()> {
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -683,12 +685,11 @@ async fn commit_lane_backfills_existing_log() -> anyhow::Result<()> {
 
     // A listener starting at BEGIN must page the whole log back, not just
     // receive what is published after it subscribes.
-    let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN);
+    let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
     let mut received = Vec::new();
     for _ in 0..8 {
-        let item = listener.next().await.expect("event");
-        item.event?;
-        received.push(u64::from(item.commit_sequence));
+        let item = listener.next().await.expect("event")?;
+        received.push(u64::from(item.position()));
     }
     assert_eq!(received, (1..=8).collect::<Vec<u64>>());
     Ok(())
@@ -703,6 +704,7 @@ async fn sequencer_runs_without_a_commit_listener() -> anyhow::Result<()> {
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -742,13 +744,14 @@ async fn sequencer_runs_without_a_commit_listener() -> anyhow::Result<()> {
 async fn two_processes_deliver_identical_commit_order() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let config = MailboxConfig::builder()
+        .commit_lane(CommitLane::Enabled)
         .build()
         .expect("Couldn't build MailboxConfig");
     let first = init_outbox::<TestEvent>(&pool, config.clone()).await?;
     let second = obix::out::Outbox::<TestEvent, TestTables>::init(&pool, config).await?;
 
-    let mut first_listener = first.listen_commit_ordered(CommitSequence::BEGIN);
-    let mut second_listener = second.listen_commit_ordered(CommitSequence::BEGIN);
+    let mut first_listener = first.listen_commit_ordered(CommitSequence::BEGIN)?;
+    let mut second_listener = second.listen_commit_ordered(CommitSequence::BEGIN)?;
 
     for n in 0..3u64 {
         let outbox = if n % 2 == 0 { &first } else { &second };
@@ -775,16 +778,10 @@ async fn two_processes_deliver_identical_commit_order() -> anyhow::Result<()> {
     let mut from_first = Vec::new();
     let mut from_second = Vec::new();
     for _ in 0..6 {
-        let item = first_listener.next().await.expect("event");
-        from_first.push((
-            u64::from(item.commit_sequence),
-            u64::from(item.event?.sequence),
-        ));
-        let item = second_listener.next().await.expect("event");
-        from_second.push((
-            u64::from(item.commit_sequence),
-            u64::from(item.event?.sequence),
-        ));
+        let item = first_listener.next().await.expect("event")?;
+        from_first.push((u64::from(item.position()), u64::from(item.sequence)));
+        let item = second_listener.next().await.expect("event")?;
+        from_second.push((u64::from(item.position()), u64::from(item.sequence)));
     }
     assert_eq!(
         from_first, from_second,
@@ -802,6 +799,7 @@ async fn insert_lane_carries_group() -> anyhow::Result<()> {
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
