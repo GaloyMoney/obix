@@ -4,12 +4,60 @@ use futures::stream::StreamExt;
 use obix::{EventSequence, MailboxConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 use helpers::{init_outbox, init_pool};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
     Ping(u64),
+}
+
+/// Counts `tracing` spans created under a given name, without pulling in
+/// `tracing-subscriber` (not a workspace dependency): a minimal
+/// `tracing::Subscriber` that only counts `new_span` calls, installed as the
+/// thread-local default for the test's duration. `#[tokio::test]` defaults
+/// to the current-thread runtime, so every task spawned by the outbox
+/// (including the catch-up task) runs on the same thread as the guard and
+/// is captured.
+struct SpanCounter {
+    name: &'static str,
+    count: Arc<AtomicUsize>,
+    next_id: AtomicU64,
+}
+
+impl SpanCounter {
+    fn install(name: &'static str) -> (tracing::subscriber::DefaultGuard, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = SpanCounter {
+            name,
+            count: count.clone(),
+            next_id: AtomicU64::new(1),
+        };
+        (tracing::subscriber::set_default(subscriber), count)
+    }
+}
+
+impl tracing::Subscriber for SpanCounter {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        if span.metadata().name() == self.name {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+        tracing::span::Id::from_u64(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, _event: &tracing::Event<'_>) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// The headline case: a single commit larger than the cache-fill broadcast
@@ -21,6 +69,8 @@ enum TestEvent {
 #[file_serial]
 async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result<()> {
     const TOTAL: u64 = 200_000;
+
+    let (_tracing_guard, catch_up_spans) = SpanCounter::install("obix.persistent_cache.catch_up");
 
     let pool = init_pool().await?;
     let outbox = init_outbox::<TestEvent>(
@@ -72,6 +122,105 @@ async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result
         }
         last_sequence = Some(u64::from(event.sequence));
     }
+
+    // Proves the drain above actually went through the catch-up path (not
+    // some other mechanism quietly delivering everything) and that it never
+    // ran more than one catch-up task at a time for this single contiguous
+    // backlog: one continuous task pages from the cursor to the head with
+    // nothing in between to end it early.
+    assert_eq!(
+        catch_up_spans.load(Ordering::SeqCst),
+        1,
+        "expected exactly one catch-up task for one uninterrupted backlog"
+    );
+
+    Ok(())
+}
+
+/// Counted observation, not just correctness: repeated truncated commits are
+/// a *standing* trigger condition (the cache loop re-evaluates "behind by at
+/// least a page" on every cache-fill drain, dozens of times over this test),
+/// which is exactly the shape that let a one-shot waiter accumulate
+/// unboundedly elsewhere. `catch_up: Option<OwnedTaskHandle>` gates spawning
+/// on a single loop-local slot, so this must stay low regardless of how many
+/// times the trigger condition re-fires — never one task per commit, and
+/// never one per re-evaluation.
+#[tokio::test]
+#[file_serial]
+async fn catch_up_does_not_accumulate_across_repeated_truncated_commits() -> anyhow::Result<()> {
+    const COMMITS: u64 = 20;
+    const PER_COMMIT: u64 = 2_000;
+    const TOTAL: u64 = COMMITS * PER_COMMIT;
+
+    let (_tracing_guard, catch_up_spans) = SpanCounter::install("obix.persistent_cache.catch_up");
+
+    let pool = init_pool().await?;
+    let outbox = init_outbox::<TestEvent>(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(200)
+            .backfill_page_size(100)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    // Every commit here (2,000 events against a 200-wide buffer) truncates
+    // on its own — twenty separate re-arms of the same trigger condition,
+    // not one big backlog.
+    for commit in 0..COMMITS {
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_all_persisted(
+                &mut op,
+                (0..PER_COMMIT).map(|n| TestEvent::Ping(commit * PER_COMMIT + n)),
+            )
+            .await?;
+        op.commit().await?;
+    }
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut events = Vec::with_capacity(TOTAL as usize);
+        for _ in 0..TOTAL {
+            let event = listener
+                .next()
+                .await
+                .expect("stream closed early")
+                .expect("undecodable event");
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("did not drain {TOTAL} events within 30s"))?;
+
+    assert_eq!(received.len(), TOTAL as usize);
+    let mut last_sequence = None;
+    for (i, event) in received.iter().enumerate() {
+        assert_eq!(event.payload, Some(TestEvent::Ping(i as u64)));
+        if let Some(last) = last_sequence {
+            assert!(
+                u64::from(event.sequence) > last,
+                "sequences must be strictly increasing (no duplicate, no reorder)"
+            );
+        }
+        last_sequence = Some(u64::from(event.sequence));
+    }
+
+    let spawned = catch_up_spans.load(Ordering::SeqCst);
+    assert!(
+        spawned >= 1,
+        "catch-up never engaged — this test would pass vacuously without it"
+    );
+    assert!(
+        spawned <= 5,
+        "catch-up spawned {spawned} times for {COMMITS} truncated commits — \
+         it must coalesce repeated triggers into a bounded few tasks, not \
+         one per commit (would be {COMMITS}) or one per re-evaluation \
+         (would be in the hundreds)"
+    );
 
     Ok(())
 }
