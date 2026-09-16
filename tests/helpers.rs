@@ -18,8 +18,8 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 pub async fn wipeout_inbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE inbox_events").execute(pool).await?;
 
-    // Delete child tables first due to foreign key constraints
-    // job_events and job_executions reference jobs(id)
+    // Delete the per-job rows before the jobs they select from — the
+    // subqueries below read `jobs`, so it must outlive them.
     sqlx::query!(
         r#"
         DELETE FROM job_events 
