@@ -68,6 +68,7 @@ use std::marker::PhantomData;
 use job::CurrentJob;
 
 use crate::out::lane::{InsertOrder, Lane};
+use crate::out::subscription::StreamPosition;
 use crate::sequence::{CommitSequence, EventSequence};
 
 /// Error type shared with the handler trait methods.
@@ -96,17 +97,6 @@ pub(crate) struct OutboxEventJobState {
     pub(crate) paused: Option<PausedState>,
 }
 
-impl OutboxEventJobState {
-    /// The position the runner compares and persists: the commit cursor when
-    /// the subscription is on the commit lane, else the insert cursor.
-    pub(crate) fn position(&self) -> i64 {
-        match self.commit_sequence {
-            Some(commit_sequence) => i64::from(commit_sequence),
-            None => u64::from(self.sequence) as i64,
-        }
-    }
-}
-
 /// The pause slot: the event the cursor is parked before, and the instant
 /// the member asked to be woken at.
 #[derive(Clone, Serialize, Deserialize)]
@@ -123,14 +113,12 @@ pub(crate) struct BatchTracker {
     /// `max_batch_size` bounds — with no deferred ops, the pending batch is
     /// exactly its collected events.
     pub(crate) collected: usize,
-    /// Highest position whose checkpoint has been persisted to the database.
-    /// Lane-agnostic, so it holds whichever cursor
-    /// [`OutboxEventJobState::position`] reports.
-    pub(crate) persisted_seq: i64,
-    /// The same checkpoint expressed as an insert sequence, for
-    /// [`FlushError`] attribution only — that range is reported in insert
-    /// sequences on both lanes.
-    pub(crate) persisted_insert_seq: EventSequence,
+    /// Highest position whose checkpoint has been persisted to the database,
+    /// on the subscription's own lane. Held in the dynamic
+    /// [`StreamPosition`] form because the ctx types this travels on are
+    /// deliberately lane-free; the handler's flusher, which knows the lane,
+    /// is what produces it.
+    pub(crate) persisted: StreamPosition,
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
 }
@@ -398,6 +386,11 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
         items: B,
         state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
+
+    /// Where the subscription's cursor sits, on the lane the handler is
+    /// implemented for — the one lane fact the lane-free ctx plumbing needs,
+    /// supplied by the one component that statically knows it.
+    fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition;
 }
 
 /// Restricted view of the batch op handed to
@@ -456,11 +449,11 @@ pub struct FlushError {
     /// `"undecodable_event"`, and for keyed subscribers `"pause_entry"` and
     /// `"staged_pause"`).
     pub reason: &'static str,
-    /// The batch covers sequences strictly after this (the last durable
-    /// checkpoint)…
-    pub after: EventSequence,
-    /// …through this (the last fully handled event).
-    pub through: EventSequence,
+    /// The batch covers positions strictly after this (the last durable
+    /// checkpoint), on the subscription's own lane…
+    pub after: StreamPosition,
+    /// …through this (the last fully handled event), on the same lane.
+    pub through: StreamPosition,
     pub source: HandlerError,
 }
 
@@ -520,11 +513,12 @@ pub(crate) async fn flush_batch<B: Default>(
         parts.tracker.collected = 0;
         let state = &*parts.state;
         let op = parts.op_slot.as_mut().expect("op was materialized above");
+        let through = flusher.position_of(state);
         if let Err(source) = flusher.flush_items(op, items, state).await {
             return Err(Box::new(FlushError {
                 reason,
-                after: parts.tracker.persisted_insert_seq,
-                through: parts.state.sequence,
+                after: parts.tracker.persisted,
+                through,
                 source,
             }));
         }
@@ -541,8 +535,7 @@ pub(crate) async fn flush_batch<B: Default>(
         mirror.mirror(&mut op, parts.state.sequence).await?;
     }
     op.commit().await?;
-    parts.tracker.persisted_seq = parts.state.position();
-    parts.tracker.persisted_insert_seq = parts.state.sequence;
+    parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
 }

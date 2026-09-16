@@ -4,7 +4,7 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
-pub mod lane;
+mod lane;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -48,7 +48,7 @@ use notifier::PersistentNotifier;
 pub use op_cursor::{CursorError, OpCursor};
 pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
-pub use persistent::{CommitOrderedListener, PersistentOutboxListener};
+pub use persistent::{CommitOrderedListener, LaneListener, PersistentOutboxListener};
 pub use post_persist_hook::PostPersistHook;
 
 #[allow(dead_code)]
@@ -433,15 +433,48 @@ where
         &events[cursor.pos.min(events.len())..]
     }
 
+    /// Listen on lane `L` from `start_after` — the lane-generic entry point
+    /// [`listen_persisted`](Self::listen_persisted) and
+    /// [`listen_commit_ordered`](Self::listen_commit_ordered) are the named
+    /// cases of.
+    ///
+    /// # Errors
+    ///
+    /// [`CommitLaneDisabled`] when `L` is [`CommitOrder`] and this outbox
+    /// leaves the lane [`Disabled`](CommitLane::Disabled). `InsertOrder`
+    /// never errors.
+    pub fn listen<L>(
+        &self,
+        start_after: impl Into<Option<L::Position>>,
+    ) -> Result<LaneListener<L, P>, CommitLaneDisabled>
+    where
+        L: Lane,
+    {
+        Ok(LaneListener::new(
+            L::handle(self)?,
+            start_after,
+            self.event_buffer_size,
+        ))
+    }
+
     pub fn listen_persisted(
         &self,
         start_after: impl Into<Option<EventSequence>>,
     ) -> PersistentOutboxListener<P> {
-        PersistentOutboxListener::new(
-            self.persistent_cache.handle(),
-            start_after,
-            self.event_buffer_size,
-        )
+        self.listen::<InsertOrder>(start_after)
+            .expect("the insert lane is always available")
+    }
+
+    /// The frontier of lane `L`: the highest position it has handed out.
+    ///
+    /// On the insert lane that is the sequence generator's `last_value`, so
+    /// it counts sequences already assigned to transactions that have not
+    /// committed yet; on the commit lane it is the head of the commit log.
+    pub async fn frontier<L>(&self) -> Result<L::Position, sqlx::Error>
+    where
+        L: Lane,
+    {
+        L::frontier::<Tables>(&self.pool).await
     }
 
     /// Listen in commit order rather than insert order: a source
@@ -457,11 +490,7 @@ where
         &self,
         start_after: impl Into<Option<CommitSequence>>,
     ) -> Result<CommitOrderedListener<P>, CommitLaneDisabled> {
-        Ok(CommitOrderedListener::new(
-            self.commit_lane()?.handle(),
-            start_after,
-            self.event_buffer_size,
-        ))
+        self.listen::<CommitOrder>(start_after)
     }
 
     /// This outbox's sequencer, or the refusal to report when the lane is off.
@@ -469,6 +498,11 @@ where
         &self,
     ) -> Result<&persistent::SequencerHandle<P>, CommitLaneDisabled> {
         self.sequencer.as_deref().ok_or(CommitLaneDisabled)
+    }
+
+    /// The insert lane's source handle — always available.
+    pub(crate) fn persistent_cache_handle(&self) -> lane::LaneHandle<InsertOrder, P> {
+        self.persistent_cache.handle()
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {

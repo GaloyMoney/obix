@@ -299,8 +299,8 @@ where
 /// One item as delivered on lane `L`: the thing, plus where it sits.
 ///
 /// The position rides *around* the value rather than on it because it belongs
-/// to the delivery, not to the event — see the [lane module](crate::out::lane)
-/// for why. Reading through a delivery is unchanged:
+/// to the delivery, not to the event — see [`Lane`] for why. Reading through
+/// a delivery is unchanged:
 /// [`Deref`](std::ops::Deref) reaches the carried value, so an
 /// [`EventDelivery`] behaves like the `Arc<PersistentOutboxEvent<P>>` it
 /// carries (`event.payload`, `event.as_event::<E>()`, and passing `event`

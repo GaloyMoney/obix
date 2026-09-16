@@ -10,6 +10,7 @@ use job::{
 
 use crate::out::ctx::*;
 use crate::out::lane::{InsertOrder, Lane};
+use crate::out::subscription::StreamPosition;
 use crate::out::{EphemeralOutboxListener, Outbox, event::*};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
@@ -234,6 +235,16 @@ where
             self.handler.flush(&mut op, items).await
         })
     }
+
+    fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition {
+        L::checkpoint(state.sequence, state.commit_sequence).into()
+    }
+}
+
+/// The subscription's cursor on `L`, in the dynamic form the lane-free ctx
+/// plumbing compares and stores.
+fn checkpoint_of<L: Lane>(state: &OutboxEventJobState) -> StreamPosition {
+    L::checkpoint(state.sequence, state.commit_sequence).into()
 }
 
 /// What the fair two-stream race yielded while no batch was pending.
@@ -513,9 +524,9 @@ where
     fn select_lane(
         &self,
         state: &OutboxEventJobState,
-    ) -> Result<L::Listener<P>, Box<dyn std::error::Error>> {
+    ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
         let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
-        Ok(L::listen(&self.outbox, start_after)?)
+        Ok(self.outbox.listen::<L>(start_after)?)
     }
 
     async fn run_with_persistent(
@@ -538,8 +549,7 @@ where
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
             collected: 0,
-            persisted_seq: state.position(),
-            persisted_insert_seq: state.sequence,
+            persisted: checkpoint_of::<L>(&state),
             last_persist: tokio::time::Instant::now(),
         };
         let mut in_group = false;
@@ -604,7 +614,7 @@ where
                 let next = tokio::select! {
                     biased;
                     _ = current_job.shutdown_requested() => {
-                        if tracker.persisted_seq < state.position() {
+                        if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -612,12 +622,11 @@ where
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
-                        if tracker.persisted_seq < state.position() => {
+                        if tracker.persisted < checkpoint_of::<L>(&state) => {
                         persist_checkpoint(&mut current_job, &state, None)
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
-                        tracker.persisted_seq = state.position();
-                        tracker.persisted_insert_seq = state.sequence;
+                        tracker.persisted = checkpoint_of::<L>(&state);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
                     }
@@ -650,7 +659,7 @@ where
                     }
                     NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
-                        if tracker.persisted_seq < state.position() {
+                        if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -693,7 +702,7 @@ where
                             continue;
                         }
                         Err(error) => {
-                            if tracker.persisted_seq < state.position() {
+                            if tracker.persisted < checkpoint_of::<L>(&state) {
                                 persist_checkpoint(&mut current_job, &state, None)
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;

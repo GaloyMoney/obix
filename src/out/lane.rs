@@ -33,13 +33,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use super::event::{EventDelivery, Transport, UndecodableDelivery};
+use super::Outbox;
+use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
     StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use super::{CommitOrderedListener, Outbox, PersistentOutboxListener};
 use crate::config::CommitLaneDisabled;
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
@@ -70,23 +70,18 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     const ORDERING: Ordering;
 
     #[doc(hidden)]
-    type Listener<P>: futures::Stream<Item = Result<EventDelivery<P, Self>, UndecodableDelivery<Self>>>
-        + Send
-        + Unpin
-    where
-        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin;
-
-    #[doc(hidden)]
     fn require<P, Tables>(outbox: &Outbox<P, Tables>) -> Result<(), CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
 
+    /// This lane's source handle on `outbox` — the only place the two lanes
+    /// diverge below the public API: one comes from the insert cache, the
+    /// other from the sequencer. Everything downstream is shared.
     #[doc(hidden)]
-    fn listen<P, Tables>(
+    fn handle<P, Tables>(
         outbox: &Outbox<P, Tables>,
-        start_after: Self::Position,
-    ) -> Result<Self::Listener<P>, CommitLaneDisabled>
+    ) -> Result<LaneHandle<Self, P>, CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -150,11 +145,6 @@ impl Lane for InsertOrder {
     type Position = EventSequence;
     const ORDERING: Ordering = Ordering::Insert;
 
-    type Listener<P>
-        = PersistentOutboxListener<P>
-    where
-        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin;
-
     fn require<P, Tables>(_outbox: &Outbox<P, Tables>) -> Result<(), CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -163,15 +153,14 @@ impl Lane for InsertOrder {
         Ok(())
     }
 
-    fn listen<P, Tables>(
+    fn handle<P, Tables>(
         outbox: &Outbox<P, Tables>,
-        start_after: EventSequence,
-    ) -> Result<Self::Listener<P>, CommitLaneDisabled>
+    ) -> Result<LaneHandle<Self, P>, CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
     {
-        Ok(outbox.listen_persisted(Some(start_after)))
+        Ok(outbox.persistent_cache_handle())
     }
 
     fn begin() -> EventSequence {
@@ -227,11 +216,6 @@ impl Lane for CommitOrder {
     type Position = CommitSequence;
     const ORDERING: Ordering = Ordering::Commit;
 
-    type Listener<P>
-        = CommitOrderedListener<P>
-    where
-        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin;
-
     fn require<P, Tables>(outbox: &Outbox<P, Tables>) -> Result<(), CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -241,15 +225,14 @@ impl Lane for CommitOrder {
         Ok(())
     }
 
-    fn listen<P, Tables>(
+    fn handle<P, Tables>(
         outbox: &Outbox<P, Tables>,
-        start_after: CommitSequence,
-    ) -> Result<Self::Listener<P>, CommitLaneDisabled>
+    ) -> Result<LaneHandle<Self, P>, CommitLaneDisabled>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
     {
-        outbox.listen_commit_ordered(Some(start_after))
+        Ok(outbox.commit_lane()?.handle())
     }
 
     fn begin() -> CommitSequence {
@@ -312,7 +295,10 @@ impl Lane for CommitOrder {
 /// that difference lives entirely on the producing side. Everything from
 /// "a stream of positioned deliveries, a head, and a backfill channel"
 /// downwards is lane-agnostic, so the lane type reaches exactly this far.
-pub(crate) struct LaneHandle<L, P>
+/// Sealed the same way [`Lane`]'s operations are: this module is private, so
+/// the type is reachable through [`Lane::handle`] but unnameable outside the
+/// crate.
+pub struct LaneHandle<L, P>
 where
     L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -325,7 +311,7 @@ where
 
 /// A listener's "serve me everything after this position" channel: the
 /// cursor it is stuck at, and where to deliver the range.
-pub(crate) type BackfillRequests<L, P> =
+pub type BackfillRequests<L, P> =
     mpsc::UnboundedSender<(<L as Lane>::Position, mpsc::Sender<Transport<L, P>>)>;
 
 impl<L, P> LaneHandle<L, P>
