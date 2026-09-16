@@ -1,3 +1,15 @@
+# [obix release v0.11.0](https://github.com/GaloyMoney/obix/releases/tag/0.11.0)
+
+
+
+### Features
+
+- [**breaking**] Commit-ordered delivery as an opt-in second lane (#151)
+
+### Miscellaneous Tasks
+
+- Bump syn from 3.0.4 to 3.0.5 in the all-dependencies group (#152)
+
 # [obix release v0.10.0](https://github.com/GaloyMoney/obix/releases/tag/0.10.0)
 
 
