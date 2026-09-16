@@ -1,3 +1,11 @@
+# [obix release v0.11.1](https://github.com/GaloyMoney/obix/releases/tag/0.11.1)
+
+
+
+### Bug Fixes
+
+- Resolve as_event::<E>() through Arc<PersistentOutboxEvent<P>> (#154)
+
 # [obix release v0.11.0](https://github.com/GaloyMoney/obix/releases/tag/0.11.0)
 
 
