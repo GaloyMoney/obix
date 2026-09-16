@@ -39,6 +39,10 @@ impl ToTokens for OutboxEvent {
             _ => panic!("OutboxEvent can only be derived for enums"),
         };
 
+        tokens.append_all(quote! {
+            impl #crate_name::out::OutboxPayload for #enum_ident {}
+        });
+
         for variant in variants {
             // Skip variants marked with #[serde(other)]
             if variant.other {

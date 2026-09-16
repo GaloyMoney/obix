@@ -13,7 +13,7 @@ use std::sync::Arc;
 use obix::{
     EventCtx, FlushOp, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
     MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, SubscriptionDef, WakeKey,
-    out::{Outbox, PersistentOutboxEvent},
+    out::{Outbox, OutboxEventMarker, PersistentOutboxEvent},
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -26,6 +26,7 @@ use helpers::{
 
 const JOB_TYPE: &str = "test-subscriber-event-arc";
 const KEYED_JOB_TYPE: &str = "test-subscriber-event-arc-keyed";
+const CLASSIFY_JOB_TYPE: &str = "test-subscriber-event-arc-classify";
 
 /// No `Clone`. That is the point of this file.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -126,6 +127,65 @@ impl SingletonSubscriber<NonCloneEvent> for EphemeralReader {
     }
 }
 
+// === Classifying through the Arc ===
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct PingPayload {
+    owner: u64,
+    n: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct PongPayload;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, obix::OutboxEvent)]
+#[serde(tag = "type")]
+enum ClassifiedEvent {
+    Ping(PingPayload),
+    Pong(PongPayload),
+}
+
+type ClassifiedRetained = Arc<PersistentOutboxEvent<ClassifiedEvent>>;
+
+/// Classifies through the `Arc` (`event.as_event::<PingPayload>()`) and
+/// retains the same `Arc` in the batch, in the same `handle_persistent`
+/// body.
+struct ClassifyingSubscriber {
+    /// `n` of every `Ping` the handler classified and retained.
+    classified: Arc<Mutex<Vec<u64>>>,
+}
+
+impl SingletonSubscriber<ClassifiedEvent> for ClassifyingSubscriber {
+    type Batch = Vec<ClassifiedRetained>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Self::Batch>,
+        event: &ClassifiedRetained,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(ping) = event.as_event::<PingPayload>() else {
+            return Ok(ctx.skip());
+        };
+        self.classified.lock().await.push(ping.n);
+        Ok(ctx.collect(Arc::clone(event)))
+    }
+
+    async fn flush(
+        &self,
+        _op: &mut FlushOp<'_>,
+        items: Self::Batch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for event in items {
+            let payload = event.payload.as_ref().expect("payload");
+            assert_eq!(
+                <ClassifiedEvent as OutboxEventMarker<PingPayload>>::as_event(payload),
+                event.as_event::<PingPayload>()
+            );
+        }
+        Ok(())
+    }
+}
+
 // === Keyed ===
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -213,6 +273,21 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<NonCloneEvent
     wipeout_subscriptions(pool, KEYED_JOB_TYPE).await?;
 
     Ok(Outbox::<NonCloneEvent, TestTables>::init(
+        pool,
+        MailboxConfig::builder()
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?)
+}
+
+async fn init_classify_outbox(
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<Outbox<ClassifiedEvent, TestTables>> {
+    wipeout_outbox_tables(pool).await?;
+    wipeout_outbox_job_tables(pool, CLASSIFY_JOB_TYPE).await?;
+
+    Ok(Outbox::<ClassifiedEvent, TestTables>::init(
         pool,
         MailboxConfig::builder()
             .build()
@@ -368,6 +443,58 @@ async fn a_keyed_batch_retains_whole_events() -> anyhow::Result<()> {
         vec![1, 2, 3]
     );
     assert_batch_retained_what_it_was_handed(&observed).await;
+
+    let _ = jobs.shutdown().await;
+    Ok(())
+}
+
+/// `ClassifyingSubscriber` classifies through the `Arc` and retains it, in
+/// the same `handle_persistent` body.
+#[tokio::test]
+#[file_serial]
+async fn a_singleton_classifies_through_the_arc_while_retaining() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_classify_outbox(&pool).await?;
+
+    let classified = Arc::new(Mutex::new(Vec::new()));
+    outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(CLASSIFY_JOB_TYPE)),
+            ClassifyingSubscriber {
+                classified: classified.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    jobs.start_poll().await?;
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            ClassifiedEvent::Ping(PingPayload { owner: 1, n: 1 }),
+        )
+        .await?;
+    outbox
+        .publish_persisted_in_op(&mut op, ClassifiedEvent::Pong(PongPayload))
+        .await?;
+    outbox
+        .publish_persisted_in_op(
+            &mut op,
+            ClassifiedEvent::Ping(PingPayload { owner: 1, n: 2 }),
+        )
+        .await?;
+    op.commit().await?;
+
+    eventually(std::time::Duration::from_secs(10), || async {
+        Ok(classified.lock().await.len() >= 2)
+    })
+    .await?;
+
+    assert_eq!(*classified.lock().await, vec![1, 2]);
 
     let _ = jobs.shutdown().await;
     Ok(())
