@@ -2,10 +2,10 @@
 //!
 //! obix delivers persistent events in two orders — insert order and commit
 //! order — and the two differ in what a *position* is. Insert order numbers
-//! events by the contiguous, gap-filled
-//! [`EventSequence`](crate::EventSequence) the database allocated; commit
-//! order numbers them by the dense [`CommitSequence`](crate::CommitSequence)
-//! the sequencer assigned when it placed their source transaction.
+//! events by the contiguous, gap-filled [`crate::EventSequence`] the database
+//! allocated; commit order numbers them by the dense
+//! [`crate::CommitSequence`] the sequencer assigned when it placed their
+//! source transaction.
 //!
 //! A position is therefore a property of a **delivery on a lane**, never of
 //! the event row: the same event has a commit position when it arrives on the
@@ -16,8 +16,8 @@
 //!
 //! So the lane is a type parameter, defaulting to [`InsertOrder`], and it
 //! decides the position type of everything a subscriber touches: the event
-//! ([`EventDelivery`](crate::out::EventDelivery)), the undecodable stand-in
-//! ([`UndecodableDelivery`](crate::out::UndecodableDelivery)), the batch
+//! ([`crate::out::EventDelivery`]), the undecodable stand-in
+//! ([`crate::out::UndecodableDelivery`]), the batch
 //! flush ([`FlushOp`](crate::FlushOp)) and the durable checkpoint
 //! ([`Subscription`]). Insert-lane code sees `EventSequence`, commit-lane
 //! code sees `CommitSequence`, and the compiler refuses to run a commit-lane
