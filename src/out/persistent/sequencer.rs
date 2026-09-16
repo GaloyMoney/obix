@@ -128,15 +128,29 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
 {
-    /// Fold one insert-lane delivery.
+    /// Fold one insert-lane delivery, then publish how far the fold has got.
     async fn fold(&mut self, delivery: Transport<InsertOrder, P>) {
         let sequence = delivery.sequence();
-        // INVARIANT: published before every branch below, including the
-        // skips — fold_position must advance on placeholders and on
-        // already-logged members too, or the commit-lane fence stalls on an
-        // aborted tail.
+        self.place(delivery).await;
+        // INVARIANT: published only once this delivery is fully ACCOUNTED
+        // FOR — its group appended and committed, or provably never going to
+        // be. The commit-lane fence reads this and then reads the log head,
+        // so publishing on entry instead leaves a window one
+        // `append_commit_group` round trip wide in which the fence sees the
+        // fold past the insert frontier but reads a head the in-flight
+        // append has not written yet, and returns with the frontier event
+        // undelivered.
+        //
+        // It must still advance on every early return in `place`, or the
+        // fence stalls on an aborted tail instead.
         self.fold_position
             .store(u64::from(sequence), Ordering::Release);
+    }
+
+    /// Place one delivery into the commit log, or establish that it never
+    /// needs to be.
+    async fn place(&mut self, delivery: Transport<InsertOrder, P>) {
+        let sequence = delivery.sequence();
         if self.logged_ahead.remove(&sequence) {
             return;
         }

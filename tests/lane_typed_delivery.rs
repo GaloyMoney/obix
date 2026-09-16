@@ -1978,3 +1978,121 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// === 19. The fence must not pass while an append is still in flight ===
+
+/// Test 19 — `fold_position` must mean "every sequence at or below this is
+/// **accounted for** on the commit lane", not "the fold has *started* looking
+/// at it".
+///
+/// Reported by Bugbot on #156, and real. `append_commit_group` is a round
+/// trip: if the fold publishes its position on entry, there is a window in
+/// which the fence sees `fold_position >= insert_frontier`, reads
+/// `commit_log_state`, and gets the head from *before* the in-flight append —
+/// so it waits for a commit position that is already reached and returns with
+/// the frontier event undelivered. A single-event transaction at the frontier
+/// is the common case, not a corner.
+///
+/// The window is one statement wide in production; here it is held open
+/// deterministically by taking the `FOR UPDATE` lock that
+/// `append_commit_group` needs, so the sequencer parks inside the append.
+#[tokio::test]
+#[file_serial]
+async fn caught_up_fence_does_not_pass_while_an_append_is_in_flight() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool, CommitLane::Enabled).await?;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let subscription = outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            Consumer {
+                received: received.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    // One event, delivered and durably checkpointed at commit position 1.
+    publish_group(&outbox, [1]).await?;
+    until(
+        async || {
+            subscription
+                .load()
+                .await
+                .map(|s| s.checkpoint() == CommitSequence::from(1u64))
+                .unwrap_or(false)
+        },
+        "the subscriber checkpoints at commit position 1",
+    )
+    .await?;
+
+    // Freeze the next append by holding the row it locks.
+    let mut blocker = pool.begin().await?;
+    sqlx::query(
+        "SELECT last_commit_seq FROM persistent_outbox_commit_log_state
+         WHERE singleton FOR UPDATE",
+    )
+    .fetch_one(&mut *blocker)
+    .await?;
+
+    // A second single-event transaction: the insert frontier moves to 2, the
+    // sequencer reaches it, and its append parks on the lock above.
+    publish_group(&outbox, [2]).await?;
+    until(
+        async || {
+            let blocked: Result<(i64,), _> = sqlx::query_as(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE wait_event_type = 'Lock'
+                   AND query ILIKE '%persistent_outbox_commit_log_state%'",
+            )
+            .fetch_one(&pool)
+            .await;
+            blocked.map(|(n,)| n >= 1).unwrap_or(false)
+        },
+        "the sequencer's append parks on the held lock",
+    )
+    .await?;
+    assert_eq!(
+        outbox.highest_known_persistent_sequence().await?,
+        EventSequence::from(2u64),
+        "precondition: the insert frontier has moved to the event whose append is in flight",
+    );
+    assert_eq!(
+        commit_log_state(&pool).await?.0,
+        1,
+        "precondition: the log head is still 1 — the append has not committed",
+    );
+
+    // The fence must NOT report caught up here: commit position 2 exists as
+    // soon as that append lands and has not been delivered to anyone.
+    let fenced = subscription.await_caught_up(Duration::from_secs(2)).await;
+    assert!(
+        fenced.is_err(),
+        "await_caught_up returned while the frontier event's append was still in flight, so \
+         commit position 2 was undelivered: {fenced:?}",
+    );
+    assert_eq!(
+        *received.lock().await,
+        vec![1],
+        "precondition: the second event really was undelivered at that point",
+    );
+
+    // Released, it completes normally.
+    blocker.rollback().await?;
+    subscription
+        .await_caught_up(Duration::from_secs(20))
+        .await
+        .map_err(|e| anyhow::anyhow!("await_caught_up after the append landed: {e}"))?;
+    assert_eq!(
+        *received.lock().await,
+        vec![1, 2],
+        "both events delivered once the append committed",
+    );
+
+    Ok(())
+}
