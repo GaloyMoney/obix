@@ -40,7 +40,7 @@ use super::subscription::{
     StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use crate::config::CommitLaneDisabled;
+use crate::config::{CommitLaneDisabled, FrontierError};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
@@ -110,10 +110,28 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
 
+    /// This lane's frontier as a subscription sees it.
+    ///
+    /// The insert lane reads the sequence generator; the commit lane reads
+    /// **this process's** fold head, because the lane is computed rather than
+    /// materialised and there is no shared head to read.
     #[doc(hidden)]
-    fn frontier<Tables: MailboxTables>(
-        pool: &sqlx::PgPool,
-    ) -> impl std::future::Future<Output = Result<Self::Position, sqlx::Error>> + Send;
+    fn frontier<'a, P, Tables>(
+        subscription: &'a Subscription<P, Tables, Self>,
+    ) -> impl std::future::Future<Output = Result<Self::Position, SubscriptionError>> + Send + 'a
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables;
+
+    /// The same value read straight off an outbox, for
+    /// [`Outbox::frontier`](crate::out::Outbox::frontier).
+    #[doc(hidden)]
+    fn outbox_frontier<'a, P, Tables>(
+        outbox: &'a Outbox<P, Tables>,
+    ) -> impl std::future::Future<Output = Result<Self::Position, FrontierError>> + Send + 'a
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables;
 
     #[doc(hidden)]
     fn await_caught_up<'a, P, Tables>(
@@ -194,10 +212,24 @@ impl Lane for InsertOrder {
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
-    async fn frontier<Tables: MailboxTables>(
-        pool: &sqlx::PgPool,
-    ) -> Result<EventSequence, sqlx::Error> {
-        read_frontier::<Tables>(pool).await
+    async fn frontier<P, Tables>(
+        subscription: &Subscription<P, Tables, Self>,
+    ) -> Result<EventSequence, SubscriptionError>
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables,
+    {
+        Ok(read_frontier::<Tables>(subscription.pool()).await?)
+    }
+
+    async fn outbox_frontier<P, Tables>(
+        outbox: &Outbox<P, Tables>,
+    ) -> Result<EventSequence, FrontierError>
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables,
+    {
+        Ok(read_frontier::<Tables>(outbox.pool()).await?)
     }
 
     fn await_caught_up<'a, P, Tables>(
@@ -268,10 +300,24 @@ impl Lane for CommitOrder {
         *commit_cursor = Some(position);
     }
 
-    async fn frontier<Tables: MailboxTables>(
-        pool: &sqlx::PgPool,
-    ) -> Result<CommitSequence, sqlx::Error> {
-        Ok(Tables::commit_log_state(pool).await?.0)
+    async fn frontier<P, Tables>(
+        subscription: &Subscription<P, Tables, Self>,
+    ) -> Result<CommitSequence, SubscriptionError>
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables,
+    {
+        subscription.sequencer_positions().map(|p| p.commit_head())
+    }
+
+    async fn outbox_frontier<P, Tables>(
+        outbox: &Outbox<P, Tables>,
+    ) -> Result<CommitSequence, FrontierError>
+    where
+        P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+        Tables: MailboxTables,
+    {
+        Ok(outbox.commit_lane()?.positions().commit_head())
     }
 
     fn await_caught_up<'a, P, Tables>(

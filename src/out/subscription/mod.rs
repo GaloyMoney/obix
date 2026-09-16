@@ -676,8 +676,27 @@ where
         Ok(L::checkpoint(state.sequence, state.commit_sequence))
     }
 
-    async fn frontier(&self) -> Result<L::Position, sqlx::Error> {
-        L::frontier::<Tables>(&self.pool).await
+    async fn frontier(&self) -> Result<L::Position, SubscriptionError> {
+        L::frontier(self).await
+    }
+
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
+    /// This process's sequencer positions. Absent only where the type system
+    /// already rules the commit lane out — a keyed subscription, or an
+    /// outbox running no sequencer, neither of which can host a
+    /// `CommitOrder` handler.
+    pub(crate) fn sequencer_positions(&self) -> Result<&SequencerPositions, SubscriptionError> {
+        self.positions.as_ref().ok_or_else(|| {
+            SubscriptionError::LaneMismatch(
+                "a commit-lane subscription without sequencer positions is unreachable: the lane \
+                 cannot be registered on an outbox that runs no sequencer, and keyed \
+                 subscriptions are insert-lane by construction"
+                    .to_string(),
+            )
+        })
     }
 }
 
@@ -735,14 +754,7 @@ where
     let start = tokio::time::Instant::now();
     let deadline = start + timeout;
 
-    let positions = subscription.positions.as_ref().ok_or_else(|| {
-        SubscriptionError::LaneMismatch(
-            "a commit-lane subscription without sequencer positions is unreachable: the lane \
-             cannot be registered on an outbox that runs no sequencer, and keyed subscriptions \
-             are insert-lane by construction"
-                .to_string(),
-        )
-    })?;
+    let positions = subscription.sequencer_positions()?;
 
     let mut interval = INITIAL_POLL_INTERVAL;
     loop {
@@ -762,7 +774,13 @@ where
         interval = (interval * 2).min(MAX_POLL_INTERVAL);
     }
 
-    let (commit_frontier, _) = Tables::commit_log_state(&subscription.pool).await?;
+    // This process's own head, not a cluster-wide one: the lane is computed,
+    // not materialised, so there is no shared head to read. Sound for the
+    // same reason the fold-position invariant is — the fold publishes its
+    // position only after emitting a group and advancing the head, so once it
+    // has passed `h` the head it reports covers every group whose lowest
+    // member is at or below `h`.
+    let commit_frontier = positions.commit_head();
     subscription
         .poll_checkpoint_until(commit_frontier, start, deadline)
         .await

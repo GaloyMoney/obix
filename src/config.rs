@@ -99,6 +99,24 @@ pub const DEFAULT_PARTITION_PREMAKE: u64 = 5;
 pub const DEFAULT_PARTITION_MAINTAINER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(3600);
 
+/// How many groups the commit-lane fold emits between sparse checkpoints.
+///
+/// The commit order is computed, not stored, so a checkpoint is only a
+/// shortcut: it bounds how far a restarting process re-folds before it is
+/// live, and how far a lagging subscriber's backfill re-folds below the
+/// position it actually wants (the overshoot is read but never sent). The
+/// cost is one small row per interval per process — against one locked
+/// INSERT per source transaction under the superseded materialised log.
+pub const DEFAULT_COMMIT_CHECKPOINT_EVERY: usize = 1_000;
+
+/// Longest the commit-lane fold goes without a checkpoint while it is
+/// emitting, regardless of group count; see
+/// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Bounds the re-fold on a quiet
+/// outbox, where the group count alone would leave the last checkpoint far
+/// behind.
+pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// Whether this outbox runs the commit-ordered lane.
 ///
 /// The lane costs one commit-log append per source transaction plus a fold
@@ -138,6 +156,19 @@ pub enum CommitLane {
     /// This process sequences the commit lane and can host `CommitOrder`
     /// subscribers.
     Enabled,
+}
+
+/// Why a lane's frontier could not be read.
+///
+/// Two lanes, two sources: the insert lane reads the sequence generator and
+/// can fail like any query; the commit lane reads this process's fold head,
+/// which does not exist when the lane is off.
+#[derive(Debug, thiserror::Error)]
+pub enum FrontierError {
+    #[error("FrontierError - Sqlx: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("FrontierError - {0}")]
+    CommitLaneDisabled(#[from] CommitLaneDisabled),
 }
 
 /// The commit lane is off for this outbox.
@@ -199,6 +230,15 @@ pub struct MailboxConfig {
     /// Defaults to [`Disabled`](CommitLane::Disabled).
     #[builder(default)]
     pub commit_lane: CommitLane,
+    /// Groups between sparse checkpoints of the commit-lane fold; see
+    /// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Ignored when the lane is
+    /// `Disabled`.
+    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_EVERY")]
+    pub commit_checkpoint_every: usize,
+    /// Longest the commit-lane fold goes without a checkpoint while
+    /// emitting; see [`DEFAULT_COMMIT_CHECKPOINT_INTERVAL`].
+    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_INTERVAL")]
+    pub commit_checkpoint_interval: std::time::Duration,
     #[builder(default = "Clock::handle().clone()")]
     pub clock: ClockHandle,
 }

@@ -171,14 +171,20 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
+        // Shared before the sequencer starts: a commit-lane backfill re-folds
+        // the insert stream, so it needs to open listeners of its own rather
+        // than borrowing the fold's one.
+        let persistent_cache = Arc::new(persistent_cache);
         let sequencer = match config.commit_lane {
             CommitLane::Disabled => None,
             CommitLane::Enabled => Some(Arc::new(
                 persistent::spawn_sequencer::<P, Tables>(
                     &pool,
-                    persistent_cache.handle(),
+                    persistent_cache.clone(),
                     config.event_buffer_size,
                     config.backfill_page_size,
+                    config.commit_checkpoint_every,
+                    config.commit_checkpoint_interval,
                 )
                 .await?,
             )),
@@ -200,7 +206,7 @@ where
             persist_events_batch_size: config.persist_events_batch_size,
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
-            persistent_cache: Arc::new(persistent_cache),
+            persistent_cache,
             ephemeral_cache: Arc::new(ephemeral_cache),
             sequencer,
             _pg_listener_handle: Arc::new(pg_listener_handle),
@@ -470,11 +476,15 @@ where
     /// On the insert lane that is the sequence generator's `last_value`, so
     /// it counts sequences already assigned to transactions that have not
     /// committed yet; on the commit lane it is the head of the commit log.
-    pub async fn frontier<L>(&self) -> Result<L::Position, sqlx::Error>
+    pub async fn frontier<L>(&self) -> Result<L::Position, FrontierError>
     where
         L: Lane,
     {
-        L::frontier::<Tables>(&self.pool).await
+        L::outbox_frontier(self).await
+    }
+
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 
     /// Listen in commit order rather than insert order: a source

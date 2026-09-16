@@ -20,10 +20,10 @@ mod tables;
 pub mod test_utils;
 
 pub use config::{
-    CommitLane, CommitLaneDisabled, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_GAP_FILL_GRACE,
-    DEFAULT_IDLE_RESYNC_INTERVAL, DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL,
-    DEFAULT_PARTITION_PREMAKE, DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE,
-    MailboxConfig,
+    CommitLane, CommitLaneDisabled, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_COMMIT_CHECKPOINT_EVERY,
+    DEFAULT_COMMIT_CHECKPOINT_INTERVAL, DEFAULT_GAP_FILL_GRACE, DEFAULT_IDLE_RESYNC_INTERVAL,
+    DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
+    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, FrontierError, MailboxConfig,
 };
 
 pub use inbox::{
@@ -41,10 +41,10 @@ pub use out::{
     UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
-pub use tables::MailboxTables;
 #[doc(hidden)]
-pub use tables::{CommitGroupAppend, CommitLogRow};
-pub use tables::{CommitRestartState, PersistentEventRows, SubscriptionRow};
+pub use tables::CommitCheckpoint;
+pub use tables::MailboxTables;
+pub use tables::{PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
     decode_persistent_event, record_ephemeral_event_type_undecodable,

@@ -5,7 +5,6 @@ use std::{borrow::Cow, sync::Arc};
 use crate::out::lane::{CommitOrder, InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
 use crate::sequence::*;
-use crate::tables::CommitLogRow;
 
 es_entity::entity_id! { OutboxEventId }
 
@@ -506,19 +505,6 @@ where
     #[allow(clippy::result_large_err)]
     pub(crate) fn into_item(self) -> Result<EventDelivery<P, L>, UndecodableDelivery<L>> {
         self.map(PersistentDelivery::into_item).transpose()
-    }
-}
-
-impl<P> From<CommitLogRow<P>> for Transport<CommitOrder, P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    fn from(row: CommitLogRow<P>) -> Self {
-        Delivery::new(
-            row.commit_sequence,
-            row.commit_boundary,
-            PersistentDelivery::from(row.event),
-        )
     }
 }
 

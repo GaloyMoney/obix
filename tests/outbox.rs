@@ -2355,18 +2355,13 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
             .execute(&pool)
             .await?;
     }
-    // Start the sequencer already caught up. `idx_tup_fetch` is per table, so
-    // it counts every reader of `persistent_outbox_events`; leaving the
-    // sequencer to replay this history would put a second reader's one-time
-    // catch-up inside a budget that is about this listener's paging.
-    sqlx::query(
-        "UPDATE persistent_outbox_commit_log_state
-         SET logged_through_sequence = $1 WHERE singleton",
-    )
-    .bind(HISTORY as i64)
-    .execute(&pool)
-    .await?;
-
+    // No sequencer runs here: `idx_tup_fetch` is per table, so it counts
+    // every reader of `persistent_outbox_events`, and a commit-lane fold
+    // replaying this history would put a second reader's one-time catch-up
+    // inside a budget that is about this listener's paging. The lane is
+    // `Disabled` by default and this test must keep it that way — it used to
+    // need an explicit nudge to the sequencer's cursor, which the opt-in
+    // makes unnecessary.
     let before = rows_read_by_index(&pool).await?;
 
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(

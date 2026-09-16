@@ -22,7 +22,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use obix::{
     CommitLane, CommitLaneDisabled, CommitOrder, CommitSequence, EventCtx, EventDelivery,
     EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, Ordering, OutboxEventJobConfig,
@@ -62,6 +62,16 @@ async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
 fn config(commit_lane: CommitLane) -> MailboxConfig {
     MailboxConfig::builder()
         .commit_lane(commit_lane)
+        .build()
+        .expect("Couldn't build MailboxConfig")
+}
+
+/// A checkpoint after every group, so a test asserting on resume points needs
+/// no timing slack.
+fn config_checkpointing_every_group() -> MailboxConfig {
+    MailboxConfig::builder()
+        .commit_lane(CommitLane::Enabled)
+        .commit_checkpoint_every(1)
         .build()
         .expect("Couldn't build MailboxConfig")
 }
@@ -137,16 +147,23 @@ async fn seed(pool: &sqlx::PgPool, rows: &[Seeded]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `(last_commit_seq, logged_through_sequence)` straight from the sequencer's
-/// state row — an independent reading of the lane's head.
-async fn commit_log_state(pool: &sqlx::PgPool) -> anyhow::Result<(i64, i64)> {
-    let row: (i64, i64) = sqlx::query_as(
-        "SELECT last_commit_seq, logged_through_sequence
-         FROM persistent_outbox_commit_log_state WHERE singleton",
+/// How many sparse checkpoints the commit-lane fold has written, and the
+/// newest one's `(sequence, commit_seq)`.
+///
+/// The lane is computed rather than materialised, so this is the only thing
+/// it persists — there is no head to read back, and a test that wants the
+/// head asks the subscription for it.
+async fn checkpoint_state(pool: &sqlx::PgPool) -> anyhow::Result<(i64, Option<(i64, i64)>)> {
+    let count: (i64,) = sqlx::query_as("SELECT count(*) FROM persistent_outbox_commit_checkpoints")
+        .fetch_one(pool)
+        .await?;
+    let newest: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT sequence, commit_seq FROM persistent_outbox_commit_checkpoints
+         ORDER BY sequence DESC LIMIT 1",
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(row)
+    Ok((count.0, newest))
 }
 
 async fn publish_group(
@@ -1096,10 +1113,12 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
     )
     .await?;
 
-    let (last_commit_seq, _) = commit_log_state(&pool).await?;
+    // The lane's head is an in-process value now, so the independent reading
+    // is the outbox's own — not a table.
     assert_eq!(
-        last_commit_seq, 3,
-        "the log's own head agrees with what the subscription reports",
+        outbox.frontier::<CommitOrder>().await?,
+        expected,
+        "the outbox's commit-lane frontier agrees with what the subscription reports",
     );
     let insert_frontier = outbox.highest_known_persistent_sequence().await?;
     assert_eq!(
@@ -1112,7 +1131,7 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
     assert_eq!(
         snapshot.frontier(),
         expected,
-        "the commit-lane frontier is the log's head, not the sequence generator's last value",
+        "the commit-lane frontier is the fold's head, not the sequence generator's last value",
     );
     assert_eq!(snapshot.checkpoint(), expected);
     assert_eq!(snapshot.lag(), 0);
@@ -1347,9 +1366,9 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
     .await?;
 
     assert_eq!(
-        commit_log_state(&pool).await?,
-        (0, 0),
-        "no sequencer ran: the commit log and its state row are untouched",
+        checkpoint_state(&pool).await?.0,
+        0,
+        "no sequencer ran: nothing folded, so nothing checkpointed",
     );
 
     Ok(())
@@ -1388,14 +1407,14 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
     )
     .await?;
     assert_eq!(
-        commit_log_state(&pool).await?,
-        (0, 0),
+        checkpoint_state(&pool).await?.0,
+        0,
         "precondition: nothing was sequenced while the lane was disabled — without this the \
          test is merely the always-on case again",
     );
 
-    // Phase 2 — enable it. The fold resumes from `logged_through_sequence`
-    // (0 here), so the whole history is placed, page by page.
+    // Phase 2 — enable it. With no checkpoint to seed from, the fold starts
+    // at the beginning of the stream, so the whole history is emitted.
     let mut jobs = init_jobs(&pool).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
     let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1496,7 +1515,12 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
     // checkpointed at commit position 3.
     {
         let mut jobs = init_jobs(&pool).await?;
-        let outbox = init_outbox(&pool, CommitLane::Enabled).await?;
+        wipe(&pool).await?;
+        // A checkpoint per group, so phase 3's fold has one to resume from
+        // without waiting on the cadence.
+        let outbox =
+            Outbox::<TestEvent, TestTables>::init(&pool, config_checkpointing_every_group())
+                .await?;
         let received = Arc::new(Mutex::new(Vec::new()));
         let subscription = outbox
             .register_singleton_subscriber(
@@ -1532,9 +1556,13 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
     // Phase 2 — lane off: three more groups reach the table, nothing folds.
     seed(&pool, &[ev(4, 7101, 4), ev(5, 7102, 5), ev(6, 7103, 6)]).await?;
     assert_eq!(
-        commit_log_state(&pool).await?.0,
-        3,
-        "precondition: with the lane off the log stays where phase 1 left it",
+        checkpoint_state(&pool)
+            .await?
+            .1
+            .map(|(_, commit_seq)| commit_seq),
+        Some(3),
+        "precondition: with the lane off nothing folds, so the newest checkpoint stays where \
+         phase 1 left it",
     );
 
     // Phase 3 — lane on again: the fold resumes from its stored cursor and
@@ -1979,120 +2007,223 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 19. The fence must not pass while an append is still in flight ===
+// === 19. Positions are the first-sight numbering, computed not stored ===
 
-/// Test 19 — `fold_position` must mean "every sequence at or below this is
-/// **accounted for** on the commit lane", not "the fold has *started* looking
-/// at it".
+/// Test 19 (rev 3) — the position a delivery carries is exactly what I9
+/// says: groups placed at first sight of their lowest member, members in
+/// `sequence` order, positions a running count of rows emitted.
 ///
-/// Reported by Bugbot on #156, and real. `append_commit_group` is a round
-/// trip: if the fold publishes its position on entry, there is a window in
-/// which the fence sees `fold_position >= insert_frontier`, reads
-/// `commit_log_state`, and gets the head from *before* the in-flight append —
-/// so it waits for a commit position that is already reached and returns with
-/// the frontier event undelivered. A single-event transaction at the frontier
-/// is the common case, not a corner.
-///
-/// The window is one statement wide in production; here it is held open
-/// deterministically by taking the `FOR UPDATE` lock that
-/// `append_commit_group` needs, so the sequencer parks inside the append.
+/// The expectation is computed here from the seeded layout rather than read
+/// back from anything the implementation wrote, so this pins the *numbering
+/// rule* — and, because these are the values the superseded commit log would
+/// have held, it is also the evidence that removing the log changed no
+/// consumer-visible number.
 #[tokio::test]
 #[file_serial]
-async fn caught_up_fence_does_not_pass_while_an_append_is_in_flight() -> anyhow::Result<()> {
+async fn positions_equal_the_first_sight_numbering() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
-    let outbox = init_outbox(&pool, CommitLane::Enabled).await?;
 
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let subscription = outbox
+    // Five groups, interleaved, including a straddler (group 8005 is first
+    // sighted at 3 and has a member at 14, after three later groups have
+    // been emitted whole).
+    let layout: Vec<(i64, i64, u64)> = vec![
+        (1, 8001, 11),
+        (2, 8002, 21),
+        (3, 8005, 51),
+        (4, 8001, 12),
+        (5, 8003, 31),
+        (6, 8002, 22),
+        (7, 8003, 32),
+        (8, 8004, 41),
+        (9, 8004, 42),
+        (10, 8001, 13),
+        (11, 8002, 23),
+        (12, 8003, 33),
+        (13, 8004, 43),
+        (14, 8005, 52),
+    ];
+    wipe(&pool).await?;
+    seed(
+        &pool,
+        &layout
+            .iter()
+            .map(|(seq, xid, payload)| ev(*seq, *xid, *payload))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+
+    // I9, computed independently of the implementation: walk the table in
+    // insert order; at each first sight emit that group's whole membership in
+    // sequence order, numbering from the running count.
+    let mut expected: Vec<(u64, u64)> = Vec::new(); // (position, payload)
+    let mut emitted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (_, xid, _) in &layout {
+        if !emitted.insert(*xid) {
+            continue;
+        }
+        let mut members: Vec<(i64, u64)> = layout
+            .iter()
+            .filter(|(_, x, _)| x == xid)
+            .map(|(seq, _, payload)| (*seq, *payload))
+            .collect();
+        members.sort_unstable();
+        for (_, payload) in members {
+            expected.push((expected.len() as u64 + 1, payload));
+        }
+    }
+
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    outbox
         .register_singleton_subscriber(
             &mut jobs,
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
-            Consumer {
-                received: received.clone(),
+            CommitPositionRecorder {
+                recorded: recorded.clone(),
             },
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    // One event, delivered and durably checkpointed at commit position 1.
-    publish_group(&outbox, [1]).await?;
+    until(
+        async || recorded.lock().await.len() >= layout.len(),
+        "every seeded event delivered",
+    )
+    .await?;
+
+    let delivered: Vec<(u64, u64)> = recorded
+        .lock()
+        .await
+        .iter()
+        .map(|r| (u64::from(r.position), r.payload))
+        .collect();
+    assert_eq!(
+        delivered, expected,
+        "the computed numbering must equal the first-sight rule, member for member",
+    );
+
+    Ok(())
+}
+
+// === 21. A restart resumes from a checkpoint without renumbering ===
+
+/// Test 21 (rev 3) — a checkpoint's `open_groups` is what stops a resumed
+/// fold re-emitting a group that straddles its resume point, and what keeps
+/// the numbering continuous across the restart.
+#[tokio::test]
+#[file_serial]
+async fn restart_resumes_from_a_checkpoint_without_renumbering() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Group 8101 straddles: first sighted at 1, last member at 5. With a
+    // checkpoint after every group, the fold checkpoints while 8101 is still
+    // open, so the resumed fold must learn about it from `open_groups`.
+    wipe(&pool).await?;
+    seed(
+        &pool,
+        &[
+            ev(1, 8101, 11),
+            ev(2, 8102, 21),
+            ev(3, 8102, 22),
+            ev(4, 8103, 31),
+            ev(5, 8101, 12),
+        ],
+    )
+    .await?;
+
+    let first: Vec<(u64, u64)> = {
+        let outbox =
+            Outbox::<TestEvent, TestTables>::init(&pool, config_checkpointing_every_group())
+                .await?;
+        let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let item = listener.next().await.expect("event")?;
+            seen.push((u64::from(item.position()), item.sequence.into()));
+        }
+        // A checkpoint must exist, or the restart below proves nothing.
+        until(
+            async || {
+                checkpoint_state(&pool)
+                    .await
+                    .map(|(count, _)| count > 0)
+                    .unwrap_or(false)
+            },
+            "the fold wrote a checkpoint",
+        )
+        .await?;
+        seen
+    };
+    assert_eq!(
+        first.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+    );
+
+    // A fresh process, seeded from the checkpoint rather than from zero.
+    seed(&pool, &[ev(6, 8104, 41)]).await?;
+    let outbox =
+        Outbox::<TestEvent, TestTables>::init(&pool, config_checkpointing_every_group()).await?;
+    let mut listener = outbox.listen_commit_ordered(CommitSequence::from(5u64))?;
+    let item = tokio::time::timeout(Duration::from_secs(20), listener.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("the resumed fold never reached the new group"))?
+        .expect("event")?;
+    assert_eq!(
+        (u64::from(item.position()), u64::from(item.sequence)),
+        (6, 6),
+        "the numbering must continue at 6 — a fold that re-emitted the straddling group would \
+         renumber, and one that restarted from zero would repeat",
+    );
+
+    Ok(())
+}
+
+// === 23. No per-group writes ===
+
+/// Test 23 (rev 3) — the whole point of the revision: the lane writes one
+/// sparse checkpoint per cadence, not one row per group, and the log tables
+/// are gone.
+#[tokio::test]
+#[file_serial]
+async fn no_per_group_writes() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool, CommitLane::Enabled).await?;
+
+    // Twenty single-event groups against the default cadence of 1,000.
+    for n in 1..=20u64 {
+        publish_group(&outbox, [n]).await?;
+    }
     until(
         async || {
-            subscription
-                .load()
+            outbox
+                .frontier::<CommitOrder>()
                 .await
-                .map(|s| s.checkpoint() == CommitSequence::from(1u64))
+                .map(|head| head == CommitSequence::from(20u64))
                 .unwrap_or(false)
         },
-        "the subscriber checkpoints at commit position 1",
+        "the fold emitted all twenty groups",
     )
     .await?;
 
-    // Freeze the next append by holding the row it locks.
-    let mut blocker = pool.begin().await?;
-    sqlx::query(
-        "SELECT last_commit_seq FROM persistent_outbox_commit_log_state
-         WHERE singleton FOR UPDATE",
-    )
-    .fetch_one(&mut *blocker)
-    .await?;
-
-    // A second single-event transaction: the insert frontier moves to 2, the
-    // sequencer reaches it, and its append parks on the lock above.
-    publish_group(&outbox, [2]).await?;
-    until(
-        async || {
-            let blocked: Result<(i64,), _> = sqlx::query_as(
-                "SELECT count(*) FROM pg_stat_activity
-                 WHERE wait_event_type = 'Lock'
-                   AND query ILIKE '%persistent_outbox_commit_log_state%'",
-            )
-            .fetch_one(&pool)
-            .await;
-            blocked.map(|(n,)| n >= 1).unwrap_or(false)
-        },
-        "the sequencer's append parks on the held lock",
-    )
-    .await?;
-    assert_eq!(
-        outbox.highest_known_persistent_sequence().await?,
-        EventSequence::from(2u64),
-        "precondition: the insert frontier has moved to the event whose append is in flight",
-    );
-    assert_eq!(
-        commit_log_state(&pool).await?.0,
-        1,
-        "precondition: the log head is still 1 — the append has not committed",
-    );
-
-    // The fence must NOT report caught up here: commit position 2 exists as
-    // soon as that append lands and has not been delivered to anyone.
-    let fenced = subscription.await_caught_up(Duration::from_secs(2)).await;
+    let (checkpoints, _) = checkpoint_state(&pool).await?;
     assert!(
-        fenced.is_err(),
-        "await_caught_up returned while the frontier event's append was still in flight, so \
-         commit position 2 was undelivered: {fenced:?}",
-    );
-    assert_eq!(
-        *received.lock().await,
-        vec![1],
-        "precondition: the second event really was undelivered at that point",
+        checkpoints <= 1,
+        "twenty groups under a 1,000-group cadence must not write twenty rows: {checkpoints}",
     );
 
-    // Released, it completes normally.
-    blocker.rollback().await?;
-    subscription
-        .await_caught_up(Duration::from_secs(20))
-        .await
-        .map_err(|e| anyhow::anyhow!("await_caught_up after the append landed: {e}"))?;
-    assert_eq!(
-        *received.lock().await,
-        vec![1, 2],
-        "both events delivered once the append committed",
-    );
+    for table in [
+        "persistent_outbox_commit_log",
+        "persistent_outbox_commit_log_state",
+    ] {
+        let exists: (Option<String>,) = sqlx::query_as("SELECT to_regclass($1)::text")
+            .bind(table)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(exists.0, None, "{table} must not exist any more");
+    }
 
     Ok(())
 }

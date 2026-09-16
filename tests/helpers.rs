@@ -56,20 +56,13 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reset the commit-ordered lane: the log and the sequencer's state row.
-/// The state row must be reset alongside the events table — a surviving
-/// `head`/`cursor` would sit past the sequences a truncated stream reissues
-/// and the sequencer would never log them.
+/// Reset the commit-ordered lane's checkpoints. They must go alongside the
+/// events table — a surviving checkpoint sits past the sequences a truncated
+/// stream reissues, so a fold seeded from it would skip them entirely.
 pub async fn wipeout_commit_log(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query!("TRUNCATE persistent_outbox_commit_log")
+    sqlx::query!("TRUNCATE persistent_outbox_commit_checkpoints")
         .execute(pool)
         .await?;
-    sqlx::query!(
-        "UPDATE persistent_outbox_commit_log_state
-         SET last_commit_seq = 0, logged_through_sequence = 0 WHERE singleton"
-    )
-    .execute(pool)
-    .await?;
     Ok(())
 }
 

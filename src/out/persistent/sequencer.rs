@@ -1,43 +1,50 @@
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 
-use super::cache::CacheHandle;
+use super::cache::PersistentOutboxEventCache;
 use super::listener::PersistentOutboxListener;
 use crate::{
     handle::{OwnedTaskHandle, spawn_supervised},
     out::event::*,
     out::lane::{CommitOrder, InsertOrder, LaneHandle},
     sequence::{CommitGroupId, CommitSequence, EventSequence},
-    tables::{CommitGroupAppend, MailboxTables},
+    tables::{CommitCheckpoint, MailboxTables, PersistentEventRows},
 };
 
-/// How long a failed append waits before retrying the same group.
-const APPEND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a failed group fetch waits before retrying the same group.
+const FETCH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How far this process's sequencer has folded the insert-ordered stream.
+/// How far this process's sequencer has folded the insert-ordered stream, and
+/// how many rows it has emitted on the commit lane.
 ///
-/// Distinct from `persistent_outbox_commit_log_state.logged_through_sequence`,
-/// which advances only when a group is *appended*: this advances over every
-/// delivery the fold has seen, placeholders and already-logged members
-/// included, which is what the commit lane's caught-up barrier needs to know.
+/// Both are in-process values. The commit lane is not materialised — every
+/// `Enabled` process computes the same numbering from the same table — so
+/// "the head" is a per-process fact about how far *this* fold has got, not a
+/// cluster-wide one.
 #[derive(Clone)]
 pub(crate) struct SequencerPositions {
     fold_position: Arc<AtomicU64>,
+    commit_head: Arc<AtomicU64>,
 }
 
 impl SequencerPositions {
     /// The highest insert sequence this process's fold has passed. Every
-    /// sequence at or below it has been placed into the commit log (with its
+    /// sequence at or below it has been emitted on the commit lane (with its
     /// whole group) or skipped.
     pub(crate) fn fold_position(&self) -> EventSequence {
         EventSequence::from(self.fold_position.load(Ordering::Acquire))
+    }
+
+    /// The highest position this process's fold has emitted.
+    pub(crate) fn commit_head(&self) -> CommitSequence {
+        CommitSequence::from(self.commit_head.load(Ordering::Acquire))
     }
 }
 
@@ -56,8 +63,8 @@ where
 }
 
 /// The commit lane's internal transport: a [`PersistentDelivery`] positioned
-/// at the slot the sequencer placed it in, and flagged when it closes its
-/// source transaction.
+/// at the slot the fold emitted it in, and flagged when it closes its source
+/// transaction.
 type CommitTransport<P> = Transport<CommitOrder, P>;
 
 impl<P> std::fmt::Debug for SequencerHandle<P>
@@ -92,34 +99,87 @@ where
     }
 }
 
-/// Folds the insert-ordered stream into commit order and materialises it
-/// into the commit log.
+/// Where a fold's output goes.
+enum Sink<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// The live lane: broadcast to every listener.
+    Live(broadcast::Sender<CommitTransport<P>>),
+    /// One backfill request: only positions above what the consumer already
+    /// has, and only until the live fold's head is reached — from there the
+    /// consumer's listener takes over from the broadcast, the same hand-off
+    /// the insert lane's backfill makes.
+    Backfill {
+        sender: mpsc::Sender<CommitTransport<P>>,
+        after: CommitSequence,
+        until: CommitSequence,
+    },
+}
+
+impl<P> Sink<P>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// Emit one positioned delivery. `false` means the fold should stop.
+    async fn emit(&mut self, delivery: CommitTransport<P>) -> bool {
+        match self {
+            Self::Live(sender) => {
+                let _ = sender.send(delivery);
+                true
+            }
+            Self::Backfill { sender, after, .. } => {
+                if delivery.position() <= *after {
+                    return true;
+                }
+                sender.send(delivery).await.is_ok()
+            }
+        }
+    }
+
+    /// Whether this fold has produced everything it was asked for.
+    fn finished(&self, head: CommitSequence) -> bool {
+        match self {
+            Self::Live(_) => false,
+            Self::Backfill { until, .. } => head >= *until,
+        }
+    }
+}
+
+/// Folds the insert-ordered stream into commit order.
 ///
-/// One task per process, always running. It consumes a
-/// [`PersistentOutboxListener`] from its stored cursor, so contiguity, gap
-/// parking and lag recovery are the listener's job, not this one's. Every
-/// process folds the same stream from the same state row and therefore
-/// computes the same log, including `commit_seq`; the per-group cursor check
-/// is what makes each group appended exactly once.
+/// The order is **computed, never materialised**: a group is emitted whole at
+/// first sight of its lowest member over the contiguous, gap-filled insert
+/// stream, its members in `sequence` order, and a position is a running count
+/// of rows emitted. That makes the numbering a pure function of the events
+/// table — every process derives the same `CommitSequence`s independently,
+/// with no lock, no log and no coordination.
+///
+/// What is persisted is a *sparse checkpoint* of the fold
+/// ([`CommitCheckpoint`]): enough to resume mid-stream without replaying
+/// history, written every `checkpoint_every` groups or `checkpoint_interval`,
+/// never per group.
 struct Sequencer<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    page: usize,
+    /// Rows emitted so far — the next group's members are numbered from
+    /// `head + 1`.
     head: CommitSequence,
-    commit_head: Arc<AtomicU64>,
-    fold_position: Arc<AtomicU64>,
-    commit_sender: broadcast::Sender<CommitTransport<P>>,
-    /// Groups appended but whose later members the fold has not reached yet,
-    /// mapped to their highest member. Dropped as the stream passes them.
+    /// Published copy of `head`, for the fence and for listeners.
+    commit_head: Option<Arc<AtomicU64>>,
+    fold_position: Option<Arc<AtomicU64>>,
+    sink: Sink<P>,
+    /// Groups already emitted whose later members the fold has not reached
+    /// yet, mapped to their highest member. Dropped as the stream passes
+    /// them. Seeded from a checkpoint's `open_groups`, which is what stops a
+    /// resumed fold re-emitting a group that straddles its resume point.
     seen: HashMap<CommitGroupId, EventSequence>,
-    /// Sequences already in the log at or above the resume cursor.
-    ///
-    /// A group appended before a crash can have members above the cursor the
-    /// crash left behind; without this seed the resumed fold would append it
-    /// a second time. Drained as the stream reaches each one.
-    logged_ahead: BTreeSet<EventSequence>,
+    checkpoint_every: usize,
+    checkpoint_interval: std::time::Duration,
+    groups_since_checkpoint: usize,
+    last_checkpoint: tokio::time::Instant,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -128,224 +188,391 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
 {
-    /// Fold one insert-lane delivery, then publish how far the fold has got.
-    async fn fold(&mut self, delivery: Transport<InsertOrder, P>) {
-        let sequence = delivery.sequence();
-        self.place(delivery).await;
-        // INVARIANT: published only once this delivery is fully ACCOUNTED
-        // FOR — its group appended and committed, or provably never going to
-        // be. The commit-lane fence reads this and then reads the log head,
-        // so publishing on entry instead leaves a window one
-        // `append_commit_group` round trip wide in which the fence sees the
-        // fold past the insert frontier but reads a head the in-flight
-        // append has not written yet, and returns with the frontier event
-        // undelivered.
-        //
-        // It must still advance on every early return in `place`, or the
-        // fence stalls on an aborted tail instead.
-        self.fold_position
-            .store(u64::from(sequence), Ordering::Release);
+    /// Fold a drained batch of insert-lane deliveries.
+    ///
+    /// The members of every group first sighted in the batch are fetched in
+    /// ONE statement, then the batch is placed in order from that map. The
+    /// fetch is per page; emission, the head advance and the published fold
+    /// position all stay per delivery and in order, so the fence invariant
+    /// below is unaffected by the batching.
+    ///
+    /// `false` means the fold should stop (the sink is done or gone).
+    async fn fold_batch(&mut self, batch: Vec<Transport<InsertOrder, P>>) -> bool {
+        let mut members = self.fetch_members(&batch).await;
+        for delivery in batch {
+            let sequence = delivery.sequence();
+            if !self.place(delivery, &mut members).await {
+                return false;
+            }
+            // INVARIANT: published only once this delivery is fully ACCOUNTED
+            // FOR — its group emitted and the head advanced, or provably
+            // never going to be. The commit-lane fence reads this and then
+            // reads the head, so publishing before the group is emitted
+            // leaves a window in which the fence sees the fold past the
+            // insert frontier while the head still excludes that group, and
+            // returns with the frontier event undelivered.
+            //
+            // It must still advance on every early return in `place`, or the
+            // fence stalls on an aborted tail instead.
+            if let Some(position) = &self.fold_position {
+                position.store(u64::from(sequence), Ordering::Release);
+            }
+            if self.sink.finished(self.head) {
+                return false;
+            }
+        }
+        true
     }
 
-    /// Place one delivery into the commit log, or establish that it never
-    /// needs to be.
-    async fn place(&mut self, delivery: Transport<InsertOrder, P>) {
-        let sequence = delivery.sequence();
-        if self.logged_ahead.remove(&sequence) {
-            return;
+    /// One statement for every group first sighted in `batch`.
+    ///
+    /// The floor is the lowest first-sight sequence in the batch: a group's
+    /// members never sit below its own MIN, and every MIN here is in the
+    /// batch, so the bound prunes partitions without losing a row.
+    async fn fetch_members(
+        &self,
+        batch: &[Transport<InsertOrder, P>],
+    ) -> HashMap<CommitGroupId, PersistentEventRows<P>> {
+        let mut wanted: Vec<CommitGroupId> = Vec::new();
+        let mut floor: Option<EventSequence> = None;
+        for delivery in batch {
+            if !delivery.has_payload() {
+                continue;
+            }
+            let group = delivery.commit_group();
+            if self.seen.contains_key(&group) || wanted.contains(&group) {
+                continue;
+            }
+            wanted.push(group);
+            floor.get_or_insert(delivery.sequence());
         }
+        let Some(floor) = floor else {
+            return HashMap::new();
+        };
+
+        // Retried rather than skipped: nothing has been emitted for these
+        // groups, so a retry re-reads the same rows and produces the same
+        // numbering. Giving up would silently drop them from the lane.
+        loop {
+            match Tables::load_group_members::<P>(&self.pool, &wanted, floor).await {
+                Ok(groups) => return groups.into_iter().collect(),
+                Err(error) => {
+                    record_fetch_failed(&error, u64::from(floor));
+                    tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    /// Emit one delivery's group if this is its first sight, or establish
+    /// that it never needs emitting.
+    async fn place(
+        &mut self,
+        delivery: Transport<InsertOrder, P>,
+        members: &mut HashMap<CommitGroupId, PersistentEventRows<P>>,
+    ) -> bool {
         if !delivery.has_payload() {
-            return;
+            return true;
         }
+        let sequence = delivery.sequence();
         let group = delivery.commit_group();
         if let Some(group_max) = self.seen.get(&group).copied() {
             if sequence >= group_max {
                 self.seen.remove(&group);
             }
-            return;
+            return true;
         }
 
-        let append = self.append(group, sequence).await;
-        if append.group_max > sequence {
-            self.seen.insert(group, append.group_max);
-        }
-        if append.appended.is_empty() {
-            self.deliver_tail().await;
-            return;
-        }
-        for row in append.appended {
-            let delivery = CommitTransport::from(row);
-            self.head = self.head.max(delivery.position());
-            let _ = self.commit_sender.send(delivery);
-        }
-        self.commit_head
-            .store(u64::from(self.head), Ordering::Release);
-    }
-
-    /// Append one group, retrying the same group until the statement
-    /// succeeds.
-    ///
-    /// Skipping on error would lose the group permanently: the cursor
-    /// advances at the next group and a restart resumes above it. The
-    /// statement is a no-op once the cursor has passed `at`, so retrying is
-    /// always safe.
-    async fn append(&self, group: CommitGroupId, at: EventSequence) -> CommitGroupAppend<P> {
-        loop {
-            match Tables::append_commit_group::<P>(&self.pool, group, at).await {
-                Ok(append) => return append,
-                Err(error) => {
-                    record_append_failed(&error, u64::from(at));
-                    tokio::time::sleep(APPEND_RETRY_INTERVAL).await;
-                }
-            }
-        }
-    }
-
-    /// Read and broadcast whatever another process appended. Paging stops at
-    /// a short page: the log is dense, so a short page means the head, never
-    /// a gap to wait on.
-    async fn deliver_tail(&mut self) {
-        loop {
-            let rows = match Tables::load_commit_ordered_page::<P>(&self.pool, self.head, self.page)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    record_tail_read_failed(&error, u64::from(self.head));
-                    return;
-                }
-            };
-            if rows.is_empty() {
-                return;
-            }
-            let returned = rows.len();
-            for row in rows {
-                let delivery = CommitTransport::from(row);
-                self.head = self.head.max(delivery.position());
-                let _ = self.commit_sender.send(delivery);
-            }
-            self.commit_head
-                .store(u64::from(self.head), Ordering::Release);
-            if returned < self.page {
-                return;
-            }
-        }
-    }
-}
-
-/// Serve one commit-lane backfill request by paging the log.
-///
-/// No park, no probe, no gap report: the log is dense, so a short page means
-/// the reader reached the head. A read error ends the request with the
-/// listener's cursor unchanged, and its next poll asks again.
-async fn serve_commit_backfill<P, Tables>(
-    pool: sqlx::PgPool,
-    page: usize,
-    mut after: CommitSequence,
-    sender: mpsc::Sender<CommitTransport<P>>,
-) where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    Tables: MailboxTables,
-{
-    loop {
-        // Don't spend a query without demand.
-        match sender.reserve().await {
-            Ok(permit) => drop(permit),
-            Err(_) => return,
-        }
-        let rows = match Tables::load_commit_ordered_page::<P>(&pool, after, page).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                record_tail_read_failed(&error, u64::from(after));
-                return;
+        let rows = match members.remove(&group) {
+            Some(rows) => rows,
+            // Not in the prefetch (a group whose first sight was skipped for
+            // want of a payload, say) — fetch it alone.
+            None => {
+                let mut fetched = self.fetch_group(group, sequence).await;
+                fetched.remove(&group).unwrap_or_default()
             }
         };
         if rows.is_empty() {
-            return;
+            return true;
         }
-        let returned = rows.len();
-        for row in rows {
-            let delivery = CommitTransport::from(row);
-            after = after.max(delivery.position());
-            if sender.send(delivery).await.is_err() {
-                return;
+
+        let group_max = rows
+            .iter()
+            .map(|row| match row {
+                Ok(event) => event.sequence,
+                Err(error) => error.sequence,
+            })
+            .max()
+            .unwrap_or(sequence);
+        if group_max > sequence {
+            self.seen.insert(group, group_max);
+        }
+
+        let last = rows.len() - 1;
+        for (index, row) in rows.into_iter().enumerate() {
+            self.head = self.head.next();
+            let delivery = Delivery::new(self.head, index == last, PersistentDelivery::from(row));
+            if !self.sink.emit(delivery).await {
+                return false;
             }
         }
-        if returned < page {
+        if let Some(head) = &self.commit_head {
+            head.store(u64::from(self.head), Ordering::Release);
+        }
+
+        self.groups_since_checkpoint += 1;
+        if self.groups_since_checkpoint >= self.checkpoint_every
+            || self.last_checkpoint.elapsed() >= self.checkpoint_interval
+        {
+            self.checkpoint(sequence);
+        }
+        true
+    }
+
+    async fn fetch_group(
+        &self,
+        group: CommitGroupId,
+        floor: EventSequence,
+    ) -> HashMap<CommitGroupId, PersistentEventRows<P>> {
+        loop {
+            match Tables::load_group_members::<P>(&self.pool, &[group], floor).await {
+                Ok(groups) => return groups.into_iter().collect(),
+                Err(error) => {
+                    record_fetch_failed(&error, u64::from(floor));
+                    tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    /// Record where the fold is, without blocking it.
+    ///
+    /// Captured at `sequence` *after* placing it, which is the same point the
+    /// fold position is published — so the triple is consistent by
+    /// construction. Fire-and-forget: the content is a pure function of the
+    /// table, so a lost write costs only a longer resume next time.
+    fn checkpoint(&mut self, sequence: EventSequence) {
+        self.groups_since_checkpoint = 0;
+        self.last_checkpoint = tokio::time::Instant::now();
+        if !matches!(self.sink, Sink::Live(_)) {
+            return;
+        }
+        let checkpoint = CommitCheckpoint {
+            sequence,
+            commit_seq: self.head,
+            open_groups: self.seen.iter().map(|(g, max)| (*g, *max)).collect(),
+        };
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            if let Err(error) = Tables::write_commit_checkpoint(&pool, &checkpoint).await {
+                record_checkpoint_failed(&error, u64::from(checkpoint.sequence));
+            }
+        });
+    }
+}
+
+/// What a backfill needs to run a private fold: the same inputs the live one
+/// was spawned with.
+struct BackfillSource<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pool: sqlx::PgPool,
+    cache: Arc<PersistentOutboxEventCache<P, Tables>>,
+    page: usize,
+    checkpoint_every: usize,
+    checkpoint_interval: std::time::Duration,
+}
+
+impl<P, Tables> Clone for BackfillSource<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            cache: self.cache.clone(),
+            page: self.page,
+            checkpoint_every: self.checkpoint_every,
+            checkpoint_interval: self.checkpoint_interval,
+        }
+    }
+}
+
+/// Serve one commit-lane backfill request by **re-folding** from the nearest
+/// checkpoint.
+///
+/// There is no log to page: the consumer's cursor names a position, the
+/// nearest checkpoint at or below it names where the fold that produced that
+/// position was, and replaying from there reproduces it exactly (the
+/// numbering is a pure function of the table). Overshoot — rows re-folded but
+/// below the consumer's cursor, so never sent — is bounded by the checkpoint
+/// cadence.
+async fn serve_commit_backfill<P, Tables>(
+    source: BackfillSource<P, Tables>,
+    after: CommitSequence,
+    until: CommitSequence,
+    sender: mpsc::Sender<CommitTransport<P>>,
+) where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    let BackfillSource {
+        pool,
+        cache,
+        page,
+        checkpoint_every,
+        checkpoint_interval,
+    } = source;
+    let seed = match Tables::load_commit_checkpoint_for(&pool, after).await {
+        Ok(seed) => seed,
+        Err(error) => {
+            record_checkpoint_read_failed(&error, u64::from(after));
+            return;
+        }
+    };
+    let (from, head, seen) = match seed {
+        Some(checkpoint) => (
+            checkpoint.sequence,
+            checkpoint.commit_seq,
+            checkpoint.open_groups.into_iter().collect(),
+        ),
+        None => (EventSequence::BEGIN, CommitSequence::BEGIN, HashMap::new()),
+    };
+    record_backfill_started(u64::from(after), u64::from(from), u64::from(head));
+
+    let mut listener = PersistentOutboxListener::transport_stream(cache.handle(), Some(from), page);
+    let mut sequencer = Sequencer::<P, Tables> {
+        pool,
+        head,
+        commit_head: None,
+        fold_position: None,
+        sink: Sink::Backfill {
+            sender,
+            after,
+            until,
+        },
+        seen,
+        checkpoint_every,
+        checkpoint_interval,
+        groups_since_checkpoint: 0,
+        last_checkpoint: tokio::time::Instant::now(),
+        _phantom: std::marker::PhantomData,
+    };
+
+    loop {
+        let Some(batch) = next_batch(&mut listener, page).await else {
+            return;
+        };
+        if !sequencer.fold_batch(batch).await {
             return;
         }
     }
 }
 
+/// Wait for one delivery, then take whatever else is already buffered, up to
+/// `page`. `None` means the stream ended.
+async fn next_batch<P, S>(listener: &mut S, page: usize) -> Option<Vec<Transport<InsertOrder, P>>>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    S: StreamExt<Item = Transport<InsertOrder, P>> + Unpin,
+{
+    let first = listener.next().await?;
+    let mut batch = Vec::with_capacity(page);
+    batch.push(first);
+    while batch.len() < page {
+        match listener.next().now_or_never() {
+            Some(Some(delivery)) => batch.push(delivery),
+            Some(None) => break,
+            None => break,
+        }
+    }
+    Some(batch)
+}
+
 /// Start this process's sequencer. Called from `Outbox::init` when the commit
-/// lane is [`Enabled`](crate::CommitLane::Enabled): a process with no
-/// commit-ordered listener still folds and still appends, so the log never
-/// lags a live process.
+/// lane is [`Enabled`](crate::CommitLane::Enabled).
 ///
-/// The fold resumes from `logged_through_sequence`, which is `0` on a
-/// database where the lane has never run — so enabling the lane late is the
-/// same code path as a restart after downtime, only longer. Placement is a
-/// pure function of the persisted table, so the log it produces is the one a
-/// sequencer running from day one would have produced.
+/// The fold resumes from the newest checkpoint, or from the beginning of the
+/// stream when there is none — so enabling the lane late is the same code
+/// path as a restart after downtime, only longer. The numbering is a pure
+/// function of the persisted table, so what it produces is what a sequencer
+/// running from day one would have produced.
 pub(crate) async fn spawn<P, Tables>(
     pool: &sqlx::PgPool,
-    cache: CacheHandle<P>,
+    cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     buffer_size: usize,
     page: usize,
+    checkpoint_every: usize,
+    checkpoint_interval: std::time::Duration,
 ) -> Result<SequencerHandle<P>, sqlx::Error>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
     let page = page.max(1);
-    let restart = Tables::commit_log_restart_state(pool).await?;
-    let logged_ahead: BTreeSet<EventSequence> = restart.logged_ahead.into_iter().collect();
     let frontier = Tables::highest_known_persistent_sequence(pool).await?;
+    let seed = Tables::load_commit_checkpoint(pool, frontier).await?;
+    let (from, head, seen): (_, _, HashMap<_, _>) = match seed {
+        Some(checkpoint) => (
+            checkpoint.sequence,
+            checkpoint.commit_seq,
+            checkpoint.open_groups.into_iter().collect(),
+        ),
+        None => (EventSequence::BEGIN, CommitSequence::BEGIN, HashMap::new()),
+    };
     record_started(
-        u64::from(restart.logged_through),
+        u64::from(from),
         u64::from(frontier),
-        u64::from(frontier).saturating_sub(u64::from(restart.logged_through)),
+        u64::from(frontier).saturating_sub(u64::from(from)),
     );
 
     let (commit_sender, _) = broadcast::channel(buffer_size);
-    let commit_head = Arc::new(AtomicU64::new(u64::from(restart.last_commit_seq)));
-    let fold_position = Arc::new(AtomicU64::new(u64::from(restart.logged_through)));
+    let commit_head = Arc::new(AtomicU64::new(u64::from(head)));
+    let fold_position = Arc::new(AtomicU64::new(u64::from(from)));
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
-    let backfill_pool = pool.clone();
+    let backfill_source = BackfillSource {
+        pool: pool.clone(),
+        cache: cache.clone(),
+        page,
+        checkpoint_every: checkpoint_every.max(1),
+        checkpoint_interval,
+    };
+    let backfill_head = commit_head.clone();
 
-    let mut listener = PersistentOutboxListener::transport_stream(
-        cache,
-        Some(restart.logged_through),
-        buffer_size,
-    );
+    let mut listener =
+        PersistentOutboxListener::transport_stream(cache.handle(), Some(from), buffer_size);
     let mut sequencer = Sequencer::<P, Tables> {
         pool: pool.clone(),
-        page,
-        head: restart.last_commit_seq,
-        commit_head: commit_head.clone(),
-        fold_position: fold_position.clone(),
-        commit_sender: commit_sender.clone(),
-        seen: HashMap::new(),
-        logged_ahead,
+        head,
+        commit_head: Some(commit_head.clone()),
+        fold_position: Some(fold_position.clone()),
+        sink: Sink::Live(commit_sender.clone()),
+        seen,
+        checkpoint_every: checkpoint_every.max(1),
+        checkpoint_interval,
+        groups_since_checkpoint: 0,
+        last_checkpoint: tokio::time::Instant::now(),
         _phantom: std::marker::PhantomData,
     };
 
     let task = spawn_supervised("obix::commit_sequencer", async move {
-        // INVARIANT: the published head is reconciled against the log before
-        // the fold runs. The seeded sequences are skipped without appending,
-        // so nothing else in the loop would correct a head that a peer has
-        // already moved past, and a listener trusting it would never backfill.
-        sequencer.deliver_tail().await;
-
         loop {
             tokio::select! {
                 request = backfill_rx.recv() => {
                     match request {
                         Some((after, sender)) => {
+                            // Sampled here, not inside the task: the hand-off
+                            // point is the head as of the request, so a fold
+                            // that runs on cannot keep the backfill running
+                            // behind it forever.
+                            let until = CommitSequence::from(
+                                backfill_head.load(Ordering::Acquire),
+                            );
                             tokio::spawn(serve_commit_backfill::<P, Tables>(
-                                backfill_pool.clone(),
-                                page,
+                                backfill_source.clone(),
                                 after,
+                                until,
                                 sender,
                             ));
                         }
@@ -353,9 +580,13 @@ where
                     }
                 }
 
-                delivery = listener.next() => {
-                    match delivery {
-                        Some(delivery) => sequencer.fold(delivery).await,
+                batch = next_batch(&mut listener, page) => {
+                    match batch {
+                        Some(batch) => {
+                            if !sequencer.fold_batch(batch).await {
+                                break;
+                            }
+                        }
                         None => {
                             record_stream_closed();
                             break;
@@ -367,11 +598,14 @@ where
     });
 
     Ok(SequencerHandle {
-        commit_head,
+        commit_head: commit_head.clone(),
         commit_sender,
         backfill_request,
         backfill_buffer_size: page,
-        positions: SequencerPositions { fold_position },
+        positions: SequencerPositions {
+            fold_position,
+            commit_head,
+        },
         _task: OwnedTaskHandle::new(task),
     })
 }
@@ -383,25 +617,42 @@ where
     name = "obix.sequencer.started",
     level = "info",
     skip_all,
-    fields(logged_through = logged_through, insert_frontier = insert_frontier, behind = behind),
+    fields(from_sequence = from_sequence, insert_frontier = insert_frontier, behind = behind),
 )]
-fn record_started(logged_through: u64, insert_frontier: u64, behind: u64) {}
+fn record_started(from_sequence: u64, insert_frontier: u64, behind: u64) {}
+
+/// Which checkpoint a backfill re-folds from — the assertion test 22 reads.
+#[tracing::instrument(
+    name = "obix.sequencer.backfill_started",
+    level = "info",
+    skip_all,
+    fields(after = after, from_sequence = from_sequence, from_commit_seq = from_commit_seq),
+)]
+fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64) {}
 
 #[tracing::instrument(
-    name = "obix.sequencer.append_failed",
+    name = "obix.sequencer.fetch_failed",
+    level = "warn",
+    skip_all,
+    fields(error = %error, floor = floor),
+)]
+fn record_fetch_failed(error: &sqlx::Error, floor: u64) {}
+
+#[tracing::instrument(
+    name = "obix.sequencer.checkpoint_failed",
     level = "warn",
     skip_all,
     fields(error = %error, sequence = sequence),
 )]
-fn record_append_failed(error: &sqlx::Error, sequence: u64) {}
+fn record_checkpoint_failed(error: &sqlx::Error, sequence: u64) {}
 
 #[tracing::instrument(
-    name = "obix.sequencer.tail_read_failed",
+    name = "obix.sequencer.checkpoint_read_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, head = head),
+    fields(error = %error, after = after),
 )]
-fn record_tail_read_failed(error: &sqlx::Error, head: u64) {}
+fn record_checkpoint_read_failed(error: &sqlx::Error, after: u64) {}
 
 #[tracing::instrument(
     name = "obix.sequencer.stream_closed",
