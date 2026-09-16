@@ -7,6 +7,12 @@
 //! corrected commit-lane fence (6, 7), lane inference and refusal (9), and
 //! the commit lane's opt-in switch with its late-enable guarantee (12, 13,
 //! 14).
+//!
+//! Tests 15-18 cover the same principle carried below the handler, where one
+//! handle, one transport and one listener now serve both lanes: lag recovery
+//! (15), that the shared listener really is one type (16), that the flush
+//! boundary is total across lanes (17), and that a flush failure reports its
+//! range on the subscription's own lane (18).
 
 mod helpers;
 
@@ -1563,6 +1569,411 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
         subscription.load().await?.checkpoint(),
         CommitSequence::from(6u64),
         "the log continued from 3 rather than restarting",
+    );
+
+    Ok(())
+}
+
+// === 15. A lagged listener recovers from the head, not from the next event ===
+
+/// Test 15 — a listener that fell out of the broadcast window must catch up
+/// from what the source already holds, with **no further publish** to nudge
+/// it.
+///
+/// What this pins is the backfill-recovery path: disable the "behind the head
+/// ⇒ request a backfill" branch and it stalls at 0 of 20.
+///
+/// It does **not** discriminate the head refresh the unified listener gained,
+/// and the addendum's claim that it would is wrong: a lagged
+/// `BroadcastStream` yields `Lagged(n)` and then the surviving suffix, whose
+/// highest position is the head, so `latest_known` reaches the head through
+/// the broadcast anyway. The refresh remains as the commit listener always
+/// had it — it is what covers the case where the cache advanced its head but
+/// has broadcast nothing (a contiguity gap holds the broadcast back while
+/// `highest_known_sequence` moves) — but no test here separates the two, and
+/// none is claimed to.
+#[tokio::test]
+#[file_serial]
+async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    wipe(&pool).await?;
+    // A four-deep broadcast against twenty events: the listener cannot
+    // possibly stay inside the window.
+    let outbox = Outbox::<TestEvent, TestTables>::init(
+        &pool,
+        MailboxConfig::builder()
+            .event_buffer_size(4)
+            .build()
+            .expect("Couldn't build MailboxConfig"),
+    )
+    .await?;
+
+    let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
+
+    for n in 1..=20u64 {
+        publish_group(&outbox, [n]).await?;
+    }
+
+    // Nothing is published from here on: everything below must come from the
+    // backfill the listener asks for once it sees how far the head has moved.
+    let mut received = Vec::new();
+    while received.len() < 20 {
+        let item = tokio::time::timeout(Duration::from_secs(20), listener.try_next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "a lagged listener stalled after {} of 20 events, with no further \
+                     publish to wake it",
+                    received.len()
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("the stream stays open");
+        received.push(u64::from(item.position()));
+    }
+    assert_eq!(
+        received,
+        (1..=20).collect::<Vec<u64>>(),
+        "every event, in order, after lagging out of the window",
+    );
+
+    Ok(())
+}
+
+// === 16. Both lanes really are one listener ===
+
+/// Test 16 — compile-time: one function generic over [`Lane`] drives either
+/// lane's listener, which is only possible because they are the same type.
+#[tokio::test]
+#[file_serial]
+async fn both_lanes_share_one_listener_state_machine() -> anyhow::Result<()> {
+    async fn first_position<L: obix::Lane>(
+        listener: &mut obix::out::LaneListener<L, TestEvent>,
+    ) -> anyhow::Result<L::Position> {
+        let item = listener
+            .try_next()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("an item");
+        Ok(item.position())
+    }
+
+    let pool = init_pool().await?;
+    wipe(&pool).await?;
+    seed(&pool, &[ev(1, 9501, 11), ev(2, 9501, 12)]).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
+
+    let mut insert = outbox.listen_persisted(EventSequence::BEGIN);
+    let mut commit = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
+
+    assert_eq!(
+        first_position(&mut insert).await?,
+        EventSequence::from(1u64),
+    );
+    assert_eq!(
+        first_position(&mut commit).await?,
+        CommitSequence::from(1u64),
+    );
+
+    Ok(())
+}
+
+// === 17. The flush boundary is total across lanes ===
+
+struct BoundaryFlusher<L> {
+    flushes: Arc<Mutex<Vec<Vec<u64>>>>,
+    _lane: std::marker::PhantomData<fn() -> L>,
+}
+
+impl<L> BoundaryFlusher<L> {
+    fn new(flushes: Arc<Mutex<Vec<Vec<u64>>>>) -> Self {
+        Self {
+            flushes,
+            _lane: std::marker::PhantomData,
+        }
+    }
+}
+
+impl SingletonSubscriber<TestEvent> for BoundaryFlusher<InsertOrder> {
+    type Batch = Vec<u64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<u64>>,
+        event: &EventDelivery<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        match &event.payload {
+            Some(TestEvent::Ping(n)) => {
+                let n = *n;
+                Ok(ctx.collect_with(move |batch| batch.push(n)))
+            }
+            None => Ok(ctx.skip()),
+        }
+    }
+
+    async fn flush(
+        &self,
+        _op: &mut FlushOp<'_, InsertOrder>,
+        items: Vec<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flushes.lock().await.push(items);
+        Ok(())
+    }
+}
+
+impl SingletonSubscriber<TestEvent, CommitOrder> for BoundaryFlusher<CommitOrder> {
+    type Batch = Vec<u64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<u64>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        match &event.payload {
+            Some(TestEvent::Ping(n)) => {
+                let n = *n;
+                Ok(ctx.collect_with(move |batch| batch.push(n)))
+            }
+            None => Ok(ctx.skip()),
+        }
+    }
+
+    async fn flush(
+        &self,
+        _op: &mut FlushOp<'_, CommitOrder>,
+        items: Vec<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flushes.lock().await.push(items);
+        Ok(())
+    }
+}
+
+/// Test 17 — "boundary" means *a flush may land here without splitting a
+/// unit*, and that is total: always true on the insert lane, which promises
+/// no atomic groups, and the group's last member on the commit lane.
+///
+/// With `max_batch_size = 1` the difference is visible in the flush record:
+/// the insert lane force-flushes after every single collect, while the commit
+/// lane holds the batch open to the group boundary and lands all three at
+/// once. Same runner, same gate, opposite outcomes — which is what makes the
+/// gate lane-agnostic rather than lane-blind.
+#[tokio::test]
+#[file_serial]
+async fn insert_lane_delivery_is_always_a_boundary() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Insert lane: three events in one transaction, one flush each.
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool, CommitLane::Disabled).await?;
+    let flushes = Arc::new(Mutex::new(Vec::new()));
+    outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                .with_max_batch_size(1)
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            BoundaryFlusher::<InsertOrder>::new(flushes.clone()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    publish_group(&outbox, [1, 2, 3]).await?;
+    until(
+        async || flushes.lock().await.iter().flatten().count() >= 3,
+        "all three insert-lane events flushed",
+    )
+    .await?;
+    assert_eq!(
+        *flushes.lock().await,
+        vec![vec![1], vec![2], vec![3]],
+        "every insert-lane delivery is a legal flush point, so `max_batch_size = 1` lands one \
+         event per flush",
+    );
+    let _ = jobs.shutdown().await;
+    drop(jobs);
+    drop(outbox);
+
+    // Commit lane: one group of three, held open past the soft limit.
+    let mut jobs = init_jobs(&pool).await?;
+    wipe(&pool).await?;
+    seed(&pool, &[ev(1, 9601, 11), ev(2, 9601, 12), ev(3, 9601, 13)]).await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
+    let flushes = Arc::new(Mutex::new(Vec::new()));
+    outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                .with_max_batch_size(1)
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            BoundaryFlusher::<CommitOrder>::new(flushes.clone()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    until(
+        async || flushes.lock().await.iter().flatten().count() >= 3,
+        "the commit-lane group flushed",
+    )
+    .await?;
+    assert_eq!(
+        *flushes.lock().await,
+        vec![vec![11, 12, 13]],
+        "the soft limit gives way to the group boundary: one flush, the whole transaction",
+    );
+
+    Ok(())
+}
+
+// === 18. A failed flush reports its range on the subscription's lane ===
+
+struct FailingFlusher<L> {
+    _lane: std::marker::PhantomData<fn() -> L>,
+}
+
+impl<L> FailingFlusher<L> {
+    fn new() -> Self {
+        Self {
+            _lane: std::marker::PhantomData,
+        }
+    }
+}
+
+impl SingletonSubscriber<TestEvent> for FailingFlusher<InsertOrder> {
+    type Batch = Vec<u64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<u64>>,
+        event: &EventDelivery<TestEvent>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = event;
+        Ok(ctx.collect_with(|batch| batch.push(1)))
+    }
+
+    async fn flush(
+        &self,
+        _op: &mut FlushOp<'_, InsertOrder>,
+        _items: Vec<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("flush refused".into())
+    }
+}
+
+impl SingletonSubscriber<TestEvent, CommitOrder> for FailingFlusher<CommitOrder> {
+    type Batch = Vec<u64>;
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<u64>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = event;
+        Ok(ctx.collect_with(|batch| batch.push(1)))
+    }
+
+    async fn flush(
+        &self,
+        _op: &mut FlushOp<'_, CommitOrder>,
+        _items: Vec<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("flush refused".into())
+    }
+}
+
+/// Test 18 — `FlushError` names the range it covers, and that range is in the
+/// subscription's own lane's numbering. Reporting insert sequences to a
+/// commit-lane handler — which is what it did before — attributes the failure
+/// to positions the handler never saw.
+///
+/// The error surfaces through the job's `last_error`, which is
+/// `FlushError`'s `Display`, i.e. its `after`/`through` fields rendered.
+#[tokio::test]
+#[file_serial]
+async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    // Insert lane.
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool, CommitLane::Disabled).await?;
+    let subscription = outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            FailingFlusher::<InsertOrder>::new(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    publish_group(&outbox, [1]).await?;
+    let mut reported = String::new();
+    until(
+        async || {
+            if let Ok(snapshot) = subscription.load().await
+                && let Some(error) = snapshot.last_error()
+            {
+                reported = error.to_string();
+                return true;
+            }
+            false
+        },
+        "the insert-lane flush failure reached the job",
+    )
+    .await?;
+    assert!(
+        reported.contains("(insert:0, insert:1]"),
+        "the insert lane must report insert positions: {reported}",
+    );
+    let _ = jobs.shutdown().await;
+    drop(jobs);
+    drop(outbox);
+
+    // Commit lane, over an interleaving where the two numberings differ:
+    // group X at sequences 1 and 4, group Y at 2 and 3.
+    let mut jobs = init_jobs(&pool).await?;
+    wipe(&pool).await?;
+    seed(
+        &pool,
+        &[
+            ev(1, 9701, 11),
+            ev(2, 9702, 21),
+            ev(3, 9702, 22),
+            ev(4, 9701, 12),
+        ],
+    )
+    .await?;
+    let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
+    let subscription = outbox
+        .register_singleton_subscriber(
+            &mut jobs,
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+                .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
+            FailingFlusher::<CommitOrder>::new(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    jobs.start_poll().await?;
+
+    let mut reported = String::new();
+    until(
+        async || {
+            if let Ok(snapshot) = subscription.load().await
+                && let Some(error) = snapshot.last_error()
+            {
+                reported = error.to_string();
+                return true;
+            }
+            false
+        },
+        "the commit-lane flush failure reached the job",
+    )
+    .await?;
+    assert!(
+        reported.contains("commit:") && !reported.contains("insert:"),
+        "the commit lane must report commit positions, and only those: {reported}",
     );
 
     Ok(())
