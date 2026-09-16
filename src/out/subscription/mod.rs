@@ -624,6 +624,14 @@ where
     /// lane at all — and it inherits the insert lane's bound on abandoned
     /// sequences, which become placeholders once the gap-fill grace elapses.
     ///
+    /// The operational consequence: called on an outbox that has just
+    /// switched [`CommitLane::Enabled`](crate::CommitLane) on a database with
+    /// history, this waits for the whole catch-up to reach the sampled
+    /// frontier. That is correct rather than a stall — nothing below that
+    /// frontier has been delivered on this lane yet — but it is a fence over
+    /// a backfill, so size the timeout for one or fence after the sequencer
+    /// has caught up (`obix.sequencer.started` logs how far behind it began).
+    ///
     /// The frontier read happens before the deadline starts, so the reported
     /// `waited` measures the polling, and total call time is that read plus
     /// at most `timeout`.
