@@ -259,9 +259,19 @@ pub struct EventCtx<'inv, B = ()> {
     pub(crate) parts: CtxParts<'inv>,
     pub(crate) batch: &'inv mut B,
     pub(crate) flusher: &'inv dyn ItemFlush<B>,
+    /// This event's position on the commit-ordered lane, when the
+    /// subscription is on one. `None` on the insert lane.
+    pub(crate) commit: Option<(CommitSequence, bool)>,
 }
 
 impl<'inv, B> EventCtx<'inv, B> {
+    /// This event's position on the commit-ordered lane, and whether it is
+    /// the last event of its source transaction (a commit boundary). `None`
+    /// on the insert lane.
+    pub fn commit_position(&self) -> Option<(CommitSequence, bool)> {
+        self.commit
+    }
+
     /// This event is not for me — no transaction is opened, an open batch op
     /// is left untouched, and the checkpoint advances lazily (piggybacked on
     /// the next flush, or persisted on the configured checkpoint interval).
@@ -309,6 +319,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             mut parts,
             batch,
             flusher,
+            commit: _,
         } = self;
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         *parts.op_slot = Some(
@@ -390,6 +401,7 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: B,
+        commit_position: Option<CommitSequence>,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
 }
 
@@ -401,15 +413,31 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
 /// checkpoint is written and the transaction commits — items, work and
 /// pointer land atomically. There is no access to the raw
 /// [`es_entity::DbOp`], mirroring [`IsolatedOp`]'s sealing.
-pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
+pub struct FlushOp<'a> {
+    op: &'a mut es_entity::DbOp<'static>,
+    commit_position: Option<CommitSequence>,
+}
 
 impl<'a> FlushOp<'a> {
-    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>) -> Self {
-        Self(op)
+    pub(crate) fn new(
+        op: &'a mut es_entity::DbOp<'static>,
+        commit_position: Option<CommitSequence>,
+    ) -> Self {
+        Self {
+            op,
+            commit_position,
+        }
+    }
+
+    /// The commit-lane position this batch landed at — the last fully
+    /// handled event's, which is a group boundary unless a handler consumed
+    /// mid-group. `None` on the insert lane.
+    pub fn commit_position(&self) -> Option<CommitSequence> {
+        self.commit_position
     }
 }
 
-es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
+es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.op });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
@@ -488,7 +516,10 @@ pub(crate) async fn flush_batch<B: Default>(
         let items = std::mem::take(batch);
         parts.tracker.collected = 0;
         let op = parts.op_slot.as_mut().expect("op was materialized above");
-        if let Err(source) = flusher.flush_items(op, items).await {
+        if let Err(source) = flusher
+            .flush_items(op, items, parts.state.commit_sequence)
+            .await
+        {
             return Err(Box::new(FlushError {
                 reason,
                 after: parts.tracker.persisted_insert_seq,

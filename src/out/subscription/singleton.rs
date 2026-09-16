@@ -195,9 +195,10 @@ where
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: H::Batch,
+        commit_position: Option<CommitSequence>,
     ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
-            let mut op = FlushOp::new(op);
+            let mut op = FlushOp::new(op, commit_position);
             self.handler.flush(&mut op, items).await
         })
     }
@@ -726,6 +727,7 @@ where
                 },
                 batch: &mut batch,
                 flusher: &flusher,
+                commit,
             };
             // The Handled token is branded with the invocation lifetime (it
             // cannot leave this call) and every path that mints one consumes

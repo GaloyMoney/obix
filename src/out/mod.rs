@@ -30,7 +30,7 @@ pub use self::subscription::singleton::{
     Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
-    Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
 use crate::{
     config::*,
@@ -443,6 +443,13 @@ where
         CommitOrderedListener::new(self.sequencer.lane(), start_after, self.event_buffer_size)
     }
 
+    /// The non-generic positions this process's sequencer publishes — backs
+    /// the commit-lane [`await_caught_up`](Subscription::await_caught_up)
+    /// fence.
+    pub(crate) fn sequencer_positions(&self) -> persistent::SequencerPositions {
+        self.sequencer.positions()
+    }
+
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
         EphemeralOutboxListener::new(self.ephemeral_cache.handle())
     }
@@ -489,7 +496,11 @@ where
         let handle = spawner
             .spawn(subscription::singleton::OutboxEventJobData::default())
             .await?;
-        Ok(Subscription::new(handle, self.pool.clone()))
+        Ok(Subscription::new(
+            handle,
+            self.pool.clone(),
+            self.sequencer_positions(),
+        ))
     }
 
     /// Register a keyed subscriber type: per-entity consumers, created and

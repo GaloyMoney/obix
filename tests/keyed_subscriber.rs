@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use obix::{
     EventSequence, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, MailboxConfig,
-    SubscriptionDef, WakeKey, WakeKeys, out::Outbox,
+    StreamPosition, SubscriptionDef, WakeKey, WakeKeys, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -491,7 +491,7 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     );
     assert_eq!(
         subscription.load().await?.checkpoint(),
-        EventSequence::BEGIN,
+        StreamPosition::Insert(EventSequence::BEGIN),
         "checkpoint must not advance past a held event"
     );
 
@@ -503,7 +503,10 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     .await?;
     eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
-        async move { Ok(subscription.load().await?.checkpoint() >= EventSequence::from(1u64)) }
+        async move {
+            Ok(subscription.load().await?.checkpoint()
+                >= StreamPosition::Insert(EventSequence::from(1u64)))
+        }
     })
     .await?;
 
@@ -747,7 +750,7 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     // Watermark survives passivation (inherits_state = true).
     assert_eq!(
         subscription.load().await?.checkpoint(),
-        EventSequence::from(1u64)
+        StreamPosition::Insert(EventSequence::from(1u64))
     );
 
     // Publish while Dormant — nothing is running to observe it directly.

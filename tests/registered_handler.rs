@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use obix::{
     EventCtx, EventSequence, FlushOp, Handled, MailboxConfig, OutboxEventJobConfig,
-    SingletonSubscriber, Subscription, SubscriptionError, SubscriptionSnapshot,
+    SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot,
     SubscriptionStreamStatus, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
@@ -228,20 +228,29 @@ async fn checkpoint_reads_begin_before_the_handler_runs() -> anyhow::Result<()> 
     .await?;
 
     // Deliberately no `jobs.start_poll()`.
-    assert_eq!(handle.load().await?.checkpoint(), EventSequence::BEGIN);
+    assert_eq!(
+        handle.load().await?.checkpoint(),
+        StreamPosition::Insert(EventSequence::BEGIN)
+    );
 
     publish_pings(&outbox, 1..=3).await?;
 
     let snapshot = handle.load().await?;
-    assert_eq!(snapshot.checkpoint(), EventSequence::BEGIN);
-    assert_eq!(snapshot.frontier(), EventSequence::from(3u64));
+    assert_eq!(
+        snapshot.checkpoint(),
+        StreamPosition::Insert(EventSequence::BEGIN)
+    );
+    assert_eq!(
+        snapshot.frontier(),
+        StreamPosition::Insert(EventSequence::from(3u64))
+    );
     assert_eq!(snapshot.lag(), 3);
     assert!(!snapshot.is_caught_up());
     assert_eq!(
         snapshot.stream_status(),
         SubscriptionStreamStatus {
-            checkpoint: EventSequence::BEGIN,
-            frontier: EventSequence::from(3u64),
+            checkpoint: StreamPosition::Insert(EventSequence::BEGIN),
+            frontier: StreamPosition::Insert(EventSequence::from(3u64)),
         }
     );
 
@@ -275,7 +284,7 @@ async fn checkpoint_trails_applied_state_and_converges() -> anyhow::Result<()> {
 
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.load().await?.checkpoint() >= frontier) }
+        async move { Ok(handle.load().await?.checkpoint() >= StreamPosition::Insert(frontier)) }
     })
     .await?;
 
@@ -283,7 +292,7 @@ async fn checkpoint_trails_applied_state_and_converges() -> anyhow::Result<()> {
     // Nothing published since, so the checkpoint must sit exactly on the
     // frontier — never past it.
     let snapshot = handle.load().await?;
-    assert_eq!(snapshot.checkpoint(), frontier);
+    assert_eq!(snapshot.checkpoint(), StreamPosition::Insert(frontier));
     assert!(snapshot.is_caught_up());
 
     Ok(())
@@ -392,7 +401,7 @@ async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     let frontier = outbox.highest_known_persistent_sequence().await?;
     eventually(Duration::from_secs(10), || {
         let handle = handle.clone();
-        async move { Ok(handle.load().await?.checkpoint() >= frontier) }
+        async move { Ok(handle.load().await?.checkpoint() >= StreamPosition::Insert(frontier)) }
     })
     .await?;
 
@@ -403,7 +412,7 @@ async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     // `highest_known_persistent_sequence`'s opaque future directly makes
     // these `Send` bounds higher-ranked and fails to compile here.
     let snapshot = tokio::spawn(load_owned(handle.clone())).await??;
-    assert_eq!(snapshot.checkpoint(), frontier);
+    assert_eq!(snapshot.checkpoint(), StreamPosition::Insert(frontier));
 
     let spawned_outbox = outbox.clone();
     let spawned_frontier =
@@ -443,7 +452,7 @@ async fn await_caught_up_fences_a_backlog() -> anyhow::Result<()> {
     // The barrier's guarantee: applied, not merely delivered — and one load
     // answers every question about the handler.
     let snapshot = handle.load().await?;
-    assert!(snapshot.checkpoint() >= frontier_at_call);
+    assert!(snapshot.checkpoint() >= StreamPosition::Insert(frontier_at_call));
     assert!(
         !snapshot.job_status().is_terminal(),
         "a resident handler job should still be live, got {:?}",
@@ -496,14 +505,17 @@ async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<(
     // Alive by every other measure: never terminal, checkpoint parked before
     // the poison event. That pair is the wedge.
     assert!(!snapshot.job_status().is_terminal());
-    assert_eq!(snapshot.checkpoint(), EventSequence::BEGIN);
+    assert_eq!(
+        snapshot.checkpoint(),
+        StreamPosition::Insert(EventSequence::BEGIN)
+    );
     assert!(!snapshot.is_caught_up());
 
     // The barrier reports a plain timeout — identical in shape to a merely
     // backlogged handler — so the diagnosis has to come from the snapshot.
     match handle.await_caught_up(Duration::from_millis(200)).await {
         Err(SubscriptionError::CaughtUpTimeout { checkpoint, .. }) => {
-            assert_eq!(checkpoint, EventSequence::BEGIN);
+            assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }
@@ -537,7 +549,7 @@ async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()>
     handle
         .await_sequence(target, Duration::from_secs(60))
         .await?;
-    assert!(handle.load().await?.checkpoint() >= target);
+    assert!(handle.load().await?.checkpoint() >= StreamPosition::Insert(target));
 
     // A target the stream has not reached is not an error — it is simply a
     // wait the handler cannot satisfy yet, and it times out honestly.
@@ -546,8 +558,8 @@ async fn await_sequence_fences_on_a_caller_chosen_target() -> anyhow::Result<()>
         Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
-            assert_eq!(target, beyond);
-            assert!(checkpoint < beyond);
+            assert_eq!(target, StreamPosition::Insert(beyond));
+            assert!(checkpoint < StreamPosition::Insert(beyond));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }
@@ -585,9 +597,9 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
         Err(SubscriptionError::CaughtUpTimeout {
             checkpoint, target, ..
         }) => {
-            assert_eq!(checkpoint, EventSequence::BEGIN);
+            assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
             // `await_caught_up`'s target is the call-time frontier.
-            assert_eq!(target, EventSequence::from(3u64));
+            assert_eq!(target, StreamPosition::Insert(EventSequence::from(3u64)));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
     }
@@ -636,7 +648,7 @@ async fn await_caught_up_anchors_to_the_call_time_frontier() -> anyhow::Result<(
     // Terminates despite the handler extending the stream as it drains — the
     // frontier is sampled once, at call time.
     handle.await_caught_up(Duration::from_secs(60)).await?;
-    assert!(handle.load().await?.checkpoint() >= pings_frontier);
+    assert!(handle.load().await?.checkpoint() >= StreamPosition::Insert(pings_frontier));
 
     // The self-publishing tail really happened: the stream grew past the
     // frontier this fence anchored to.

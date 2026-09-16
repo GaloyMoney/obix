@@ -28,6 +28,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     commit_head: Arc<AtomicU64>,
+    fold_position: Arc<AtomicU64>,
     commit_sender: broadcast::Sender<CommitDelivery<P>>,
     backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitDelivery<P>>)>,
     backfill_buffer_size: usize,
@@ -56,6 +57,41 @@ where
             backfill_request: self.backfill_request.clone(),
             backfill_buffer_size: self.backfill_buffer_size,
         }
+    }
+
+    /// The non-generic positions this sequencer publishes — deliberately
+    /// decoupled from the listener plumbing above (which is generic over the
+    /// payload type `P`), so a payload-agnostic caller like
+    /// [`Subscription`](crate::out::Subscription) can hold one without a `P`
+    /// parameter of its own.
+    pub(crate) fn positions(&self) -> SequencerPositions {
+        SequencerPositions {
+            fold_position: self.fold_position.clone(),
+        }
+    }
+}
+
+/// Read-only positions the sequencer publishes, with no dependency on the
+/// outbox's payload type. Backs the commit-lane [`await_caught_up`]
+/// (crate::out::Subscription::await_caught_up) fence: `fold_position` is how
+/// far the fold has *examined* the insert-lane stream (advanced for every
+/// delivery, including placeholders and already-seen group members), which
+/// is the position that fence must wait past — not the commit log's
+/// `logged_through_sequence`, which only advances when a group is appended
+/// and therefore stalls behind an open group or a quiet stream (see
+/// obix-dev/handoff-commit-lane-consumer-gaps.md §4).
+#[derive(Clone)]
+pub(crate) struct SequencerPositions {
+    fold_position: Arc<AtomicU64>,
+}
+
+impl SequencerPositions {
+    /// Highest insert `EventSequence` the fold has examined — in-process,
+    /// advances past placeholders, `logged_ahead` seeds and already-seen
+    /// group members, none of which the durable `logged_through_sequence`
+    /// watermark advances past.
+    pub(crate) fn fold_position(&self) -> EventSequence {
+        EventSequence::from(self.fold_position.load(Ordering::Acquire))
     }
 }
 
@@ -114,6 +150,9 @@ where
     page: usize,
     head: CommitSequence,
     commit_head: Arc<AtomicU64>,
+    /// Published unconditionally as the fold examines each insert-lane
+    /// delivery — see [`SequencerPositions::fold_position`].
+    fold_position: Arc<AtomicU64>,
     commit_sender: broadcast::Sender<CommitDelivery<P>>,
     /// Groups appended but whose later members the fold has not reached yet,
     /// mapped to their highest member. Dropped as the stream passes them.
@@ -135,6 +174,11 @@ where
     /// Fold one insert-lane delivery.
     async fn fold(&mut self, delivery: PersistentDelivery<P>) {
         let sequence = delivery.sequence();
+        // INVARIANT: published before every branch below, including the
+        // skips — fold_position must advance on placeholders too, or the
+        // commit-lane fence stalls on an aborted tail.
+        self.fold_position
+            .store(u64::from(sequence), Ordering::Release);
         if self.logged_ahead.remove(&sequence) {
             return;
         }
@@ -280,6 +324,7 @@ where
 
     let (commit_sender, _) = broadcast::channel(buffer_size);
     let commit_head = Arc::new(AtomicU64::new(u64::from(restart.last_commit_seq)));
+    let fold_position = Arc::new(AtomicU64::new(u64::from(restart.logged_through)));
     let (backfill_request, mut backfill_rx) = mpsc::unbounded_channel();
     let backfill_pool = pool.clone();
 
@@ -290,6 +335,7 @@ where
         page,
         head: restart.last_commit_seq,
         commit_head: commit_head.clone(),
+        fold_position: fold_position.clone(),
         commit_sender: commit_sender.clone(),
         seen: HashMap::new(),
         logged_ahead,
@@ -334,6 +380,7 @@ where
 
     Ok(SequencerHandle {
         commit_head,
+        fold_position,
         commit_sender,
         backfill_request,
         backfill_buffer_size: page,

@@ -48,8 +48,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
 
 use crate::out::ctx::OutboxEventJobState;
+use crate::out::persistent::SequencerPositions;
+use crate::out::subscription::singleton::Ordering;
 use crate::{
-    sequence::EventSequence,
+    sequence::{CommitSequence, EventSequence},
     tables::{DefaultMailboxTables, MailboxTables},
 };
 
@@ -89,26 +91,88 @@ pub enum SubscriptionError {
     /// caller can alert with real numbers instead of reporting a bare
     /// timeout.
     ///
-    /// `target` is the sequence being awaited: the caller's own for
-    /// `await_sequence`, the call-time frontier for `await_caught_up`.
+    /// `target` is the position being awaited: the caller's own for
+    /// `await_sequence`, the call-time frontier for `await_caught_up`. Lane
+    /// (`Insert`/`Commit`) since a commit-lane subscription's `await_caught_up`
+    /// polls its commit cursor, not `EventSequence`.
     #[error(
         "SubscriptionError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
     )]
     CaughtUpTimeout {
-        checkpoint: EventSequence,
-        target: EventSequence,
+        checkpoint: StreamPosition,
+        target: StreamPosition,
         waited: Duration,
     },
+}
+
+/// Which lane a position was read from — see
+/// [`Ordering`](crate::out::Ordering).
+///
+/// [`SubscriptionSnapshot::checkpoint`] / [`frontier`](SubscriptionSnapshot::frontier)
+/// return this rather than a bare number because the two lanes count
+/// different things: an insert-lane position is a contiguous, gap-filled
+/// [`EventSequence`]; a commit-lane position is a dense, gap-free
+/// [`CommitSequence`]. Comparing across variants is never meaningful — both
+/// accessors on one [`SubscriptionSnapshot`] always report the same variant,
+/// since the lane is a property of the subscription, not of the individual
+/// read.
+///
+/// Derives [`Ord`] purely for the ergonomics of comparing two positions
+/// already known to be on the same lane (`checkpoint >= frontier`, as
+/// `stream_status` does below) — a cross-variant comparison type-checks but
+/// is meaningless, per the paragraph above, so it is on the caller to only
+/// ever compare positions read from the same subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StreamPosition {
+    Insert(EventSequence),
+    Commit(CommitSequence),
+}
+
+impl StreamPosition {
+    fn lane(&self) -> Ordering {
+        match self {
+            Self::Insert(_) => Ordering::Insert,
+            Self::Commit(_) => Ordering::Commit,
+        }
+    }
+
+    /// Numeric value for lag/comparison math — only ever compared against
+    /// another `StreamPosition` sampled from the same lane (see the type's
+    /// doc comment), so collapsing to `u64` here loses nothing.
+    fn as_u64(&self) -> u64 {
+        match self {
+            Self::Insert(s) => u64::from(*s),
+            Self::Commit(s) => u64::from(*s),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insert(s) => write!(f, "insert:{s}"),
+            Self::Commit(s) => write!(f, "commit:{s}"),
+        }
+    }
+}
+
+/// Read the lane a subscription's checkpoint is on, and its position on it,
+/// from execution state — the one place that decides Insert vs. Commit.
+fn lane_position(state: &OutboxEventJobState) -> StreamPosition {
+    match state.commit_sequence {
+        Some(commit_sequence) => StreamPosition::Commit(commit_sequence),
+        None => StreamPosition::Insert(state.sequence),
+    }
 }
 
 /// A `{ checkpoint, frontier }` pair sampled by
 /// [`SubscriptionSnapshot::stream_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionStreamStatus {
-    /// Highest sequence the handler has durably applied.
-    pub checkpoint: EventSequence,
-    /// Highest sequence the outbox has handed out.
-    pub frontier: EventSequence,
+    /// Highest position the handler has durably applied.
+    pub checkpoint: StreamPosition,
+    /// Highest position the outbox has handed out.
+    pub frontier: StreamPosition,
 }
 
 impl SubscriptionStreamStatus {
@@ -117,7 +181,9 @@ impl SubscriptionStreamStatus {
     /// Zero does not by itself prove the handler is idle — see
     /// [`is_caught_up`](Self::is_caught_up).
     pub fn lag(&self) -> u64 {
-        u64::from(self.frontier).saturating_sub(u64::from(self.checkpoint))
+        self.frontier
+            .as_u64()
+            .saturating_sub(self.checkpoint.as_u64())
     }
 
     /// Whether the checkpoint has reached the frontier sampled alongside it.
@@ -140,22 +206,31 @@ impl SubscriptionStreamStatus {
 /// is why these accessors cannot fail.
 pub struct SubscriptionSnapshot {
     job: ::job::JobSnapshot,
-    checkpoint: EventSequence,
-    frontier: EventSequence,
+    checkpoint: StreamPosition,
+    frontier: StreamPosition,
 }
 
 impl SubscriptionSnapshot {
-    /// The handler's committed checkpoint: every persistent event with a
-    /// sequence at or below this has been handled and its effects committed
-    /// (semantics 1). A handler that has never checkpointed reads as
-    /// [`EventSequence::BEGIN`] (semantics 4).
-    pub fn checkpoint(&self) -> EventSequence {
+    /// Which lane this snapshot's positions are on. A convenience over
+    /// matching [`checkpoint`](Self::checkpoint) or
+    /// [`frontier`](Self::frontier) when the caller only needs to know which
+    /// arm it is, not the value.
+    pub fn ordering(&self) -> Ordering {
+        self.checkpoint.lane()
+    }
+
+    /// The handler's committed checkpoint: every event at or below this
+    /// position, on this subscription's lane, has been handled and its
+    /// effects committed (semantics 1). A handler that has never
+    /// checkpointed reads as [`EventSequence::BEGIN`] on the insert lane
+    /// (semantics 4).
+    pub fn checkpoint(&self) -> StreamPosition {
         self.checkpoint
     }
 
-    /// The stream frontier as of this load — the highest sequence the outbox
-    /// had handed out (semantics 2).
-    pub fn frontier(&self) -> EventSequence {
+    /// The stream frontier as of this load — the highest position the outbox
+    /// had handed out on this subscription's lane (semantics 2).
+    pub fn frontier(&self) -> StreamPosition {
         self.frontier
     }
 
@@ -266,6 +341,12 @@ where
 {
     anchor: JobAnchor,
     pool: sqlx::PgPool,
+    /// The local sequencer's published positions, for the commit-lane
+    /// `await_caught_up` fence. `None` for a keyed member: keyed
+    /// subscribers never run on the commit lane (no `ordering` on
+    /// `register_keyed_subscriber`), so their checkpoint is always
+    /// [`StreamPosition::Insert`] and this is never consulted.
+    positions: Option<SequencerPositions>,
     _phantom: PhantomData<(P, Tables)>,
 }
 
@@ -316,6 +397,7 @@ where
         Self {
             anchor: self.anchor.clone(),
             pool: self.pool.clone(),
+            positions: self.positions.clone(),
             _phantom: PhantomData,
         }
     }
@@ -343,16 +425,26 @@ where
     Tables: MailboxTables,
 {
     /// For a resident (singleton-subscriber) job, whose id is stable.
-    pub(super) fn new(job: ::job::JobHandle, pool: sqlx::PgPool) -> Self {
+    ///
+    /// `positions` is the process's sequencer positions, needed for the
+    /// commit-lane `await_caught_up` fence should this subscription turn
+    /// out to be on that lane.
+    pub(super) fn new(
+        job: ::job::JobHandle,
+        pool: sqlx::PgPool,
+        positions: SequencerPositions,
+    ) -> Self {
         Self {
             anchor: JobAnchor::Resident(job),
             pool,
+            positions: Some(positions),
             _phantom: PhantomData,
         }
     }
 
     /// For a keyed member, identified by `(subscriber_type, key)` rather than
-    /// by a job id — see [`JobAnchor::Keyed`].
+    /// by a job id — see [`JobAnchor::Keyed`]. Keyed subscribers never run on
+    /// the commit lane, so this carries no sequencer positions.
     pub(super) fn new_keyed(
         jobs: ::job::Jobs,
         job_type: ::job::JobType,
@@ -366,6 +458,7 @@ where
                 key,
             })),
             pool,
+            positions: None,
             _phantom: PhantomData,
         }
     }
@@ -414,7 +507,7 @@ where
     pub async fn load(&self) -> Result<SubscriptionSnapshot, SubscriptionError> {
         let job = self.handle().await?.load().await?;
         let checkpoint = decode_checkpoint(&job)?;
-        let frontier = self.frontier().await?;
+        let frontier = self.frontier_for(checkpoint).await?;
         Ok(SubscriptionSnapshot {
             job,
             checkpoint,
@@ -442,6 +535,11 @@ where
     /// stopped handler surfaces as an alertable error rather than a silent
     /// hang.
     ///
+    /// Insert-lane only: this compares `state.sequence`, which is not
+    /// monotone under `Ordering::Commit` (commit order is a permutation of
+    /// insert order). A commit-lane subscription should fence with
+    /// [`await_caught_up`](Self::await_caught_up), which is lane-aware.
+    ///
     /// # Errors
     ///
     /// Returns [`SubscriptionError::CaughtUpTimeout`] — carrying the
@@ -460,12 +558,155 @@ where
         target: EventSequence,
         timeout: Duration,
     ) -> Result<(), SubscriptionError> {
+        self.poll_until(StreamPosition::Insert(target), timeout, |state| {
+            StreamPosition::Insert(state.sequence)
+        })
+        .await
+    }
+
+    /// Block until the handler's checkpoint reaches the frontier **sampled at
+    /// call time** — the fence for "everything published before this call has
+    /// been applied".
+    ///
+    /// On the insert lane this is a strict special case of
+    /// [`await_sequence`](Self::await_sequence) over the call-time frontier,
+    /// and inherits its polling and timeout behaviour. Events published
+    /// *after* the call are not waited for (semantics 5).
+    ///
+    /// On the commit lane the checkpoint is a `CommitSequence`, so this
+    /// delegates to an internal commit-lane fence instead of
+    /// `await_sequence` — see obix-dev/handoff-commit-lane-consumer-gaps.md
+    /// §4 for why the originally-specced version hangs.
+    ///
+    /// The lane is read once at the start of the call (a single-row
+    /// execution-state point read, same cost class as one checkpoint poll)
+    /// to decide which fence applies — the frontier itself differs by lane,
+    /// so this cannot be decided from the frontier read alone the way it
+    /// could before the commit lane existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::CaughtUpTimeout`] — where `target`
+    /// is the sampled frontier — if the deadline passes first.
+    #[tracing::instrument(
+        name = "obix.registered_handler.await_caught_up",
+        skip_all,
+        fields(timeout_ms = timeout.as_millis()),
+        err
+    )]
+    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), SubscriptionError> {
+        // Sampled ONCE: the fence is anchored to the stream position at call
+        // time, so a handler that publishes as it drains cannot extend its
+        // own barrier indefinitely (semantics 5).
+        match lane_position(&self.read_state().await?) {
+            StreamPosition::Insert(_) => {
+                let frontier = read_frontier::<Tables>(&self.pool).await?;
+                self.await_sequence(frontier, timeout).await
+            }
+            StreamPosition::Commit(_) => self.await_caught_up_commit_lane(timeout).await,
+        }
+    }
+
+    /// The corrected §10 fence for a commit-lane subscription.
+    ///
+    /// The originally-specced step 2 — poll
+    /// `commit_log_state().logged_through_sequence >= H` — hangs: that
+    /// watermark only advances when `append_commit_group` runs, so it stalls
+    /// behind an open group (an aborted transaction at the head, which is
+    /// exactly what inflates `H`) or during a quiet period. See
+    /// obix-dev/handoff-commit-lane-consumer-gaps.md §4 (recorded as
+    /// CORRECTION 3 in obix-dev/handoff-commit-ordered-delivery.md §10).
+    ///
+    /// Step 2 below instead polls this process's own sequencer fold
+    /// position — an in-process atomic, no query — which advances on every
+    /// insert-lane delivery the fold examines, placeholders and
+    /// already-logged members included.
+    async fn await_caught_up_commit_lane(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), SubscriptionError> {
+        let positions = self.positions.as_ref().expect(
+            "a commit-lane checkpoint (state.commit_sequence: Some) is only ever written by a \
+             resident singleton-subscriber job, which always carries sequencer positions — see \
+             Subscription::new_keyed's doc comment",
+        );
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
+
+        let h = read_frontier::<Tables>(&self.pool).await?;
+
+        loop {
+            if positions.fold_position() >= h {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(SubscriptionError::CaughtUpTimeout {
+                    checkpoint: StreamPosition::Insert(positions.fold_position()),
+                    target: StreamPosition::Insert(h),
+                    waited: now.duration_since(start),
+                });
+            }
+            tokio::time::sleep(INITIAL_POLL_INTERVAL.min(deadline - now)).await;
+        }
+
+        let (last_commit_seq, _logged_through) = Tables::commit_log_state(&self.pool).await?;
+        let now = tokio::time::Instant::now();
+        let remaining = if now >= deadline {
+            Duration::ZERO
+        } else {
+            deadline - now
+        };
+        self.poll_until(
+            StreamPosition::Commit(last_commit_seq),
+            remaining,
+            |state| StreamPosition::Commit(state.commit_sequence.unwrap_or_default()),
+        )
+        .await
+    }
+
+    /// The committed checkpoint alone, via job's point-read: a single-row
+    /// `SELECT` on the execution row, with no entity hydration and no
+    /// snapshot reconciliation. Backs [`poll_until`](Self::poll_until), which
+    /// already holds the target it anchored to and needs nothing else per
+    /// tick.
+    ///
+    /// Staying off [`load`](Self::load) here matters because the entity
+    /// hydration it skips grows with the job's event log — that is, with
+    /// retries — so a full-snapshot poll would get more expensive exactly
+    /// when a handler is wedged and someone is watching a fence time out.
+    ///
+    /// Safe because this does not serve
+    /// [`job_status`](SubscriptionSnapshot::job_status): a missing or
+    /// mid-transition row reads `None` ⇒ [`EventSequence::BEGIN`], which can
+    /// only under-report progress, and under-reporting preserves the
+    /// barrier's never-return-early invariant.
+    async fn read_state(&self) -> Result<OutboxEventJobState, SubscriptionError> {
+        Ok(self
+            .handle()
+            .await?
+            .execution_state::<OutboxEventJobState>()
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Shared poll loop behind [`await_sequence`](Self::await_sequence) and
+    /// the commit-lane leg of [`await_caught_up`](Self::await_caught_up):
+    /// starting at 100ms and doubling to a 250ms ceiling, bounded by
+    /// `timeout`, until `extract` of the freshly-read state reaches `target`.
+    async fn poll_until(
+        &self,
+        target: StreamPosition,
+        timeout: Duration,
+        extract: impl Fn(&OutboxEventJobState) -> StreamPosition,
+    ) -> Result<(), SubscriptionError> {
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
 
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
-            let checkpoint = self.checkpoint().await?;
+            let checkpoint = extract(&self.read_state().await?);
             if checkpoint >= target {
                 return Ok(());
             }
@@ -486,65 +727,20 @@ where
         }
     }
 
-    /// Block until the handler's checkpoint reaches the frontier **sampled at
-    /// call time** — the fence for "everything published before this call has
-    /// been applied".
-    ///
-    /// A strict special case of [`await_sequence`](Self::await_sequence) over
-    /// the call-time frontier, and inherits its polling and timeout
-    /// behaviour. Events published *after* the call are not waited for
-    /// (semantics 5).
-    ///
-    /// The frontier read happens before the deadline starts, so the reported
-    /// `waited` measures the polling, and total call time is that read plus
-    /// at most `timeout`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubscriptionError::CaughtUpTimeout`] — where `target`
-    /// is the sampled frontier — if the deadline passes first.
-    #[tracing::instrument(
-        name = "obix.registered_handler.await_caught_up",
-        skip_all,
-        fields(timeout_ms = timeout.as_millis()),
-        err
-    )]
-    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), SubscriptionError> {
-        // Sampled ONCE: the fence is anchored to the stream position at call
-        // time, so a handler that publishes as it drains cannot extend its
-        // own barrier indefinitely (semantics 5).
-        let frontier = self.frontier().await?;
-        self.await_sequence(frontier, timeout).await
-    }
-
-    /// The committed checkpoint alone, via job's point-read: a single-row
-    /// `SELECT` on the execution row, with no entity hydration and no
-    /// snapshot reconciliation. Backs the
-    /// [`await_sequence`](Self::await_sequence) poll loop, which already
-    /// holds the target it anchored to and needs nothing else per tick.
-    ///
-    /// Staying off [`load`](Self::load) here matters because the entity
-    /// hydration it skips grows with the job's event log — that is, with
-    /// retries — so a full-snapshot poll would get more expensive exactly
-    /// when a handler is wedged and someone is watching a fence time out.
-    ///
-    /// Safe because this does not serve
-    /// [`job_status`](SubscriptionSnapshot::job_status): a missing or
-    /// mid-transition row reads `None` ⇒ [`EventSequence::BEGIN`], which can
-    /// only under-report progress, and under-reporting preserves the
-    /// barrier's never-return-early invariant.
-    async fn checkpoint(&self) -> Result<EventSequence, SubscriptionError> {
-        Ok(self
-            .handle()
-            .await?
-            .execution_state::<OutboxEventJobState>()
-            .await?
-            .unwrap_or_default()
-            .sequence)
-    }
-
-    async fn frontier(&self) -> Result<EventSequence, sqlx::Error> {
-        read_frontier::<Tables>(&self.pool).await
+    async fn frontier_for(
+        &self,
+        checkpoint: StreamPosition,
+    ) -> Result<StreamPosition, sqlx::Error> {
+        match checkpoint {
+            StreamPosition::Insert(_) => Ok(StreamPosition::Insert(
+                read_frontier::<Tables>(&self.pool).await?,
+            )),
+            StreamPosition::Commit(_) => {
+                let (last_commit_seq, _logged_through) =
+                    Tables::commit_log_state(&self.pool).await?;
+                Ok(StreamPosition::Commit(last_commit_seq))
+            }
+        }
     }
 }
 
@@ -573,9 +769,9 @@ pub(super) async fn read_frontier<Tables: MailboxTables>(
 /// Decode a handler job's committed checkpoint. Absent state — no execution
 /// row, or a job that has not checkpointed yet — reads as
 /// [`EventSequence::BEGIN`] (semantics 4).
-fn decode_checkpoint(job: &::job::JobSnapshot) -> Result<EventSequence, SubscriptionError> {
-    Ok(job
-        .execution_state::<OutboxEventJobState>()?
-        .unwrap_or_default()
-        .sequence)
+fn decode_checkpoint(job: &::job::JobSnapshot) -> Result<StreamPosition, SubscriptionError> {
+    Ok(lane_position(
+        &job.execution_state::<OutboxEventJobState>()?
+            .unwrap_or_default(),
+    ))
 }

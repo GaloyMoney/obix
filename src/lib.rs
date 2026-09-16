@@ -34,9 +34,9 @@ pub use out::{
     CommitOrderedEnvelope, CursorError, DecodeFailure, EventCtx, FlushError, FlushOp, Handled,
     IsolatedOp, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, OpCursor, Ordering, Outbox,
     OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
-    SingletonSubscriber, StagedOp, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
-    SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
-    UndecodableEventError, WakeKey, WakeKeys,
+    SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, SubscribeError, Subscription,
+    SubscriptionDef, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    Subscriptions, Suspended, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 pub use tables::MailboxTables;
