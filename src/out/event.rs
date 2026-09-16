@@ -12,9 +12,28 @@ pub trait OutboxEventMarker<E>:
 {
     fn as_event(&self) -> Option<&E>;
 }
+
+/// A type that can itself be an outbox payload. Opting in is what makes
+/// `T: OutboxEventMarker<T>` hold; it deliberately excludes wrappers such as
+/// `Arc<PersistentOutboxEvent<_>>`, which would otherwise satisfy the
+/// blanket impl below and shadow `PersistentOutboxEvent::as_event` /
+/// `EphemeralOutboxEvent::as_event` at the call site.
+///
+/// `#[derive(OutboxEvent)]` implements this for you. A hand-rolled payload
+/// type used directly as `P` (no wrapping enum) needs one line:
+/// `impl OutboxPayload for MyPayload {}`.
+pub trait OutboxPayload {}
+
 impl<T> OutboxEventMarker<T> for T
 where
-    T: serde::de::DeserializeOwned + serde::Serialize + Send + Sync + 'static + Unpin + From<T>,
+    T: OutboxPayload
+        + serde::de::DeserializeOwned
+        + serde::Serialize
+        + Send
+        + Sync
+        + 'static
+        + Unpin
+        + From<T>,
 {
     fn as_event(&self) -> Option<&T> {
         Some(self)
