@@ -631,10 +631,12 @@ where
              Subscription::new_keyed's doc comment",
         );
 
+        // Sampled before the deadline starts, as on the insert lane, so the
+        // reported `waited` measures the polling and not this read.
+        let h = read_frontier::<Tables>(&self.pool).await?;
+
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
-
-        let h = read_frontier::<Tables>(&self.pool).await?;
 
         loop {
             if positions.fold_position() >= h {
