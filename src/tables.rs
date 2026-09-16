@@ -26,13 +26,19 @@ pub struct DefaultMailboxTables;
 /// ([`UndecodableEventError`]), still occupying its sequence position, and
 /// its fate is decided by consumer policy (see
 /// [`SingletonSubscriber::handle_undecodable`](crate::SingletonSubscriber::handle_undecodable)).
+///
+/// The `Err` arm is the delivery of an undecodable event rather than a
+/// failure path, so boxing it to shrink the `Result` would change the public
+/// stream item type for every consumer.
 #[doc(hidden)]
+#[allow(clippy::result_large_err)]
 pub fn decode_persistent_event<P>(
     id: OutboxEventId,
     sequence: u64,
     recorded_at: chrono::DateTime<chrono::Utc>,
     tracing_context: Option<es_entity::context::TracingContext>,
     payload: Option<serde_json::Value>,
+    commit_group: CommitGroupId,
 ) -> Result<PersistentOutboxEvent<P>, UndecodableEventError>
 where
     P: Serialize + DeserializeOwned + Send,
@@ -52,6 +58,7 @@ where
                         error: error.to_string(),
                         raw,
                     },
+                    commit_group,
                 });
             }
         },
@@ -62,6 +69,7 @@ where
         payload,
         tracing_context,
         recorded_at,
+        commit_group,
     })
 }
 
@@ -287,8 +295,60 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// Append every payload-bearing row of `group` to the commit log,
+    /// numbered from `head + 1` in `sequence` order, and set the cursor to
+    /// `at` — all in one statement, so the append and the head advance share
+    /// a fate.
+    ///
+    /// Taken only when `at` is above the stored cursor, re-checked against
+    /// the row version this call's lock wait resolved to. That condition is
+    /// what makes concurrent sequencers append each group exactly once:
+    /// `appended` comes back empty when another process got there first, and
+    /// the caller reads the log instead.
+    ///
+    /// `group_max` is reported either way, so the caller can skip the
+    /// group's remaining members without another round trip.
+    fn append_commit_group<P>(
+        pool: &sqlx::PgPool,
+        group: CommitGroupId,
+        at: EventSequence,
+    ) -> impl Future<Output = Result<CommitGroupAppend<P>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// Everything the sequencer needs to resume, read in **one statement**.
+    ///
+    /// `last_commit_seq` and `logged_ahead` must come from a single
+    /// snapshot. Read separately, a peer appending between them returns a
+    /// `last_commit_seq` that does not account for rows the seed then tells
+    /// the fold to skip, and the fold has no other occasion to reconcile it
+    /// — leaving this process's published head behind the log for as long as
+    /// the stream stays quiet.
+    fn commit_log_restart_state(
+        pool: &sqlx::PgPool,
+    ) -> impl Future<Output = Result<CommitRestartState, sqlx::Error>> + Send;
+
+    /// Load the commit-ordered page `(after, after + limit]`, joined to the
+    /// events table for payloads. Dense by construction, so a short page
+    /// means the reader has reached the head — never a gap to wait on.
+    fn load_commit_ordered_page<P>(
+        pool: &sqlx::PgPool,
+        after: CommitSequence,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<CommitLogRow<P>>, sqlx::Error>> + Send
+    where
+        P: Serialize + DeserializeOwned + Send;
+
+    /// The sequencer's `(last_commit_seq, logged_through)`.
+    fn commit_log_state(
+        pool: &sqlx::PgPool,
+    ) -> impl Future<Output = Result<(CommitSequence, EventSequence), sqlx::Error>> + Send;
+
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
+
+    /// Base name of the commit log table, for the partition maintainer.
+    fn persistent_outbox_commit_log_table() -> &'static str;
 
     /// Base name of the persistent outbox events table (honouring any table
     /// prefix). The partition maintainer derives child partition names
@@ -419,6 +479,46 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_types: &[String],
         wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+}
+
+/// One commit-log row as the loading queries report it: the lane position
+/// plus the decoded event it points at.
+#[doc(hidden)]
+pub struct CommitLogRow<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    pub commit_sequence: CommitSequence,
+    pub commit_boundary: bool,
+    pub event: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
+}
+
+/// Outcome of one [`append_commit_group`](MailboxTables::append_commit_group).
+#[doc(hidden)]
+pub struct CommitGroupAppend<P>
+where
+    P: Serialize + DeserializeOwned + Send,
+{
+    /// The group's highest insert sequence, reported whether or not the
+    /// append was taken.
+    pub group_max: EventSequence,
+    /// The rows appended, in commit order. Empty when another process had
+    /// already advanced the cursor past this group.
+    pub appended: Vec<CommitLogRow<P>>,
+}
+
+/// The sequencer's resume point, all three values from one snapshot.
+#[derive(Debug, Clone)]
+pub struct CommitRestartState {
+    /// Highest position handed out on the commit lane. The log is dense, so
+    /// this is also how many rows it holds.
+    pub last_commit_seq: CommitSequence,
+    /// Every payload-bearing event at or below this insert sequence is in
+    /// the log.
+    pub logged_through: EventSequence,
+    /// Insert sequences above `logged_through` that are already logged,
+    /// which happens when a group straddles it.
+    pub logged_ahead: Vec<EventSequence>,
 }
 
 /// One subscription's identity and terms, as stored — everything but the

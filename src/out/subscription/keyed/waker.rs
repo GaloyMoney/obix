@@ -225,7 +225,7 @@ where
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &PersistentOutboxEvent<P>,
+        event: &Arc<PersistentOutboxEvent<P>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         // Scoped so the guard cannot be held across the return: classifying
         // is synchronous by `SubscriptionDef`'s contract, and a lock guard

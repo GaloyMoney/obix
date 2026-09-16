@@ -22,7 +22,7 @@ mod runner;
 mod waker;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{marker::PhantomData, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use job::JobType;
 
@@ -197,10 +197,13 @@ where
     /// [`SingletonSubscriber::Batch`](crate::out::SingletonSubscriber::Batch).
     type Batch: Default + Send + 'static;
 
+    /// The event arrives as the shared [`Arc`] the outbox decoded once and
+    /// broadcast to every subscriber — see
+    /// [`SingletonSubscriber::handle_persistent`](crate::out::SingletonSubscriber::handle_persistent).
     fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,
-        event: &PersistentOutboxEvent<P>,
+        event: &Arc<PersistentOutboxEvent<P>>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;

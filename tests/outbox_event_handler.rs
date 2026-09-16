@@ -32,7 +32,7 @@ impl SingletonSubscriber<TestEvent> for SkippingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -79,7 +79,7 @@ impl SingletonSubscriber<TestEvent> for AckingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -107,7 +107,7 @@ impl SingletonSubscriber<TestEvent> for CheckpointingObserver {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
@@ -126,7 +126,7 @@ impl SingletonSubscriber<TestEvent> for TestEphemeralHandler {
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.received.lock().await.push(*n);
@@ -145,7 +145,7 @@ impl SingletonSubscriber<TestEvent> for TestBothHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -155,7 +155,7 @@ impl SingletonSubscriber<TestEvent> for TestBothHandler {
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);
@@ -195,7 +195,7 @@ impl SingletonSubscriber<TestEvent> for CollectingEffectHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -242,7 +242,7 @@ impl SingletonSubscriber<TestEvent> for SlowCollectingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -264,7 +264,7 @@ impl SingletonSubscriber<TestEvent> for SlowCollectingHandler {
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);
@@ -294,7 +294,7 @@ impl SingletonSubscriber<TestEvent> for CollectingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<i64>>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -338,7 +338,7 @@ impl SingletonSubscriber<TestEvent> for CoalescingHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -376,7 +376,7 @@ impl SingletonSubscriber<TestEvent> for CollectThenIsolateHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<i64>>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(TestEvent::Ping(n)) = &event.payload else {
             return Ok(ctx.skip());
@@ -421,7 +421,7 @@ impl SingletonSubscriber<TestEvent> for FairnessProbeHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -431,7 +431,7 @@ impl SingletonSubscriber<TestEvent> for FairnessProbeHandler {
 
     async fn handle_ephemeral(
         &self,
-        _event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        _event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Slower than the flood's inter-arrival time: the ephemeral channel
         // never goes empty while the flood runs.
@@ -454,7 +454,7 @@ impl SingletonSubscriber<TestEvent> for PersistentOnlyHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -464,7 +464,7 @@ impl SingletonSubscriber<TestEvent> for PersistentOnlyHandler {
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);
@@ -486,7 +486,7 @@ impl SingletonSubscriber<TestEvent> for EphemeralOnlyHandler {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv>,
-        event: &obix::out::PersistentOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.persistent_received.lock().await.push(*n);
@@ -496,7 +496,7 @@ impl SingletonSubscriber<TestEvent> for EphemeralOnlyHandler {
 
     async fn handle_ephemeral(
         &self,
-        event: &obix::out::EphemeralOutboxEvent<TestEvent>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let TestEvent::Ping(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);

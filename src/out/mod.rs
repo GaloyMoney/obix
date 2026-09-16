@@ -27,12 +27,17 @@ pub use self::subscription::keyed::{
     WakeKey, WakeKeys,
 };
 pub use self::subscription::singleton::{
-    OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
+    Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
     Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
-use crate::{config::*, handle::OwnedTaskHandle, sequence::EventSequence, tables::*};
+use crate::{
+    config::*,
+    handle::OwnedTaskHandle,
+    sequence::{CommitSequence, EventSequence},
+    tables::*,
+};
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
@@ -41,7 +46,7 @@ use notifier::PersistentNotifier;
 pub use op_cursor::{CursorError, OpCursor};
 pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
-pub use persistent::PersistentOutboxListener;
+pub use persistent::{CommitOrderedListener, PersistentOutboxListener};
 pub use post_persist_hook::PostPersistHook;
 
 #[allow(dead_code)]
@@ -60,6 +65,8 @@ where
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
+    /// This process's commit-order sequencer, and the commit lane's fan-out.
+    sequencer: Arc<persistent::SequencerHandle<P>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
@@ -110,6 +117,7 @@ where
             partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
             ephemeral_cache: self.ephemeral_cache.clone(),
+            sequencer: self.sequencer.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             notifier: self.notifier.clone(),
             gap_filler: self.gap_filler.clone(),
@@ -157,6 +165,14 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
+        let sequencer = persistent::spawn_sequencer::<P, Tables>(
+            &pool,
+            persistent_cache.handle(),
+            config.event_buffer_size,
+            config.backfill_page_size,
+        )
+        .await?;
+
         let gap_filler = gap_fill::GapFiller::spawn::<P, Tables>(
             &pool,
             gap_fill_rx,
@@ -175,6 +191,7 @@ where
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache: Arc::new(persistent_cache),
             ephemeral_cache: Arc::new(ephemeral_cache),
+            sequencer: Arc::new(sequencer),
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
             gap_filler,
@@ -414,6 +431,16 @@ where
             start_after,
             self.event_buffer_size,
         )
+    }
+
+    /// Listen in commit order rather than insert order: a source
+    /// transaction's events arrive contiguously and are never split, and the
+    /// cursor is a dense [`CommitSequence`].
+    pub fn listen_commit_ordered(
+        &self,
+        start_after: impl Into<Option<CommitSequence>>,
+    ) -> CommitOrderedListener<P> {
+        CommitOrderedListener::new(self.sequencer.lane(), start_after, self.event_buffer_size)
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {

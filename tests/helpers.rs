@@ -18,8 +18,8 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 pub async fn wipeout_inbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE inbox_events").execute(pool).await?;
 
-    // Delete child tables first due to foreign key constraints
-    // job_events and job_executions reference jobs(id)
+    // Delete the per-job rows before the jobs they select from — the
+    // subqueries below read `jobs`, so it must outlive them.
     sqlx::query!(
         r#"
         DELETE FROM job_events 
@@ -52,6 +52,24 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE ephemeral_outbox_events")
         .execute(pool)
         .await?;
+    wipeout_commit_log(pool).await?;
+    Ok(())
+}
+
+/// Reset the commit-ordered lane: the log and the sequencer's state row.
+/// The state row must be reset alongside the events table — a surviving
+/// `head`/`cursor` would sit past the sequences a truncated stream reissues
+/// and the sequencer would never log them.
+pub async fn wipeout_commit_log(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query!("TRUNCATE persistent_outbox_commit_log")
+        .execute(pool)
+        .await?;
+    sqlx::query!(
+        "UPDATE persistent_outbox_commit_log_state
+         SET last_commit_seq = 0, logged_through_sequence = 0 WHERE singleton"
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
