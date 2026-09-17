@@ -210,6 +210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "convert_case"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,7 +496,34 @@ dependencies = [
  "async-stream",
  "chrono",
  "derive_builder",
- "es-entity-macros",
+ "es-entity-macros 0.12.21",
+ "futures-core",
+ "futures-util",
+ "im",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+]
+
+[[package]]
+name = "es-entity"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fb3c5aea95b26c71cca017d41e18401425306ebbe584266710cf5480d80db65"
+dependencies = [
+ "async-stream",
+ "chrono",
+ "derive_builder",
+ "es-entity-macros 0.13.0",
  "futures-core",
  "futures-util",
  "im",
@@ -511,7 +547,23 @@ version = "0.12.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da2606ff27f6bcec08395ea6f65d92e5d6f895f2bdebb6dbe24a5a00f601f342"
 dependencies = [
- "convert_case",
+ "convert_case 0.11.0",
+ "darling 0.24.1",
+ "pluralizer",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "sqlparser",
+ "syn 3.0.5",
+]
+
+[[package]]
+name = "es-entity-macros"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59a928a22a5aff65307c4dabdc9cc2e87f3ac75bafe348467bbd4a500faadf4e"
+dependencies = [
+ "convert_case 0.12.0",
  "darling 0.24.1",
  "pluralizer",
  "proc-macro2",
@@ -999,7 +1051,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "derive_builder",
- "es-entity",
+ "es-entity 0.12.21",
  "futures",
  "rand 0.10.0",
  "serde",
@@ -1178,7 +1230,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "derive_builder",
- "es-entity",
+ "es-entity 0.13.0",
  "futures",
  "im",
  "job",
