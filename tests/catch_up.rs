@@ -475,3 +475,137 @@ async fn in_flight_bulk_insert_costs_one_probe_then_waits() -> anyhow::Result<()
 
     Ok(())
 }
+
+/// Regression (Bugbot on this PR): a catch-up that merely re-discovers a
+/// hole a GapFiller episode is already working must never restart that
+/// episode's grace clock. The original code sent `GapFillRequest::StallCleared`
+/// unconditionally whenever `StartCatchUp` fired — including a catch-up
+/// re-armed by a notification unrelated to the hole (e.g. a wide, distant
+/// commit, or even a debounced echo of the process's own earlier commits)
+/// — so every such interference pushed the abandoned sequence's fill
+/// further out. Under sustained concurrent write load this never
+/// terminates: "an abandoned sequence never becomes fillable, and every
+/// listener stays blocked."
+///
+/// This is a timing proof, not a count: the fix moved `StallCleared` off
+/// catch-up *start* and onto catch-up *outcome*, sent only when the
+/// outcome actually differs from what is already reported (see the
+/// `catch_up_done_rx` arm in `spawn_cache_loop`) — so a catch-up that lands
+/// back on the exact position already reported must leave that episode's
+/// grace clock untouched, no matter how many times it re-fires. Proving
+/// that requires firing it repeatedly against a wall-clock deadline, which
+/// is why this test measures elapsed time rather than counting spans.
+#[tokio::test]
+#[file_serial]
+async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace()
+-> anyhow::Result<()> {
+    let grace = std::time::Duration::from_secs(2);
+
+    let pool = init_pool().await?;
+    let config = MailboxConfig::builder()
+        .backfill_page_size(1)
+        .gap_fill_grace(grace)
+        .build()
+        .expect("Couldn't build MailboxConfig");
+    let outbox = init_outbox::<TestEvent>(&pool, config.clone()).await?;
+
+    let mut listener = outbox.listen_persisted(None);
+
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+        .await?;
+    op.commit().await?;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("first event")?;
+    assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
+
+    // Burn seq 2 permanently — no transaction ever holds it, so it is
+    // abandoned from the moment it is allocated (matching
+    // `gap_fill_waits_for_grace_period`'s approach in tests/outbox.rs).
+    let stall_reported_at = tokio::time::Instant::now();
+    sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+        .fetch_one(&pool)
+        .await?;
+
+    // seq 3 commits through the outbox, stalling the cursor at 1. With
+    // backfill_page_size(1), distance (2) reaches the threshold
+    // immediately, so catch-up engages right away, discovers the hole, and
+    // hands it to the GapFiller's grace-gated episode.
+    let mut op = outbox.begin_op().await?;
+    outbox
+        .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+        .await?;
+    op.commit().await?;
+
+    // Nothing before the grace period, matching the unmodified stall path
+    // (`gap_fill_waits_for_grace_period`).
+    assert!(
+        tokio::time::timeout(grace / 2, listener.next())
+            .await
+            .is_err(),
+        "no premature placeholder before the grace period elapses"
+    );
+
+    // While the episode's grace clock is running, repeatedly insert real
+    // rows well past the hole and manually emit the same `pg_notify` a
+    // second instance's own debounced notifier would send for them —
+    // exactly what an unrelated concurrent bulk commit looks like from
+    // this outbox's perspective, without spinning up a second `Outbox`
+    // (whose own auto-registered sequencer would independently discover
+    // and no-grace Historical-fill this same shared-table hole, racing the
+    // very episode this test observes). Raw SQL, not `publish_all_persisted`,
+    // for the same reason. Each notified range is wide enough to bypass
+    // `fetch_notified_range` and reach the `catch_up_exhausted_at` re-arm
+    // paths, re-triggering `StartCatchUp` roughly every 150ms for nearly
+    // the whole grace window. If starting a catch-up ever cleared the
+    // episode, every one of these would push the eventual delivery further
+    // out.
+    let mut inserted_up_to = 3u64;
+    while stall_reported_at.elapsed() < grace.mul_f32(0.9) {
+        let batch_start = inserted_up_to + 1;
+        let batch_end = inserted_up_to + 10;
+        for n in batch_start..=batch_end {
+            sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
+                .bind(format!(r#"{{"Ping": {n}}}"#))
+                .execute(&pool)
+                .await?;
+        }
+        inserted_up_to = batch_end;
+        sqlx::query(&format!(
+            "SELECT pg_notify('persistent_outbox_events', \
+             '{{\"min_sequence\": {batch_start}, \"max_sequence\": {batch_end}}}')"
+        ))
+        .execute(&pool)
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    // A generous safety net so a genuinely broken build fails outright
+    // rather than hanging; the real assertion is the elapsed-time check
+    // below, which is tight enough to tell "one grace period" from
+    // "restarted on the last interference".
+    let gap_event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("gap-filled placeholder never arrived"))?
+        .expect("gap-filled placeholder")?;
+    let elapsed = stall_reported_at.elapsed();
+    assert!(
+        gap_event.payload.is_none(),
+        "gap-filled event should have None payload"
+    );
+    assert!(
+        elapsed < grace + std::time::Duration::from_millis(800),
+        "placeholder arrived after {elapsed:?} (grace was {grace:?}) — well past one \
+         grace period from the original stall report, meaning an interfering \
+         notification reset the episode's grace clock"
+    );
+
+    let real_event = tokio::time::timeout(std::time::Duration::from_secs(2), listener.next())
+        .await?
+        .expect("real event after the gap")?;
+    assert!(matches!(real_event.payload, Some(TestEvent::Ping(1))));
+
+    Ok(())
+}

@@ -733,12 +733,32 @@ where
                         // No `continue`: falls through to the stall-reporting
                         // block below, which reports the hole (or moves on)
                         // exactly as it would for an ordinary stall.
+                        //
+                        // A GapFiller episode is only cleared here on
+                        // genuine progress (`AtHead`, or a hole at a
+                        // *different* position than whatever is currently
+                        // reported) — never merely because a catch-up ran.
+                        // A catch-up that re-probes and lands on the exact
+                        // position already reported must leave that episode
+                        // alone: clearing it unconditionally on every run
+                        // would restart its grace period every time a
+                        // spurious re-arm (e.g. an unrelated notification)
+                        // triggers a redundant, no-progress catch-up.
                         if let Some(outcome) = result {
                             catch_up = None;
                             match outcome {
-                                CatchUpOutcome::AtHead => catch_up_exhausted_at = None,
+                                CatchUpOutcome::AtHead => {
+                                    catch_up_exhausted_at = None;
+                                    if reported_stall.take().is_some() {
+                                        let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
+                                    }
+                                }
                                 CatchUpOutcome::HoleAfter(pos) => {
                                     catch_up_exhausted_at = Some(pos);
+                                    if reported_stall.is_some_and(|stalled_at| stalled_at != pos) {
+                                        reported_stall = None;
+                                        let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
+                                    }
                                 }
                             }
                         }
@@ -923,12 +943,24 @@ where
                                                     clamped_up_to,
                                                     cache_fill_sender.clone(),
                                                 ));
-                                            } else {
+                                            } else if u64::from(after)
+                                                <= u64::from(last_broadcast_sequence)
+                                            {
                                                 // Wider than one page: not
                                                 // this task's job — the
                                                 // decision rule's catch-up
                                                 // reads it contiguously once
                                                 // the cursor reaches it.
+                                                // Re-arm only when the range
+                                                // reaches back to (or before)
+                                                // the cursor: an unrelated
+                                                // wide range elsewhere must
+                                                // never clear a stale
+                                                // exhaustion, or `StartCatchUp`
+                                                // sends `StallCleared` and
+                                                // resets an unresolved hole's
+                                                // grace-gated episode for no
+                                                // reason.
                                                 catch_up_exhausted_at = None;
                                             }
                                         }
@@ -987,9 +1019,13 @@ where
                         let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
                     }
                     StallAction::StartCatchUp => {
-                        if reported_stall.take().is_some() {
-                            let _ = gap_fill_tx.send(GapFillRequest::StallCleared);
-                        }
+                        // Do NOT clear `reported_stall` / notify the
+                        // GapFiller here: starting a catch-up is not itself
+                        // progress. If this run just re-discovers the same
+                        // position an existing GapFiller episode is already
+                        // working, that episode must be left running,
+                        // untouched — see the `catch_up_done_rx` arm, which
+                        // clears it only once the outcome proves progress.
                         let task_handle = spawn_supervised(
                             "obix::persistent_cache_catch_up",
                             Self::run_catch_up(
