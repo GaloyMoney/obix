@@ -19,10 +19,7 @@ where
     Tables: MailboxTables,
 {
     /// The hook's entire cache-facing surface: `post_commit` hands its
-    /// committed batch straight to `CacheFeeder::accept`, which advances the
-    /// head watermark and queues it for the persistent cache's feeder task
-    /// to drain from memory — no DB round trip to read it back, and no
-    /// truncation policy living here.
+    /// committed batch straight to `CacheFeeder::accept`.
     feeder: CacheFeeder<P>,
     /// Reports the committed batch's `(min, max)` to the debounced notifier.
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
@@ -186,13 +183,9 @@ where
         PreCommitRet::ok(self, op)
     }
 
-    /// Hand the committed batch to the cache's feeder, then report its
-    /// `(min, max)` to the debounced notifier. `CacheFeeder::accept` owns
-    /// everything about how the batch reaches listeners — advancing the
-    /// head watermark, queuing it for the feeder task to drain from memory
-    /// at whatever pace the cursor allows. This hook does not hold an
-    /// opinion about cache capacity or broadcast channel width; it commits
-    /// events and hands off.
+    /// Hand the committed batch to the feeder, then report its `(min, max)`
+    /// to the debounced notifier. How the batch reaches listeners — and at
+    /// what pace — is entirely `CacheFeeder::accept`'s business.
     fn post_commit(mut self) {
         let post_commit_events = std::mem::take(&mut self.post_commit_events);
         let range = match (post_commit_events.first(), post_commit_events.last()) {

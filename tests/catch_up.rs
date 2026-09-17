@@ -41,26 +41,9 @@ struct WatchedSpan {
     handle: SpanWatch,
 }
 
-/// Counts `tracing` spans created under given names, without pulling in
-/// `tracing-subscriber` (not a workspace dependency): a minimal
-/// `tracing::Subscriber` that counts `new_span` calls per watched name and
-/// installs as the thread-local default for the test's duration.
-/// `#[tokio::test]` defaults to the current-thread runtime, so every task
-/// spawned by the outbox (including the feeder task) runs on the same
-/// thread as the guard and is captured.
-///
-/// `tracing::subscriber::set_default` installs a single thread-local
-/// dispatcher — a second `set_default` call would silently shadow the
-/// first rather than layering — so one test that needs to watch several
-/// span names (e.g. both `catch_up` and `memory_feed`) must install one
-/// `SpanCounter` watching all of them, never several.
-///
-/// For a name with a field requested, sums that field across every match —
-/// both the value a span is created with (`new_span`'s `Attributes`) and
-/// anything recorded on it afterwards (`record`'s `Record`), since a span
-/// may set a field at creation (`memory_feed`'s `rows`, known up front) or
-/// only once its work finishes (`catch_up`'s `rows`, recorded when the read
-/// loop exits).
+/// Counts spans by name without `tracing-subscriber` (not a workspace
+/// dependency). One instance must watch *every* name a test cares about:
+/// `set_default` replaces the thread-local dispatcher rather than layering.
 struct SpanCounter {
     watched: Vec<WatchedSpan>,
     /// span id -> index into `watched`, for spans matching a name whose
@@ -69,6 +52,9 @@ struct SpanCounter {
     next_id: AtomicU64,
 }
 
+/// Sums a field across matching spans, from both `Attributes` (set at
+/// creation, e.g. `memory_feed`'s `rows`) and `Record` (set later, e.g.
+/// `catch_up`'s `rows`).
 struct FieldSum<'a> {
     field_name: &'static str,
     sum: &'a Arc<AtomicU64>,
@@ -177,17 +163,9 @@ impl tracing::Subscriber for SpanCounter {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-/// The headline case: a single commit larger than the cache-fill broadcast
-/// must drain at DB speed, not at the gap-fill-grace cadence
-/// (`backfill_page_size / gap_fill_grace`, ~500/s on `main`). On unfixed
-/// code this test does not merely run slowly — it fails outright, because
-/// 200,000 / 500/s = 400s blows the 60s budget by 6x.
-///
-/// Since the feeder (`CacheFeeder`), a *local* commit this large is fed
-/// straight from memory — the batch `post_commit` already holds — rather
-/// than dropped and re-read from Postgres: `catch_up` (the database branch)
-/// must never engage for it, and exactly one `memory_feed` span (one per
-/// batch, never per page) must cover the whole thing.
+/// The headline case: one commit larger than the cache-fill broadcast drains
+/// at page speed, not the ~500/s gap-fill-grace cadence `main` manages (which
+/// needs 400s and blows the 60s budget 6x). Local, so memory feeds it.
 #[tokio::test]
 #[file_serial]
 async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result<()> {
@@ -251,11 +229,8 @@ async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result
         last_sequence = Some(u64::from(event.sequence));
     }
 
-    // A local commit this large is fed straight from memory — the database
-    // catch-up branch must never engage for it (proves the drain above went
-    // through the memory path, not some other mechanism quietly delivering
-    // everything), and exactly one `memory_feed` span covers the whole
-    // batch (one per batch, never per page).
+    // Pins *which* path drained it, so the timing above cannot pass via some
+    // other mechanism quietly delivering everything.
     assert_eq!(
         catch_up_spans.count(),
         0,
@@ -270,15 +245,9 @@ async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result
     Ok(())
 }
 
-/// Counted observation, not just correctness: repeated local commits are a
-/// *standing* trigger condition (the feeder re-derives `pending` and
-/// `memory_next` on every loop iteration, dozens of times over this test),
-/// which is exactly the shape that let a one-shot waiter accumulate
-/// unboundedly elsewhere. Each commit hands the feeder exactly one batch —
-/// this must produce exactly one `memory_feed` span per commit regardless
-/// of how many pages that batch takes to drain, never one per page and
-/// never one per loop iteration; the database `catch_up` branch must never
-/// engage at all, since every batch here is already in memory.
+/// Counted observation against a *standing* trigger: twenty commits, each
+/// re-arming the condition, must produce exactly one `memory_feed` span each —
+/// never one per page or per loop iteration.
 #[tokio::test]
 #[file_serial]
 async fn local_commits_are_fed_from_memory_one_span_per_batch() -> anyhow::Result<()> {
@@ -503,12 +472,9 @@ async fn small_buffer_large_local_commit_is_fed_from_memory() -> anyhow::Result<
     Ok(())
 }
 
-/// Trim safety: a memory-fed page delivered in order must be fully consumed
-/// by the contiguity walk (and broadcast) before the cache trim can evict
-/// it, even when the configured cache is much smaller than one page. If
-/// trim ever did evict an unconsumed tail, the feeder's re-derive-from-the-
-/// real-cursor rule heals it by re-feeding from memory — this must never
-/// need the database.
+/// Trim safety: a cache far smaller than one page must not lose a fed page's
+/// tail. If trim ever does evict one, the feeder's re-derive-from-the-real-
+/// cursor rule re-feeds it from memory, never from the database.
 #[tokio::test]
 #[file_serial]
 async fn catch_up_page_survives_a_cache_smaller_than_the_page() -> anyhow::Result<()> {
@@ -567,10 +533,9 @@ async fn catch_up_page_survives_a_cache_smaller_than_the_page() -> anyhow::Resul
     Ok(())
 }
 
-/// A bulk insert still in flight is a hole, not a catch-up loop: the
-/// catch-up's empty first read must hand over to the existing grace-gated
-/// stall path rather than spinning, and no placeholder may be written while
-/// the writer that owns the gap is still live.
+/// A bulk insert still in flight is a hole, not a backlog: the empty first
+/// read must hand over to the grace-gated stall path rather than spinning,
+/// and no placeholder may be written while that writer is still live.
 #[tokio::test]
 #[file_serial]
 async fn in_flight_bulk_insert_costs_one_probe_then_waits() -> anyhow::Result<()> {
@@ -646,25 +611,9 @@ async fn in_flight_bulk_insert_costs_one_probe_then_waits() -> anyhow::Result<()
     Ok(())
 }
 
-/// Regression (Bugbot on this PR): a catch-up that merely re-discovers a
-/// hole a GapFiller episode is already working must never restart that
-/// episode's grace clock. The original code sent `GapFillRequest::StallCleared`
-/// unconditionally whenever `StartCatchUp` fired — including a catch-up
-/// re-armed by a notification unrelated to the hole (e.g. a wide, distant
-/// commit, or even a debounced echo of the process's own earlier commits)
-/// — so every such interference pushed the abandoned sequence's fill
-/// further out. Under sustained concurrent write load this never
-/// terminates: "an abandoned sequence never becomes fillable, and every
-/// listener stays blocked."
-///
-/// This is a timing proof, not a count: the fix moved `StallCleared` off
-/// catch-up *start* and onto catch-up *outcome*, sent only when the
-/// outcome actually differs from what is already reported (see the
-/// `catch_up_done_rx` arm in `spawn_cache_loop`) — so a catch-up that lands
-/// back on the exact position already reported must leave that episode's
-/// grace clock untouched, no matter how many times it re-fires. Proving
-/// that requires firing it repeatedly against a wall-clock deadline, which
-/// is why this test measures elapsed time rather than counting spans.
+/// Regression: a catch-up that merely re-discovers a hole an episode is already
+/// working must not restart its grace clock, or under sustained write load an
+/// abandoned sequence never becomes fillable. Hence a timing proof.
 #[tokio::test]
 #[file_serial]
 async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace()
@@ -699,10 +648,9 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
         .fetch_one(&pool)
         .await?;
 
-    // seq 3 commits through the outbox, stalling the cursor at 1. With
-    // backfill_page_size(1), distance (2) reaches the threshold
-    // immediately, so catch-up engages right away, discovers the hole, and
-    // hands it to the GapFiller's grace-gated episode.
+    // seq 3 commits, stalling the cursor at 1. With backfill_page_size(1) the
+    // distance reaches the threshold at once, so catch-up engages, finds the
+    // hole, and hands it to the grace-gated episode.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
@@ -718,20 +666,9 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
         "no premature placeholder before the grace period elapses"
     );
 
-    // While the episode's grace clock is running, repeatedly insert real
-    // rows well past the hole and manually emit the same `pg_notify` a
-    // second instance's own debounced notifier would send for them —
-    // exactly what an unrelated concurrent bulk commit looks like from
-    // this outbox's perspective, without spinning up a second `Outbox`
-    // (whose own auto-registered sequencer would independently discover
-    // and no-grace Historical-fill this same shared-table hole, racing the
-    // very episode this test observes). Raw SQL, not `publish_all_persisted`,
-    // for the same reason. Each notified range is wide enough to bypass
-    // `fetch_notified_range` and reach the `catch_up_exhausted_at` re-arm
-    // paths, re-triggering `StartCatchUp` roughly every 150ms for nearly
-    // the whole grace window. If starting a catch-up ever cleared the
-    // episode, every one of these would push the eventual delivery further
-    // out.
+    // Interfere every 150ms for most of the grace window, each notified range
+    // wide enough to re-arm the exhaustion and re-fire a catch-up. Raw SQL,
+    // since a second `Outbox` would Historical-fill this hole and race us.
     let mut inserted_up_to = 3u64;
     while stall_reported_at.elapsed() < grace.mul_f32(0.9) {
         let batch_start = inserted_up_to + 1;
@@ -752,10 +689,8 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
-    // A generous safety net so a genuinely broken build fails outright
-    // rather than hanging; the real assertion is the elapsed-time check
-    // below, which is tight enough to tell "one grace period" from
-    // "restarted on the last interference".
+    // A safety net so a broken build fails rather than hangs; the real
+    // assertion is the elapsed-time check below.
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
         .await
         .map_err(|_| anyhow::anyhow!("gap-filled placeholder never arrived"))?
@@ -780,33 +715,9 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
     Ok(())
 }
 
-/// The one hazard a single-batch feeder never had to face: two *concurrent*
-/// local commits whose sequences interleave, with the smaller one's
-/// `post_commit` landing *after* the larger one's. Batch A (20,000 events)
-/// commits first but a concurrent single-event batch B steals a sequence
-/// number from the middle of A's range (Postgres's `nextval` is shared and
-/// not transactional, so a concurrent INSERT elsewhere always can) and does
-/// not commit until ~3s later — held open by a `PostPersistHook` that
-/// sleeps on a batch of exactly one event.
-///
-/// If the feeder considered only the oldest pending batch's front (an
-/// "arrival order" bug, the FIFO shape this regression targets) rather than
-/// scanning every pending batch for the smallest sequence above the cursor,
-/// A would park behind B's hole forever (A's own tail can never become the
-/// smallest pending sequence while B is missing) and B would sit queued
-/// behind A — resolved only once the grace-gated `GapFiller` notices the
-/// single missing sequence, `gap_fill_grace` (set to 10s here) after it was
-/// first reported. `next_after`'s full scan picks B — the batch that
-/// actually holds `cursor + 1` — the instant it arrives, letting A's
-/// remainder resume immediately: the whole range must be fully delivered in
-/// a small multiple of B's 3s hold, never anywhere near the 10s grace.
-///
-/// Delivery order here is by sequence, not by commit or publish order —
-/// since B's sequence lands somewhere inside A's range (exactly where
-/// depends on real scheduling, not something this test controls), the
-/// assertions check the delivered *set* of payloads (exactly once each,
-/// nothing missing) and strict sequence ordering, rather than assuming a
-/// fixed position for B's payload.
+/// Interleaved concurrent commits: B steals a sequence from the middle of A's
+/// 20,000 and commits ~3s later. Considering only the oldest pending batch's
+/// front, A parks behind B's hole and B queues behind A until the 10s grace.
 #[tokio::test]
 #[file_serial]
 async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> anyhow::Result<()> {
@@ -865,10 +776,8 @@ async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> a
         op.commit().await.expect("commit A");
     });
 
-    // Give A's inserts a head start so its sequences are already allocated
-    // (and largely committed) before B's single event steals one from the
-    // middle of A's range — the shape that makes B a hole *inside* an
-    // already-pending batch, not merely a hole ahead of it.
+    // A head start, so B steals from the middle of A's range: a hole *inside*
+    // an already-pending batch, not merely one ahead of it.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let outbox_b = outbox.clone();
@@ -929,9 +838,8 @@ async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> a
         "every payload 0..={A_TOTAL} must be delivered exactly once"
     );
 
-    // Delivery must complete a small multiple of B's 3s hold after B's
-    // commit started — nowhere near the 10s grace. On the FIFO bug this
-    // bound fails outright (the grace-gated fill dominates instead).
+    // A small multiple of B's hold, nowhere near the grace — on the FIFO bug
+    // the grace-gated fill dominates and this fails outright.
     assert!(
         elapsed < B_HOLD + std::time::Duration::from_secs(3),
         "took {elapsed:?} after B's commit started (hold was {B_HOLD:?}) — memory should \
@@ -948,30 +856,9 @@ async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> a
     Ok(())
 }
 
-/// Proves the database branch is *bounded*: a genuinely remote backlog
-/// (rows with no in-memory copy in this process) sitting below a large
-/// pending local batch must be read only up to where that batch begins —
-/// never past it, which would silently re-read from Postgres what memory
-/// is about to feed anyway.
-///
-/// Construction mirrors `in_flight_bulk_insert_costs_one_probe_then_waits`
-/// (T6) and `repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace`
-/// (T7): raw SQL and a manually fired `pg_notify`, never a second `Outbox`
-/// on the same pool — its own auto-registered sequencer would independently
-/// discover and no-grace Historical-fill this same shared-table hole,
-/// masking the bound this test exists to prove (see the regression notes on
-/// T7).
-///
-/// Sequence: a raw transaction burns 1,500 sequences and stays open (a
-/// remote writer's uncommitted backlog); then a 20,000-event batch commits
-/// through the outbox, landing entirely above that gap and going straight
-/// to the feeder's `pending`. The gap is a full page wide, so the loop
-/// requests a catch-up immediately — its first read finds nothing (the raw
-/// rows are still uncommitted) and reports a hole. Only once the raw
-/// transaction commits and the notification arrives does the second,
-/// *bounded* catch-up read the 1,500 real rows — stopping exactly at the
-/// pending batch's front, not at its own (memory-inflated) view of the
-/// head.
+/// The database branch is *bounded*: 1,500 remote rows below a pending 20,000
+/// local batch are read only up to where that batch begins. Counted on the
+/// span's `rows`, so an unbounded read fails rather than reading twice.
 #[tokio::test]
 #[file_serial]
 async fn remote_gap_below_a_parked_batch_is_read_bounded_then_memory_resumes() -> anyhow::Result<()>
@@ -1070,10 +957,8 @@ async fn remote_gap_below_a_parked_batch_is_read_bounded_then_memory_resumes() -
         assert_eq!(event.payload, Some(TestEvent::Ping(BURNED + i as u64)));
     }
 
-    // The counted bound: the database catch-up path must account for
-    // exactly the BURNED rows memory could not supply — never the local
-    // batch's rows sitting above them, which would mean the bound was not
-    // applied and the DB re-read rows already held in memory.
+    // Exactly the rows memory could not supply — counting the batch's rows
+    // above them would mean the bound was never applied.
     assert_eq!(
         catch_up_spans.field_sum(),
         BURNED,
