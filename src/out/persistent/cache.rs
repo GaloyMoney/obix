@@ -19,6 +19,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use super::feeder::{CatchUpOutcome, FeedRequest, run_feeder};
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
@@ -75,17 +76,6 @@ struct NotifiedRange {
     /// `None` when every notified sequence is already cached (the warm
     /// in-process path: the post-commit broadcast beat the NOTIFY).
     missing: Option<(EventSequence, EventSequence)>,
-}
-
-/// Outcome of one catch-up task run, reported to the cache loop over its
-/// done channel.
-enum CatchUpOutcome {
-    /// The cursor reached the head with no gap — nothing left to catch up.
-    AtHead,
-    /// The catch-up stopped at `pos` because `pos + 1` is missing from the
-    /// table: a hole, not a backlog of committed rows. Handed to the same
-    /// grace-gated stall path a stall has always used.
-    HoleAfter(EventSequence),
 }
 
 /// What the stall-reporting block at the bottom of the cache loop does this
@@ -147,6 +137,7 @@ where
     backfill_buffer_size: usize,
     cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
     _cache_loop_handle: OwnedTaskHandle,
+    _feeder_handle: OwnedTaskHandle,
     _phantom: std::marker::PhantomData<Tables>,
 }
 
@@ -172,6 +163,8 @@ where
     /// can advance it directly when it truncates a batch too large for the
     /// cache-fill broadcast — before the loop would otherwise discover the
     /// batch's tail from the (budgeted) sends it does receive.
+    /// // @@ instead of exposing this and putting logit in persist_events_hook.rs can we add some
+    /// kind of feed_from_post_persist on the chache?
     pub(crate) fn highest_known_sequence(&self) -> Arc<AtomicU64> {
         self.highest_known_sequence.clone()
     }
@@ -189,6 +182,35 @@ where
         let highest_known_sequence = Arc::new(AtomicU64::from(
             Tables::highest_known_persistent_sequence(pool).await?,
         ));
+
+        // The cursor, observable so the feeder can pace itself off it.
+        // `send_replace` never errors regardless of receiver count, so no
+        // receiver needs to exist yet.
+        let (cursor_tx, feeder_cursor_rx) =
+            watch::channel(highest_known_sequence.load(Ordering::Relaxed));
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<FeedRequest>();
+        let (catch_up_done_tx, catch_up_done_rx) = mpsc::unbounded_channel::<CatchUpOutcome>();
+        // Bounds a fed page: it is sent into the cache-fill broadcast, so a
+        // page wider than that channel would lag the very channel it is
+        // trying to refill.
+        let catch_up_page_size = config
+            .backfill_page_size
+            .max(1)
+            .min((config.event_buffer_size / 2).max(1))
+            .max(1);
+        let feeder_handle = spawn_supervised(
+            "obix::persistent_cache_feeder",
+            run_feeder::<P, Tables>(
+                pool.clone(),
+                cache_fill_send.clone(),
+                feeder_cursor_rx,
+                highest_known_sequence.clone(),
+                catch_up_page_size,
+                request_rx,
+                catch_up_done_tx,
+            ),
+        );
+
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
             config,
@@ -199,6 +221,9 @@ where
             cache_fill_send.clone(),
             persistent_notification_rx,
             gap_fill_tx,
+            cursor_tx,
+            request_tx,
+            catch_up_done_rx,
         )
         .await?;
 
@@ -209,6 +234,7 @@ where
             backfill_buffer_size: config.backfill_page_size.max(1),
             cache_fill_sender: cache_fill_send,
             _cache_loop_handle: cache_loop_handle,
+            _feeder_handle: OwnedTaskHandle::new(feeder_handle),
             _phantom: std::marker::PhantomData,
         };
         Ok(ret)
@@ -495,102 +521,6 @@ where
         }
     }
 
-    /// How long the catch-up task waits for the cache loop to consume a
-    /// delivered page (observed via the cursor watch) before re-reading from
-    /// wherever the real cursor has reached. A hint only — a timeout just
-    /// means the loop is slower than expected, not that anything is wrong.
-    const CATCH_UP_CONSUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// Drain the cursor's backlog against *committed* rows at DB speed: page
-    /// [`MailboxTables::load_next_contiguous_page`] from wherever the cursor
-    /// actually is, one page in flight, until a page is empty (a hole — the
-    /// cache loop's stall reporting takes over) or the cursor reaches the
-    /// head (nothing left to catch up on). Never writes anything; the
-    /// GapFiller remains the only writer of placeholder rows.
-    ///
-    /// Paced by the cursor itself — read from `cursor_rx.borrow()` fresh on
-    /// every iteration, not from a locally tracked position — because the
-    /// contiguous run this task delivers is exactly what lets the cursor
-    /// move at all, so re-reading it is how this task discovers its own
-    /// progress.
-    async fn run_catch_up(
-        pool: sqlx::PgPool,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
-        mut cursor_rx: watch::Receiver<u64>,
-        highest_known_sequence: Arc<AtomicU64>,
-        page_size: usize,
-        done_tx: mpsc::UnboundedSender<CatchUpOutcome>,
-    ) {
-        let catch_up_span = tracing::info_span!(
-            "obix.persistent_cache.catch_up",
-            from = *cursor_rx.borrow(),
-            to = tracing::field::Empty,
-            pages = tracing::field::Empty,
-            rows = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
-        let mut pages: u64 = 0;
-        let mut rows: u64 = 0;
-        let outcome = async {
-            loop {
-                let from = EventSequence::from(*cursor_rx.borrow());
-                let head = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
-                if from >= head {
-                    break CatchUpOutcome::AtHead;
-                }
-
-                let events =
-                    match Tables::load_next_contiguous_page::<P>(&pool, from, page_size).await {
-                        Ok(events) => events,
-                        Err(e) => {
-                            record_catch_up_failed(&e, u64::from(from));
-                            tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
-                            continue;
-                        }
-                    };
-                pages += 1;
-
-                let deliveries: Vec<PersistentDelivery<P>> =
-                    events.into_iter().map(PersistentDelivery::from).collect();
-                let Some(first) = deliveries.first() else {
-                    break CatchUpOutcome::HoleAfter(from);
-                };
-                if first.sequence() != from.next() {
-                    break CatchUpOutcome::HoleAfter(from);
-                }
-                rows += deliveries.len() as u64;
-                let last = deliveries
-                    .last()
-                    .expect("checked non-empty above")
-                    .sequence();
-                for delivery in &deliveries {
-                    let _ = cache_fill_sender.send(delivery.clone());
-                }
-
-                // One page in flight: wait for the cache loop to have
-                // consumed it before reading the next. A timeout just means
-                // the loop is behind — re-read from wherever it actually is.
-                let _ = tokio::time::timeout(
-                    Self::CATCH_UP_CONSUME_TIMEOUT,
-                    cursor_rx.wait_for(|c| *c >= u64::from(last)),
-                )
-                .await;
-            }
-        }
-        .instrument(catch_up_span.clone())
-        .await;
-
-        catch_up_span.record("to", *cursor_rx.borrow());
-        catch_up_span.record("pages", pages);
-        catch_up_span.record("rows", rows);
-        let outcome_label = match &outcome {
-            CatchUpOutcome::AtHead => "at_head",
-            CatchUpOutcome::HoleAfter(_) => "hole",
-        };
-        catch_up_span.record("outcome", outcome_label);
-        let _ = done_tx.send(outcome);
-    }
-
     /// Authoritative head read (the O(1) sequence `last_value` query).
     /// Logs and returns `None` on failure so callers skip their advance.
     async fn read_confirmed_head(pool: &sqlx::PgPool) -> Option<EventSequence> {
@@ -653,17 +583,14 @@ where
         cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
+        cursor_tx: watch::Sender<u64>,
+        request_tx: mpsc::UnboundedSender<FeedRequest>,
+        mut catch_up_done_rx: mpsc::UnboundedReceiver<CatchUpOutcome>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
         let cache_size = config.event_cache_size;
         let backfill_page_size = config.backfill_page_size.max(1);
-        // Bounds a catch-up page: it is sent into the cache-fill broadcast,
-        // so a page wider than that channel would lag the very channel it
-        // is trying to refill.
-        let catch_up_page_size = backfill_page_size
-            .min((config.event_buffer_size / 2).max(1))
-            .max(1);
         let high_water = cache_size * (100 + config.event_cache_trim_percent as usize) / 100;
         let low_water = cache_size * (100 - config.event_cache_trim_percent as usize) / 100;
         let idle_resync_interval = config.idle_resync_interval;
@@ -685,17 +612,15 @@ where
             let init_head = u64::from(initial_sequence);
             let mut last_progress_at = tokio::time::Instant::now();
 
-            // The cursor, observable so a catch-up task can pace itself off
-            // it. `send_replace` never errors regardless of receiver count,
-            // so no receiver needs to exist yet.
-            let (cursor_tx, _) = watch::channel(u64::from(initial_sequence));
-            let mut catch_up: Option<OwnedTaskHandle> = None;
+            // Whether a feeder-run catch-up is currently in flight — the
+            // feeder task itself is long-lived (spawned once in `init`);
+            // this just tracks whether it currently owns progress. See
+            // `decide_stall_action`'s `catch_up_active` gate.
+            let mut catch_up_active = false;
             // The position the last catch-up run ended a hole at — prevents
             // re-probing the same hole every loop iteration. See
             // `decide_stall_action` for the re-arm points.
             let mut catch_up_exhausted_at: Option<EventSequence> = None;
-            let (catch_up_done_tx, mut catch_up_done_rx) =
-                mpsc::unbounded_channel::<CatchUpOutcome>();
 
             loop {
                 tokio::select! {
@@ -745,7 +670,7 @@ where
                         // spurious re-arm (e.g. an unrelated notification)
                         // triggers a redundant, no-progress catch-up.
                         if let Some(outcome) = result {
-                            catch_up = None;
+                            catch_up_active = false;
                             match outcome {
                                 CatchUpOutcome::AtHead => {
                                     catch_up_exhausted_at = None;
@@ -1006,7 +931,7 @@ where
 
                 match decide_stall_action(
                     behind,
-                    catch_up.is_some(),
+                    catch_up_active,
                     catch_up_exhausted_at,
                     last_broadcast_sequence,
                     distance,
@@ -1026,18 +951,8 @@ where
                         // working, that episode must be left running,
                         // untouched — see the `catch_up_done_rx` arm, which
                         // clears it only once the outcome proves progress.
-                        let task_handle = spawn_supervised(
-                            "obix::persistent_cache_catch_up",
-                            Self::run_catch_up(
-                                pool.clone(),
-                                cache_fill_sender.clone(),
-                                cursor_tx.subscribe(),
-                                highest_known_sequence.clone(),
-                                catch_up_page_size,
-                                catch_up_done_tx.clone(),
-                            ),
-                        );
-                        catch_up = Some(OwnedTaskHandle::new(task_handle));
+                        let _ = request_tx.send(FeedRequest::CatchUp);
+                        catch_up_active = true;
                     }
                     StallAction::ReportStall => {
                         let _ = gap_fill_tx.send(GapFillRequest::Stalled(last_broadcast_sequence));
@@ -1071,14 +986,6 @@ fn record_no_receivers(sequence: u64) {}
     fields(error = %error, current_sequence = current_sequence),
 )]
 fn record_backfill_failed(error: &sqlx::Error, current_sequence: u64) {}
-
-#[tracing::instrument(
-    name = "obix.persistent_cache.catch_up_failed",
-    level = "warn",
-    skip_all,
-    fields(error = %error, from = from),
-)]
-fn record_catch_up_failed(error: &sqlx::Error, from: u64) {}
 
 #[tracing::instrument(
     name = "obix.persistent_cache.backfill_channel_closed",
