@@ -625,7 +625,7 @@ where
         cursor_tx: watch::Sender<u64>,
         request_tx: mpsc::UnboundedSender<FeedRequest>,
         mut catch_up_done_rx: mpsc::UnboundedReceiver<CatchUpOutcome>,
-        front_rx: watch::Receiver<Option<u64>>,
+        mut front_rx: watch::Receiver<Option<u64>>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let pool = pool.clone();
 
@@ -940,6 +940,36 @@ where
                         }
                     }
 
+                    // Bugbot (this PR): the clamp above reads a stale-low
+                    // `front_rx` as "memory is still feeding here", which is
+                    // right while the feeder's own page-send caused this
+                    // exact wake — but if the cursor instead moved via a
+                    // *different* mechanism (a GapFiller fill, a bounded
+                    // catch-up page, `fetch_notified_range`) while the
+                    // feeder sat parked on a now-stale front, that clamp can
+                    // wrongly suppress a stall report for however long it
+                    // takes something else to wake this loop — up to
+                    // `idle_resync_interval` with no other traffic. This arm
+                    // closes that window: any change the feeder publishes —
+                    // including correcting itself after noticing the same
+                    // cursor move via its own `cursor_rx.changed()` — reruns
+                    // the decision block immediately with a fresh value,
+                    // instead of waiting on an unrelated wake. A no-op
+                    // during active feeding (the published value is already
+                    // `cursor + 1`, so the decision block's early return
+                    // fires the same way it would have anyway).
+                    front_changed = front_rx.changed() => {
+                        if front_changed.is_err() {
+                            // The feeder task is gone (dropped its sender).
+                            // `changed()` would otherwise return this same
+                            // error immediately forever, busy-spinning this
+                            // arm — treat it like every other core channel
+                            // closing in this loop.
+                            record_front_channel_closed();
+                            break;
+                        }
+                    }
+
                     _ = tokio::time::sleep_until(last_progress_at + idle_resync_interval) => {
                         if let Some(head) = Self::read_confirmed_head(&pool).await {
                             highest_known_sequence.fetch_max(
@@ -1074,6 +1104,13 @@ fn record_cache_fill_closed() {}
     fields(otel.status_code = "ERROR"),
 )]
 fn record_notification_channel_closed() {}
+
+#[tracing::instrument(
+    name = "obix.persistent_cache.front_channel_closed",
+    level = "error",
+    fields(otel.status_code = "ERROR"),
+)]
+fn record_front_channel_closed() {}
 
 #[tracing::instrument(
     name = "obix.persistent_cache.resync_failed",
