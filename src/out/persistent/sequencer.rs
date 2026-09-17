@@ -283,18 +283,20 @@ where
             return true;
         }
 
-        let rows = match members.remove(&group) {
+        // INVARIANT: `place` only reaches here on `group`'s first sight, and
+        // every member of a commit group is inserted in the same transaction
+        // as the one that produced `delivery` — so by the time `delivery`
+        // itself is visible (committed, delivered on the insert lane), every
+        // other member is already committed too. An empty result — from the
+        // batch prefetch or the single-group fallback — can therefore never
+        // be `group`'s true membership; it is a transient visibility miss,
+        // and is retried exactly like a fetch error rather than accepted,
+        // which would silently and permanently drop the group from this
+        // process's commit lane.
+        let rows = match members.remove(&group).filter(|rows| !rows.is_empty()) {
             Some(rows) => rows,
-            // Not in the prefetch (a group whose first sight was skipped for
-            // want of a payload, say) — fetch it alone.
-            None => {
-                let mut fetched = self.fetch_group(group, sequence).await;
-                fetched.remove(&group).unwrap_or_default()
-            }
+            None => self.fetch_group(group, sequence).await,
         };
-        if rows.is_empty() {
-            return true;
-        }
 
         let group_max = rows
             .iter()
@@ -329,19 +331,31 @@ where
         true
     }
 
+    /// Fetch one group's membership, retrying until it is non-empty: an
+    /// `Ok` result missing `group` entirely is treated the same as a fetch
+    /// error (see the INVARIANT at the call site), not returned as "no
+    /// members".
     async fn fetch_group(
         &self,
         group: CommitGroupId,
         floor: EventSequence,
-    ) -> HashMap<CommitGroupId, PersistentEventRows<P>> {
+    ) -> PersistentEventRows<P> {
         loop {
             match Tables::load_group_members::<P>(&self.pool, &[group], floor).await {
-                Ok(groups) => return groups.into_iter().collect(),
-                Err(error) => {
-                    record_fetch_failed(&error, u64::from(floor));
-                    tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
+                Ok(groups) => {
+                    if let Some(rows) = groups
+                        .into_iter()
+                        .find(|(id, _)| *id == group)
+                        .map(|(_, rows)| rows)
+                        .filter(|rows| !rows.is_empty())
+                    {
+                        return rows;
+                    }
+                    record_empty_group_fetch(u64::from(floor), i64::from(group));
                 }
+                Err(error) => record_fetch_failed(&error, u64::from(floor)),
             }
+            tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
         }
     }
 
@@ -637,6 +651,18 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
     fields(error = %error, floor = floor),
 )]
 fn record_fetch_failed(error: &sqlx::Error, floor: u64) {}
+
+/// A single-group fetch came back `Ok` but without `group` at all — per the
+/// INVARIANT in `Sequencer::place`, this can only be a transient visibility
+/// miss (every member is already committed by the time the fold sees any
+/// one of them), never `group`'s true membership. Logged at `warn` because
+/// the caller retries silently otherwise, and this should never fire.
+#[tracing::instrument(
+    name = "obix.sequencer.empty_group_fetch",
+    level = "warn",
+    fields(floor = floor, group = group),
+)]
+fn record_empty_group_fetch(floor: u64, group: i64) {}
 
 #[tracing::instrument(
     name = "obix.sequencer.checkpoint_failed",

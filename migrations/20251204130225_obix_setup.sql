@@ -43,6 +43,15 @@ CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 
+-- Migration checksum: amended in place per this repo's pre-1.0 convention
+-- (see 5aa5377, 2d233eb) rather than as a follow-up migration. Every
+-- already-migrated database must be recreated (`make clean-deps &&
+-- make start-deps`) — sqlx otherwise reports "migration ... was previously
+-- applied but has been modified" — and a database that keeps the superseded
+-- `persistent_outbox_commit_log`(`_state`) tables from before this change
+-- never gets this one; `Outbox::init` with `CommitLane::Enabled` fails on
+-- the first checkpoint read or write until it is recreated.
+--
 -- Commit-ordered delivery lane: sparse checkpoints of the sequencer's fold
 -- (`src/out/persistent/sequencer.rs`). The commit order itself is NOT
 -- materialised — it is a pure function of this table's companion,
