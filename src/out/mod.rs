@@ -61,10 +61,6 @@ where
     /// saves it a cold read.
     event_cache_size: usize,
     persist_events_batch_size: usize,
-    /// Also the persistent cache's catch-up threshold (`decide_stall_action`)
-    /// and the ceiling on a truncated `post_commit` batch's remainder — kept
-    /// as one value so the two always agree.
-    backfill_page_size: usize,
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
@@ -117,7 +113,6 @@ where
             event_buffer_size: self.event_buffer_size,
             event_cache_size: self.event_cache_size,
             persist_events_batch_size: self.persist_events_batch_size,
-            backfill_page_size: self.backfill_page_size,
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
@@ -192,7 +187,6 @@ where
             event_buffer_size: config.event_buffer_size,
             event_cache_size: config.event_cache_size,
             persist_events_batch_size: config.persist_events_batch_size,
-            backfill_page_size: config.backfill_page_size.max(1),
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache: Arc::new(persistent_cache),
@@ -292,16 +286,13 @@ where
             .expect("persist_after lock poisoned")
             .clone();
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
-            self.persistent_cache.cache_fill_sender(),
+            self.persistent_cache.feeder(),
             self.notifier.report_sender(),
             self.gap_filler.report_sender(),
             events,
             self.persist_events_batch_size,
             post_persist_hooks,
             persist_after,
-            (self.event_buffer_size / 2).max(1),
-            self.backfill_page_size,
-            self.persistent_cache.highest_known_sequence(),
         );
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;

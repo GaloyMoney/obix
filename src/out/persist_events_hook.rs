@@ -1,16 +1,14 @@
 use std::any::TypeId;
 use std::marker::PhantomData;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
-use crate::out::event::{PersistentDelivery, PersistentOutboxEvent};
+use crate::out::event::PersistentOutboxEvent;
 use crate::out::gap_fill::GapFillRequest;
+use crate::out::persistent::CacheFeeder;
 use crate::out::post_persist_hook::PostPersistHooks;
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
@@ -20,7 +18,12 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    sender: broadcast::Sender<PersistentDelivery<P>>,
+    /// The hook's entire cache-facing surface: `post_commit` hands its
+    /// committed batch straight to `CacheFeeder::accept`, which advances the
+    /// head watermark and queues it for the persistent cache's feeder task
+    /// to drain from memory — no DB round trip to read it back, and no
+    /// truncation policy living here.
+    feeder: CacheFeeder<P>,
     /// Reports the committed batch's `(min, max)` to the debounced notifier.
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     /// Reports sequences this operation allocated but failed to commit to
@@ -61,22 +64,6 @@ where
     /// first snapshot — identical by construction, since all instances of
     /// this concrete type come from the same outbox.
     runs_after: Arc<[TypeId]>,
-    /// Ceiling on events pushed into the cache-fill broadcast by one commit
-    /// (`event_buffer_size / 2`): a batch above `broadcast_budget +
-    /// catch_up_threshold` is truncated to this many, with the remainder
-    /// left for the persistent cache's catch-up task rather than lagging
-    /// the very channel it would fill. See `post_commit`.
-    broadcast_budget: usize,
-    /// Same threshold the persistent cache's catch-up decision rule uses
-    /// (`backfill_page_size`) — kept identical so a truncated remainder is
-    /// always large enough to trigger a catch-up rather than falling into
-    /// the grace-gated stall path for a few hundred events.
-    catch_up_threshold: usize,
-    /// The persistent cache's head watermark, shared with the cache loop.
-    /// Advanced here, before any truncated send, so the loop's next wake
-    /// already sees the batch's tail rather than waiting for the idle
-    /// resync to discover it.
-    highest_known: Arc<AtomicU64>,
     _phantom: PhantomData<Tables>,
 }
 
@@ -85,21 +72,17 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sender: broadcast::Sender<PersistentDelivery<P>>,
+        feeder: CacheFeeder<P>,
         notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
         abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
         events: impl IntoIterator<Item = impl Into<P>>,
         batch_size: usize,
         post_persist_hooks: PostPersistHooks<P>,
         runs_after: Arc<[TypeId]>,
-        broadcast_budget: usize,
-        catch_up_threshold: usize,
-        highest_known: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            sender,
+            feeder,
             notifier_tx,
             abandoned_tx,
             pre_commit_events: events.into_iter().map(Into::into).collect(),
@@ -108,9 +91,6 @@ where
             post_persist_hooks,
             notify_in_tx: false,
             runs_after,
-            broadcast_budget,
-            catch_up_threshold,
-            highest_known,
             _phantom: PhantomData,
         }
     }
@@ -206,47 +186,21 @@ where
         PreCommitRet::ok(self, op)
     }
 
-    /// Push the committed batch into the cache-fill broadcast, then report
-    /// its `(min, max)` to the debounced notifier.
-    ///
-    /// A batch larger than `broadcast_budget + catch_up_threshold` is
-    /// truncated to `broadcast_budget` events rather than sent whole: a
-    /// single-transaction commit wider than the broadcast buffer would
-    /// otherwise lag the cache loop's *own* receiver (`Lagged`, never a
-    /// tokio `send` error — broadcast only errors on zero receivers), which
-    /// is what pinned the cursor's contiguity walk to gap-fill-grace
-    /// cadence instead of DB speed. The untruncated remainder is left for
-    /// the persistent cache's catch-up task, which pages it back out at DB
-    /// speed once the cursor reaches it.
+    /// Hand the committed batch to the cache's feeder, then report its
+    /// `(min, max)` to the debounced notifier. `CacheFeeder::accept` owns
+    /// everything about how the batch reaches listeners — advancing the
+    /// head watermark, queuing it for the feeder task to drain from memory
+    /// at whatever pace the cursor allows. This hook does not hold an
+    /// opinion about cache capacity or broadcast channel width; it commits
+    /// events and hands off.
     fn post_commit(mut self) {
         let post_commit_events = std::mem::take(&mut self.post_commit_events);
-        let total = post_commit_events.len();
-        let batch_range = match (post_commit_events.first(), post_commit_events.last()) {
+        let range = match (post_commit_events.first(), post_commit_events.last()) {
             (Some(first), Some(last)) => Some((first.sequence, last.sequence)),
             _ => None,
         };
-
-        let send_all = total <= self.broadcast_budget + self.catch_up_threshold;
-        if !send_all {
-            // Before any send: the truncated events below still wake the
-            // loop, and its decision rule must already see the batch's tail
-            // as the head, not just what it happens to receive.
-            if let Some((_, last)) = batch_range {
-                self.highest_known
-                    .fetch_max(u64::from(last), Ordering::AcqRel);
-            }
-            record_post_commit_truncated(total, self.broadcast_budget);
-        }
-
-        let take = if send_all {
-            total
-        } else {
-            self.broadcast_budget
-        };
-        for event in post_commit_events.into_iter().take(take) {
-            let _ = self.sender.send(PersistentDelivery::from(Ok(event)));
-        }
-        if let Some(range) = batch_range {
+        self.feeder.accept(post_commit_events);
+        if let Some(range) = range {
             let _ = self.notifier_tx.send(range);
         }
     }
@@ -289,10 +243,3 @@ where
         &self.runs_after
     }
 }
-
-#[tracing::instrument(
-    name = "obix.persistent_outbox.post_commit_truncated",
-    level = "info",
-    fields(total = total, budget = budget),
-)]
-fn record_post_commit_truncated(total: usize, budget: usize) {}
