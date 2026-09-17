@@ -595,4 +595,75 @@ mod tests {
         let pending: Vec<PendingBatch<()>> = Vec::new();
         assert_eq!(next_after(&pending, seq(0)), None);
     }
+
+    /// A handle plus the feeder-side senders, so a test can kill either half.
+    fn handle() -> (
+        FeederHandle,
+        mpsc::UnboundedSender<CatchUpOutcome>,
+        watch::Sender<Option<EventSequence>>,
+    ) {
+        let (cursor, _cursor_rx) = watch::channel(EventSequence::BEGIN);
+        let (requests, _requests_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcomes) = mpsc::unbounded_channel();
+        let (front_tx, front) = watch::channel(None);
+        (
+            FeederHandle {
+                cursor,
+                requests,
+                outcomes,
+                front,
+            },
+            outcome_tx,
+            front_tx,
+        )
+    }
+
+    /// A dead feeder must be *reported*, repeatedly, even while the other half
+    /// still lives. An arm that instead resolved to "nothing happened" would
+    /// spin the cache loop's `biased` select forever without ever breaking.
+    #[tokio::test]
+    async fn a_dead_outcome_channel_keeps_reporting_gone_while_the_front_lives() {
+        let (mut handle, outcome_tx, front_tx) = handle();
+        drop(outcome_tx);
+
+        for _ in 0..3 {
+            let report =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle.next_report())
+                    .await
+                    .expect("must not block once the feeder is gone");
+            assert!(matches!(report, FeederReport::Gone));
+        }
+        drop(front_tx);
+    }
+
+    /// The same, with the halves swapped: a closed front is equally fatal.
+    #[tokio::test]
+    async fn a_dead_front_channel_reports_gone_while_outcomes_live() {
+        let (mut handle, outcome_tx, front_tx) = handle();
+        drop(front_tx);
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), handle.next_report())
+            .await
+            .expect("must not block once the feeder is gone");
+        assert!(matches!(report, FeederReport::Gone));
+        drop(outcome_tx);
+    }
+
+    /// A queued outcome is not lost to a closed front: `biased` polls outcomes
+    /// first, so real progress is drained before `Gone` is reported.
+    #[tokio::test]
+    async fn a_queued_outcome_is_delivered_before_a_closed_front_reports_gone() {
+        let (mut handle, outcome_tx, front_tx) = handle();
+        outcome_tx
+            .send(CatchUpOutcome::AtHead)
+            .expect("handle holds the receiver");
+        drop(front_tx);
+
+        assert!(matches!(
+            handle.next_report().await,
+            FeederReport::CaughtUp(CatchUpOutcome::AtHead)
+        ));
+        drop(outcome_tx);
+        assert!(matches!(handle.next_report().await, FeederReport::Gone));
+    }
 }
