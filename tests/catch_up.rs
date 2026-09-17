@@ -865,7 +865,7 @@ async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> a
         op.commit().await.expect("commit A");
     });
 
-    // Give A's INSERTs a head start so its sequences are already allocated
+    // Give A's inserts a head start so its sequences are already allocated
     // (and largely committed) before B's single event steals one from the
     // middle of A's range — the shape that makes B a hole *inside* an
     // already-pending batch, not merely a hole ahead of it.
