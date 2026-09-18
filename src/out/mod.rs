@@ -531,7 +531,7 @@ where
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<Subscription<P, Tables, L>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Subscription<P, L, Tables>, Box<dyn std::error::Error + Send + Sync>>
     where
         H: SingletonSubscriber<P, L>,
         L: Lane,

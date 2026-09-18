@@ -334,7 +334,7 @@ where
 ///    process's fold to pass the sampled insert frontier, then for the
 ///    subscriber's cursor to reach the head that fold produced. One timeout
 ///    covers both halves; the error says which was outstanding.
-pub struct Subscription<P, Tables = DefaultMailboxTables, L = InsertOrder>
+pub struct Subscription<P, L = InsertOrder, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     L: Lane,
@@ -344,7 +344,7 @@ where
     /// `Some` only for a resident job on an outbox running the commit lane,
     /// whose fence is the only reader.
     positions: Option<SequencerPositions>,
-    _phantom: PhantomData<(P, Tables, L)>,
+    _phantom: PhantomData<(P, L, Tables)>,
 }
 
 /// A keyed member's stable identity: `(subscriber_type, key)`, plus the
@@ -386,7 +386,7 @@ enum JobAnchor {
 // Manual `Clone`: this is cloneable regardless of whether `P` is, so
 // deriving (which would bound `P: Clone` through `PhantomData`) is wrong.
 // Mirrors `Outbox`'s manual impl.
-impl<P, Tables, L> Clone for Subscription<P, Tables, L>
+impl<P, L, Tables> Clone for Subscription<P, L, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     L: Lane,
@@ -401,7 +401,7 @@ where
     }
 }
 
-impl<P, Tables, L> std::fmt::Debug for Subscription<P, Tables, L>
+impl<P, L, Tables> std::fmt::Debug for Subscription<P, L, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     L: Lane,
@@ -418,7 +418,7 @@ where
     }
 }
 
-impl<P, Tables, L> Subscription<P, Tables, L>
+impl<P, L, Tables> Subscription<P, L, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -671,7 +671,7 @@ where
 /// The insert lane's caught-up barrier: the checkpoint against the
 /// call-time frontier.
 pub(crate) async fn await_caught_up_insert_lane<P, Tables>(
-    subscription: &Subscription<P, Tables, InsertOrder>,
+    subscription: &Subscription<P, InsertOrder, Tables>,
     timeout: Duration,
 ) -> Result<(), SubscriptionError>
 where
@@ -689,7 +689,7 @@ where
 /// subscriber's cursor to reach the head that fold reached. Comparing the
 /// cursor against `h` directly would compare two different numberings.
 pub(crate) async fn await_caught_up_commit_lane<P, Tables>(
-    subscription: &Subscription<P, Tables, CommitOrder>,
+    subscription: &Subscription<P, CommitOrder, Tables>,
     timeout: Duration,
 ) -> Result<(), SubscriptionError>
 where

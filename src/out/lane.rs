@@ -89,7 +89,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     /// This lane's frontier: the sequence generator, or this process's fold head.
     #[doc(hidden)]
     fn frontier<'a, P, Tables>(
-        subscription: &'a Subscription<P, Tables, Self>,
+        subscription: &'a Subscription<P, Self, Tables>,
     ) -> impl std::future::Future<Output = Result<Self::Position, SubscriptionError>> + Send + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -105,7 +105,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
 
     #[doc(hidden)]
     fn await_caught_up<'a, P, Tables>(
-        subscription: &'a Subscription<P, Tables, Self>,
+        subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
     ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
     where
@@ -179,7 +179,7 @@ impl Lane for InsertOrder {
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
     async fn frontier<P, Tables>(
-        subscription: &Subscription<P, Tables, Self>,
+        subscription: &Subscription<P, Self, Tables>,
     ) -> Result<EventSequence, SubscriptionError>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -199,7 +199,7 @@ impl Lane for InsertOrder {
     }
 
     fn await_caught_up<'a, P, Tables>(
-        subscription: &'a Subscription<P, Tables, Self>,
+        subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
     ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
     where
@@ -267,7 +267,7 @@ impl Lane for CommitOrder {
     }
 
     async fn frontier<P, Tables>(
-        subscription: &Subscription<P, Tables, Self>,
+        subscription: &Subscription<P, Self, Tables>,
     ) -> Result<CommitSequence, SubscriptionError>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -287,7 +287,7 @@ impl Lane for CommitOrder {
     }
 
     fn await_caught_up<'a, P, Tables>(
-        subscription: &'a Subscription<P, Tables, Self>,
+        subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
     ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
     where

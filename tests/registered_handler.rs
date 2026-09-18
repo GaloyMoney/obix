@@ -144,7 +144,7 @@ async fn register<H: SingletonSubscriber<TestEvent>>(
     outbox: &Outbox<TestEvent, TestTables>,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<Subscription<TestEvent, TestTables>> {
+) -> anyhow::Result<Subscription<TestEvent, InsertOrder, TestTables>> {
     register_with(outbox, jobs, test_config(), handler).await
 }
 
@@ -153,7 +153,7 @@ async fn register_with<H: SingletonSubscriber<TestEvent>>(
     jobs: &mut job::Jobs,
     config: OutboxEventJobConfig,
     handler: H,
-) -> anyhow::Result<Subscription<TestEvent, TestTables>> {
+) -> anyhow::Result<Subscription<TestEvent, InsertOrder, TestTables>> {
     outbox
         .register_singleton_subscriber(jobs, config, handler)
         .await
@@ -177,7 +177,7 @@ async fn publish_pings(
 /// Taking the handle by value keeps the future borrow-free so it can cross a
 /// `tokio::spawn` (an inline `async move` hits rust-lang/rust#100013 here).
 async fn load_owned(
-    handle: Subscription<TestEvent, TestTables>,
+    handle: Subscription<TestEvent, InsertOrder, TestTables>,
 ) -> Result<SubscriptionSnapshot, SubscriptionError> {
     handle.load().await
 }
@@ -350,7 +350,7 @@ async fn stream_status_never_understates_lag() -> anyhow::Result<()> {
 #[file_serial]
 async fn handle_retains_no_jobs_borrow() -> anyhow::Result<()> {
     fn assert_portable<T: Send + Sync + Clone + 'static>() {}
-    assert_portable::<Subscription<TestEvent, TestTables>>();
+    assert_portable::<Subscription<TestEvent, InsertOrder, TestTables>>();
 
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;

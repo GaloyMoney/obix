@@ -486,7 +486,8 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let key_str = key.to_string();
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
@@ -586,7 +587,8 @@ where
     pub async fn subscription(
         &self,
         key: &D::Key,
-    ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let key_str = key.to_string();
         // Resolved once here only to report "never subscribed" as an error
         // rather than deferring it to the first read.
