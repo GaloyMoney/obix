@@ -16,6 +16,10 @@ pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 /// *provably abandoned* (every transaction that could have produced them
 /// has ended — see `MailboxTables::abandonment_proof_passed`), so a fill
 /// can never collide with a live writer regardless of this setting.
+///
+/// This grace no longer paces draining a backlog of *committed* rows — the
+/// feeder drains those from memory, or reads them at DB speed. It governs the
+/// hole case exactly as before.
 pub const DEFAULT_GAP_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Ceiling on the rows a single backfill page read may return, and the width

@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
-use crate::out::event::{PersistentDelivery, PersistentOutboxEvent};
+use crate::out::event::PersistentOutboxEvent;
 use crate::out::gap_fill::GapFillRequest;
+use crate::out::persistent::CacheFeeder;
 use crate::out::post_persist_hook::PostPersistHooks;
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
@@ -17,7 +18,9 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    sender: broadcast::Sender<PersistentDelivery<P>>,
+    /// The hook's entire cache-facing surface: `post_commit` hands its
+    /// committed batch straight to `CacheFeeder::accept`.
+    feeder: CacheFeeder<P>,
     /// Reports the committed batch's `(min, max)` to the debounced notifier.
     notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
     /// Reports sequences this operation allocated but failed to commit to
@@ -67,7 +70,7 @@ where
     Tables: MailboxTables,
 {
     pub fn new(
-        sender: broadcast::Sender<PersistentDelivery<P>>,
+        feeder: CacheFeeder<P>,
         notifier_tx: mpsc::UnboundedSender<(EventSequence, EventSequence)>,
         abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
         events: impl IntoIterator<Item = impl Into<P>>,
@@ -76,7 +79,7 @@ where
         runs_after: Arc<[TypeId]>,
     ) -> Self {
         Self {
-            sender,
+            feeder,
             notifier_tx,
             abandoned_tx,
             pre_commit_events: events.into_iter().map(Into::into).collect(),
@@ -180,16 +183,17 @@ where
         PreCommitRet::ok(self, op)
     }
 
+    /// Hand the committed batch to the feeder, then report its `(min, max)`
+    /// to the debounced notifier. How the batch reaches listeners — and at
+    /// what pace — is entirely `CacheFeeder::accept`'s business.
     fn post_commit(mut self) {
         let post_commit_events = std::mem::take(&mut self.post_commit_events);
-        let batch_range = match (post_commit_events.first(), post_commit_events.last()) {
+        let range = match (post_commit_events.first(), post_commit_events.last()) {
             (Some(first), Some(last)) => Some((first.sequence, last.sequence)),
             _ => None,
         };
-        for event in post_commit_events {
-            let _ = self.sender.send(PersistentDelivery::from(Ok(event)));
-        }
-        if let Some(range) = batch_range {
+        self.feeder.accept(post_commit_events);
+        if let Some(range) = range {
             let _ = self.notifier_tx.send(range);
         }
     }

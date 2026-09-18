@@ -286,7 +286,7 @@ where
             .expect("persist_after lock poisoned")
             .clone();
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
-            self.persistent_cache.cache_fill_sender(),
+            self.persistent_cache.feeder(),
             self.notifier.report_sender(),
             self.gap_filler.report_sender(),
             events,

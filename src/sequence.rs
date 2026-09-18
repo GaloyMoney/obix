@@ -11,6 +11,17 @@ impl EventSequence {
     pub fn next(&self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// The sequence just below this one, saturating at [`Self::BEGIN`].
+    pub fn prev(&self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
+
+    /// How many sequences separate this one from a later `other`; `0` when
+    /// `other` is not actually later.
+    pub fn distance_to(&self, other: Self) -> u64 {
+        other.0.saturating_sub(self.0) as u64
+    }
 }
 
 impl Default for EventSequence {
