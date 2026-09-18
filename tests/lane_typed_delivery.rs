@@ -159,8 +159,6 @@ where
 }
 
 struct InsertPositionRecorder {
-    gate: Arc<Notify>,
-    gated: Arc<AtomicBool>,
     seen: Arc<Mutex<Vec<(EventSequence, EventSequence)>>>,
     last_handled: Arc<Mutex<Option<EventSequence>>>,
     flushes: Arc<Mutex<Vec<(EventSequence, Option<EventSequence>, Vec<u64>)>>>,
@@ -174,9 +172,6 @@ impl SingletonSubscriber<TestEvent> for InsertPositionRecorder {
         ctx: EventCtx<'inv, Vec<u64>>,
         event: &EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.gated.swap(true, AtomicOrd::SeqCst) {
-            self.gate.notified().await;
-        }
         self.seen
             .lock()
             .await
@@ -209,7 +204,6 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
     let mut jobs = init_jobs(&pool).await?;
     let outbox = init_outbox(&pool, CommitLane::Disabled).await?;
 
-    let gate = Arc::new(Notify::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let flushes = Arc::new(Mutex::new(Vec::new()));
     outbox
@@ -218,8 +212,6 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             InsertPositionRecorder {
-                gate: gate.clone(),
-                gated: Arc::new(AtomicBool::new(false)),
                 seen: seen.clone(),
                 last_handled: Arc::new(Mutex::new(None)),
                 flushes: flushes.clone(),
@@ -229,11 +221,10 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    publish_group(&outbox, [1]).await?;
-    publish_group(&outbox, [2, 3]).await?;
-    // Released only once all three are broadcast, so the batch cannot split on
-    // arrival timing.
-    gate.notify_one();
+    // One source transaction: the insert lane promises no group atomicity, so
+    // a batch may only span events the runner finds already buffered — which a
+    // single commit's events are, and two separate commits' never are.
+    publish_group(&outbox, [1, 2, 3]).await?;
 
     until(
         async || seen.lock().await.len() >= 3,
