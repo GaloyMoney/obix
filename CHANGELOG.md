@@ -1,3 +1,19 @@
+# [obix release v0.12.0](https://github.com/GaloyMoney/obix/releases/tag/0.12.0)
+
+
+
+### Bug Fixes
+
+- Catch up at DB speed when the broadcast cursor falls behind committed rows (#157)
+
+### Features
+
+- [**breaking**] Lane-typed delivery — one handler API for both lanes, exact flush position, lane-aware fence, commit lane opt-in (#156)
+
+### Testing
+
+- Publish the insert-lane batch from one source transaction (#159)
+
 # [obix release v0.11.1](https://github.com/GaloyMoney/obix/releases/tag/0.11.1)
 
 
