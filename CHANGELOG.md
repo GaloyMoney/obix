@@ -1,3 +1,11 @@
+# [obix release v0.12.2](https://github.com/GaloyMoney/obix/releases/tag/0.12.2)
+
+
+
+### Bug Fixes
+
+- Add idempotency guard back
+
 # [obix release v0.12.1](https://github.com/GaloyMoney/obix/releases/tag/0.12.1)
 
 

@@ -1,6 +1,6 @@
 [package]
 name = "obix-fuzz"
-version = "0.12.2-dev"
+version = "0.12.2"
 publish = false
 edition = "2021"
 
