@@ -1,3 +1,11 @@
+# [obix release v0.12.1](https://github.com/GaloyMoney/obix/releases/tag/0.12.1)
+
+
+
+### Miscellaneous Tasks
+
+- Cleanup migration
+
 # [obix release v0.12.0](https://github.com/GaloyMoney/obix/releases/tag/0.12.0)
 
 
