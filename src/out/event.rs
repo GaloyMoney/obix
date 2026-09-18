@@ -297,26 +297,16 @@ where
 
 /// One item as delivered on lane `L`: the thing, plus where it sits.
 ///
-/// The position rides *around* the value rather than on it because it belongs
-/// to the delivery, not to the event — see [`Lane`] for why. Reading through
-/// a delivery is unchanged:
 /// [`Deref`](std::ops::Deref) reaches the carried value, so an
-/// [`EventDelivery`] behaves like the `Arc<PersistentOutboxEvent<P>>` it
-/// carries (`event.payload`, `event.as_event::<E>()`, and passing `event`
-/// where a `&PersistentOutboxEvent<P>` is expected all work).
-///
-/// Retaining the event past the invocation goes through
-/// [`inner`](Self::inner): cloning the shared `Arc`'s refcount, never the
-/// payload, so `P` need not be `Clone`.
+/// [`EventDelivery`] reads like the event it carries; retain it past the
+/// invocation with [`inner`](Self::inner), which clones only an `Arc`.
 pub struct Delivery<L, T>
 where
     L: Lane,
 {
     position: L::Position,
-    /// Whether a flush here splits nothing. Meaningful on
-    /// [`CommitOrder`](crate::out::CommitOrder), where it marks a source
-    /// transaction's last event; on the insert lane every event is its own
-    /// boundary, so this is always `true` and never exposed.
+    /// Whether a flush here splits nothing. Always `true` on the insert lane,
+    /// which promises no atomic groups.
     boundary: bool,
     inner: T,
 }
@@ -333,15 +323,13 @@ where
         }
     }
 
-    /// Where this delivery sits on its lane: an
-    /// [`EventSequence`](crate::EventSequence) on the insert lane, a
-    /// [`CommitSequence`](crate::CommitSequence) on the commit lane.
+    /// Where this delivery sits on its lane.
     pub fn position(&self) -> L::Position {
         self.position
     }
 
-    /// The carried value — for an event, the shared [`Arc`] the outbox
-    /// decoded once and broadcast to every subscriber.
+    /// The carried value: the shared `Arc` the outbox decoded once and
+    /// broadcast to every subscriber.
     pub fn inner(&self) -> &T {
         &self.inner
     }
@@ -351,12 +339,6 @@ where
         self.inner
     }
 
-    /// Whether a flush may land after this delivery without splitting a
-    /// unit. Total across lanes: the insert lane promises no atomic groups,
-    /// so every point is a legal flush point and this is always `true`; the
-    /// commit lane sets it on a group's last member. The public accessor
-    /// stays [`is_commit_boundary`](Delivery::is_commit_boundary), which
-    /// exists only where a reader could act on it.
     pub(crate) fn is_boundary(&self) -> bool {
         self.boundary
     }
@@ -374,9 +356,7 @@ impl<L, T, E> Delivery<L, Result<T, E>>
 where
     L: Lane,
 {
-    /// Move the `Result` outside the delivery, so both arms keep the position
-    /// they were delivered at — the shape every listener and the runner
-    /// consume.
+    /// Move the `Result` outside, so both arms keep the position.
     pub(crate) fn transpose(self) -> Result<Delivery<L, T>, Delivery<L, E>> {
         let Self {
             position,
@@ -399,8 +379,8 @@ where
 }
 
 impl<T> Delivery<CommitOrder, T> {
-    /// Whether this is the last event of its source transaction — the point
-    /// at which a batch may land without splitting a group.
+    /// Whether this is the last event of its source transaction — where a batch
+    /// may land without splitting a group.
     pub fn is_commit_boundary(&self) -> bool {
         self.boundary
     }
@@ -417,8 +397,7 @@ where
     }
 }
 
-// Manual: deriving would bound `L: Clone`, and a lane is a marker with no
-// value to clone.
+// Manual: deriving would bound `L: Clone`, and a lane is an empty marker.
 impl<L, T> Clone for Delivery<L, T>
 where
     L: Lane,
@@ -450,9 +429,8 @@ where
 /// A persistent event as delivered on lane `L`.
 pub type EventDelivery<P, L = InsertOrder> = Delivery<L, Arc<PersistentOutboxEvent<P>>>;
 
-/// An undecodable persistent event as delivered on lane `L` — the `Err` arm
-/// of every persistent stream, occupying the position the event would have
-/// been delivered at.
+/// An undecodable persistent event as delivered on lane `L` — the `Err` arm of
+/// every persistent stream, at the position the event occupies.
 pub type UndecodableDelivery<L = InsertOrder> = Delivery<L, UndecodableEventError>;
 
 impl<L> std::fmt::Display for UndecodableDelivery<L>
@@ -475,12 +453,7 @@ where
 }
 
 /// What every lane's fan-out, backfill and in-memory window carry: the public
-/// [`Delivery`] shape wrapped around the payload carrier.
-///
-/// There is no third envelope type — the internal item *is* the public one,
-/// minus the `Result` transpose the listeners do at their yield boundary. On
-/// [`InsertOrder`] the position is the inner delivery's own sequence by
-/// construction, the same redundancy that lets code be written once over `L`.
+/// [`Delivery`] minus the `Result` transpose the listeners do when they yield.
 pub(crate) type Transport<L, P> = Delivery<L, PersistentDelivery<P>>;
 
 impl<P> Transport<InsertOrder, P>
@@ -488,8 +461,6 @@ where
     P: Serialize + DeserializeOwned + Send,
 {
     /// Position an insert-lane delivery from the sequence it already carries.
-    /// Every insert-lane delivery is its own flush boundary — the lane
-    /// promises no atomic groups.
     pub(crate) fn insert(inner: PersistentDelivery<P>) -> Self {
         Delivery::new(inner.sequence(), true, inner)
     }
@@ -500,8 +471,6 @@ where
     L: Lane,
     P: Serialize + DeserializeOwned + Send,
 {
-    /// The public stream item: the same position, with the `Result` moved to
-    /// the outside so both arms keep it.
     #[allow(clippy::result_large_err)]
     pub(crate) fn into_item(self) -> Result<EventDelivery<P, L>, UndecodableDelivery<L>> {
         self.map(PersistentDelivery::into_item).transpose()

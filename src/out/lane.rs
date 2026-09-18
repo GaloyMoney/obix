@@ -1,27 +1,7 @@
-//! The delivery lane as a type.
-//!
-//! obix delivers persistent events in two orders — insert order and commit
-//! order — and the two differ in what a *position* is. Insert order numbers
-//! events by the contiguous, gap-filled [`crate::EventSequence`] the database
-//! allocated; commit order numbers them by the dense
-//! [`crate::CommitSequence`] the sequencer assigned when it placed their
-//! source transaction.
-//!
-//! A position is therefore a property of a **delivery on a lane**, never of
-//! the event row: the same event has a commit position when it arrives on the
-//! commit lane and none at all when it arrives on the insert lane, through
-//! [`load`](crate::MailboxTables), or from an
-//! [`OpCursor`](crate::OpCursor) before it is even written. Carrying it on
-//! the event would be provenance masquerading as data.
-//!
-//! So the lane is a type parameter, defaulting to [`InsertOrder`], and it
-//! decides the position type of everything a subscriber touches: the event
-//! ([`crate::out::EventDelivery`]), the undecodable stand-in
-//! ([`crate::out::UndecodableDelivery`]), the batch
-//! flush ([`FlushOp`](crate::FlushOp)) and the durable checkpoint
-//! ([`Subscription`]). Insert-lane code sees `EventSequence`, commit-lane
-//! code sees `CommitSequence`, and the compiler refuses to run a commit-lane
-//! handler on the insert lane.
+//! The delivery lane as a type: [`InsertOrder`] positions deliveries by
+//! [`crate::EventSequence`], [`CommitOrder`] by [`crate::CommitSequence`]. The
+//! lane is a type parameter on everything a subscriber touches, so the compiler
+//! refuses to run a commit-lane handler on the insert lane.
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
@@ -45,9 +25,7 @@ use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
 pub(crate) mod sealed {
-    /// Seals [`Lane`](super::Lane): exactly two lanes exist, and a third
-    /// would have to answer questions (what is a flush boundary? what does
-    /// the checkpoint mean?) that the runner and the fence answer per lane.
+    /// Seals [`Lane`](super::Lane): exactly two lanes exist.
     pub trait Sealed {}
 }
 
@@ -66,7 +44,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
         + Unpin
         + 'static;
 
-    /// The dynamic name of this lane, as stored state and read-outs report it.
+    /// The dynamic name of this lane, as stored state reports it.
     const ORDERING: Ordering;
 
     #[doc(hidden)]
@@ -75,9 +53,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
 
-    /// This lane's source handle on `outbox` — the only place the two lanes
-    /// diverge below the public API: one comes from the insert cache, the
-    /// other from the sequencer. Everything downstream is shared.
+    /// This lane's source handle on `outbox`: the insert cache or the sequencer.
     #[doc(hidden)]
     fn handle<P, Tables>(
         outbox: &Outbox<P, Tables>,
@@ -110,11 +86,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
 
-    /// This lane's frontier as a subscription sees it.
-    ///
-    /// The insert lane reads the sequence generator; the commit lane reads
-    /// **this process's** fold head, because the lane is computed rather than
-    /// materialised and there is no shared head to read.
+    /// This lane's frontier: the sequence generator, or this process's fold head.
     #[doc(hidden)]
     fn frontier<'a, P, Tables>(
         subscription: &'a Subscription<P, Tables, Self>,
@@ -123,8 +95,6 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
 
-    /// The same value read straight off an outbox, for
-    /// [`Outbox::frontier`](crate::out::Outbox::frontier).
     #[doc(hidden)]
     fn outbox_frontier<'a, P, Tables>(
         outbox: &'a Outbox<P, Tables>,
@@ -143,17 +113,13 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
         Tables: MailboxTables;
 }
 
-/// Insert order: a contiguous [`EventSequence`], gap-filled. The default lane,
-/// and the one every subscriber used before the commit lane existed.
+/// Insert order: a contiguous, gap-filled [`EventSequence`]. The default lane.
 pub struct InsertOrder;
 
 /// Commit order: a dense [`CommitSequence`]. A source transaction's events
-/// arrive contiguously and a batch flush never splits one.
-///
-/// Available only on an outbox whose
-/// [`commit_lane`](crate::MailboxConfig::commit_lane) is
-/// [`Enabled`](crate::CommitLane::Enabled), and only to singleton
-/// subscribers.
+/// arrive contiguously and a batch flush never splits one. Requires
+/// [`commit_lane`](crate::MailboxConfig::commit_lane) =
+/// [`Enabled`](crate::CommitLane::Enabled), and a singleton subscriber.
 pub struct CommitOrder;
 
 impl sealed::Sealed for InsertOrder {}
@@ -334,16 +300,6 @@ impl Lane for CommitOrder {
 
 /// What a listener needs from whichever source produces its lane: the head,
 /// the live fan-out, and a way to ask for what it missed.
-///
-/// The two sources differ only in how a position is *assigned* — Postgres
-/// allocates the insert position inside the writer's transaction, the
-/// sequencer assigns the commit position at read time by a CAS append — and
-/// that difference lives entirely on the producing side. Everything from
-/// "a stream of positioned deliveries, a head, and a backfill channel"
-/// downwards is lane-agnostic, so the lane type reaches exactly this far.
-/// Sealed the same way [`Lane`]'s operations are: this module is private, so
-/// the type is reachable through [`Lane::handle`] but unnameable outside the
-/// crate.
 pub struct LaneHandle<L, P>
 where
     L: Lane,
@@ -355,8 +311,7 @@ where
     backfill_buffer_size: usize,
 }
 
-/// A listener's "serve me everything after this position" channel: the
-/// cursor it is stuck at, and where to deliver the range.
+/// A listener's "serve me everything after this position" channel.
 pub type BackfillRequests<L, P> =
     mpsc::UnboundedSender<(<L as Lane>::Position, mpsc::Sender<Transport<L, P>>)>;
 
@@ -399,15 +354,12 @@ where
     }
 }
 
-/// `decide_lane` is total on each `(state, ordering)` pair — it yields that
-/// ordering's cursor or refuses — so this is unreachable. Reported rather
-/// than panicked: a runner is a poor place to assert.
+/// Unreachable: `decide_lane` is total on each `(state, ordering)` pair.
 fn lane_choice_mismatch(ordering: Ordering) -> String {
     format!("lane resolution yielded the other lane's cursor for Ordering::{ordering:?}")
 }
 
 impl LaneChoice {
-    /// The insert cursor, when the insert lane was chosen.
     pub(crate) fn insert(self) -> Option<EventSequence> {
         match self {
             Self::Insert(sequence) => Some(sequence),
@@ -415,7 +367,6 @@ impl LaneChoice {
         }
     }
 
-    /// The commit cursor, when the commit lane was chosen.
     pub(crate) fn commit(self) -> Option<CommitSequence> {
         match self {
             Self::Commit(commit_sequence) => Some(commit_sequence),

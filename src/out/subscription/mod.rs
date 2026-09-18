@@ -63,11 +63,8 @@ const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Ceiling for the [`Subscription::await_caught_up`] poll interval.
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// A position on whichever lane produced it — the dynamic form of
-/// [`Lane::Position`], for the places a type cannot carry the lane.
-///
-/// Ordered by lane first, then by value: two positions from different lanes
-/// number different things and are never comparable as quantities.
+/// The dynamic form of [`Lane::Position`], for places a type cannot carry the
+/// lane. Ordered by lane first: positions from different lanes never compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StreamPosition {
     Insert(EventSequence),
@@ -119,11 +116,8 @@ pub enum SubscriptionError {
     /// Reading the stream frontier failed.
     #[error("SubscriptionError - Sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    /// The stored checkpoint is on the other lane from the one this handle is
-    /// typed for — the subscription was established under a handler
-    /// implemented for a different [`Lane`], which is unsupported for the
-    /// same reason the runner refuses it: the two cursors count different
-    /// things.
+    /// The stored checkpoint is on the other [`Lane`] from the one this handle
+    /// is typed for; the two cursors count different things.
     #[error("SubscriptionError - LaneMismatch: {0}")]
     LaneMismatch(String),
     /// Reading the handler job failed — a snapshot load (including the job
@@ -151,10 +145,8 @@ pub enum SubscriptionError {
     /// timeout.
     ///
     /// `target` is the position being awaited: the caller's own for
-    /// `await_position`, the call-time frontier for `await_caught_up`. Both
-    /// name their lane, so on the commit lane it is visible which half of the
-    /// two-stage fence ran out of budget — the sequencer's fold (reported in
-    /// insert positions) or the subscriber's own cursor.
+    /// `await_position`, the call-time frontier for `await_caught_up`. It names
+    /// its lane, so on the commit lane it says which half of the fence ran out.
     #[error(
         "SubscriptionError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
     )]
@@ -231,9 +223,8 @@ where
         self.checkpoint
     }
 
-    /// The lane's frontier as of this load (semantics 2): on the insert lane
-    /// the sequence generator's `last_value`; on the commit lane the head of
-    /// the commit log.
+    /// The lane's frontier as of this load (semantics 2): the sequence
+    /// generator's `last_value`, or this process's fold head.
     pub fn frontier(&self) -> L::Position {
         self.frontier
     }
@@ -339,14 +330,10 @@ where
 ///    anchors to its own call-time frontier, and sequential barriers still
 ///    compose: the first commits its emissions before returning, so the
 ///    second's snapshot includes them.
-/// 6. **On the commit lane the barrier is two-stage.** The insert-lane
-///    frontier is not a commit-lane position, so
-///    [`await_caught_up`](Self::await_caught_up) first waits for this
-///    process's sequencer to have *folded* past the sampled insert frontier —
-///    every event up to it placed into the log or skipped — and only then
-///    waits for the subscriber's commit cursor to reach the log head that
-///    fold produced. Both halves are bounded by the one timeout; the error
-///    says which was still outstanding.
+/// 6. **On the commit lane the barrier is two-stage.** It waits for this
+///    process's fold to pass the sampled insert frontier, then for the
+///    subscriber's cursor to reach the head that fold produced. One timeout
+///    covers both halves; the error says which was outstanding.
 pub struct Subscription<P, Tables = DefaultMailboxTables, L = InsertOrder>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -354,9 +341,8 @@ where
 {
     anchor: JobAnchor,
     pool: sqlx::PgPool,
-    /// This process's sequencer positions — `Some` for a resident (singleton)
-    /// job on an outbox running the commit lane, `None` otherwise. Only the
-    /// commit-lane fence reads it.
+    /// `Some` only for a resident job on an outbox running the commit lane,
+    /// whose fence is the only reader.
     positions: Option<SequencerPositions>,
     _phantom: PhantomData<(P, Tables, L)>,
 }
@@ -512,11 +498,8 @@ where
     /// advance between the two can only overstate the snapshot's lag — never
     /// understate it. A caller acting on
     /// [`is_caught_up`](SubscriptionSnapshot::is_caught_up) therefore never acts
-    /// on an optimistic reading.
-    /// A stored checkpoint on the other lane is refused with
-    /// [`SubscriptionError::LaneMismatch`] rather than reported: the two
-    /// cursors count different things, so there is no honest number to hand
-    /// back.
+    /// on an optimistic reading. A stored checkpoint on the other lane is
+    /// refused with [`SubscriptionError::LaneMismatch`] rather than reported.
     #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
     pub async fn load(&self) -> Result<SubscriptionSnapshot<L>, SubscriptionError> {
         let job = self.handle().await?.load().await?;
@@ -575,9 +558,8 @@ where
             .await
     }
 
-    /// The [`await_position`](Self::await_position) poll loop over an
-    /// explicit deadline, so the commit lane's two-stage fence can spend one
-    /// budget across both halves.
+    /// The [`await_position`](Self::await_position) poll loop over an explicit
+    /// deadline, so the commit lane's fence spends one budget across both halves.
     async fn poll_checkpoint_until(
         &self,
         target: L::Position,
@@ -616,21 +598,9 @@ where
     /// inheriting its polling and timeout behaviour. Events published *after*
     /// the call are not waited for (semantics 5).
     ///
-    /// On the commit lane it is the two-stage fence of semantics 6: the
-    /// insert frontier is sampled, this process's sequencer is awaited past
-    /// it, and the log head that fold reached becomes the target for the
-    /// subscriber's own cursor. Waiting for the fold is not overhead — an
-    /// event the sequencer has not placed yet has not been delivered on this
-    /// lane at all — and it inherits the insert lane's bound on abandoned
-    /// sequences, which become placeholders once the gap-fill grace elapses.
-    ///
-    /// The operational consequence: called on an outbox that has just
-    /// switched [`CommitLane::Enabled`](crate::CommitLane) on a database with
-    /// history, this waits for the whole catch-up to reach the sampled
-    /// frontier. That is correct rather than a stall — nothing below that
-    /// frontier has been delivered on this lane yet — but it is a fence over
-    /// a backfill, so size the timeout for one or fence after the sequencer
-    /// has caught up (`obix.sequencer.started` logs how far behind it began).
+    /// On the commit lane it is the two-stage fence of semantics 6: the fold is
+    /// awaited past the sampled insert frontier, then the subscriber's cursor to
+    /// the head that fold reached.
     ///
     /// The frontier read happens before the deadline starts, so the reported
     /// `waited` measures the polling, and total call time is that read plus
@@ -684,10 +654,8 @@ where
         &self.pool
     }
 
-    /// This process's sequencer positions. Absent only where the type system
-    /// already rules the commit lane out — a keyed subscription, or an
-    /// outbox running no sequencer, neither of which can host a
-    /// `CommitOrder` handler.
+    /// This process's sequencer positions; absent only where the type system
+    /// already rules the commit lane out.
     pub(crate) fn sequencer_positions(&self) -> Result<&SequencerPositions, SubscriptionError> {
         self.positions.as_ref().ok_or_else(|| {
             SubscriptionError::LaneMismatch(
@@ -710,38 +678,16 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    // Sampled ONCE: the fence is anchored to the stream position at call
-    // time, so a handler that publishes as it drains cannot extend its
+    // Sampled ONCE, so a handler that publishes as it drains cannot extend its
     // own barrier indefinitely (semantics 5).
     let frontier = subscription.frontier().await?;
     subscription.await_position(frontier, timeout).await
 }
 
-/// The commit lane's caught-up barrier.
-///
-/// The subscriber's cursor counts commit positions, so comparing it against
-/// the insert frontier would be comparing two different numberings — and
-/// because commit order is a permutation of insert order, the comparison can
-/// read as caught up while events before the frontier are still undelivered.
-/// The fence therefore runs in two stages against one budget:
-///
-/// 1. sample the insert frontier `h` (before the deadline starts, so `waited`
-///    measures only the polling);
-/// 2. wait for this process's sequencer to have folded past `h`. The stream
-///    it folds is contiguous and gap-filled, so that means every sequence up
-///    to `h` is placed — with its whole group, since placement appends every
-///    member at first sight — or skipped as a placeholder. This is bounded by
-///    the gap-fill grace on abandoned allocations, the same wait the insert
-///    lane's fence already implies;
-/// 3. read the log head `l` the fold has reached;
-/// 4. wait for the subscriber's commit cursor to reach `l` with what is left
-///    of the budget.
-///
-/// The fold is watched through the sequencer's in-process position rather
-/// than `logged_through_sequence`: that column is an *append* watermark,
-/// written only when a group is appended, so it never advances over
-/// placeholders or already-seen members and an aborted transaction at the
-/// head — exactly what inflates the insert frontier — would park it forever.
+/// The commit lane's caught-up barrier, in two stages against one budget: wait
+/// for the fold to pass the sampled insert frontier `h`, then for the
+/// subscriber's cursor to reach the head that fold reached. Comparing the
+/// cursor against `h` directly would compare two different numberings.
 pub(crate) async fn await_caught_up_commit_lane<P, Tables>(
     subscription: &Subscription<P, Tables, CommitOrder>,
     timeout: Duration,
@@ -774,12 +720,8 @@ where
         interval = (interval * 2).min(MAX_POLL_INTERVAL);
     }
 
-    // This process's own head, not a cluster-wide one: the lane is computed,
-    // not materialised, so there is no shared head to read. Sound for the
-    // same reason the fold-position invariant is — the fold publishes its
-    // position only after emitting a group and advancing the head, so once it
-    // has passed `h` the head it reports covers every group whose lowest
-    // member is at or below `h`.
+    // Sound because the fold publishes its position only after advancing the
+    // head: past `h`, the head covers every group with a member at or below it.
     let commit_frontier = positions.commit_head();
     subscription
         .poll_checkpoint_until(commit_frontier, start, deadline)

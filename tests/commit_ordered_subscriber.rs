@@ -23,9 +23,6 @@ enum TestEvent {
     Ping(u64),
 }
 
-/// Collects every event and records each flush as the group of payloads it
-/// landed, so a test can assert on batch composition rather than just on
-/// delivery — plus the commit position each flush reported.
 struct FlushRecorder {
     flushes: Arc<Mutex<Vec<Vec<u64>>>>,
     flush_positions: Arc<Mutex<Vec<CommitSequence>>>,
@@ -107,8 +104,6 @@ async fn publish_group(
     Ok(())
 }
 
-/// Poll until `f` holds, without sleeping on a fixed budget: the condition
-/// itself is the synchronisation.
 async fn until<F>(mut f: F, what: &str) -> anyhow::Result<()>
 where
     F: AsyncFnMut() -> bool,
@@ -123,8 +118,6 @@ where
     anyhow::bail!("timed out waiting for {what}")
 }
 
-/// A flush on the commit lane never lands a partial source transaction, even
-/// when the group is larger than `max_batch_size`.
 #[tokio::test]
 #[file_serial]
 async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
@@ -134,8 +127,7 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
 
     let flushes = Arc::new(Mutex::new(Vec::new()));
 
-    // Groups of three against a max batch size of two: the soft limit must
-    // give way to the group boundary.
+    // Groups of three against a max batch size of two.
     outbox
         .register_singleton_subscriber(
             &mut jobs,
@@ -160,8 +152,6 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
     let delivered: Vec<u64> = flushes.iter().flatten().copied().collect();
     assert_eq!(delivered.len(), 12, "every event delivered exactly once");
 
-    // Every group of three landed inside a single flush: no flush boundary
-    // falls strictly inside {3k, 3k+1, 3k+2}.
     for group in 0..4u64 {
         let members: Vec<u64> = (group * 3..group * 3 + 3).collect();
         let containing: Vec<&Vec<u64>> = flushes
@@ -184,8 +174,6 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delivery on the commit lane survives a restart: the second run resumes
-/// from the stored commit cursor rather than replaying from the beginning.
 #[tokio::test]
 #[file_serial]
 async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
@@ -211,13 +199,11 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
             "first run delivered its events",
         )
         .await?;
-        // The first instance must stop competing for the job before the
-        // second registers, or the restart is not a restart.
+        // The first instance must stop competing for the job before the second
+        // registers, or the restart is not a restart.
         let _ = jobs.shutdown().await;
     }
 
-    // A fresh Jobs instance re-runs the same job type against the stored
-    // checkpoint.
     let second = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = init_jobs(&pool).await?;
     outbox
@@ -245,13 +231,9 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Counts deliveries and acknowledges undecodable payloads, so a test can
-/// see whether an acknowledged one comes back after a restart.
 struct UndecodableAcker {
     seen: Arc<Mutex<Vec<u64>>>,
     undecodable: Arc<Mutex<usize>>,
-    /// The commit position each undecodable delivery reported — the slot it
-    /// occupies on the lane, which the insert-lane `sequence` is not.
     undecodable_at: Arc<Mutex<Vec<CommitSequence>>>,
 }
 
@@ -279,9 +261,6 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for UndecodableAcker {
     }
 }
 
-/// Acknowledging an undecodable payload must advance the *commit* cursor,
-/// not only the insert one: leaving it behind redelivers the event after
-/// every restart.
 #[tokio::test]
 #[file_serial]
 async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result<()> {
@@ -327,8 +306,6 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
         let _ = jobs.shutdown().await;
     }
 
-    // The delivery carried its commit position, not its insert sequence: the
-    // lone event occupies commit slot 1.
     assert_eq!(
         *undecodable_at.lock().await,
         vec![CommitSequence::from(1u64)],
@@ -353,8 +330,8 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    // Publish past it and wait for that to arrive, so the restarted run has
-    // demonstrably reached the stream rather than merely not started.
+    // Publish past it, so the restarted run has demonstrably reached the
+    // stream rather than merely not started.
     publish_group(&outbox, 100, 1).await?;
     until(
         async || seen.lock().await.contains(&100),

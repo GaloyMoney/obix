@@ -23,10 +23,8 @@ use crate::{
     tables::MailboxTables,
 };
 
-/// The insert lane's internal transport, positioned at its own sequence —
-/// what the cache-fill broadcast actually carries. Matches
-/// `cache::InsertTransport`, kept as its own alias since that one is private
-/// to `cache.rs`.
+/// What the cache-fill broadcast carries; `cache::InsertTransport` is the same
+/// alias, private to that module.
 type InsertTransport<P> = Transport<InsertOrder, P>;
 
 /// The cache loop asking for a database read. Carries no policy — the loop

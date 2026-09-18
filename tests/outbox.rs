@@ -13,7 +13,6 @@ enum TestEvent {
     LargePayload(String),
 }
 
-// Test the OutboxEvent derive macro
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PingEvent(u64);
 
@@ -31,7 +30,6 @@ enum DerivedEvent {
 
 #[test]
 fn outbox_event_derive_generates_marker_impls() {
-    // Test From impls
     let ping = PingEvent(42);
     let event: DerivedEvent = ping.clone().into();
     assert_eq!(event, DerivedEvent::Ping(PingEvent(42)));
@@ -40,7 +38,6 @@ fn outbox_event_derive_generates_marker_impls() {
     let event: DerivedEvent = pong.clone().into();
     assert_eq!(event, DerivedEvent::Pong(PongEvent("hello".to_string())));
 
-    // Test OutboxEventMarker::as_event
     let event = DerivedEvent::Ping(PingEvent(42));
     assert_eq!(
         <DerivedEvent as OutboxEventMarker<PingEvent>>::as_event(&event),
@@ -61,7 +58,6 @@ fn outbox_event_derive_generates_marker_impls() {
         None
     );
 
-    // Unknown variant returns None for all
     let event = DerivedEvent::Unknown;
     assert_eq!(
         <DerivedEvent as OutboxEventMarker<PingEvent>>::as_event(&event),
@@ -146,10 +142,8 @@ async fn event_batch_via_pg_notify() -> anyhow::Result<()> {
 
     let mut listener = outbox.listen_persisted(None);
 
-    // A bare transaction has no commit hooks, so nothing reaches the cache
-    // via the in-process broadcast: delivery depends entirely on the single
-    // {min_sequence, max_sequence} NOTIFY emitted by the insert statement
-    // and the SELECT-only range fetch it triggers.
+    // A bare transaction has no commit hooks, so delivery depends entirely on
+    // the insert statement's NOTIFY and the range fetch it triggers.
     let mut op = pool.begin().await?;
     outbox
         .publish_all_persisted(&mut op, (0..5).map(TestEvent::Ping))
@@ -218,7 +212,6 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         .expect("Couldn't build MailboxConfig");
     let outbox = init_outbox::<TestEvent>(&pool, config).await?;
 
-    // Create listener before publish to track when all events are processed
     let mut pre_listener = outbox.listen_persisted(None);
 
     let mut op = pool.begin().await?;
@@ -227,7 +220,6 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // Wait for all 10 events
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         (&mut pre_listener).take(5).for_each(|_| async {}),
@@ -236,7 +228,6 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
 
     let mut listener = outbox.listen_persisted(EventSequence::BEGIN);
 
-    // This should now work because backfill will fetch from PG even if events are not in cache
     let mut events = Vec::new();
     for _ in 0..10 {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
@@ -246,7 +237,6 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
         events.push(event);
     }
 
-    // Verify we got all 10 events in order
     for (i, event) in events.iter().enumerate() {
         assert!(matches!(event.payload, Some(TestEvent::Ping(n)) if n == i as u64));
     }
@@ -385,9 +375,8 @@ async fn large_batch_persisted_in_bounded_chunks() -> anyhow::Result<()> {
 async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Small grace so the fill episode starts quickly; a raw nextval burn
-    // has no owning transaction left, so the abandonment proof passes on
-    // the episode's first check and the placeholder follows immediately.
+    // A raw nextval burn has no owning transaction left, so the abandonment
+    // proof passes on the episode's first check.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -399,7 +388,6 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
 
     let mut listener = outbox.listen_persisted(None);
 
-    // Publish an event (seq N)
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -411,19 +399,17 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
         .expect("should receive first event")?;
     assert!(matches!(event.payload, Some(TestEvent::Ping(0))));
 
-    // Create a gap by consuming a sequence number without inserting a row
+    // Burn a sequence number without inserting a row, then publish past it.
     sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
         .fetch_one(&pool)
         .await?;
 
-    // Publish another event (seq N+2, skipping the consumed N+1)
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
         .await?;
     op.commit().await?;
 
-    // Should receive the gap-filled placeholder (None payload) followed by the real event
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
         .expect("should receive gap-filled placeholder")?;
@@ -456,7 +442,6 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
 
     let mut listener = outbox.listen_persisted(None);
 
-    // Publish an event (seq N)
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -479,9 +464,8 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // Within the grace period nothing may be yielded: no premature
-    // placeholder for the gap, and the real event is contiguous-blocked
-    // behind it.
+    // Within the grace period nothing may be yielded: the real event is
+    // contiguous-blocked behind the gap.
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(500), listener.next())
             .await
@@ -511,10 +495,8 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
 async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Default grace (2s) — the in-flight transaction below commits well
-    // within it (and while it lives its sequence is never provably
-    // abandoned), so the gap must resolve with the real row, never a
-    // placeholder.
+    // Default grace (2s): the transaction below commits well within it, so the
+    // gap must resolve with the real row.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -525,7 +507,6 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 
     let mut listener = outbox.listen_persisted(None);
 
-    // Publish an event (seq N)
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -544,15 +525,13 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
         .execute(&mut *tx)
         .await?;
 
-    // …while a later event (seq N+2) commits first, creating the classic
-    // allocation-order vs commit-order gap.
+    // …while a later event (seq N+2) commits first, creating the gap.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
         .await?;
     op.commit().await?;
 
-    // Nothing is yielded while the gap is unresolved (contiguous broadcast).
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), listener.next())
             .await
@@ -560,8 +539,7 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
         "no event may be yielded while the gap sequence is uncommitted"
     );
 
-    // Commit the in-flight transaction within the grace period: the gap
-    // resolves with the real event, not a placeholder.
+    // Committing within the grace period resolves the gap with the real event.
     tx.commit().await?;
 
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -586,10 +564,8 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Grace far below the writer's lifetime: fill episodes start early but
-    // must stay read-only while a transaction that could own the gap is
-    // still running — the abandonment proof (xmin horizon) cannot pass
-    // until that writer ends.
+    // Grace far below the writer's lifetime: fill episodes start early, but the
+    // abandonment proof (xmin horizon) cannot pass until that writer ends.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -626,10 +602,8 @@ async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // Well past the grace period: fill episodes have been running, but no
-    // placeholder may appear while the writer lives (and the episode must
-    // not block on the writer's speculative-insertion lock either — it
-    // never touches an unproven sequence).
+    // Well past the grace period: no placeholder may appear while the writer
+    // lives, and the episode must not block on its insertion lock either.
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(1500), listener.next())
             .await
@@ -637,8 +611,7 @@ async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
         "no placeholder may be written while the gap's writer is still in flight"
     );
 
-    // The writer aborts: its sequence is now provably abandoned and the
-    // running episode fills it on its next proof check.
+    // The writer aborts: its sequence is now provably abandoned.
     tx.rollback().await?;
 
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -657,11 +630,8 @@ async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The reactive tier: a transaction that fails *after* its outbox persist
-/// ran (here: a post-persist hook veto) reports its allocated sequences to
-/// the in-process compensator, which placeholder-fills them immediately —
-/// downstream listeners resume in milliseconds, well before the
-/// grace-gated backstop (2s default here) would even take its first look.
+/// A transaction failing after its outbox persist ran reports its allocated
+/// sequences to the in-process compensator, which fills them immediately.
 #[tokio::test]
 #[file_serial]
 async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<()> {
@@ -703,8 +673,8 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
 
     let mut listener = outbox.listen_persisted(None);
 
-    // The hook vetoes the first commit — after the persist allocated its
-    // sequence. The rollback burns the sequence.
+    // The veto fires after the persist allocated its sequence, so the rollback
+    // burns it.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -714,8 +684,7 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
         "the hook veto must fail the commit"
     );
 
-    // Reactive compensation: the placeholder must arrive well before the
-    // 2s grace period would allow the backstop's first fill attempt.
+    // Reactively, well inside the 2s grace the backstop would wait for.
     let gap_event = tokio::time::timeout(std::time::Duration::from_millis(1500), listener.next())
         .await
         .map_err(|_| anyhow::anyhow!("compensation placeholder did not arrive reactively"))?
@@ -725,7 +694,6 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
         "the compensated sequence must be a placeholder"
     );
 
-    // The stream continues normally past the compensated sequence.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
@@ -741,14 +709,8 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
     Ok(())
 }
 
-/// The `on_rollback` tier: a LATER commit hook on the same operation fails
-/// after `PersistEvents::pre_commit` already persisted its batch — the
-/// whole transaction rolls back, and es-entity fires `on_rollback` on the
-/// persist hook (after the rollback), which reports the burned sequences
-/// for immediate compensation. Regression test for the review question
-/// "does compensation survive a later hook's failure?": the placeholder
-/// must arrive reactively, well before the 2s grace period would let the
-/// backstop act.
+/// A LATER commit hook failing after the persist batch landed rolls the whole
+/// transaction back; `on_rollback` reports the burned sequences for filling.
 #[tokio::test]
 #[file_serial]
 async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Result<()> {
@@ -777,9 +739,8 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
 
     let mut listener = outbox.listen_persisted(None);
 
-    // Publish first (registers PersistEvents), then register the vetoing
-    // hook — hooks run in registration order, so the veto fires AFTER the
-    // outbox persist has allocated its sequence.
+    // Hooks run in registration order, so the veto registered second fires
+    // after the outbox persist has allocated its sequence.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -791,8 +752,7 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
         "the later hook's veto must fail the commit"
     );
 
-    // Reactive compensation via on_rollback: the placeholder must arrive
-    // well before the 2s grace period would allow a backstop fill.
+    // Reactively, well inside the 2s grace the backstop would wait for.
     let gap_event = tokio::time::timeout(std::time::Duration::from_millis(1500), listener.next())
         .await
         .map_err(|_| anyhow::anyhow!("compensation placeholder did not arrive reactively"))?
@@ -802,7 +762,6 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
         "the compensated sequence must be a placeholder"
     );
 
-    // The stream continues normally past the compensated sequence.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
@@ -818,11 +777,8 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
     Ok(())
 }
 
-/// One backfill request serves its whole range, parking on gaps it cannot
-/// yet serve instead of terminating: a replaying listener that runs into a
-/// young frontier gap (in-flight writer) must receive the writer's REAL
-/// event once it commits — through the same request, with no placeholder
-/// and no listener-side re-request logic.
+/// One backfill request serves its whole range, parking on a young frontier gap
+/// until the in-flight writer commits rather than terminating.
 #[tokio::test]
 #[file_serial]
 async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
@@ -836,9 +792,8 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
     )
     .await?;
 
-    // seq 1 committed; seq 2 allocated by a writer that stays in flight;
-    // seq 3 committed — all after outbox init, so seq 2 is a young gap the
-    // backfill task must never placeholder-fill.
+    // seq 1 committed; seq 2 allocated by a writer that stays in flight; seq 3
+    // committed — all after init, so seq 2 is a young gap.
     let mut op = outbox.begin_op().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -857,8 +812,6 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // Replay from the beginning: backfill serves seq 1, then parks at the
-    // in-flight seq 2.
     let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
 
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -866,8 +819,6 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
         .expect("should replay first event")?;
     assert!(matches!(first.payload, Some(TestEvent::Ping(0))));
 
-    // While the writer lives nothing may be delivered past the gap — and
-    // no placeholder may be written for it.
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(500), listener.next())
             .await
@@ -875,9 +826,7 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
         "the parked backfill must not deliver past (or placeholder) an in-flight gap"
     );
 
-    // The writer commits: the parked request resumes and delivers the real
-    // event, then the rest of the range — same request, no re-request
-    // needed.
+    // The writer commits: the same parked request resumes and delivers the rest.
     tx.commit().await?;
 
     let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -897,10 +846,8 @@ async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Concurrent replays over the same burned range: both listeners' backfills
-/// report the same historical gap; the GapFiller merges the overlapping
-/// requests into one proof + one locked fill, and both replays complete
-/// with the placeholder in position.
+/// Two replays over the same burned range: the GapFiller merges the overlapping
+/// requests into one proof and one locked fill, and both replays complete.
 #[tokio::test]
 #[file_serial]
 async fn overlapping_backfills_share_one_historical_fill() -> anyhow::Result<()> {
@@ -956,9 +903,6 @@ async fn overlapping_backfills_share_one_historical_fill() -> anyhow::Result<()>
     Ok(())
 }
 
-/// The cluster-wide fill lock: a backstop fill skips entirely (inserting
-/// nothing) while another connection holds the lock, and proceeds once it
-/// is released.
 #[tokio::test]
 #[file_serial]
 async fn fill_gaps_deduped_skips_while_fill_lock_held() -> anyhow::Result<()> {
@@ -971,8 +915,8 @@ async fn fill_gaps_deduped_skips_while_fill_lock_held() -> anyhow::Result<()> {
         .fetch_one(&pool)
         .await?;
 
-    // Another session holds the fill lock (same key the generated query
-    // derives from the table name).
+    // Another session holds the fill lock, under the key the generated query
+    // derives from the table name.
     let mut tx = pool.begin().await?;
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended('persistent_outbox_events_gap_fill', 0))",
@@ -1008,9 +952,8 @@ async fn fill_gaps_deduped_skips_while_fill_lock_held() -> anyhow::Result<()> {
 async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Batch limit of 2 with 5 lost sequences: no single fill may insert
-    // more than 2 placeholders, and successive attempts must recover the
-    // remainder — capped, never skipped.
+    // Batch limit of 2 against 5 lost sequences, so the remainder must recover
+    // across successive attempts.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -1047,8 +990,6 @@ async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // All five placeholders arrive, in order, across at least three
-    // batch-capped fill attempts.
     let first_gap = u64::from(event.sequence) + 1;
     for expected_sequence in first_gap..first_gap + 5 {
         let gap_event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -1069,19 +1010,15 @@ async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A batch-capped fill episode stays alive across batches: the remainder
-/// of the window recovers at the 1s loop cadence, not one full grace
-/// period per batch (delivering a batch advances the broadcast cursor,
-/// which discards the gap state — a returning episode would restart grace
-/// from scratch for every batch).
+/// A batch-capped fill episode stays alive across batches, so the remainder of
+/// its window recovers at the loop cadence rather than one grace per batch.
 #[tokio::test]
 #[file_serial]
 async fn batch_capped_fill_does_not_pay_grace_per_batch() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Grace (2.5s) far above the episode's 1s loop cadence: if each batch
-    // paid a fresh grace, consecutive placeholders would arrive ~2.5s
-    // apart; within one episode they arrive ~1s apart.
+    // Grace (2.5s) far above the episode's 1s loop cadence, so per-batch grace
+    // is visible in the spacing of the placeholders.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -1142,18 +1079,15 @@ async fn batch_capped_fill_does_not_pay_grace_per_batch() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A stall just past a running episode's window (a gap allocated AFTER the
-/// episode's marker was taken) must start a fresh episode rather than be
-/// swallowed by the episode-coverage dedup — the episode's stale marker
-/// head can never cover it, and the cache loop won't re-report the same
-/// stall position until its idle-resync re-arm (~10s).
+/// A gap allocated after a running episode's marker was taken must start a
+/// fresh episode rather than be swallowed by the episode-coverage dedup.
 #[tokio::test]
 #[file_serial]
 async fn stall_past_episode_window_starts_fresh_episode() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // batch 1 keeps the first episode alive across ticks so the follow-on
-    // stall arrives while it still exists.
+    // A batch limit of 1 keeps the first episode alive across ticks, so the
+    // follow-on stall arrives while it still exists.
     let outbox = init_outbox::<TestEvent>(
         &pool,
         MailboxConfig::builder()
@@ -1189,17 +1123,15 @@ async fn stall_past_episode_window_starts_fresh_episode() -> anyhow::Result<()> 
         .await?;
     op.commit().await?;
 
-    // First placeholder = the episode's first tick ran, so its marker (and
-    // window end) is now fixed. Everything allocated from here on is past
-    // that window.
+    // The first placeholder fixes the episode's marker, so everything allocated
+    // from here on is past its window.
     let first_gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
         .expect("should receive first placeholder")?;
     assert!(first_gap.payload.is_none());
 
-    // Burn another sequence and commit one more — a NEW gap beyond the
-    // running episode's marker head. The cursor will stall on it while
-    // the episode is still alive; that report must not be swallowed.
+    // A new gap beyond the running episode's marker head: the cursor stalls on
+    // it while that episode is still alive.
     sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
         .fetch_one(&pool)
         .await?;
@@ -1209,9 +1141,8 @@ async fn stall_past_episode_window_starts_fresh_episode() -> anyhow::Result<()> 
         .await?;
     op.commit().await?;
 
-    // Everything must flow, in order: second placeholder (old episode),
-    // Ping(1), the new gap's placeholder (fresh episode), Ping(2) — well
-    // inside the ~10s idle-resync that recovery would otherwise wait for.
+    // In order: second placeholder (old episode), Ping(1), the new gap's
+    // placeholder (fresh episode), Ping(2).
     let second_gap = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
         .expect("should receive second placeholder")?;
@@ -1259,9 +1190,8 @@ async fn fill_gaps_leaves_committed_rows_untouched() -> anyhow::Result<()> {
     .fetch_all(&pool)
     .await?;
 
-    // Filling over already-committed sequences must insert nothing and —
-    // unlike the previous DO UPDATE upsert — rewrite nothing (no new row
-    // versions, no dead tuples).
+    // Filling over already-committed sequences must insert nothing and rewrite
+    // nothing: no new row versions, no dead tuples.
     let inserted = helpers::TestTables::fill_gaps::<TestEvent>(
         &pool,
         vec![EventSequence::from(1), EventSequence::from(2)],
@@ -1282,7 +1212,6 @@ async fn fill_gaps_leaves_committed_rows_untouched() -> anyhow::Result<()> {
         "committed rows must keep their xmin — a rewrite would create dead tuples"
     );
 
-    // And the payloads survive untouched.
     let events =
         helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
     let payloads = events
@@ -1305,8 +1234,7 @@ async fn backfill_fills_historical_gap_for_replaying_listener() -> anyhow::Resul
     let pool = init_pool().await?;
     helpers::wipeout_outbox_tables(&pool).await?;
 
-    // History written with NO cache loop running: seq 1 committed, seq 2
-    // burned (a rolled-back writer nobody observed as a frontier stall),
+    // History written with NO cache loop running: seq 1 committed, seq 2 burned,
     // seq 3 committed.
     sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
         .bind(r#"{"Ping": 0}"#)
@@ -1320,11 +1248,8 @@ async fn backfill_fills_historical_gap_for_replaying_listener() -> anyhow::Resul
         .execute(&pool)
         .await?;
 
-    // Init AFTER the gap exists: the broadcast cursor starts at the head
-    // and never visits the historical gap — only backfill can serve a
-    // replaying listener, and it must placeholder-fill the lost sequence
-    // (provably abandoned: allocated before the cache loop started, and
-    // its writer is long gone, so the abandonment proof passes at once).
+    // Init AFTER the gap exists: the broadcast cursor starts at the head and
+    // never visits it, so only backfill can serve a replaying listener.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -1364,8 +1289,8 @@ async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<(
     let pool = init_pool().await?;
     helpers::wipeout_outbox_tables(&pool).await?;
 
-    // History ends in burned sequences: seq 1 committed, seqs 2 and 3
-    // allocated but never committed, no process running at the time.
+    // History ends in burned sequences: seq 1 committed, seqs 2 and 3 allocated
+    // but never committed.
     sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
         .bind(r#"{"Ping": 0}"#)
         .execute(&pool)
@@ -1376,10 +1301,8 @@ async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<(
             .await?;
     }
 
-    // The cursor initializes at the allocation head (3); a replaying
-    // listener must not stall forever on the burned tail — backfill
-    // placeholder-fills it once the abandonment proof passes (immediately:
-    // the burning connections are gone).
+    // The cursor initializes at the allocation head (3), so a replaying listener
+    // must not stall forever on the burned tail.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -1423,13 +1346,11 @@ async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
 
     let mut listener = outbox.listen_ephemeral();
 
-    // Publish an ephemeral event
     let event_type = obix::out::EphemeralEventType::new("test_type");
     outbox
         .publish_ephemeral(event_type.clone(), TestEvent::Ping(42))
         .await?;
 
-    // Should receive the event from the cache
     let Some(event) =
         tokio::time::timeout(std::time::Duration::from_secs(1), listener.next()).await?
     else {
@@ -1454,7 +1375,6 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Publish events before creating listener
     let type1 = obix::out::EphemeralEventType::new("type1");
     let type2 = obix::out::EphemeralEventType::new("type2");
 
@@ -1465,10 +1385,8 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
         .publish_ephemeral(type2.clone(), TestEvent::Ping(2))
         .await?;
 
-    // Give the cache time to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Create listener - should receive backfill of current events
     let mut listener = outbox.listen_ephemeral();
 
     let mut received_events = Vec::new();
@@ -1479,7 +1397,6 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
         received_events.push(event);
     }
 
-    // Should have received both events (order may vary since it's a HashMap)
     assert_eq!(received_events.len(), 2);
     let has_type1 = received_events.iter().any(|e| e.event_type == type1);
     let has_type2 = received_events.iter().any(|e| e.event_type == type2);
@@ -1502,7 +1419,6 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Publish events of the same type - later should replace earlier
     let event_type = obix::out::EphemeralEventType::new("replaceable");
 
     outbox
@@ -1528,7 +1444,6 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     assert_eq!(event.event_type, event_type);
     assert!(matches!(event.payload, TestEvent::Ping(3)));
 
-    // Should not receive any more events from backfill
     let timeout_result =
         tokio::time::timeout(std::time::Duration::from_millis(200), listener.next()).await;
 
@@ -1540,11 +1455,8 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     Ok(())
 }
 
-// SECURITY regression: a forged pg_notify on the ephemeral channel must not
-// inject events. LISTEN/NOTIFY has no per-channel authorization in
-// PostgreSQL — any role able to connect can signal any channel — so the
-// notification is only a hint; the event must come from the table (and a
-// forged hint with no matching row must yield nothing).
+// LISTEN/NOTIFY has no per-channel authorization, so a notification is only a
+// hint: the event must come from the table, and a forged hint yields nothing.
 #[tokio::test]
 #[file_serial]
 async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> {
@@ -1560,8 +1472,7 @@ async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> 
 
     let mut listener = outbox.listen_ephemeral();
 
-    // Fully-formed forged event, as the pre-fix listener would have accepted
-    // and broadcast directly from the notification body.
+    // A fully-formed forged event in the notification body.
     sqlx::query("SELECT pg_notify('ephemeral_outbox_events', $1)")
         .bind(
             serde_json::json!({
@@ -1596,10 +1507,8 @@ async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> 
     Ok(())
 }
 
-// An ephemeral event written by another process (straight SQL insert,
-// bypassing this process's in-process publish broadcast) must still reach
-// listeners: the trigger's {event_type, recorded_at} hint triggers a
-// fetch from the table with the listener's own credentials.
+// A raw SQL insert bypasses this process's publish broadcast, so delivery here
+// depends on the trigger's hint plus a fetch from the table.
 #[tokio::test]
 #[file_serial]
 async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Result<()> {
@@ -1630,13 +1539,8 @@ async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Resu
     Ok(())
 }
 
-// SECURITY regression: a forged {min_sequence, max_sequence} notification
-// on the persistent channel must not (a) advance the cache head past the
-// database's actual sequence, (b) synthesize phantom events, (c) drive an
-// unbounded range scan over a populated table, or (d) stall real delivery.
-// Unlike the ephemeral forgery test this runs against a POPULATED table, so
-// the range-fetch amplification (fetch_notified_range(0, i64::MAX) streaming
-// the whole tail) is actually exercised and the clamp is tested.
+// A forged {min_sequence, max_sequence} must not advance the head past the real
+// sequence, synthesize events, drive an unbounded scan, or stall delivery.
 #[tokio::test]
 #[file_serial]
 async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Result<()> {
@@ -1650,8 +1554,8 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
     )
     .await?;
 
-    // Populate the table so the forged range fetch has real rows to amplify
-    // over if the clamp were absent.
+    // Populate the table so the forged range fetch has rows to amplify over if
+    // the clamp were absent.
     let mut op = pool.begin().await?;
     outbox
         .publish_all_persisted(&mut op, (0..5).map(TestEvent::Ping))
@@ -1671,9 +1575,8 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
         .execute(&pool)
         .await?;
 
-    // The forged claim is clamped to the real head, so no phantom events
-    // beyond the committed 5 are synthesized. (The 5 real events may arrive
-    // from the clamped fetch — that's correct, not a forgery.)
+    // Clamped to the real head: the 5 committed events may arrive, nothing past
+    // them may.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     while let Ok(Some(item)) =
         tokio::time::timeout(std::time::Duration::from_millis(300), listener.next()).await
@@ -1689,8 +1592,7 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
         );
     }
 
-    // Real delivery still works, promptly (the forged head must not wedge
-    // the contiguity machinery).
+    // The forged head must not wedge the contiguity machinery.
     let mut op = pool.begin().await?;
     outbox
         .publish_persisted_in_op(&mut op, TestEvent::Ping(99))
@@ -1705,24 +1607,8 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
     Ok(())
 }
 
-/// Regression: an event whose NOTIFY fires while the LISTEN connection is
-/// down must still reach consumers.
-///
-/// Publishing through a plain transaction delivers exclusively via pg_notify
-/// (no same-process short-circuit hook), so the event below travels the wire
-/// path or not at all. The LISTEN backends are terminated *inside* the
-/// publishing transaction: they die at statement time and the NOTIFY fires at
-/// COMMIT moments later, guaranteeing it is sent while no listener connection
-/// exists — that notification is unrecoverably lost.
-///
-/// Before the fix the pump ran on `PgListener::recv()`, which silently
-/// swallows the reconnect marker, so a notification lost in the gap was never
-/// resynced and the consumer stalled forever (and when the internal reconnect
-/// itself failed, the pump task exited, dropping the notification senders and
-/// killing the cache loops outright — the sb-realtime staging wedge, where
-/// every outbox consumer froze mid-sequence while its listener job kept
-/// heartbeating). With the fix the pump surfaces the gap (`try_recv` +
-/// `NotifyMessage::Resync`) and the caches re-read the tables.
+/// A plain transaction delivers exclusively via pg_notify, so an event whose
+/// NOTIFY is lost with the LISTEN connection must be recovered by a resync.
 #[tokio::test]
 #[file_serial]
 async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Result<()> {
@@ -1751,13 +1637,8 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("listener stream ended"))??;
     assert!(matches!(event.payload, Some(TestEvent::Ping(1))));
 
-    // Terminate every LISTEN backend and insert the event in ONE autocommit
-    // statement: the backends die mid-statement and the insert trigger's
-    // NOTIFY fires at that same statement's commit, before any client-side
-    // reconnect round trip can complete — so the notification is
-    // deterministically sent while no LISTEN connection exists. (Publishing
-    // in a separate statement is racy: sqlx's eager reconnect re-subscribes off
-    // a warm pool connection faster than a second round trip.)
+    // Kill and insert in ONE statement: the NOTIFY fires at its commit, before
+    // any reconnect round trip can complete. Two statements would be racy.
     sqlx::query(
         r#"
         WITH kill AS (
@@ -1787,9 +1668,8 @@ async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Resu
     Ok(())
 }
 
-// A hook-supporting op carries no pg_notify; a second Outbox instance can
-// only learn about the event through the out-of-band debounced hint —
-// receipt well under the 10s idle-resync default proves that path works.
+// A hook-supporting op carries no pg_notify, so a second instance can only
+// learn about the event through the out-of-band debounced hint.
 #[tokio::test]
 #[file_serial]
 async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
@@ -1805,8 +1685,6 @@ async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
 
     let mut listener_b = outbox_b.listen_persisted(None);
 
-    // DbOp supports commit hooks: the persist statement is the silent
-    // variant, so cross-process delivery depends on the debounced notify.
     let mut op = outbox_a.begin_op().await?;
     outbox_a
         .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
@@ -1822,8 +1700,6 @@ async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
     Ok(())
 }
 
-// A burst of commits must coalesce into fewer NOTIFYs, and the final
-// hint's max_sequence must still cover the last committed batch.
 #[tokio::test]
 #[file_serial]
 async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
@@ -1850,8 +1726,7 @@ async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
         op.commit().await?;
     }
 
-    // Collect notifications until the channel goes quiet for well over a
-    // debounce interval.
+    // Collect until the channel goes quiet for well over a debounce interval.
     let mut payloads = Vec::new();
     while let Ok(notification) =
         tokio::time::timeout(std::time::Duration::from_millis(500), raw_listener.recv()).await
@@ -1882,9 +1757,8 @@ async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Crash-window backstop: rows that never get any notification (writer died
-// between commit and notify, or external raw-SQL insert) must still be
-// delivered via the idle head-poll.
+// Rows that never get any notification (a writer died, or a raw SQL insert) must
+// still be delivered via the idle head-poll.
 #[tokio::test]
 #[file_serial]
 async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
@@ -1916,10 +1790,8 @@ async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
     Ok(())
 }
 
-// SECURITY regression: garbage traffic on the notify channel must not
-// count as pipeline activity — the idle head-poll timer only resets on
-// authoritative progress (a new committed row or a confirmed head read),
-// so junk spam cannot suppress the backstop and starve unnotified events.
+// The idle head-poll timer resets only on authoritative progress, so garbage
+// traffic on the channel cannot suppress the backstop.
 #[tokio::test]
 #[file_serial]
 async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> {
@@ -1936,7 +1808,7 @@ async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> 
 
     let mut listener = outbox.listen_persisted(None);
 
-    // Unnotified row, as in unnotified_events_delivered_via_idle_resync…
+    // An unnotified row…
     sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
         .bind(r#"{"Ping": 42}"#)
         .execute(&pool)
@@ -1963,9 +1835,8 @@ async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> 
     Ok(())
 }
 
-// The bare-transaction path keeps the legacy in-tx NOTIFY: prompt
-// cross-instance delivery proves the notifying variant is wired on the
-// force-execute path.
+// The bare-transaction path carries an in-tx NOTIFY, so delivery to another
+// instance is prompt.
 #[tokio::test]
 #[file_serial]
 async fn bare_transaction_publish_delivers_promptly_cross_instance() -> anyhow::Result<()> {
@@ -1996,10 +1867,8 @@ async fn bare_transaction_publish_delivers_promptly_cross_instance() -> anyhow::
     Ok(())
 }
 
-// Rows written into a shared database by a different event enum (e.g.
-// test-only module tags) must neither crash the reader nor be silently
-// dropped: the event is still delivered — in order, as the `Err` item
-// carrying the raw payload and the serde error — and later events flow.
+// Rows written by a different event enum sharing the database must be delivered
+// in order, as the `Err` item carrying the raw payload and the serde error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "module")]
 enum ForeignEvent {
@@ -2035,9 +1904,8 @@ async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    // The load path delivers the poison row as its Err item — raw JSON and
-    // serde error attached, sequence position occupied — and the valid row
-    // intact.
+    // The load path delivers the poison row as its Err item, with the raw JSON
+    // and serde error attached.
     let events =
         helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
     assert_eq!(events.len(), 2);
@@ -2056,9 +1924,8 @@ async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
     let decoded = events[1].as_ref().expect("valid row must be the Ok item");
     assert!(matches!(decoded.payload, Some(TestEvent::Ping(0))));
 
-    // The raw stream delivers the poison event as its Err arm, in sequence
-    // position — the type forces every raw consumer to decide (`?` would
-    // fail loudly here) — and later events still arrive, in order.
+    // The raw stream delivers it as its Err arm, in sequence position, and
+    // later events still arrive in order.
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("listener stream closed"))?;
@@ -2077,8 +1944,8 @@ async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build `1,2,3, <gap 4>, 5,6, <gap 7>, 8` directly in the table, with no
-/// cache loop running — the shape the read-path queries are cut against.
+/// Build `1,2,3, <gap 4>, 5,6, <gap 7>, 8` directly in the table, with no cache
+/// loop running.
 async fn write_history_with_gaps(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     for n in [0u64, 1, 2] {
         sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
@@ -2114,9 +1981,8 @@ async fn contiguous_page_read_stops_at_the_first_gap() -> anyhow::Result<()> {
     helpers::wipeout_outbox_tables(&pool).await?;
     write_history_with_gaps(&pool).await?;
 
-    // The window read sees every committed row past the gaps — which is
-    // what the gap filler needs, and exactly what a reader delivering in
-    // order cannot use.
+    // The window read sees every committed row past the gaps, which is what the
+    // gap filler needs and what an in-order reader cannot use.
     let window =
         helpers::TestTables::load_next_page::<TestEvent>(&pool, EventSequence::from(0), 10).await?;
     assert_eq!(window.len(), 6, "window read returns rows past both gaps");
@@ -2158,7 +2024,6 @@ async fn contiguous_page_read_stops_at_the_first_gap() -> anyhow::Result<()> {
         "a read starting on a gap delivers nothing"
     );
 
-    // And the ceiling still bounds the page.
     let capped = helpers::TestTables::load_next_contiguous_page::<TestEvent>(
         &pool,
         EventSequence::from(0),
@@ -2207,7 +2072,6 @@ async fn missing_sequences_enumerates_holes() -> anyhow::Result<()> {
     let missing: Vec<u64> = missing.into_iter().map(u64::from).collect();
     assert_eq!(missing, vec![4, 7]);
 
-    // A run with no holes reports none.
     let none = helpers::TestTables::missing_sequences(
         &pool,
         EventSequence::from(0),
@@ -2216,8 +2080,8 @@ async fn missing_sequences_enumerates_holes() -> anyhow::Result<()> {
     .await?;
     assert!(none.is_empty());
 
-    // Sequences above the allocation head count as missing — the caller
-    // bounds the range, not this query.
+    // Sequences above the allocation head count as missing: the caller bounds
+    // the range, not this query.
     let beyond = helpers::TestTables::missing_sequences(
         &pool,
         EventSequence::from(8),
@@ -2238,8 +2102,8 @@ async fn backfill_replays_across_many_small_pages() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     helpers::wipeout_outbox_tables(&pool).await?;
 
-    // History well past a single page, written before any cache loop runs
-    // so only the backfill path can serve it.
+    // History well past a single page, written before any cache loop runs so
+    // only the backfill path can serve it.
     for n in 0..25u64 {
         sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
             .bind(format!(r#"{{"Ping": {n}}}"#))
@@ -2247,8 +2111,7 @@ async fn backfill_replays_across_many_small_pages() -> anyhow::Result<()> {
             .await?;
     }
 
-    // A deliberately tiny ceiling: replay must page across it, in order,
-    // losing nothing at the boundaries.
+    // A deliberately tiny page ceiling.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -2278,9 +2141,8 @@ async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     helpers::wipeout_outbox_tables(&pool).await?;
 
-    // Buffers far smaller than the burst: the listener cannot hold what is
-    // published, so the drain has to apply backpressure rather than pull
-    // events in and evict them. Nothing may be lost or reordered.
+    // Buffers far smaller than the burst, so the drain has to apply
+    // backpressure rather than pull events in and evict them.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -2314,16 +2176,8 @@ async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A slow consumer must not make the catch-up reader read the same rows over
-/// and over. The reader is only bounded by what the listener takes from the
-/// backfill channel, so a listener that empties it on every poll lets the
-/// reader run arbitrarily far ahead — and everything past `event_buffer_size`
-/// is then evicted and re-read.
-///
-/// Measured against `idx_tup_fetch`, which counts rows actually fetched via
-/// index. The bound is deliberately loose: the gap-cut read scans its window
-/// twice, so ~2x is the floor, while an unbounded drain on this shape reads
-/// well over 30x.
+/// Measured against `idx_tup_fetch`. The bound is loose: the gap-cut read scans
+/// its window twice (~2x floor), while an unbounded drain reads over 30x.
 #[tokio::test]
 #[file_serial]
 async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
@@ -2333,7 +2187,7 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
 
     async fn rows_read_by_index(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
         // Stats land at transaction end and are read through a per-snapshot
-        // cache; give the collector a moment before sampling.
+        // cache, so give the collector a moment before sampling.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let n: Option<i64> = sqlx::query_scalar(
             "SELECT sum(idx_tup_fetch)::bigint FROM pg_stat_user_tables
@@ -2355,13 +2209,8 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
             .execute(&pool)
             .await?;
     }
-    // No sequencer runs here: `idx_tup_fetch` is per table, so it counts
-    // every reader of `persistent_outbox_events`, and a commit-lane fold
-    // replaying this history would put a second reader's one-time catch-up
-    // inside a budget that is about this listener's paging. The lane is
-    // `Disabled` by default and this test must keep it that way — it used to
-    // need an explicit nudge to the sequencer's cursor, which the opt-in
-    // makes unnecessary.
+    // The commit lane must stay off: `idx_tup_fetch` is per table, so a fold
+    // replaying this history would land inside a budget about this listener.
     let before = rows_read_by_index(&pool).await?;
 
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(

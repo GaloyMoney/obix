@@ -72,20 +72,11 @@ pub enum StreamSelection {
 /// [`SUBSCRIPTION`](Self::SUBSCRIPTION) and the other stream is never even
 /// subscribed.
 ///
-/// # The lane
-///
-/// `L` is the delivery lane, and it decides what a position is — for the
-/// event, for the batch flush, and for the durable checkpoint. It defaults to
-/// [`InsertOrder`](crate::out::InsertOrder), so `impl SingletonSubscriber<P>
-/// for X` is an insert-lane handler; `impl SingletonSubscriber<P,
-/// CommitOrder> for X` is the same code reading `CommitSequence`s, and the
-/// two cannot be confused because the compiler will not let a commit-lane
-/// handler run on the insert lane.
-///
-/// The lane is settled by the impl, not by configuration: it is a semantic
-/// contract (what a flush boundary is, what the checkpoint counts), and a
-/// subscription already checkpointed on one lane cannot move to the other —
-/// registration refuses it.
+/// `L` is the delivery lane, which decides what a position is — for the event,
+/// the flush and the checkpoint. It defaults to
+/// [`InsertOrder`](crate::out::InsertOrder); `impl SingletonSubscriber<P,
+/// CommitOrder> for X` is the same code reading `CommitSequence`s. A
+/// subscription cannot later move to the other lane — registration refuses it.
 pub trait SingletonSubscriber<P, L = InsertOrder>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -108,20 +99,9 @@ where
     /// `Default` container. Handlers that never collect use `()`.
     type Batch: Default + Send + 'static;
 
-    /// The event, plus where it sits on `L`
-    /// ([`position`](crate::out::Delivery::position) — an `EventSequence` on
-    /// the insert lane, a `CommitSequence` on the commit lane, readable at
-    /// any point in the invocation).
-    ///
-    /// Reading through the delivery is unchanged: it derefs to the shared
-    /// [`Arc`] the outbox decoded once and broadcast to every subscriber,
-    /// which in turn derefs to the event — so `event.payload`,
-    /// `event.as_event::<E>()` and passing `event` where a
-    /// `&PersistentOutboxEvent<P>` is expected all work. A handler that
-    /// retains the event past the call — any
-    /// [`collect_with`](EventCtx::collect_with) fold — clones the refcount
-    /// via [`inner`](crate::out::Delivery::inner), not the payload, so `P`
-    /// need not be `Clone`.
+    /// The event, plus its [`position`](crate::out::Delivery::position) on `L`.
+    /// It derefs to the event, and a handler retaining it past the call clones
+    /// only an `Arc` via [`inner`](crate::out::Delivery::inner).
     fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
@@ -136,11 +116,9 @@ where
     /// Handle a persistent event whose stored payload could not be decoded
     /// into `P` — delivered as the persistent stream's `Err` arm and never
     /// as an ordinary event, so it cannot reach
-    /// [`handle_persistent`](Self::handle_persistent). It arrives with the
-    /// same [`position`](crate::out::Delivery::position) an ordinary event
-    /// would have had (the slot it occupies on `L`), and derefs to the
-    /// [`UndecodableEventError`] carrying the event's identity and the raw
-    /// payload + serde error (`error.failure`).
+    /// [`handle_persistent`](Self::handle_persistent). It arrives at the
+    /// position an ordinary event would have had, and derefs to the
+    /// [`UndecodableEventError`] carrying the raw payload and serde error.
     ///
     /// The runner lands the pending batch *before* invoking this — like
     /// [`handle_ephemeral`](Self::handle_ephemeral), nothing is pending
@@ -180,9 +158,8 @@ where
     /// statements or register commit hooks on it for work that must share
     /// the checkpoint's fate; ignore it when flushing to a foreign database
     /// (then make the writes idempotent — the checkpoint only advances after
-    /// `Ok`, and a failure replays and re-collects the whole batch). It also
-    /// carries [`position`](FlushOp::position): exactly where this batch
-    /// lands on `L`, which is the watermark to record downstream.
+    /// `Ok`, and a failure replays and re-collects the whole batch). Its
+    /// [`position`](FlushOp::position) is where the batch lands on `L`.
     fn flush(
         &self,
         op: &mut FlushOp<'_, L>,
@@ -241,8 +218,7 @@ where
     }
 }
 
-/// The subscription's cursor on `L`, in the dynamic form the lane-free ctx
-/// plumbing compares and stores.
+/// The subscription's cursor on `L`, in the dynamic form the ctx plumbing uses.
 fn checkpoint_of<L: Lane>(state: &OutboxEventJobState) -> StreamPosition {
     L::checkpoint(state.sequence, state.commit_sequence).into()
 }
@@ -315,13 +291,9 @@ pub(crate) fn decide_lane(
 const DEFAULT_MAX_BATCH_SIZE: usize = 100;
 const DEFAULT_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Which order a subscriber receives persistent events in — the dynamic form
-/// of the lane, as stored state and read-outs report it.
-///
-/// A subscriber declares its lane in the *type* system instead, by which
-/// [`Lane`](crate::out::Lane) it implements
-/// [`SingletonSubscriber`] for; this is what that
-/// choice is called when it has to be a value.
+/// Which order a subscriber receives persistent events in — the dynamic form of
+/// the lane a subscriber declares by implementing
+/// [`SingletonSubscriber`] for a [`Lane`](crate::out::Lane).
 ///
 /// Name-clashes with [`std::cmp::Ordering`]; import or path-qualify
 /// explicitly.
@@ -519,8 +491,8 @@ where
         }
     }
 
-    /// Open `L`'s stream at the subscription's stored cursor — refusing, as
-    /// [`decide_lane`] does, a subscription established on the other lane.
+    /// Open `L`'s stream at the stored cursor, refusing a subscription
+    /// established on the other lane.
     fn select_lane(
         &self,
         state: &OutboxEventJobState,

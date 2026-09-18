@@ -113,11 +113,8 @@ pub(crate) struct BatchTracker {
     /// `max_batch_size` bounds — with no deferred ops, the pending batch is
     /// exactly its collected events.
     pub(crate) collected: usize,
-    /// Highest position whose checkpoint has been persisted to the database,
-    /// on the subscription's own lane. Held in the dynamic
-    /// [`StreamPosition`] form because the ctx types this travels on are
-    /// deliberately lane-free; the handler's flusher, which knows the lane,
-    /// is what produces it.
+    /// Highest position whose checkpoint has been persisted, on the
+    /// subscription's own lane. Dynamic because the ctx types are lane-free.
     pub(crate) persisted: StreamPosition,
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
@@ -373,12 +370,8 @@ pub(crate) type BoxFuture<'a, T> =
 /// Object-safe bridge from the runner (and [`EventCtx::consume`]'s
 /// entry fence) to the handler's typed
 /// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
-/// [`EventCtx`] only needs to know the accumulator `B`.
-///
-/// The whole [`OutboxEventJobState`] is passed rather than a position because
-/// the lane is the *handler*'s, not the ctx's: the erased implementor knows
-/// its `L` and reads the cursor `L` checkpoints, which is what keeps
-/// [`EventCtx`] free of a lane parameter.
+/// [`EventCtx`] only needs to know the accumulator `B`. The whole
+/// [`OutboxEventJobState`] is passed because only the implementor knows its `L`.
 pub(crate) trait ItemFlush<B>: Send + Sync {
     fn flush_items<'a>(
         &'a self,
@@ -387,9 +380,7 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
         state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
 
-    /// Where the subscription's cursor sits, on the lane the handler is
-    /// implemented for — the one lane fact the lane-free ctx plumbing needs,
-    /// supplied by the one component that statically knows it.
+    /// Where the subscription's cursor sits, on the handler's own lane.
     fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition;
 }
 
@@ -418,16 +409,9 @@ where
         Self { op, position }
     }
 
-    /// Where this batch lands: the position of the last *fully handled*
-    /// event on this lane.
-    ///
-    /// Every event at or below it has been collected or skipped, so it is the
-    /// exact watermark for the batch — and it is the checkpoint this very
-    /// transaction is about to commit. Folding `max` over the flushed items
-    /// instead understates it whenever the batch ended on skipped events.
-    ///
-    /// On [`CommitOrder`](crate::out::CommitOrder) this is a group boundary
-    /// unless a handler entered [`consume`](EventCtx::consume) mid-group.
+    /// Where this batch lands: the last *fully handled* event on this lane, and
+    /// the checkpoint this transaction is about to commit. Folding `max` over the
+    /// flushed items understates it when the batch ended on skipped events.
     pub fn position(&self) -> L::Position {
         self.position
     }
@@ -450,9 +434,9 @@ pub struct FlushError {
     /// `"staged_pause"`).
     pub reason: &'static str,
     /// The batch covers positions strictly after this (the last durable
-    /// checkpoint), on the subscription's own lane…
+    /// checkpoint)…
     pub after: StreamPosition,
-    /// …through this (the last fully handled event), on the same lane.
+    /// …through this (the last fully handled event).
     pub through: StreamPosition,
     pub source: HandlerError,
 }

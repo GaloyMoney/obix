@@ -458,12 +458,10 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         // === Commit-ordered lane queries ===
 
-        // INVARIANT: the `sequence >= $2` bound is what makes this a
-        // per-partition read. `$2` is the lowest MIN among the groups asked
-        // for, and every member sits at or above its own group's MIN, so the
-        // bound loses no row while pruning every partition below it. Without
-        // it (as the superseded per-group append did) each fetch walks every
-        // partition's `commit_xid` index.
+        // INVARIANT: the `sequence >= $2` bound is what keeps this a
+        // per-partition read. `$2` is the lowest MIN among the groups asked for,
+        // and every member sits at or above its own group's MIN, so the bound
+        // loses no row; without it each fetch walks every partition's index.
         let load_group_members_query = format!(
             r#"
             SELECT commit_xid, sequence AS "sequence!: i64", id, payload,
@@ -474,15 +472,10 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // INVARIANT: untargeted `DO NOTHING`, not `ON CONFLICT (sequence)`.
-        // Checkpoint content is a pure function of the events table, so two
-        // processes writing the same `sequence` write the same row — but they
-        // need not pick the same `sequence`, and two different sequences can
-        // share a `commit_seq` when only placeholders or straddling members
-        // separate them. Naming a single conflict target would let that
-        // collide with the `commit_seq` UNIQUE and fail the write. Either row
-        // is a valid resume point, so keeping whichever landed first is
-        // correct.
+        // INVARIANT: untargeted `DO NOTHING`, not `ON CONFLICT (sequence)`. Two
+        // different sequences can share a `commit_seq`, so naming one target
+        // would collide with the `commit_seq` UNIQUE and fail the write; either
+        // row is a valid resume point.
         let write_commit_checkpoint_query = format!(
             r#"
             INSERT INTO {tbl}persistent_outbox_commit_checkpoints
@@ -548,9 +541,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                             floor as #crate_name::EventSequence,
                         ).fetch_all(&pool).await?;
 
-                        // Rows arrive ordered by (commit_xid, sequence), so a
-                        // group's members are contiguous and already in the
-                        // order the lane emits them.
+                        // Rows arrive ordered by (commit_xid, sequence), so each
+                        // group's members are contiguous and already in order.
                         let mut grouped: Vec<(#crate_name::CommitGroupId, #crate_name::PersistentEventRows<P>)> =
                             Vec::new();
                         for row in rows {

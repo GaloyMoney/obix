@@ -19,9 +19,7 @@ CREATE TABLE persistent_outbox_events (
   PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
 
--- Backs the sequencer's per-group fetch: every row of one `commit_xid`. The
--- fetch is bounded below by the group's lowest member, so this is read per
--- partition rather than across all of them.
+-- Backs the sequencer's per-group fetch: every row of one `commit_xid`.
 -- Created on the parent; Postgres cascades it to existing and future
 -- partitions.
 CREATE INDEX idx_persistent_outbox_events_commit_xid
@@ -43,35 +41,10 @@ CREATE TABLE persistent_outbox_events_p0 PARTITION OF persistent_outbox_events
 CREATE TABLE persistent_outbox_events_default
   PARTITION OF persistent_outbox_events DEFAULT;
 
--- Migration checksum: amended in place per this repo's pre-1.0 convention
--- (see 5aa5377, 2d233eb) rather than as a follow-up migration. Every
--- already-migrated database must be recreated (`make clean-deps &&
--- make start-deps`) — sqlx otherwise reports "migration ... was previously
--- applied but has been modified" — and a database that keeps the superseded
--- `persistent_outbox_commit_log`(`_state`) tables from before this change
--- never gets this one; `Outbox::init` with `CommitLane::Enabled` fails on
--- the first checkpoint read or write until it is recreated.
---
--- Commit-ordered delivery lane: sparse checkpoints of the sequencer's fold
--- (`src/out/persistent/sequencer.rs`). The commit order itself is NOT
--- materialised — it is a pure function of this table's companion,
--- `persistent_outbox_events`: a group is emitted whole at first sight of its
--- lowest member in insert order, members by `sequence` within it, and the
--- position is a running count of rows emitted. Every `Enabled` process
--- computes the same numbering independently, with no coordination.
---
--- A row here means: after folding every event with `sequence <= sequence`,
--- the fold had emitted `commit_seq` rows, and the groups in `open_groups`
--- had been emitted with members still above `sequence` (the straddlers).
--- That triple is all a restart or a lagging subscriber's backfill needs to
--- resume the fold mid-stream instead of replaying from the beginning.
---
--- Values are a pure function of the events table, so any process may write
--- any row and a duplicate is a no-op — which is why the write is
--- `ON CONFLICT DO NOTHING` and needs no lock. Not partitioned: one row per
--- `commit_checkpoint_every` groups (or per `commit_checkpoint_interval`),
--- not one per group. Retention deletes rows below the floor together with
--- the event partitions they describe.
+-- Sparse checkpoints of the commit lane's fold: after folding through
+-- `sequence` it had emitted `commit_seq` rows, with `open_groups` straddling.
+-- Values are a pure function of `persistent_outbox_events`, so any process
+-- may write any row and duplicates are no-ops.
 CREATE TABLE persistent_outbox_commit_checkpoints (
   sequence    BIGINT PRIMARY KEY,
   commit_seq  BIGINT NOT NULL UNIQUE,

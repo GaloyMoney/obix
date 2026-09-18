@@ -1,10 +1,4 @@
-//! The commit-ordered lane's placement rules, exercised through the lane
-//! itself.
-//!
-//! The order is computed, not stored: there is no log table to read back, so
-//! these assert on what the lane *delivers*. The tuples are the same ones the
-//! materialised log used to hold — `(position, sequence, boundary)` — because
-//! the numbering is unchanged by the fact that nothing writes it down.
+//! The commit-ordered lane's placement rules, asserted on what it delivers.
 
 mod helpers;
 
@@ -43,9 +37,8 @@ const fn placeholder(sequence: i64, xid: i64) -> Row {
     }
 }
 
-/// Write rows at exact sequences and groups. Direct SQL rather than
-/// `publish`, because the point of these tests is to pin placement against
-/// interleavings that are awkward to provoke through the write path.
+/// Write rows at chosen sequences and groups — direct SQL, since the write
+/// path cannot provoke these interleavings.
 async fn seed(pool: &sqlx::PgPool, rows: &[Row]) -> anyhow::Result<()> {
     for row in rows {
         let payload = row
@@ -69,12 +62,8 @@ async fn seed(pool: &sqlx::PgPool, rows: &[Row]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What the lane delivers, as `(position, sequence, boundary)` — the shape
-/// the commit log used to store.
-///
-/// The outbox is opened here rather than by the caller so the fold starts
-/// after the seeding, which is what makes these assertions about placement
-/// rather than about timing.
+/// What the lane delivers, as `(position, sequence, boundary)`. The outbox is
+/// opened here so the fold starts after the seeding.
 async fn lane_rows(pool: &sqlx::PgPool, count: usize) -> anyhow::Result<Vec<(i64, i64, bool)>> {
     let outbox = Outbox::<TestEvent, TestTables>::init(
         pool,
@@ -113,21 +102,15 @@ async fn checkpoints(pool: &sqlx::PgPool) -> anyhow::Result<Vec<(i64, i64)>> {
     Ok(rows)
 }
 
-/// A transaction's events are contiguous in the commit lane even when
-/// another transaction's inserts interleave with them, and groups are
-/// ordered by the sequence at which they are first seen.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn interleaved_groups_are_contiguous_and_first_sight_ordered() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     wipeout_outbox_tables(&pool).await?;
 
-    // A inserts a1, B inserts b1+b2 and commits, A inserts a2 and commits.
-    // Insert order is a1, b1, b2, a2.
+    // Insert order a1, b1, b2, a2: A is first-sighted at sequence 1 and B at 2.
     seed(&pool, &[ev(1, 7001), ev(2, 7002), ev(3, 7002), ev(4, 7001)]).await?;
 
-    // A is first-sighted at sequence 1 and B at 2, so A is ordered first;
-    // each group's members are adjacent. Byte-for-byte what the log held.
     assert_eq!(
         lane_rows(&pool, 4).await?,
         vec![(1, 1, false), (2, 4, true), (3, 2, false), (4, 3, true)],
@@ -135,8 +118,6 @@ async fn interleaved_groups_are_contiguous_and_first_sight_ordered() -> anyhow::
     Ok(())
 }
 
-/// Gap-fill placeholders occupy an insert sequence but are not events, so
-/// they never reach the commit lane and never take a position.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn placeholders_are_never_emitted() -> anyhow::Result<()> {
@@ -145,22 +126,18 @@ async fn placeholders_are_never_emitted() -> anyhow::Result<()> {
 
     seed(&pool, &[ev(1, 7010), placeholder(2, 7010), ev(3, 7011)]).await?;
 
-    // Dense despite the placeholder sharing group 7010: the lane numbers
-    // events, not sequences.
+    // Dense despite the placeholder: the lane numbers events, not sequences.
     assert_eq!(lane_rows(&pool, 2).await?, vec![(1, 1, true), (2, 3, true)],);
     Ok(())
 }
 
-/// Every group is contiguous in the lane, and groups are ordered by the
-/// sequence of their lowest member, under a randomised interleaving.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn randomised_interleavings_keep_groups_contiguous() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     wipeout_outbox_tables(&pool).await?;
 
-    // Deterministic pseudo-random assignment of sequences to groups: a
-    // fixed multiplier interleaves groups without a rng dependency.
+    // A fixed multiplier interleaves groups deterministically, without an rng.
     let assignments: Vec<(i64, i64)> = (1..=300).map(|n: i64| (n, 7200 + (n * 17) % 23)).collect();
     let rows: Vec<Row> = assignments.iter().map(|(n, x)| ev(*n, *x)).collect();
     seed(&pool, &rows).await?;
@@ -173,8 +150,6 @@ async fn randomised_interleavings_keep_groups_contiguous() -> anyhow::Result<()>
 
     let group_of: std::collections::HashMap<i64, i64> = assignments.into_iter().collect();
 
-    // Each group occupies one unbroken run, the boundary marks its end, and
-    // the runs are ordered by each group's lowest sequence.
     let mut seen_groups = std::collections::HashSet::new();
     let mut previous_run_min = 0;
     let mut index = 0;
@@ -195,7 +170,6 @@ async fn randomised_interleavings_keep_groups_contiguous() -> anyhow::Result<()>
                 "the boundary must mark exactly the run's end"
             );
         }
-        // Within a group, members stay in insert order.
         let mut sorted = members.clone();
         sorted.sort_unstable();
         assert_eq!(members, sorted, "group members must stay in insert order");
@@ -211,8 +185,6 @@ async fn randomised_interleavings_keep_groups_contiguous() -> anyhow::Result<()>
     Ok(())
 }
 
-/// End to end through a real outbox: publish, then receive on the commit
-/// lane with lane metadata populated and a dense cursor.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn commit_lane_delivers_published_events_end_to_end() -> anyhow::Result<()> {
@@ -258,8 +230,6 @@ async fn commit_lane_delivers_published_events_end_to_end() -> anyhow::Result<()
     Ok(())
 }
 
-/// A commit-ordered listener created against a populated stream reads it
-/// back from the beginning — by re-folding, since there is no log to page.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn commit_lane_backfills_by_refolding() -> anyhow::Result<()> {
@@ -286,8 +256,7 @@ async fn commit_lane_backfills_by_refolding() -> anyhow::Result<()> {
         op.commit().await?;
     }
 
-    // A listener starting at BEGIN must replay the whole stream, not just
-    // receive what is published after it subscribes.
+    // A listener at BEGIN must replay the whole stream, not just what follows.
     let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
     let mut received = Vec::new();
     for _ in 0..8 {
@@ -298,9 +267,6 @@ async fn commit_lane_backfills_by_refolding() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The sequencer runs in every `Enabled` process, whether or not that
-/// process has a commit-ordered listener: the fold must not wait for a
-/// subscriber, and its checkpoints must land regardless.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn sequencer_runs_without_a_commit_listener() -> anyhow::Result<()> {
@@ -348,8 +314,6 @@ async fn sequencer_runs_without_a_commit_listener() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Two processes sharing a pool derive the same commit order — now without
-/// any shared state to derive it from: each computes it independently.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn two_processes_deliver_identical_commit_order() -> anyhow::Result<()> {
@@ -401,8 +365,6 @@ async fn two_processes_deliver_identical_commit_order() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The insert lane is untouched by the commit lane's existence: the group is
-/// reported there too.
 #[tokio::test]
 #[serial_test::file_serial]
 async fn insert_lane_carries_group() -> anyhow::Result<()> {

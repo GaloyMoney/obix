@@ -296,14 +296,9 @@ pub trait MailboxTables: Send + Sync + 'static {
         P: Serialize + DeserializeOwned + Send;
 
     /// Every payload-bearing row of each of `groups`, ordered by
-    /// `(commit_xid, sequence)` — so a group's members come back contiguous
-    /// and already in the order the commit lane emits them.
-    ///
-    /// `floor` is the lowest MIN among the groups asked for. Every member
-    /// sits at or above its own group's MIN, so bounding on it loses no row
-    /// while pruning every partition below it: the read is per-partition
-    /// rather than across all of them. One statement per batch of
-    /// first-sight groups, never one per group.
+    /// `(commit_xid, sequence)` — contiguous, in the order the commit lane
+    /// emits them. `floor` is the lowest MIN among the groups asked for, which
+    /// prunes partitions below it without losing a member.
     fn load_group_members<P>(
         pool: &sqlx::PgPool,
         groups: &[CommitGroupId],
@@ -312,11 +307,8 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// Record a sparse checkpoint of the commit-lane fold.
-    ///
-    /// Content is a pure function of the events table, so a peer's row for
-    /// the same position is the same row and a conflict is a no-op — the
-    /// write takes no lock and needs no coordination.
+    /// Record a sparse checkpoint of the commit-lane fold. A conflict is a
+    /// no-op: a peer's row for the same position is the same row.
     fn write_commit_checkpoint(
         pool: &sqlx::PgPool,
         checkpoint: &CommitCheckpoint,
@@ -329,9 +321,8 @@ pub trait MailboxTables: Send + Sync + 'static {
         at_or_below: EventSequence,
     ) -> impl Future<Output = Result<Option<CommitCheckpoint>, sqlx::Error>> + Send;
 
-    /// The newest checkpoint whose `commit_seq` is at or below
-    /// `at_or_below` — a backfill's seed, found by the position the consumer
-    /// asked to resume after rather than by insert sequence.
+    /// The newest checkpoint whose `commit_seq` is at or below `at_or_below` —
+    /// a backfill's seed, found by commit position rather than insert sequence.
     fn load_commit_checkpoint_for(
         pool: &sqlx::PgPool,
         at_or_below: CommitSequence,
@@ -471,17 +462,10 @@ pub trait MailboxTables: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
 }
 
-/// A sparse checkpoint of the commit-lane fold: everything needed to resume
-/// it mid-stream and produce exactly the numbering it would have produced
-/// from the beginning.
-///
-/// Read it as: after folding every event with `sequence <= sequence`, the
-/// fold had emitted `commit_seq` rows, and `open_groups` were the groups
-/// already emitted whose members reach above `sequence` — the straddlers the
-/// resumed fold must not emit a second time.
-///
-/// All three are a pure function of the events table, which is why any
-/// process may write one and why two processes never disagree.
+/// A sparse checkpoint of the commit-lane fold: after folding through
+/// `sequence` it had emitted `commit_seq` rows, and `open_groups` were the
+/// emitted groups still reaching above `sequence` — the ones a resumed fold
+/// must not emit twice.
 #[derive(Debug, Clone)]
 pub struct CommitCheckpoint {
     pub sequence: EventSequence,

@@ -99,58 +99,24 @@ pub const DEFAULT_PARTITION_PREMAKE: u64 = 5;
 pub const DEFAULT_PARTITION_MAINTAINER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(3600);
 
-/// How many groups the commit-lane fold emits between sparse checkpoints.
-///
-/// The commit order is computed, not stored, so a checkpoint is only a
-/// shortcut: it bounds how far a restarting process re-folds before it is
-/// live, and how far a lagging subscriber's backfill re-folds below the
-/// position it actually wants (the overshoot is read but never sent). The
-/// cost is one small row per interval per process — against one locked
-/// INSERT per source transaction under the superseded materialised log.
+/// How many groups the commit-lane fold emits between sparse checkpoints. The
+/// order is computed, so a checkpoint only bounds how far a restart or a
+/// lagging subscriber's backfill has to re-fold.
 pub const DEFAULT_COMMIT_CHECKPOINT_EVERY: usize = 1_000;
 
-/// Longest the commit-lane fold goes without a checkpoint while it is
-/// emitting, regardless of group count; see
-/// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Bounds the re-fold on a quiet
-/// outbox, where the group count alone would leave the last checkpoint far
-/// behind.
+/// Longest the commit-lane fold goes without a checkpoint while emitting,
+/// regardless of group count; see [`DEFAULT_COMMIT_CHECKPOINT_EVERY`].
 pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
 
-/// Whether this outbox runs the commit-ordered lane.
-///
-/// The lane costs one commit-log append per source transaction plus a fold
-/// over every event, in every process that runs the outbox, so it is opt-in:
-/// an embedder that never consumes commit order (cala's embedded outbox, say)
-/// should not pay for it.
-///
-/// # Enabling later is safe, and costs only time
-///
-/// Placement is a pure function of the persisted table — a group is placed at
-/// first sight of its lowest member, over a contiguous gap-filled stream — so
-/// the commit log a sequencer computes does not depend on *when* it ran. A
-/// process that enables the lane in year two resumes from
-/// `persistent_outbox_commit_log_state.logged_through_sequence` (`0` on a
-/// database where the lane never ran) and sequences the full history into the
-/// same order a sequencer running from day one would have produced, page by
-/// page, resumable at any point. A `CommitOrder` subscriber registered
-/// alongside simply trails the fold.
-///
-/// The two things that make that possible stay on regardless of this setting:
-/// the `commit_group` stamped on every event, and the commit log's partitions
-/// kept in lock-step by the maintainer.
-///
-/// obix ships no retention. If an operator has dropped event partitions, a
-/// from-zero enable gap-fills the dropped range with placeholders; seed the
-/// floor once before enabling on such a database —
-/// `UPDATE persistent_outbox_commit_log_state SET logged_through_sequence =
-/// <first retained sequence − 1> WHERE singleton AND logged_through_sequence = 0`.
+/// Whether this outbox runs the commit-ordered lane. Opt-in: the fold passes
+/// over every event, in every process that runs the outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitLane {
-    /// No sequencer runs in this process for this outbox. Registering a
-    /// [`CommitOrder`](crate::CommitOrder) subscriber or calling
-    /// `listen_commit_ordered` fails with [`CommitLaneDisabled`].
+    /// No sequencer runs here: registering a
+    /// [`CommitOrder`](crate::CommitOrder) subscriber fails with
+    /// [`CommitLaneDisabled`].
     #[default]
     Disabled,
     /// This process sequences the commit lane and can host `CommitOrder`
@@ -159,10 +125,6 @@ pub enum CommitLane {
 }
 
 /// Why a lane's frontier could not be read.
-///
-/// Two lanes, two sources: the insert lane reads the sequence generator and
-/// can fail like any query; the commit lane reads this process's fold head,
-/// which does not exist when the lane is off.
 #[derive(Debug, thiserror::Error)]
 pub enum FrontierError {
     #[error("FrontierError - Sqlx: {0}")]
@@ -171,11 +133,8 @@ pub enum FrontierError {
     CommitLaneDisabled(#[from] CommitLaneDisabled),
 }
 
-/// The commit lane is off for this outbox.
-///
-/// Raised at registration — before any job is spawned — and by
-/// `listen_commit_ordered`, so a consumer that needs the lane fails loudly at
-/// startup rather than stalling on a stream that will never advance.
+/// The commit lane is off for this outbox. Raised at registration, before any
+/// job is spawned, so a consumer that needs the lane fails at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "the commit lane is disabled on this outbox — set MailboxConfig::commit_lane = CommitLane::Enabled"

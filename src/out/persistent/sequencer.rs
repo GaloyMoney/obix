@@ -21,13 +21,8 @@ use crate::{
 /// How long a failed group fetch waits before retrying the same group.
 const FETCH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How far this process's sequencer has folded the insert-ordered stream, and
-/// how many rows it has emitted on the commit lane.
-///
-/// Both are in-process values. The commit lane is not materialised — every
-/// `Enabled` process computes the same numbering from the same table — so
-/// "the head" is a per-process fact about how far *this* fold has got, not a
-/// cluster-wide one.
+/// How far this process's fold has got. Both values are in-process: the lane is
+/// computed, so every `Enabled` process derives the same numbering on its own.
 #[derive(Clone)]
 pub(crate) struct SequencerPositions {
     fold_position: Arc<AtomicU64>,
@@ -35,9 +30,7 @@ pub(crate) struct SequencerPositions {
 }
 
 impl SequencerPositions {
-    /// The highest insert sequence this process's fold has passed. Every
-    /// sequence at or below it has been emitted on the commit lane (with its
-    /// whole group) or skipped.
+    /// The highest insert sequence this fold has passed: emitted, or skipped.
     pub(crate) fn fold_position(&self) -> EventSequence {
         EventSequence::from(self.fold_position.load(Ordering::Acquire))
     }
@@ -62,9 +55,6 @@ where
     _task: OwnedTaskHandle,
 }
 
-/// The commit lane's internal transport: a [`PersistentDelivery`] positioned
-/// at the slot the fold emitted it in, and flagged when it closes its source
-/// transaction.
 type CommitTransport<P> = Transport<CommitOrder, P>;
 
 impl<P> std::fmt::Debug for SequencerHandle<P>
@@ -86,9 +76,6 @@ where
         self.positions.clone()
     }
 
-    /// What a commit-ordered listener consumes: the same
-    /// [`LaneHandle`](crate::out::lane::LaneHandle) shape the insert cache
-    /// hands out, over this lane's positions.
     pub(crate) fn handle(&self) -> LaneHandle<CommitOrder, P> {
         LaneHandle::new(
             self.commit_head.clone(),
@@ -104,12 +91,9 @@ enum Sink<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    /// The live lane: broadcast to every listener.
     Live(broadcast::Sender<CommitTransport<P>>),
-    /// One backfill request: only positions above what the consumer already
-    /// has, and only until the live fold's head is reached — from there the
-    /// consumer's listener takes over from the broadcast, the same hand-off
-    /// the insert lane's backfill makes.
+    /// One backfill request: positions in `(after, until]`, then the
+    /// consumer's listener takes over from the broadcast.
     Backfill {
         sender: mpsc::Sender<CommitTransport<P>>,
         after: CommitSequence,
@@ -137,7 +121,6 @@ where
         }
     }
 
-    /// Whether this fold has produced everything it was asked for.
     fn finished(&self, head: CommitSequence) -> bool {
         match self {
             Self::Live(_) => false,
@@ -146,35 +129,23 @@ where
     }
 }
 
-/// Folds the insert-ordered stream into commit order.
-///
-/// The order is **computed, never materialised**: a group is emitted whole at
-/// first sight of its lowest member over the contiguous, gap-filled insert
-/// stream, its members in `sequence` order, and a position is a running count
-/// of rows emitted. That makes the numbering a pure function of the events
-/// table — every process derives the same `CommitSequence`s independently,
-/// with no lock, no log and no coordination.
-///
-/// What is persisted is a *sparse checkpoint* of the fold
-/// ([`CommitCheckpoint`]): enough to resume mid-stream without replaying
-/// history, written every `checkpoint_every` groups or `checkpoint_interval`,
-/// never per group.
+/// Folds the insert-ordered stream into commit order: a group is emitted whole
+/// at first sight of its lowest member, its members in `sequence` order, and a
+/// position is a running count of rows emitted. Pure function of the events
+/// table; only sparse [`CommitCheckpoint`]s of the fold are persisted.
 struct Sequencer<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    /// Rows emitted so far — the next group's members are numbered from
-    /// `head + 1`.
+    /// Rows emitted so far — the next group is numbered from `head + 1`.
     head: CommitSequence,
     /// Published copy of `head`, for the fence and for listeners.
     commit_head: Option<Arc<AtomicU64>>,
     fold_position: Option<Arc<AtomicU64>>,
     sink: Sink<P>,
-    /// Groups already emitted whose later members the fold has not reached
-    /// yet, mapped to their highest member. Dropped as the stream passes
-    /// them. Seeded from a checkpoint's `open_groups`, which is what stops a
-    /// resumed fold re-emitting a group that straddles its resume point.
+    /// Emitted groups with members the fold has not reached yet, by highest
+    /// member. Seeded from a checkpoint so a resumed fold cannot re-emit them.
     seen: HashMap<CommitGroupId, EventSequence>,
     checkpoint_every: usize,
     checkpoint_interval: std::time::Duration,
@@ -188,15 +159,8 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
 {
-    /// Fold a drained batch of insert-lane deliveries.
-    ///
-    /// The members of every group first sighted in the batch are fetched in
-    /// ONE statement, then the batch is placed in order from that map. The
-    /// fetch is per page; emission, the head advance and the published fold
-    /// position all stay per delivery and in order, so the fence invariant
-    /// below is unaffected by the batching.
-    ///
-    /// `false` means the fold should stop (the sink is done or gone).
+    /// Fold a drained batch of insert-lane deliveries, fetching every
+    /// first-sighted group's members in one statement. `false` means stop.
     async fn fold_batch(&mut self, batch: Vec<Transport<InsertOrder, P>>) -> bool {
         let mut members = self.fetch_members(&batch).await;
         for delivery in batch {
@@ -204,16 +168,11 @@ where
             if !self.place(delivery, &mut members).await {
                 return false;
             }
-            // INVARIANT: published only once this delivery is fully ACCOUNTED
-            // FOR — its group emitted and the head advanced, or provably
-            // never going to be. The commit-lane fence reads this and then
-            // reads the head, so publishing before the group is emitted
-            // leaves a window in which the fence sees the fold past the
-            // insert frontier while the head still excludes that group, and
-            // returns with the frontier event undelivered.
-            //
-            // It must still advance on every early return in `place`, or the
-            // fence stalls on an aborted tail instead.
+            // INVARIANT: publish only after this delivery is accounted for —
+            // its group emitted and the head advanced, or provably never. The
+            // fence reads this then the head, so publishing earlier lets it
+            // return with the frontier event still undelivered. It must also
+            // advance on every early return in `place`, or the fence stalls.
             if let Some(position) = &self.fold_position {
                 position.store(u64::from(sequence), Ordering::Release);
             }
@@ -224,11 +183,8 @@ where
         true
     }
 
-    /// One statement for every group first sighted in `batch`.
-    ///
-    /// The floor is the lowest first-sight sequence in the batch: a group's
-    /// members never sit below its own MIN, and every MIN here is in the
-    /// batch, so the bound prunes partitions without losing a row.
+    /// One statement for every group first sighted in `batch`. The floor is the
+    /// lowest first sight: no group's members sit below their own MIN.
     async fn fetch_members(
         &self,
         batch: &[Transport<InsertOrder, P>],
@@ -250,9 +206,8 @@ where
             return HashMap::new();
         };
 
-        // Retried rather than skipped: nothing has been emitted for these
-        // groups, so a retry re-reads the same rows and produces the same
-        // numbering. Giving up would silently drop them from the lane.
+        // Retried, never skipped: giving up would drop these groups from the
+        // lane, and a retry re-reads the same rows for the same numbering.
         loop {
             match Tables::load_group_members::<P>(&self.pool, &wanted, floor).await {
                 Ok(groups) => return groups.into_iter().collect(),
@@ -264,8 +219,7 @@ where
         }
     }
 
-    /// Emit one delivery's group if this is its first sight, or establish
-    /// that it never needs emitting.
+    /// Emit one delivery's group on first sight, or establish it needs none.
     async fn place(
         &mut self,
         delivery: Transport<InsertOrder, P>,
@@ -283,16 +237,10 @@ where
             return true;
         }
 
-        // INVARIANT: `place` only reaches here on `group`'s first sight, and
-        // every member of a commit group is inserted in the same transaction
-        // as the one that produced `delivery` — so by the time `delivery`
-        // itself is visible (committed, delivered on the insert lane), every
-        // other member is already committed too. An empty result — from the
-        // batch prefetch or the single-group fallback — can therefore never
-        // be `group`'s true membership; it is a transient visibility miss,
-        // and is retried exactly like a fetch error rather than accepted,
-        // which would silently and permanently drop the group from this
-        // process's commit lane.
+        // INVARIANT: a group's members all commit in one transaction, so once
+        // any one is delivered the rest are committed too. An empty result is
+        // therefore a transient visibility miss, never the true membership —
+        // retried like a fetch error, since accepting it would drop the group.
         let rows = match members.remove(&group).filter(|rows| !rows.is_empty()) {
             Some(rows) => rows,
             None => self.fetch_group(group, sequence).await,
@@ -331,10 +279,7 @@ where
         true
     }
 
-    /// Fetch one group's membership, retrying until it is non-empty: an
-    /// `Ok` result missing `group` entirely is treated the same as a fetch
-    /// error (see the INVARIANT at the call site), not returned as "no
-    /// members".
+    /// Fetch one group's membership, retrying until it is non-empty.
     async fn fetch_group(
         &self,
         group: CommitGroupId,
@@ -359,12 +304,8 @@ where
         }
     }
 
-    /// Record where the fold is, without blocking it.
-    ///
-    /// Captured at `sequence` *after* placing it, which is the same point the
-    /// fold position is published — so the triple is consistent by
-    /// construction. Fire-and-forget: the content is a pure function of the
-    /// table, so a lost write costs only a longer resume next time.
+    /// Record where the fold is. Fire-and-forget: a lost write only costs a
+    /// longer resume next time.
     fn checkpoint(&mut self, sequence: EventSequence) {
         self.groups_since_checkpoint = 0;
         self.last_checkpoint = tokio::time::Instant::now();
@@ -385,8 +326,6 @@ where
     }
 }
 
-/// What a backfill needs to run a private fold: the same inputs the live one
-/// was spawned with.
 struct BackfillSource<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -413,15 +352,8 @@ where
     }
 }
 
-/// Serve one commit-lane backfill request by **re-folding** from the nearest
-/// checkpoint.
-///
-/// There is no log to page: the consumer's cursor names a position, the
-/// nearest checkpoint at or below it names where the fold that produced that
-/// position was, and replaying from there reproduces it exactly (the
-/// numbering is a pure function of the table). Overshoot — rows re-folded but
-/// below the consumer's cursor, so never sent — is bounded by the checkpoint
-/// cadence.
+/// Serve one commit-lane backfill by re-folding from the nearest checkpoint at
+/// or below `after`, which reproduces the same numbering.
 async fn serve_commit_backfill<P, Tables>(
     source: BackfillSource<P, Tables>,
     after: CommitSequence,
@@ -504,14 +436,8 @@ where
     Some(batch)
 }
 
-/// Start this process's sequencer. Called from `Outbox::init` when the commit
-/// lane is [`Enabled`](crate::CommitLane::Enabled).
-///
-/// The fold resumes from the newest checkpoint, or from the beginning of the
-/// stream when there is none — so enabling the lane late is the same code
-/// path as a restart after downtime, only longer. The numbering is a pure
-/// function of the persisted table, so what it produces is what a sequencer
-/// running from day one would have produced.
+/// Start this process's sequencer, resuming from the newest checkpoint or from
+/// the beginning of the stream when there is none.
 pub(crate) async fn spawn<P, Tables>(
     pool: &sqlx::PgPool,
     cache: Arc<PersistentOutboxEventCache<P, Tables>>,
@@ -576,10 +502,9 @@ where
                 request = backfill_rx.recv() => {
                     match request {
                         Some((after, sender)) => {
-                            // Sampled here, not inside the task: the hand-off
-                            // point is the head as of the request, so a fold
-                            // that runs on cannot keep the backfill running
-                            // behind it forever.
+                            // Sampled here, not in the task: the hand-off point
+                            // is the head as of the request, so an advancing
+                            // fold cannot outrun the backfill forever.
                             let until = CommitSequence::from(
                                 backfill_head.load(Ordering::Acquire),
                             );
@@ -624,9 +549,6 @@ where
     })
 }
 
-/// Where the fold is resuming from and how far it has to go — so that
-/// enabling the commit lane on a database with history is visible as a
-/// backfill in the logs rather than as unexplained load.
 #[tracing::instrument(
     name = "obix.sequencer.started",
     level = "info",
@@ -635,7 +557,6 @@ where
 )]
 fn record_started(from_sequence: u64, insert_frontier: u64, behind: u64) {}
 
-/// Which checkpoint a backfill re-folds from — the assertion test 22 reads.
 #[tracing::instrument(
     name = "obix.sequencer.backfill_started",
     level = "info",
@@ -652,11 +573,7 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
 )]
 fn record_fetch_failed(error: &sqlx::Error, floor: u64) {}
 
-/// A single-group fetch came back `Ok` but without `group` at all — per the
-/// INVARIANT in `Sequencer::place`, this can only be a transient visibility
-/// miss (every member is already committed by the time the fold sees any
-/// one of them), never `group`'s true membership. Logged at `warn` because
-/// the caller retries silently otherwise, and this should never fire.
+/// Should never fire: see the INVARIANT in `Sequencer::place`.
 #[tracing::instrument(
     name = "obix.sequencer.empty_group_fetch",
     level = "warn",

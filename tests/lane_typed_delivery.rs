@@ -1,18 +1,4 @@
 //! Lane-typed delivery: one handler API for both lanes.
-//!
-//! A position is a property of a delivery on a lane, so every delivered thing
-//! — event, undecodable stand-in, batch flush, checkpoint — is typed by its
-//! lane and reports that lane's position. These tests pin the positions
-//! themselves (1, 2, 3, 4, 5, 8, 11), the exact flush watermark (1, 3), the
-//! corrected commit-lane fence (6, 7), lane inference and refusal (9), and
-//! the commit lane's opt-in switch with its late-enable guarantee (12, 13,
-//! 14).
-//!
-//! Tests 15-18 cover the same principle carried below the handler, where one
-//! handle, one transport and one listener now serve both lanes: lag recovery
-//! (15), that the shared listener really is one type (16), that the flush
-//! boundary is total across lanes (17), and that a flush failure reports its
-//! range on the subscription's own lane (18).
 
 mod helpers;
 
@@ -35,21 +21,16 @@ use tokio::sync::{Mutex, Notify};
 use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
 
 const JOB_TYPE: &str = "test-lane-typed-delivery";
-/// A second job type, for the tests that put both lanes' handles on one
-/// outbox: the two cursors count different things, so they cannot share a
-/// subscription.
+/// The two lanes' cursors count different things, so handles for both on one
+/// outbox cannot share a subscription.
 const INSERT_JOB_TYPE: &str = "test-lane-typed-delivery-insert";
 
-/// Short enough that a skip-only handler's lazy checkpoint lands inside a
-/// test's patience, rather than at the 5s production default.
 const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
     Ping(u64),
 }
-
-// === Harness ===
 
 async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
     let job_config = job::JobSvcConfig::builder()
@@ -66,8 +47,6 @@ fn config(commit_lane: CommitLane) -> MailboxConfig {
         .expect("Couldn't build MailboxConfig")
 }
 
-/// A checkpoint after every group, so a test asserting on resume points needs
-/// no timing slack.
 fn config_checkpointing_every_group() -> MailboxConfig {
     MailboxConfig::builder()
         .commit_lane(CommitLane::Enabled)
@@ -82,7 +61,6 @@ async fn wipe(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wipe, then open an outbox with the lane in the given state.
 async fn init_outbox(
     pool: &sqlx::PgPool,
     commit_lane: CommitLane,
@@ -92,7 +70,7 @@ async fn init_outbox(
 }
 
 /// One seeded event: its insert sequence, the transaction (group) it belongs
-/// to, and the payload exactly as stored.
+/// to, and its stored payload.
 struct Seeded {
     sequence: i64,
     xid: i64,
@@ -107,7 +85,6 @@ fn ev(sequence: i64, xid: i64, payload: u64) -> Seeded {
     }
 }
 
-/// A row whose stored payload cannot decode into [`TestEvent`].
 fn undecodable(sequence: i64, xid: i64) -> Seeded {
     Seeded {
         sequence,
@@ -116,17 +93,8 @@ fn undecodable(sequence: i64, xid: i64) -> Seeded {
     }
 }
 
-/// Write events at exact insert sequences and groups, then advance the
-/// generator past them.
-///
-/// Direct SQL rather than `publish`: insert sequences are allocated in
-/// `PersistEvents::pre_commit`, so the write path cannot produce a chosen
-/// interleaving of two transactions' sequences — a suite whose transactions
-/// commit in the order they opened cannot tell the two lanes apart at all.
-/// The `setval` is load-bearing for anything fencing on `await_caught_up`:
-/// the frontier is the generator's `last_value`, which explicit-sequence
-/// inserts do not move, so without it the frontier reads 0 and every fence
-/// passes trivially.
+/// Write events at chosen insert sequences and groups, an interleaving the
+/// write path cannot produce; the `setval` is what moves the insert frontier.
 async fn seed(pool: &sqlx::PgPool, rows: &[Seeded]) -> anyhow::Result<()> {
     for row in rows {
         sqlx::query(
@@ -149,10 +117,6 @@ async fn seed(pool: &sqlx::PgPool, rows: &[Seeded]) -> anyhow::Result<()> {
 
 /// How many sparse checkpoints the commit-lane fold has written, and the
 /// newest one's `(sequence, commit_seq)`.
-///
-/// The lane is computed rather than materialised, so this is the only thing
-/// it persists — there is no head to read back, and a test that wants the
-/// head asks the subscription for it.
 async fn checkpoint_state(pool: &sqlx::PgPool) -> anyhow::Result<(i64, Option<(i64, i64)>)> {
     let count: (i64,) = sqlx::query_as("SELECT count(*) FROM persistent_outbox_commit_checkpoints")
         .fetch_one(pool)
@@ -180,8 +144,6 @@ async fn publish_group(
     Ok(())
 }
 
-/// Poll until `f` holds, without sleeping on a fixed budget: the condition
-/// itself is the synchronisation.
 async fn until<F>(mut f: F, what: &str) -> anyhow::Result<()>
 where
     F: AsyncFnMut() -> bool,
@@ -196,24 +158,11 @@ where
     anyhow::bail!("timed out waiting for {what}")
 }
 
-// === 1. Insert-lane positions and the exact flush watermark ===
-
-/// Collects the first payload, skips the rest, and records what every flush
-/// reported against what the handler had actually last handled.
-///
-/// `gate` blocks the very first invocation, which is what makes the batch
-/// deterministic: the test publishes the remaining events while the runner is
-/// parked inside this handler, so they are already broadcast (and buffered)
-/// by the time the runner asks for more — the `now_or_never` path that keeps
-/// a batch open then cannot miss them.
 struct InsertPositionRecorder {
     gate: Arc<Notify>,
     gated: Arc<AtomicBool>,
-    /// `(position(), sequence)` per delivery — equal on this lane, always.
     seen: Arc<Mutex<Vec<(EventSequence, EventSequence)>>>,
-    /// The last sequence the handler fully handled, skips included.
     last_handled: Arc<Mutex<Option<EventSequence>>>,
-    /// `(FlushOp::position(), last_handled at that moment, items)`.
     flushes: Arc<Mutex<Vec<(EventSequence, Option<EventSequence>, Vec<u64>)>>>,
 }
 
@@ -253,9 +202,6 @@ impl SingletonSubscriber<TestEvent> for InsertPositionRecorder {
     }
 }
 
-/// Test 1 — on the insert lane a delivery's position IS its sequence, and a
-/// flush lands at the last *fully handled* event, not at the highest event it
-/// happened to collect.
 #[tokio::test]
 #[file_serial]
 async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
@@ -283,15 +229,10 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    // Ping(1) is collected; Ping(2) and Ping(3) are skipped after it, so the
-    // batch's last fully handled event is 3 while its only collected row is
-    // 1. Published while the handler is parked on the first delivery, so all
-    // three are buffered before the runner resumes.
     publish_group(&outbox, [1]).await?;
     publish_group(&outbox, [2, 3]).await?;
-    // Released only after every event is broadcast, so the runner's
-    // `now_or_never` poll — the one that keeps a batch open — cannot miss
-    // them and split the batch on arrival timing.
+    // Released only once all three are broadcast, so the batch cannot split on
+    // arrival timing.
     gate.notify_one();
 
     until(
@@ -334,8 +275,6 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 2. Commit-lane positions are dense and groups are contiguous ===
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Recorded {
     payload: u64,
@@ -366,10 +305,8 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for CommitPositionRecorder {
     }
 }
 
-/// The three-group round-robin interleaving: A at insert sequences 1/4/7, B
-/// at 2/5/8, C at 3/6/9. Commit order places each group at first sight of its
-/// lowest member and pulls it contiguous, so the lane reads A,A,A,B,B,B,C,C,C
-/// while insert order reads A,B,C,A,B,C,A,B,C.
+/// Three groups round-robin over insert sequences: A at 1/4/7, B at 2/5/8, C
+/// at 3/6/9 — so insert order reads A,B,C,A,B,C,A,B,C.
 fn round_robin_groups() -> Vec<Seeded> {
     let mut rows = Vec::new();
     for (idx, payloads) in [[11u64, 12, 13], [21, 22, 23], [31, 32, 33]]
@@ -383,9 +320,6 @@ fn round_robin_groups() -> Vec<Seeded> {
     rows
 }
 
-/// Test 2 — the commit lane numbers deliveries densely from 1, a source
-/// transaction's members arrive contiguously, and exactly the last member of
-/// each is a commit boundary.
 #[tokio::test]
 #[file_serial]
 async fn commit_lane_position_is_dense_and_groups_are_contiguous() -> anyhow::Result<()> {
@@ -439,8 +373,6 @@ async fn commit_lane_position_is_dense_and_groups_are_contiguous() -> anyhow::Re
     Ok(())
 }
 
-// === 3. The commit-lane flush watermark is the boundary, not the max ===
-
 struct GroupFlusher {
     seen: Arc<Mutex<Vec<(u64, CommitSequence, bool)>>>,
     flushes: Arc<Mutex<Vec<(CommitSequence, Vec<u64>)>>>,
@@ -462,8 +394,6 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for GroupFlusher {
             .lock()
             .await
             .push((n, event.position(), event.is_commit_boundary()));
-        // The group's last member is skipped, so the batch's highest
-        // collected row is strictly below the position it lands at.
         if event.is_commit_boundary() {
             return Ok(ctx.skip());
         }
@@ -482,9 +412,6 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for GroupFlusher {
     }
 }
 
-/// Test 3 — with `max_batch_size` below the group size the runner holds the
-/// batch open to the group boundary, and the flush reports that boundary's
-/// position: the exact watermark, strictly above every row it carries.
 #[tokio::test]
 #[file_serial]
 async fn commit_lane_flush_position_is_the_boundary_not_the_max() -> anyhow::Result<()> {
@@ -492,7 +419,6 @@ async fn commit_lane_flush_position_is_the_boundary_not_the_max() -> anyhow::Res
     let mut jobs = init_jobs(&pool).await?;
 
     wipe(&pool).await?;
-    // One transaction of three events: commit positions 1, 2, 3.
     seed(&pool, &[ev(1, 9101, 11), ev(2, 9101, 12), ev(3, 9101, 13)]).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
 
@@ -541,8 +467,6 @@ async fn commit_lane_flush_position_is_the_boundary_not_the_max() -> anyhow::Res
 
     Ok(())
 }
-
-// === 4. An undecodable delivery carries its lane position ===
 
 struct UndecodableRecorder<L> {
     seen: Arc<Mutex<Vec<u64>>>,
@@ -617,19 +541,13 @@ impl SingletonSubscriber<TestEvent> for UndecodableRecorder<InsertOrder> {
     }
 }
 
-/// Test 4 — `handle_undecodable` is handed the slot the event occupies on the
-/// handler's lane, and acknowledging it advances both cursors so a restart
-/// does not redeliver it.
 #[tokio::test]
 #[file_serial]
 async fn undecodable_delivery_carries_the_lane_position() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Two interleaved groups, so the undecodable row's commit slot and its
-    // insert sequence are DIFFERENT numbers — otherwise this test cannot tell
-    // a lane position from a sequence at all. Group X holds sequences 1 and
-    // 4, group Y sequences 2 and 3, so commit order is [1, 4, 2, 3] and the
-    // undecodable row at sequence 2 occupies commit slot 3.
+    // Group X holds sequences 1 and 4, group Y 2 and 3, so commit order is
+    // [1, 4, 2, 3] and the undecodable row at sequence 2 sits in commit slot 3.
     let rows = || {
         vec![
             ev(1, 9201, 11),
@@ -744,17 +662,12 @@ async fn undecodable_delivery_carries_the_lane_position() -> anyhow::Result<()> 
     Ok(())
 }
 
-// === 5. The raw listeners put the Result on the outside, on both lanes ===
-
-/// Test 5 — `try_next()?` fails loudly on an undecodable payload identically
-/// on both lanes, and the error carries the position it occupied.
 #[tokio::test]
 #[file_serial]
 async fn raw_listener_try_next_fails_with_position() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     wipe(&pool).await?;
-    // Interleaved again, so the undecodable row's commit slot (3) and its
-    // insert sequence (2) are different numbers.
+    // The undecodable row's commit slot (3) and insert sequence (2) differ.
     seed(
         &pool,
         &[
@@ -804,15 +717,8 @@ async fn raw_listener_try_next_fails_with_position() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 6. The commit-lane fence does not return early ===
-
-/// Commits the `commit_at`'th event in its own op — which persists the
-/// checkpoint durably and immediately, the state the fence reads — then
-/// blocks on the `block_at`'th until released.
-///
-/// A handler that merely blocks on its first delivery never persists a
-/// checkpoint at all, which leaves the stored state lane-less and makes the
-/// fence silently take the insert path.
+/// The `commit_at`'th delivery commits in its own op: without a durably
+/// persisted commit checkpoint the fence silently takes the insert path.
 struct CommitThenBlock {
     commit_at: usize,
     block_at: usize,
@@ -847,14 +753,8 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for CommitThenBlock {
     }
 }
 
-/// Test 6 — the fence must not return early on the commit lane.
-///
-/// Group A occupies insert sequences 1 and 4, group B sequences 2 and 3, so
-/// commit order is `[1, 4, 2, 3]`. After the subscriber handles the first two
-/// deliveries its INSERT cursor is already 4 — the insert frontier — while
-/// its COMMIT cursor is only 2 of 4. A fence comparing the insert cursor
-/// against the insert frontier therefore returns with half the stream
-/// undelivered.
+/// Group A holds insert sequences 1 and 4, group B 2 and 3: after two
+/// deliveries the insert cursor is at the frontier, the commit cursor 2 of 4.
 #[tokio::test]
 #[file_serial]
 async fn caught_up_fence_on_the_commit_lane_does_not_return_early() -> anyhow::Result<()> {
@@ -929,9 +829,6 @@ async fn caught_up_fence_on_the_commit_lane_does_not_return_early() -> anyhow::R
         async move { subscription.await_caught_up(Duration::from_secs(20)).await }
     });
 
-    // Must NOT return while blocked — a bounded assertion window, not a
-    // synchronisation sleep: `timeout` resolves the instant the barrier
-    // completes and otherwise expires deterministically.
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut barrier)
             .await
@@ -953,8 +850,6 @@ async fn caught_up_fence_on_the_commit_lane_does_not_return_early() -> anyhow::R
     Ok(())
 }
 
-// === 7. The fence is not wedged by an aborted tail ===
-
 struct Observer {
     received: Arc<Mutex<Vec<u64>>>,
 }
@@ -974,11 +869,6 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for Observer {
     }
 }
 
-/// Test 7 — an aborted transaction at the head must not wedge
-/// `await_caught_up`: the fence waits on the sequencer's own fold position,
-/// which advances over a placeholder, rather than on
-/// `logged_through_sequence`, which only moves when a real group is appended
-/// and therefore never reaches past an aborted tail.
 #[tokio::test]
 #[file_serial]
 async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()> {
@@ -1015,9 +905,8 @@ async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()
         "the two real events delivered",
     )
     .await?;
-    // The fence under test is the COMMIT-lane one, which is only taken once a
-    // commit cursor has been checkpointed. Without this the test can race onto
-    // the insert-lane fence and pass while proving nothing.
+    // Without this the test can race onto the insert-lane fence and prove
+    // nothing: that one is taken until a commit cursor is checkpointed.
     until(
         async || {
             subscription
@@ -1030,10 +919,8 @@ async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()
     )
     .await?;
 
-    // A writer that allocates the highest sequence and aborts. Raw SQL,
-    // because `publish_persisted_in_op` only registers the event: the INSERT
-    // (and with it the `nextval`) happens in the op's pre-commit, so an op
-    // that is dropped never burns a sequence at all.
+    // Raw SQL: the INSERT happens in the op's pre-commit, so a dropped op
+    // never burns a sequence at all.
     let before_abort = outbox.highest_known_persistent_sequence().await?;
     let mut aborted = pool.begin().await?;
     sqlx::query("INSERT INTO persistent_outbox_events (payload) VALUES ($1::jsonb)")
@@ -1059,8 +946,6 @@ async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()
     Ok(())
 }
 
-// === 8. The snapshot reports lane-typed positions ===
-
 struct Skipper;
 impl SingletonSubscriber<TestEvent, CommitOrder> for Skipper {
     type Batch = ();
@@ -1070,18 +955,14 @@ impl SingletonSubscriber<TestEvent> for InsertSkipper {
     type Batch = ();
 }
 
-/// Test 8 — `load()` on a `CommitOrder` subscription reports
-/// `CommitSequence`s, with the frontier read from the commit log's own head;
-/// the insert-lane handle reports `EventSequence`s against the generator.
 #[tokio::test]
 #[file_serial]
 async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
 
-    // Seeded at sequences 11-13, not 1-3: the two lanes' frontiers must be
-    // DIFFERENT numbers (insert 13, commit 3), or this test cannot tell which
-    // one the commit-lane snapshot read.
+    // Seeded at 11-13 so the two lanes' frontiers are different numbers
+    // (insert 13, commit 3).
     wipe(&pool).await?;
     seed(&pool, &[ev(11, 9401, 1), ev(12, 9402, 2), ev(13, 9403, 3)]).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
@@ -1097,9 +978,7 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    // Against the position the three groups must reach — `is_caught_up()`
-    // alone is trivially true before anything is sequenced, so waiting on it
-    // would let this test read an empty lane and assert nothing.
+    // `is_caught_up()` alone is trivially true before anything is sequenced.
     let expected = CommitSequence::from(3u64);
     until(
         async || {
@@ -1113,8 +992,6 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
     )
     .await?;
 
-    // The lane's head is an in-process value now, so the independent reading
-    // is the outbox's own — not a table.
     assert_eq!(
         outbox.frontier::<CommitOrder>().await?,
         expected,
@@ -1142,7 +1019,6 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
         "the dynamic read-out names the lane",
     );
 
-    // The insert-lane handle over the same stream counts the other thing.
     let mut insert_jobs = init_jobs(&pool).await?;
     wipeout_outbox_job_tables(&pool, INSERT_JOB_TYPE).await?;
     let insert = outbox
@@ -1165,13 +1041,6 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 9. Lane inference, and the refusal to switch ===
-
-/// Test 9 — a handler with a single `SingletonSubscriber` impl registers with
-/// no turbofish (every commit-lane registration in this file is that proof),
-/// and a handle typed for the other lane than the one the subscription is
-/// checkpointed on refuses to read rather than reporting a number that counts
-/// something else.
 #[tokio::test]
 #[file_serial]
 async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<()> {
@@ -1203,8 +1072,6 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
     )
     .await?;
 
-    // The same job type, now claimed by a commit-lane handler: `decide_lane`'s
-    // refusal, surfaced on the typed handle.
     let mut other_jobs = init_jobs(&pool).await?;
     let commit = outbox
         .register_singleton_subscriber(
@@ -1227,10 +1094,6 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
     Ok(())
 }
 
-// === 11. await_position on each lane ===
-
-/// Test 11 — `await_position` takes the lane's own position type, and its
-/// timeout names the lane on both sides.
 #[tokio::test]
 #[file_serial]
 async fn await_position_on_each_lane() -> anyhow::Result<()> {
@@ -1287,11 +1150,6 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 12. The lane is off by default, and says so ===
-
-/// Test 12 — with the lane disabled (the default) nothing folds, nothing is
-/// appended, and a commit-lane consumer is refused at startup rather than
-/// stalling on a stream that would never advance.
 #[tokio::test]
 #[file_serial]
 async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<()> {
@@ -1374,26 +1232,17 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
     Ok(())
 }
 
-// === 13. Enabling the lane later sequences the full history ===
-
-/// Test 13 — a database whose commit lane has never run is sequenced from the
-/// beginning when the lane is enabled, into the same order a sequencer
-/// running from day one would have produced: placement is a pure function of
-/// the persisted table, not of when the fold happened to run.
 #[tokio::test]
 #[file_serial]
 async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() -> anyhow::Result<()>
 {
     let pool = init_pool().await?;
 
-    // Phase 1 — the lane is off. The write path still stamps `commit_group`,
-    // which is what makes a later enable possible.
+    // Phase 1 — lane off; the write path still stamps `commit_group`.
     {
         let outbox = init_outbox(&pool, CommitLane::Disabled).await?;
         publish_group(&outbox, [1, 2]).await?;
     }
-    // …plus three groups interleaved in insert order, which the write path
-    // cannot produce on its own.
     seed(
         &pool,
         &[
@@ -1413,8 +1262,8 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
          test is merely the always-on case again",
     );
 
-    // Phase 2 — enable it. With no checkpoint to seed from, the fold starts
-    // at the beginning of the stream, so the whole history is emitted.
+    // Phase 2 — enable it: with no checkpoint to seed from, the fold starts at
+    // the beginning of the stream.
     let mut jobs = init_jobs(&pool).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
     let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1446,8 +1295,6 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
         (1..=8).collect::<Vec<u64>>(),
         "the replayed log is dense from 1",
     );
-    // First sight by group MIN: the published pair at sequences 1-2, then the
-    // seeded groups in the order their lowest members appear (3, 4, 5).
     assert_eq!(
         history.iter().map(|r| r.payload).collect::<Vec<_>>(),
         vec![1, 2, 11, 12, 21, 22, 31, 32],
@@ -1459,7 +1306,6 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
         vec![false, true, false, true, false, true, false, true],
     );
 
-    // And the lane continues live from where the backfill left off.
     publish_group(&outbox, [41, 42]).await?;
     until(
         async || recorded.lock().await.len() >= 10,
@@ -1479,8 +1325,6 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
     Ok(())
 }
 
-// === 14. Toggling off and on resumes from stored state ===
-
 struct Consumer {
     received: Arc<Mutex<Vec<u64>>>,
 }
@@ -1496,28 +1340,20 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for Consumer {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.received.lock().await.push(*n);
         }
-        // Its own op per event, so the checkpoint is durable immediately —
-        // what a restart must resume from.
+        // Its own op per event, so the checkpoint is durable immediately.
         Ok(ctx.consume().await?.commit())
     }
 }
 
-/// Test 14 — turning the lane off and on again resumes the fold and the
-/// subscriber from their stored cursors: the events written while it was off
-/// are sequenced on re-enable, continuing the log, and nothing already
-/// delivered comes back.
 #[tokio::test]
 #[file_serial]
 async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Phase 1 — lane on: three single-event groups, delivered and durably
-    // checkpointed at commit position 3.
+    // Phase 1 — lane on: three groups, checkpointed at commit position 3.
     {
         let mut jobs = init_jobs(&pool).await?;
         wipe(&pool).await?;
-        // A checkpoint per group, so phase 3's fold has one to resume from
-        // without waiting on the cadence.
         let outbox =
             Outbox::<TestEvent, TestTables>::init(&pool, config_checkpointing_every_group())
                 .await?;
@@ -1565,8 +1401,7 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
          phase 1 left it",
     );
 
-    // Phase 3 — lane on again: the fold resumes from its stored cursor and
-    // the subscriber from its own.
+    // Phase 3 — lane on again.
     let mut jobs = init_jobs(&pool).await?;
     let outbox = Outbox::<TestEvent, TestTables>::init(&pool, config(CommitLane::Enabled)).await?;
     let received = Arc::new(Mutex::new(Vec::new()));
@@ -1602,31 +1437,13 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
     Ok(())
 }
 
-// === 15. A lagged listener recovers from the head, not from the next event ===
-
-/// Test 15 — a listener that fell out of the broadcast window must catch up
-/// from what the source already holds, with **no further publish** to nudge
-/// it.
-///
-/// What this pins is the backfill-recovery path: disable the "behind the head
-/// ⇒ request a backfill" branch and it stalls at 0 of 20.
-///
-/// It does **not** discriminate the head refresh the unified listener gained,
-/// and the addendum's claim that it would is wrong: a lagged
-/// `BroadcastStream` yields `Lagged(n)` and then the surviving suffix, whose
-/// highest position is the head, so `latest_known` reaches the head through
-/// the broadcast anyway. The refresh remains as the commit listener always
-/// had it — it is what covers the case where the cache advanced its head but
-/// has broadcast nothing (a contiguity gap holds the broadcast back while
-/// `highest_known_sequence` moves) — but no test here separates the two, and
-/// none is claimed to.
 #[tokio::test]
 #[file_serial]
 async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     wipe(&pool).await?;
-    // A four-deep broadcast against twenty events: the listener cannot
-    // possibly stay inside the window.
+    // A four-deep broadcast against twenty events: the listener cannot stay
+    // inside the window.
     let outbox = Outbox::<TestEvent, TestTables>::init(
         &pool,
         MailboxConfig::builder()
@@ -1642,8 +1459,8 @@ async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()
         publish_group(&outbox, [n]).await?;
     }
 
-    // Nothing is published from here on: everything below must come from the
-    // backfill the listener asks for once it sees how far the head has moved.
+    // Nothing is published from here on: everything below must come from a
+    // backfill.
     let mut received = Vec::new();
     while received.len() < 20 {
         let item = tokio::time::timeout(Duration::from_secs(20), listener.try_next())
@@ -1668,10 +1485,6 @@ async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()
     Ok(())
 }
 
-// === 16. Both lanes really are one listener ===
-
-/// Test 16 — compile-time: one function generic over [`Lane`] drives either
-/// lane's listener, which is only possible because they are the same type.
 #[tokio::test]
 #[file_serial]
 async fn both_lanes_share_one_listener_state_machine() -> anyhow::Result<()> {
@@ -1705,8 +1518,6 @@ async fn both_lanes_share_one_listener_state_machine() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-// === 17. The flush boundary is total across lanes ===
 
 struct BoundaryFlusher<L> {
     flushes: Arc<Mutex<Vec<Vec<u64>>>>,
@@ -1776,15 +1587,6 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for BoundaryFlusher<CommitOrder
     }
 }
 
-/// Test 17 — "boundary" means *a flush may land here without splitting a
-/// unit*, and that is total: always true on the insert lane, which promises
-/// no atomic groups, and the group's last member on the commit lane.
-///
-/// With `max_batch_size = 1` the difference is visible in the flush record:
-/// the insert lane force-flushes after every single collect, while the commit
-/// lane holds the batch open to the group boundary and lands all three at
-/// once. Same runner, same gate, opposite outcomes — which is what makes the
-/// gate lane-agnostic rather than lane-blind.
 #[tokio::test]
 #[file_serial]
 async fn insert_lane_delivery_is_always_a_boundary() -> anyhow::Result<()> {
@@ -1854,8 +1656,6 @@ async fn insert_lane_delivery_is_always_a_boundary() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 18. A failed flush reports its range on the subscription's lane ===
-
 struct FailingFlusher<L> {
     _lane: std::marker::PhantomData<fn() -> L>,
 }
@@ -1910,13 +1710,8 @@ impl SingletonSubscriber<TestEvent, CommitOrder> for FailingFlusher<CommitOrder>
     }
 }
 
-/// Test 18 — `FlushError` names the range it covers, and that range is in the
-/// subscription's own lane's numbering. Reporting insert sequences to a
-/// commit-lane handler — which is what it did before — attributes the failure
-/// to positions the handler never saw.
-///
-/// The error surfaces through the job's `last_error`, which is
-/// `FlushError`'s `Display`, i.e. its `after`/`through` fields rendered.
+/// The error surfaces through the job's `last_error`, which renders
+/// `FlushError`'s `after`/`through` fields.
 #[tokio::test]
 #[file_serial]
 async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
@@ -1959,8 +1754,8 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
     drop(jobs);
     drop(outbox);
 
-    // Commit lane, over an interleaving where the two numberings differ:
-    // group X at sequences 1 and 4, group Y at 2 and 3.
+    // Commit lane, over an interleaving where the two numberings differ: group
+    // X at sequences 1 and 4, group Y at 2 and 3.
     let mut jobs = init_jobs(&pool).await?;
     wipe(&pool).await?;
     seed(
@@ -2007,26 +1802,14 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 19. Positions are the first-sight numbering, computed not stored ===
-
-/// Test 19 (rev 3) — the position a delivery carries is exactly what I9
-/// says: groups placed at first sight of their lowest member, members in
-/// `sequence` order, positions a running count of rows emitted.
-///
-/// The expectation is computed here from the seeded layout rather than read
-/// back from anything the implementation wrote, so this pins the *numbering
-/// rule* — and, because these are the values the superseded commit log would
-/// have held, it is also the evidence that removing the log changed no
-/// consumer-visible number.
 #[tokio::test]
 #[file_serial]
 async fn positions_equal_the_first_sight_numbering() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
 
-    // Five groups, interleaved, including a straddler (group 8005 is first
-    // sighted at 3 and has a member at 14, after three later groups have
-    // been emitted whole).
+    // Five interleaved groups, including a straddler: 8005 is first sighted at
+    // 3 and has a member at 14.
     let layout: Vec<(i64, i64, u64)> = vec![
         (1, 8001, 11),
         (2, 8002, 21),
@@ -2053,9 +1836,8 @@ async fn positions_equal_the_first_sight_numbering() -> anyhow::Result<()> {
     )
     .await?;
 
-    // I9, computed independently of the implementation: walk the table in
-    // insert order; at each first sight emit that group's whole membership in
-    // sequence order, numbering from the running count.
+    // The expected numbering, computed independently of the implementation: at
+    // each group's first sight emit its whole membership in sequence order.
     let mut expected: Vec<(u64, u64)> = Vec::new(); // (position, payload)
     let mut emitted: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (_, xid, _) in &layout {
@@ -2108,19 +1890,13 @@ async fn positions_equal_the_first_sight_numbering() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === 21. A restart resumes from a checkpoint without renumbering ===
-
-/// Test 21 (rev 3) — a checkpoint's `open_groups` is what stops a resumed
-/// fold re-emitting a group that straddles its resume point, and what keeps
-/// the numbering continuous across the restart.
 #[tokio::test]
 #[file_serial]
 async fn restart_resumes_from_a_checkpoint_without_renumbering() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    // Group 8101 straddles: first sighted at 1, last member at 5. With a
-    // checkpoint after every group, the fold checkpoints while 8101 is still
-    // open, so the resumed fold must learn about it from `open_groups`.
+    // Group 8101 straddles: first sighted at 1, last member at 5, so the fold
+    // checkpoints while it is still open.
     wipe(&pool).await?;
     seed(
         &pool,
@@ -2181,11 +1957,6 @@ async fn restart_resumes_from_a_checkpoint_without_renumbering() -> anyhow::Resu
     Ok(())
 }
 
-// === 23. No per-group writes ===
-
-/// Test 23 (rev 3) — the whole point of the revision: the lane writes one
-/// sparse checkpoint per cadence, not one row per group, and the log tables
-/// are gone.
 #[tokio::test]
 #[file_serial]
 async fn no_per_group_writes() -> anyhow::Result<()> {

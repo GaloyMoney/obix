@@ -67,11 +67,10 @@ where
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
-    /// This process's commit-order sequencer, and the commit lane's fan-out —
+    /// This process's commit-order sequencer, and the commit lane's fan-out.
     /// `None` when [`MailboxConfig::commit_lane`] leaves the lane
-    /// [`Disabled`](CommitLane::Disabled), which is the default. Nothing
-    /// folds, nothing is appended, and the lane's consumers are refused at
-    /// registration.
+    /// [`Disabled`](CommitLane::Disabled): nothing folds, and the lane's
+    /// consumers are refused at registration.
     sequencer: Option<Arc<persistent::SequencerHandle<P>>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
@@ -171,9 +170,8 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
-        // Shared before the sequencer starts: a commit-lane backfill re-folds
-        // the insert stream, so it needs to open listeners of its own rather
-        // than borrowing the fold's one.
+        // Shared before the sequencer starts: a commit-lane backfill re-folds the
+        // insert stream, so it opens listeners of its own.
         let persistent_cache = Arc::new(persistent_cache);
         let sequencer = match config.commit_lane {
             CommitLane::Disabled => None,
@@ -439,16 +437,9 @@ where
         &events[cursor.pos.min(events.len())..]
     }
 
-    /// Listen on lane `L` from `start_after` — the lane-generic entry point
-    /// [`listen_persisted`](Self::listen_persisted) and
-    /// [`listen_commit_ordered`](Self::listen_commit_ordered) are the named
-    /// cases of.
-    ///
-    /// # Errors
-    ///
-    /// [`CommitLaneDisabled`] when `L` is [`CommitOrder`] and this outbox
-    /// leaves the lane [`Disabled`](CommitLane::Disabled). `InsertOrder`
-    /// never errors.
+    /// Listen on lane `L` from `start_after`. Errors with
+    /// [`CommitLaneDisabled`] only when `L` is [`CommitOrder`] and this outbox
+    /// leaves the lane [`Disabled`](CommitLane::Disabled).
     pub fn listen<L>(
         &self,
         start_after: impl Into<Option<L::Position>>,
@@ -471,11 +462,8 @@ where
             .expect("the insert lane is always available")
     }
 
-    /// The frontier of lane `L`: the highest position it has handed out.
-    ///
-    /// On the insert lane that is the sequence generator's `last_value`, so
-    /// it counts sequences already assigned to transactions that have not
-    /// committed yet; on the commit lane it is the head of the commit log.
+    /// The frontier of lane `L`: the sequence generator's `last_value`, which
+    /// counts sequences assigned to uncommitted transactions, or the fold head.
     pub async fn frontier<L>(&self) -> Result<L::Position, FrontierError>
     where
         L: Lane,
@@ -487,15 +475,8 @@ where
         &self.pool
     }
 
-    /// Listen in commit order rather than insert order: a source
-    /// transaction's events arrive contiguously and are never split, and the
-    /// cursor is a dense [`CommitSequence`].
-    ///
-    /// # Errors
-    ///
-    /// [`CommitLaneDisabled`] when this outbox was initialised with
-    /// [`CommitLane::Disabled`] (the default) — there is no sequencer in this
-    /// process, so the lane would never advance.
+    /// Listen in commit order: a source transaction's events arrive contiguously
+    /// and are never split, and the cursor is a dense [`CommitSequence`].
     pub fn listen_commit_ordered(
         &self,
         start_after: impl Into<Option<CommitSequence>>,
@@ -503,14 +484,12 @@ where
         self.listen::<CommitOrder>(start_after)
     }
 
-    /// This outbox's sequencer, or the refusal to report when the lane is off.
     pub(crate) fn commit_lane(
         &self,
     ) -> Result<&persistent::SequencerHandle<P>, CommitLaneDisabled> {
         self.sequencer.as_deref().ok_or(CommitLaneDisabled)
     }
 
-    /// The insert lane's source handle — always available.
     pub(crate) fn persistent_cache_handle(&self) -> lane::LaneHandle<InsertOrder, P> {
         self.persistent_cache.handle()
     }
@@ -544,17 +523,9 @@ where
     /// twice resolves to the already-persisted job, so both calls hand back
     /// handles with the same [`job_id`](Subscription::job_id).
     ///
-    /// The lane comes from the handler's impl, and the returned
-    /// [`Subscription`] is typed by it — so the checkpoint, the frontier and
-    /// the caught-up barrier all speak that lane's positions. `L` infers from
-    /// `H` whenever the handler has a single `SingletonSubscriber` impl,
-    /// which is the normal case.
-    ///
-    /// # Errors
-    ///
-    /// [`CommitLaneDisabled`] — **before any job is spawned** — when `H` is a
-    /// [`CommitOrder`] handler and this outbox leaves the lane
-    /// [`Disabled`](CommitLane::Disabled).
+    /// The lane comes from the handler's impl and types the returned
+    /// [`Subscription`]. A [`CommitOrder`] handler is refused with
+    /// [`CommitLaneDisabled`] before any job is spawned when the lane is off.
     pub async fn register_singleton_subscriber<H, L>(
         &self,
         jobs: &mut ::job::Jobs,

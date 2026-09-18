@@ -1,8 +1,5 @@
 //! Contracts for keyed subscribers: per-entity outbox consumers with
-//! wake-on-demand — the `subscriptions` table,
-//! `SubscriptionDef`/`KeyedSubscriber`, the hold verbs, the per-key runner,
-//! the `Subscriptions` capability, and both halves of the wake plane (the
-//! waker's two paths — wake-key matches and cache-pressure catch-up).
+//! wake-on-demand.
 
 mod helpers;
 
@@ -38,8 +35,8 @@ enum TestEvent {
     Ping { owner: u64, n: u64 },
 }
 
-/// The domain key: an owning entity id. `Display`/`FromStr` round-trip it
-/// through the subscriptions table and job's string-keyed storage.
+/// The domain key: an owning entity id, round-tripped through the subscriptions
+/// table by `Display`/`FromStr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct OwnerId(u64);
 
@@ -58,24 +55,18 @@ impl std::str::FromStr for OwnerId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct InstanceConfig {
-    /// Owners this subscription records for *in addition to* its own key.
-    /// Empty for every contract where the wake key and the domain key
-    /// coincide; non-empty only for the multi-wake-key contract, which
-    /// deliberately separates the two so a subscription can watch several
-    /// partitions that are none of them its own id.
+    /// Owners this subscription records for in addition to its own key;
+    /// non-empty only where wake keys and the domain key deliberately differ.
     #[serde(default)]
     watched: Vec<u64>,
-    /// Work per event, in milliseconds. Zero everywhere except the ready-
-    /// backlog contract, which needs a handler slower than its own `linger`
-    /// so the deadline comes due *while* events are still queued — the
-    /// situation a real subscriber doing real work is in constantly.
+    /// Work per event, in milliseconds. Non-zero only where the handler must be
+    /// slower than its own `linger`.
     #[serde(default)]
     work_ms: u64,
 }
 
-/// Shared, cross-run observation point: every instantiated subscriber for a
-/// key clones this in, so the test can see what happened across the
-/// runner's many fresh `instantiate` calls (one per run/wake/retry).
+/// Shared across the runner's many fresh `instantiate` calls, so a test can see
+/// what happened over every run, wake and retry.
 #[derive(Clone, Default)]
 struct Shared {
     received: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
@@ -113,9 +104,8 @@ impl SubscriptionDef<TestEvent> for TestDef {
     }
 }
 
-/// A second subscriber type whose classification is *namespaced*: the same
-/// event yields `p:{owner}` here where [`TestDef`] yields `{owner}`. Used by
-/// the cross-type wake-key contract; everything else about it is `TestDef`.
+/// A second subscriber type whose classification is namespaced: the same event
+/// yields `p:{owner}` here where [`TestDef`] yields `{owner}`.
 struct PrefixedDef {
     shared: Shared,
 }
@@ -145,10 +135,8 @@ impl SubscriptionDef<TestEvent> for PrefixedDef {
     }
 }
 
-/// Records every `Ping` addressed to its own key. Every subscriber for one
-/// keyed subscriber type sees the WHOLE persistent stream — wake keys
-/// decide who runs, never who receives — so it must filter events belonging
-/// to other keys itself, exactly like a real per-entity consumer would.
+/// Records every `Ping` addressed to its own key. A subscriber sees the WHOLE
+/// stream — wake keys decide who runs, not who receives — so it filters.
 struct RecordingSubscriber {
     key: OwnerId,
     /// Extra owners to record for beyond `key`, from the instance config.
@@ -213,9 +201,8 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     .await?)
 }
 
-/// An outbox whose in-memory cache holds only `event_cache_size` events, so
-/// the waker's catch-up threshold (three quarters of it) is reachable within
-/// a test rather than after the default 750.
+/// A small cache, so the waker's catch-up threshold (three quarters of it) is
+/// reachable within a test.
 async fn init_outbox_with_cache_size(
     pool: &sqlx::PgPool,
     event_cache_size: usize,
@@ -270,15 +257,12 @@ async fn publish_ping_burst(
     Ok(())
 }
 
-/// The wake keys a subscription for `owner` declares: the one partition its
-/// own key names, which is exactly the string `TestDef::wake_keys`
-/// classifies a `Ping` for that owner to. Traffic addressed to any other
-/// owner therefore never wakes it — several contracts below depend on that.
+/// The one partition a subscription's own key names, so traffic addressed to any
+/// other owner never wakes it.
 fn wake_keys_for(owner: OwnerId) -> WakeKey {
     WakeKey::from(owner.to_string())
 }
 
-/// Poll `f` until it holds or `timeout` elapses.
 async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
@@ -306,19 +290,8 @@ async fn received_for(shared: &Shared, owner: u64) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-/// Contract — an empty wake-key set is unrepresentable.
-///
-/// Matching is set overlap and `{} && {anything}` is false, so a
-/// subscription declaring no wake keys can never be reached by the waker:
-/// it works while Active (a live member reads the whole stream regardless)
-/// and is stranded the first time it passivates.
-///
-/// `subscribe_in_op` takes `impl Into<WakeKeys>`, and `WakeKeys` has no
-/// empty state, so there is nothing to test at the call site — passing an
-/// empty collection does not compile (pinned by a `compile_fail` doctest on
-/// `WakeKeys`, paired with compiling controls for the single-key and
-/// multi-key forms). What remains testable is the one path a type cannot
-/// decide: keys built from runtime data.
+/// An empty wake-key set can never be matched (`{} && {anything}` is false), and
+/// only runtime-built keys can reach one — the type rejects the rest.
 #[test]
 fn an_empty_wake_key_set_cannot_be_built() {
     let from_data: Vec<WakeKey> = vec![];
@@ -329,9 +302,6 @@ fn an_empty_wake_key_set_cannot_be_built() {
     assert_eq!(ok.len(), 1);
 }
 
-/// Contract 1/2 — per-key ordering and from-birth delivery: a subscription
-/// drains its own key's events in order from its birth onward, and never
-/// sees events published before it subscribed.
 #[tokio::test]
 #[file_serial]
 async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<()> {
@@ -380,8 +350,6 @@ async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<(
     Ok(())
 }
 
-/// Contract — key isolation: two independently-subscribed keys each see only
-/// their own events, interleaved on the same stream.
 #[tokio::test]
 #[file_serial]
 async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
@@ -433,9 +401,6 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Contract — hold: `pause_until` parks the cursor strictly before the held
-/// event (checkpoint does not advance), and the same event is redelivered
-/// once the hold expires — never skipped.
 #[tokio::test]
 #[file_serial]
 async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Result<()> {
@@ -463,8 +428,8 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     op.commit().await?;
 
-    // Arm a hold for the very first event this key will see, well past the
-    // checkpoint interval so a premature advance would be caught.
+    // A hold on the first event this key sees, well past the checkpoint interval
+    // so a premature advance would be caught.
     let pause_until = chrono::Utc::now() + chrono::Duration::milliseconds(600);
     shared.hold_once.lock().await.insert(1, pause_until);
 
@@ -476,8 +441,6 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // While parked: the event must not be recorded, and the checkpoint must
-    // stay at BEGIN — proving the hold did not advance past it.
     eventually(Duration::from_secs(5), || {
         let subscription = subscription.clone();
         async move { Ok(!subscription.load().await?.job_status().is_terminal()) }
@@ -495,8 +458,7 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
         "checkpoint must not advance past a held event"
     );
 
-    // Once the hold expires, the SAME event resumes and is delivered exactly
-    // once — not skipped, not duplicated.
+    // Once the hold expires the SAME event resumes, delivered exactly once.
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![7])
     })
@@ -512,11 +474,8 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     Ok(())
 }
 
-/// Contract — wake: a pause is cut short by traffic, never by the match
-/// for the paused event itself. With the pause an hour out, an event for
-/// the same key behind the paused one wakes the member, which re-reads the
-/// paused event (delivered, since the hold was one-shot) and then the new
-/// one — long before the deadline.
+/// A pause is cut short by traffic, never by the match for the paused event
+/// itself: with the pause an hour out, a later event still wakes the member.
 #[tokio::test]
 #[file_serial]
 async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Result<()> {
@@ -555,8 +514,8 @@ async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Resul
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Parked: the only wake so far was the match for the paused event
-    // itself, which must not have cut the pause short.
+    // The only wake so far is the match for the paused event itself, which must
+    // not have cut the pause short.
     eventually(Duration::from_secs(5), || {
         let subscription = subscription.clone();
         async move { Ok(!subscription.load().await?.job_status().is_terminal()) }
@@ -581,23 +540,8 @@ async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Resul
     Ok(())
 }
 
-/// Contract — cancel: row deletion is the tombstone. A cancelled key stops
-/// processing, and no wake revives it — every wake path resolves through the
-/// `subscriptions` table, which no longer has the row.
-///
-/// Cancellation takes effect at the end of the member's *current* run: a
-/// live runner already holding the stream is not killed mid-flight, it
-/// re-reads the row at its next run start and completes. So the test waits
-/// for that run to end before publishing — the earlier version of this
-/// contract published immediately and only passed because a sleep sized to
-/// the old sweep interval happened to exceed `linger`.
-///
-/// The event published after cancellation carries the cancelled key's own
-/// wake key, so the waker actively tries to match it. A live bystander
-/// subscription supplies the happens-before: once *it* has received an event
-/// published after the cancelled one, the waker has demonstrably processed
-/// past both, and the cancelled member's silence is a result rather than a
-/// race that a longer sleep might have lost.
+/// Row deletion is the tombstone, and every wake path resolves through the
+/// `subscriptions` table. Cancellation takes effect at the end of the current run.
 #[tokio::test]
 #[file_serial]
 async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
@@ -640,10 +584,8 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
     })
     .await?;
 
-    // The handle is captured before cancelling and deliberately not
-    // re-resolved: it observes the generation that is live right now, and
-    // that generation reaching a terminal state is the signal that the run
-    // cancel had to outlive has actually ended.
+    // Captured before cancelling and deliberately not re-resolved: this
+    // generation going terminal is the signal that the run has ended.
     let cancelled = subs
         .subscription(&OwnerId(1))
         .await
@@ -657,9 +599,8 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
     })
     .await?;
 
-    // Addressed to the cancelled key's own wake key, so the waker looks it up
-    // and finds the tombstone; then one for the bystander, whose arrival
-    // proves the waker got past both.
+    // Addressed to the cancelled key's own wake key, then one for the bystander
+    // whose arrival proves the waker got past both.
     publish_ping(&outbox, 1, 2).await?;
     publish_ping(&outbox, 2, 3).await?;
     eventually(Duration::from_secs(10), || async {
@@ -673,8 +614,7 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
         "a cancelled key must never process events published after cancellation"
     );
 
-    // Row absence is the tombstone, so assert on the table itself: the
-    // cancelled key's row is gone and the bystander's is untouched.
+    // Row absence is the tombstone, so assert on the table itself.
     let live: Vec<String> = sqlx::query_scalar!(
         "SELECT key FROM subscriptions WHERE subscriber_type = $1 ORDER BY key",
         JOB_TYPE
@@ -690,15 +630,8 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Contract — dormancy + backlog drain: a caught-up member passivates to
-/// Dormant after `linger` elapses (no live execution), retains its
-/// watermark across passivation, and on its next wake drains everything
-/// published while it was Dormant, in order.
-///
-/// Distinct from the single-event wake contract below: what is asserted
-/// here is that the *watermark survives* passivation and that a multi-event
-/// backlog accumulated during dormancy is delivered whole rather than
-/// resumed from the wake point.
+/// A passivated member retains its watermark, so its next wake drains the whole
+/// backlog accumulated while Dormant rather than resuming at the wake point.
 #[tokio::test]
 #[file_serial]
 async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow::Result<()> {
@@ -733,8 +666,7 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     })
     .await?;
 
-    // Let the member go idle past `linger`: it passivates to Dormant
-    // (terminal generation, watermark retained).
+    // Idle past `linger`, so the member passivates to Dormant.
     let subscription = subs
         .subscription(&OwnerId(1))
         .await
@@ -750,12 +682,10 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
         EventSequence::from(1u64)
     );
 
-    // Publish while Dormant — nothing is running to observe it directly.
+    // Published while Dormant, so nothing is running to observe it directly.
     publish_ping(&outbox, 1, 2).await?;
     publish_ping(&outbox, 1, 3).await?;
 
-    // Respawned, it resumes from the retained watermark and drains the whole
-    // backlog it missed while dormant — not just the event that woke it.
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2, 3])
     })
@@ -764,9 +694,8 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     Ok(())
 }
 
-/// Contract — waker: a matching event wakes a Dormant member on its own.
-/// The subscription registers with a wake key matching its own owner id,
-/// and the event published while it is Dormant carries that key.
+/// A matching event wakes a Dormant member on its own: the subscription's wake
+/// key is its owner id, and the event published while Dormant carries it.
 #[tokio::test]
 #[file_serial]
 async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Result<()> {
@@ -814,10 +743,8 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     })
     .await?;
 
-    // Published while Dormant: nothing is listening for this key, so the
-    // wake-key match is the only thing that can deliver it. The catch-up
-    // path cannot explain it either — one event is nowhere near the cache
-    // depth that path triggers on.
+    // Published while Dormant, and one event is nowhere near the cache depth the
+    // catch-up path triggers on, so only a wake-key match can deliver it.
     publish_ping(&outbox, 1, 2).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1, 2])
@@ -827,20 +754,8 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     Ok(())
 }
 
-/// Contract — catch-up wake: a Dormant member drifting toward the bottom of
-/// the in-memory cache is woken to drain from memory, without any wake key
-/// matching and without a timer.
-///
-/// The member watches partition "1"; every event published after it
-/// passivates is addressed to partition "2", so the wake-key path cannot
-/// fire. The only mechanism left that can move this member is the catch-up
-/// scan, and the only thing that triggers that is the stream advancing past
-/// three quarters of the cache depth.
-///
-/// Asserted on the durable checkpoint rather than on received events,
-/// because a woken member correctly *skips* all of this traffic: the
-/// checkpoint is the observable that cannot advance unless the member
-/// actually ran.
+/// A Dormant member drifting toward the bottom of the cache is woken with no
+/// wake key matching. Asserted on the checkpoint: it skips all this traffic.
 #[tokio::test]
 #[file_serial]
 async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Result<()> {
@@ -890,16 +805,14 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
     .await?;
     let dormant_at = subscription.load().await?.checkpoint();
 
-    // Traffic for a partition this member does not watch. No wake key can
-    // match it, so nothing here is a reason to wake — until the accumulated
-    // drift is itself the reason.
+    // Traffic for a partition this member does not watch: no wake key matches,
+    // so only the accumulated drift can be the reason to wake.
     for n in 0..12 {
         publish_ping(&outbox, 2, n).await?;
     }
 
-    // Re-resolved each poll rather than reused: a handle captured before the
-    // respawn observes the generation it was minted for, and a catch-up wake
-    // starts a new one.
+    // Re-resolved each poll: a handle observes the generation it was minted for,
+    // and a catch-up wake starts a new one.
     let subs_probe = subs.clone();
     eventually(Duration::from_secs(10), || {
         let subs_probe = subs_probe.clone();
@@ -922,39 +835,15 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
     Ok(())
 }
 
-/// Contract — a ready backlog defeats the linger deadline.
-///
-/// The passivation arm is polled before the stream arm (`biased`), so a due
-/// deadline would otherwise stop a member that has events *already queued*,
-/// leaving them at its checkpoint. That is not merely late delivery: the
-/// waker races the same stream, so it can have classified those events while
-/// the member was still Active, found it live, no-op'd the spawn and
-/// checkpointed past them. Nothing would then wake the member for them —
-/// the wake-key path is spent and the catch-up scan needs another three
-/// quarters of a cache of traffic — so on an outbox that goes quiet they are
-/// stranded indefinitely.
-///
-/// Forced rather than waited for. The handler takes 5ms per event against a
-/// 1ms `linger`, so from the second event onward the deadline is already due
-/// while the rest of the burst sits queued — and it stays due, because this
-/// subscriber resolves every event with `skip`, which by design never
-/// disarms it. The burst is published in ONE transaction so it lands as a
-/// single ready backlog. (A handler slower than its own linger is not a
-/// contrived case; it is what any subscriber doing real work looks like.)
-///
-/// Critically, the member declares a wake key that **nothing published here
-/// classifies to**. That removes the waker as a rescuer, which is what makes
-/// the failure deterministic rather than a race won or lost against the
-/// waker's flush: if the deadline is allowed to passivate over a ready
-/// backlog, these events have nothing left to deliver them. Idle must mean
-/// "deadline due AND nothing ready".
+/// Idle must mean "deadline due AND nothing ready": a 5ms handler against a 1ms
+/// `linger`, and a wake key nothing published here classifies to.
 #[tokio::test]
 #[file_serial]
 async fn a_ready_backlog_defeats_the_linger_deadline() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     // Default cache size, so 24 events cannot reach the catch-up threshold
-    // either — the ready backlog is the only path to delivery.
+    // either: the ready backlog is the only path to delivery.
     let outbox = init_outbox(&pool).await?;
 
     let shared = Shared::default();
@@ -1000,20 +889,8 @@ async fn a_ready_backlog_defeats_the_linger_deadline() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Contract — a catch-up scan is not starved by unregistered types.
-///
-/// The scan orders by lag across the whole `subscriptions` table and caps
-/// the result. Rows belonging to a subscriber type this process has not
-/// registered have no runner to advance their checkpoint, so they sit at
-/// their birth frontier forever — permanently the furthest behind. Filtered
-/// in memory rather than in SQL, they would win every ordered scan, consume
-/// the entire per-pass limit, and starve the live members the scan exists to
-/// protect.
-///
-/// `CATCH_UP_WAKE_LIMIT` worth of retired rows are planted directly (there is
-/// no API to create a subscription for an unregistered type, which is the
-/// point — they arrive by deploy, not by call), each further behind than the
-/// real member.
+/// Rows of an unregistered subscriber type have no runner, so they sit at their
+/// birth frontier and would win every lag-ordered scan if not filtered in SQL.
 #[tokio::test]
 #[file_serial]
 async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Result<()> {
@@ -1080,8 +957,8 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
     .await?;
     let dormant_at = subscription.load().await?.checkpoint();
 
-    // Traffic for a partition this member does not watch: only the catch-up
-    // scan can revive it, and only if the retired rows do not eat the pass.
+    // Traffic for a partition this member does not watch, so only the catch-up
+    // scan can revive it — and only if the retired rows do not eat the pass.
     for n in 0..12 {
         publish_ping(&outbox, 2, n).await?;
     }
@@ -1102,18 +979,8 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
     Ok(())
 }
 
-/// Contract — one waker per outbox, not per subscriber type.
-///
-/// Two keyed subscriber types are registered on the same outbox. Asserted:
-///
-/// - exactly ONE waker job row exists. Per-type wakers would give two, and
-///   with them two independent full passes over the persistent stream —
-///   every event read, decoded and checkpointed once per registered type.
-/// - both types' members are revived from Dormant by the same event, which
-///   is what proves the single waker classifies through *every* registered
-///   type's `wake_keys` rather than whichever one happened to register
-///   first. A waker that consulted only one route would leave the other
-///   member Dormant and the assertion below would time out.
+/// One waker per outbox, not per subscriber type: exactly one job row, and it
+/// classifies through every registered type's `wake_keys`.
 #[tokio::test]
 #[file_serial]
 async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
@@ -1216,22 +1083,8 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Contract — a wake key belongs to its own subscriber type.
-///
-/// The waker resolves every registered type's matches in ONE query, which is
-/// only sound while that query keeps `(subscriber_type, wake key)` paired.
-/// Here the two types classify the same event differently — `TestDef` to
-/// `"1"`, `PrefixedDef` to `"p:1"` — and the `PrefixedDef` subscription
-/// declares `"1"`, a key its own type never produces. It must not be woken.
-///
-/// A union query (every registered type against every key the batch
-/// collected) passes every other contract in this file, including the
-/// shared-waker one above where both types classify identically, and fails
-/// only here.
-///
-/// The negative is anchored: the first type's member receiving the same
-/// event proves the waker processed it, so the second's silence is a result
-/// rather than a race.
+/// A wake key belongs to its own subscriber type: the waker's single query must
+/// keep `(subscriber_type, wake key)` paired rather than unioning them.
 #[tokio::test]
 #[file_serial]
 async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Result<()> {
@@ -1289,8 +1142,8 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     op.commit().await?;
 
-    // Both are Active on subscribe and a live member reads the whole stream,
-    // so the first event lands in both. Wake keys only matter from here on.
+    // Both are Active on subscribe and a live member reads the whole stream, so
+    // the first event lands in both; wake keys only matter from here on.
     jobs.start_poll().await?;
     publish_ping(&outbox, 1, 1).await?;
     eventually(Duration::from_secs(10), || async {
@@ -1332,24 +1185,8 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
     Ok(())
 }
 
-/// Contract — waker, multi-wake-key matching: the reason
-/// `subscriptions.wake_keys` is a set rather than a scalar.
-///
-/// Every other contract here registers a single wake key, so the
-/// array-ness of the column, the `&&` overlap semantics and the
-/// `$2::varchar[]` cast are all exercised at cardinality one — which is
-/// exactly the cardinality at which the missing cast once compiled clean and
-/// failed on every call. This registers a subscription watching TWO
-/// partitions, neither of which is its own key, and wakes it through each in
-/// turn:
-///
-/// - woken by an event matching only its SECOND wake key (so a match on
-///   the first element, or an equality comparison against a scalar, would
-///   not explain the wake),
-/// - woken again by an event matching only its FIRST,
-/// - and a second subscription watching two entirely different partitions is
-///   never woken by either event — asserted on its durable checkpoint, which
-///   cannot advance unless the member actually ran.
+/// Multi-wake-key matching: a subscription watching TWO partitions, neither its
+/// own key, is woken through each in turn, and a bystander through neither.
 #[tokio::test]
 #[file_serial]
 async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> anyhow::Result<()> {
@@ -1369,9 +1206,8 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // The watcher's key (10) is deliberately none of the partitions it
-    // watches (7 and 8), so nothing about this can pass by conflating the
-    // domain key with a wake key.
+    // The watcher's key (10) is none of the partitions it watches (7 and 8), so
+    // conflating the domain key with a wake key cannot pass.
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
         &mut op,
@@ -1399,9 +1235,8 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
 
     jobs.start_poll().await?;
 
-    // Both are born Active; let both passivate before anything is published,
-    // so every delivery below requires a wake rather than an already-running
-    // member happening to see the event.
+    // Both passivate before anything is published, so every delivery below
+    // requires a wake rather than an already-running member.
     let watcher = subs
         .subscription(&OwnerId(10))
         .await
@@ -1420,15 +1255,8 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
     };
     eventually(Duration::from_secs(10), both_dormant).await?;
 
-    // The bystander's durable cursor at rest. It can only move if the member
-    // actually runs, so it is the assertion that it was never woken —
-    // strictly stronger than re-reading a status that would also read
-    // Dormant after a spurious wake had come and gone.
-    //
-    // Re-resolved at the end rather than read through this handle: a
-    // `Subscription` observes the job generation it was minted for, and a
-    // wake starts a new one. Comparing two reads of the same handle would
-    // hold even if the bystander HAD been woken.
+    // The bystander's durable cursor at rest: it can only move if the member ran,
+    // and it is re-resolved at the end because a wake starts a new generation.
     let bystander_checkpoint = bystander.load().await?.checkpoint();
 
     // Matches the watcher's SECOND wake key only.
@@ -1473,16 +1301,14 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
     Ok(())
 }
 
-// === Staged processing: multi-transaction events with external I/O between
-// stages. Interim stages are durable but replayed: a crash or a hold in the
-// gap re-handles the event from its first stage. ===
+// Staged processing: interim stages are durable but replayed, so a crash or hold
+// in the gap re-handles the event from its first stage.
 
 #[derive(Clone, Default)]
 struct StagedShared {
     /// Ordered trace of everything the subscriber did, across every run.
     trace: Arc<Mutex<Vec<String>>>,
-    /// Return `Err` once, immediately after stage 1 committed — standing in
-    /// for a crash in the external-I/O gap.
+    /// Return `Err` once, right after stage 1 committed: a crash in the gap.
     fail_after_stage_one: Arc<AtomicBool>,
     /// Pause once, in the gap between the stages.
     hold_in_gap: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
@@ -1497,11 +1323,8 @@ impl SubscriptionDef<TestEvent> for StagedDef {
     type InstanceConfig = InstanceConfig;
     type Subscriber = StagedSubscriber;
 
-    /// Classifies nothing: these contracts drive the runner and the staged
-    /// chain directly and must not have holds or mid-chain crashes disturbed
-    /// by a wake. Empty here is the *event* side — "this event concerns
-    /// nobody" — which is ordinary and unrelated to the empty *subscription*
-    /// side that [`SubscribeError::EmptyWakeKeys`] rejects.
+    /// Classifies nothing, so a wake cannot disturb the holds and mid-chain
+    /// crashes these contracts drive directly.
     fn wake_keys(
         &self,
         _event: &obix::out::PersistentOutboxEvent<TestEvent>,
@@ -1517,16 +1340,15 @@ impl SubscriptionDef<TestEvent> for StagedDef {
     }
 }
 
-/// Collects small `n` (landing at flush) and processes large `n` as a
-/// two-stage chain, so one subscriber exercises both the batch fence and the
-/// staged chain.
+/// Collects small `n` (landing at flush) and processes large `n` as a two-stage
+/// chain, so one subscriber exercises both.
 struct StagedSubscriber {
     key: OwnerId,
     shared: StagedShared,
 }
 
-/// Every effect lands here as a labelled row, so the test can assert both
-/// *what* happened and *in what order* it committed.
+/// Every effect lands here as a labelled row, so a test can assert what happened
+/// and in what order it committed.
 async fn insert_label(
     op: &mut impl es_entity::AtomicOperation,
     label: &str,
@@ -1639,10 +1461,8 @@ fn staged_config() -> KeyedSubscriberConfig {
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
 }
 
-/// Contract — staged fence: the pending batch (its collected items AND its
-/// checkpoint) lands *before* stage 1's op exists, exactly as the
-/// single-stage consume fence always did. Asserted on commit order, so a
-/// stage-1 write that leaked ahead of the fence would be visible.
+/// The pending batch, items and checkpoint, lands before stage 1's op exists;
+/// asserted on commit order, so a leaked stage-1 write would be visible.
 #[tokio::test]
 #[file_serial]
 async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result<()> {
@@ -1693,10 +1513,8 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
     Ok(())
 }
 
-/// Contract — interim durability and chain error: a failure in the gap
-/// between stages leaves stage 1's writes committed and the cursor unmoved,
-/// so the event is re-read and handled again from its first stage. Stage 1
-/// lands twice; nothing it landed is lost.
+/// A failure in the gap leaves stage 1's writes committed and the cursor unmoved,
+/// so the event is handled again from its first stage and stage 1 lands twice.
 #[tokio::test]
 #[file_serial]
 async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyhow::Result<()> {
@@ -1736,8 +1554,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyho
     })
     .await?;
 
-    // Stage 1 landed before the crash and survived it; the replay handled
-    // the event from the start, landing stage 1 again before stage 2.
+    // Stage 1 survived the crash, and the replay landed it again before stage 2.
     let trace = trace_of(&shared).await;
     assert_eq!(
         trace,
@@ -1749,9 +1566,8 @@ async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyho
     Ok(())
 }
 
-/// Contract — a hold in the gap is part of processing the event: the cursor
-/// stays parked before it, and once the hold ends the event is handled again
-/// from its first stage. The next event is unaffected.
+/// A hold in the gap is part of processing the event: the cursor stays parked, and
+/// once the hold ends the event is handled again from its first stage.
 #[tokio::test]
 #[file_serial]
 async fn a_hold_between_stages_replays_the_event_from_its_first_stage() -> anyhow::Result<()> {
@@ -1830,14 +1646,8 @@ async fn a_hold_between_stages_replays_the_event_from_its_first_stage() -> anyho
     Ok(())
 }
 
-/// Contract — the `Subscriptions` capability is `tokio::spawn`-able.
-///
-/// `MailboxTables`'s methods return opaque futures that capture their
-/// executor argument's lifetime. Awaiting one directly inside a method taking
-/// `&self` makes the enclosing future's `Send`-ness higher-ranked over that
-/// lifetime, which defeats inference at `tokio::spawn` with "implementation
-/// of `Send` is not general enough" (rust-lang/rust#100013). It compiles
-/// fine at the definition site, so only an actual spawn catches it.
+/// Awaiting `MailboxTables`'s opaque futures inside `&self` methods makes `Send`
+/// higher-ranked and breaks `tokio::spawn` (rust-lang/rust#100013).
 #[tokio::test]
 #[file_serial]
 async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<()> {
@@ -1888,15 +1698,8 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
     Ok(())
 }
 
-/// Contract — dormancy is about THIS MEMBER's idleness, not the stream's.
-///
-/// A keyed member sees the whole shared persistent stream and skips almost
-/// all of it. If the linger deadline restarted on every arriving event, no
-/// member would ever passivate on an outbox busier than `linger` — idle
-/// members would hold a live job forever, and `cancel` could not take effect
-/// until the entire stream went quiet. None of the traffic carries this
-/// member's wake key, and the burst is far short of the cache depth the
-/// catch-up path triggers on, so nothing can revive it once it passivates.
+/// Dormancy is about THIS MEMBER's idleness, not the stream's: a deadline that
+/// restarted on every arriving event would never passivate a busy outbox.
 #[tokio::test]
 #[file_serial]
 async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Result<()> {
@@ -1932,8 +1735,8 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
 
     jobs.start_poll().await?;
 
-    // Traffic for a key this member does not own, faster than `linger`, for
-    // longer than `linger` — the member skips every one of these.
+    // Traffic for a key this member does not own, faster than `linger` and for
+    // longer than `linger`.
     let stop = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicUsize::new(0));
     let publisher = {
@@ -1963,9 +1766,8 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
     })
     .await;
 
-    // Capture how busy the stream actually was BEFORE stopping the
-    // publisher, so a pass cannot be explained by the traffic having dried
-    // up on its own.
+    // Captured BEFORE stopping the publisher, so a pass cannot be explained by
+    // the traffic having dried up on its own.
     let published_while_waiting = published.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
     let _ = publisher.await;
@@ -1986,11 +1788,8 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
     Ok(())
 }
 
-/// Contract — `linger: Duration::MAX` really is always-on.
-///
-/// The config documents it, and `Instant + Duration::MAX` panics, so the
-/// documented value must not be reachable by that arithmetic: an un-addable
-/// linger leaves the deadline unarmed and the passivation arm disabled.
+/// `linger: Duration::MAX` is always-on: `Instant + Duration::MAX` panics, so an
+/// un-addable linger must leave the deadline unarmed instead.
 #[tokio::test]
 #[file_serial]
 async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> {
@@ -2026,8 +1825,8 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
 
     jobs.start_poll().await?;
 
-    // Delivery at all is the panic check: an overflowing deadline kills the
-    // run before it ever reads the stream.
+    // Delivery at all is the panic check: an overflowing deadline would kill the
+    // run before it ever read the stream.
     publish_ping(&outbox, 1, 1).await?;
     eventually(Duration::from_secs(10), || async {
         Ok(received_for(&shared, 1).await == vec![1])

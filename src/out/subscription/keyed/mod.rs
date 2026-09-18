@@ -200,12 +200,7 @@ where
 
     /// The event and its insert-lane position — see
     /// [`SingletonSubscriber::handle_persistent`](crate::out::SingletonSubscriber::handle_persistent).
-    ///
-    /// Keyed subscribers are insert-lane only (a keyed member reads the
-    /// stream from its own cursor and filters), so unlike the singleton
-    /// trait this one takes no lane parameter and
-    /// [`position`](crate::out::Delivery::position) is always the event's
-    /// `sequence`.
+    /// Keyed subscribers are insert-lane only, so there is no lane parameter.
     fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,

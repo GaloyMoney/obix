@@ -8,18 +8,9 @@ use crate::out::lane::{CommitOrder, InsertOrder, Lane, LaneHandle};
 use crate::out::subscription::singleton::Ordering;
 
 /// Delivers one lane in order, from a cursor, with a bounded in-memory view.
-///
-/// One state machine for both lanes: the backfill drain (which must never be
-/// starved by newer broadcast events), the broadcast drain to capacity, the
-/// contiguity loop that only yields the cursor's successor, and the backfill
-/// request that fires when the cursor falls behind the head. What differs
-/// between the lanes is only how a position is *assigned*, which is the
-/// source's job — by the time a delivery reaches here it is already
-/// positioned, and the two look identical.
-///
-/// The commit lane is dense by construction, so on it the contiguity loop
-/// never actually parks; the insert lane is gap-filled, so on it it does.
-/// That is a property of the streams, not two behaviours in this code.
+/// One state machine for both lanes: a delivery arrives already positioned, so
+/// only the streams differ — the commit lane is dense, the insert lane
+/// gap-filled, so only the latter parks in the contiguity loop.
 pub struct LaneListener<L, P>
 where
     L: Lane,
@@ -31,12 +22,9 @@ where
     buffer_size: usize,
     local_cache: BTreeMap<L::Position, Transport<L, P>>,
     handle: LaneHandle<L, P>,
-    /// At most one backfill request is ever outstanding, and one request
-    /// serves its whole range: the source's backfill task delivers the range
-    /// in order and *parks* on any not-yet-servable gap (in-flight writer,
-    /// raced fill) until it resolves, rather than terminating. The listener
-    /// therefore never re-requests a range it already asked for — gap
-    /// semantics stay entirely inside the backfill task.
+    /// At most one request outstanding, serving its whole range: the backfill
+    /// task parks on an unservable gap rather than terminating, so the listener
+    /// never re-requests a range.
     backfill_receiver: Option<ReceiverStream<Transport<L, P>>>,
 }
 
@@ -45,8 +33,7 @@ where
 pub type PersistentOutboxListener<P> = LaneListener<InsertOrder, P>;
 
 /// The commit-ordered lane: a dense [`CommitSequence`](crate::CommitSequence),
-/// where a source transaction's events arrive contiguously and are never
-/// split.
+/// with a source transaction's events contiguous and never split.
 pub type CommitOrderedListener<P> = LaneListener<CommitOrder, P>;
 
 impl<L, P> LaneListener<L, P>
@@ -75,13 +62,8 @@ where
         }
     }
 
-    /// Take a delivery into the local view.
-    ///
-    /// Eviction is a backstop: both drains in `poll_transport` stop at
-    /// capacity, so the only way past `buffer_size` is the one backfill event
-    /// that must always be accepted to keep the cursor moving. Dropping the
-    /// *highest* is what makes that safe — the least urgent event held, never
-    /// the one blocking the cursor.
+    /// Take a delivery into the local view. Evicting the *highest* is what makes
+    /// the backstop safe: never the event blocking the cursor.
     fn maybe_add_to_cache(&mut self, delivery: Transport<L, P>) {
         let position = delivery.position();
         self.latest_known = self.latest_known.max(position);
@@ -104,11 +86,8 @@ impl<P> PersistentOutboxListener<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    /// The same contiguous stream this listener delivers, as the internal
-    /// transport rather than the public item.
-    ///
-    /// For the sequencer, which reads each delivery's group and payload
-    /// presence and must not pay the `Err`-arm clone `into_item` does.
+    /// The same stream as the internal transport, for the sequencer: it reads
+    /// each delivery's group and must not pay `into_item`'s `Err`-arm clone.
     pub(crate) fn transport_stream(
         handle: LaneHandle<InsertOrder, P>,
         start_after: impl Into<Option<<InsertOrder as Lane>::Position>>,
@@ -220,10 +199,8 @@ where
             }
         }
 
-        // INVARIANT: refresh from the head BEFORE the pop loop, so a listener
-        // that lagged out of the broadcast discovers the dropped range now
-        // and requests a backfill below. Learning it only from the next
-        // broadcast would leave a quiet stream parked indefinitely.
+        // INVARIANT: refresh from the head BEFORE the pop loop, or a listener
+        // that lagged out of the broadcast parks until the next broadcast.
         this.latest_known = this.latest_known.max(this.handle.head());
 
         while let Some((position, event)) = this.local_cache.pop_first() {
@@ -253,11 +230,8 @@ where
     L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    /// An undecodable event is yielded as the `Err` arm, in the position it
-    /// occupies — the delivery of that event in degraded form. The stream
-    /// continues past it; whether the *consumer* moves past it is the
-    /// consumer's explicit decision (`?` fails loudly). Both arms carry the
-    /// position.
+    /// An undecodable event is yielded as the `Err` arm at the position it
+    /// occupies, so moving past it is the consumer's explicit decision.
     type Item = Result<EventDelivery<P, L>, UndecodableDelivery<L>>;
 
     fn poll_next(
@@ -269,9 +243,8 @@ where
     }
 }
 
-/// Both lanes keep the span name they had before they shared a listener —
-/// `#[instrument]`'s `name` takes a literal, so the lane picks the recorder
-/// rather than supplying the string.
+/// One span name per lane: `#[instrument]`'s `name` takes a literal, so the lane
+/// picks the recorder rather than supplying the string.
 fn record_lagged<L: Lane>(dropped: u64, last_returned: u64, latest_known: u64) {
     match L::ORDERING {
         Ordering::Insert => record_persistent_lagged(dropped, last_returned, latest_known),

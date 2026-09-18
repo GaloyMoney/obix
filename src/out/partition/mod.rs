@@ -1,9 +1,6 @@
 //! Partition maintenance for the RANGE-partitioned `persistent_outbox_events`
-//! table (Stage 1 of the partitioning plan).
-//!
-//! It is the only partitioned table: the commit lane is computed from this
-//! one rather than materialised, so there is no second table to keep in
-//! lock-step and nothing whose retention has to be ordered against it.
+//! table — the only partitioned table, since the commit lane is computed from
+//! it rather than materialised.
 //!
 //! The table is partitioned `BY RANGE (sequence)` with a `DEFAULT` backstop.
 //! Two independent guarantees keep the synchronous write path total:
@@ -156,10 +153,6 @@ where
     /// decision: runbook + alert first, automate only if it recurs). It is
     /// exposed for operators and exercised by the test suite. Idempotent: a
     /// no-op when `DEFAULT` is already empty.
-    ///
-    /// Only the events table is partitioned: the commit lane is computed
-    /// rather than materialised, so there is no second table to keep in
-    /// lock-step.
     pub async fn recover_default(&self) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
