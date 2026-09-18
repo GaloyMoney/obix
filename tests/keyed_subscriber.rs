@@ -5,7 +5,7 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use obix::{
@@ -1739,10 +1739,13 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
     // longer than `linger`.
     let stop = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicUsize::new(0));
+    let last_publish_ms = Arc::new(AtomicU64::new(0));
+    let traffic_started = tokio::time::Instant::now();
     let publisher = {
         let outbox = outbox.clone();
         let stop = stop.clone();
         let published = published.clone();
+        let last_publish_ms = last_publish_ms.clone();
         tokio::spawn(async move {
             let mut n = 0u64;
             while !stop.load(Ordering::SeqCst) {
@@ -1751,7 +1754,11 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
                     break;
                 }
                 published.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                last_publish_ms.store(
+                    traffic_started.elapsed().as_millis() as u64,
+                    Ordering::SeqCst,
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
     };
@@ -1769,14 +1776,22 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
     // Captured BEFORE stopping the publisher, so a pass cannot be explained by
     // the traffic having dried up on its own.
     let published_while_waiting = published.load(Ordering::SeqCst);
+    let quiet_for_ms =
+        traffic_started.elapsed().as_millis() as u64 - last_publish_ms.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
     let _ = publisher.await;
     passivated?;
 
     assert!(
-        published_while_waiting >= 5,
-        "the stream must still have been busy when the member passivated, \
+        published_while_waiting >= 2,
+        "the stream carried no traffic for the member to stay busy with, \
          published: {published_while_waiting}"
+    );
+    assert!(
+        quiet_for_ms < TEST_LINGER.as_millis() as u64,
+        "the stream had been quiet for {quiet_for_ms}ms when the member passivated, longer \
+         than its {TEST_LINGER:?} linger — passivation cannot be attributed to live traffic \
+         (published: {published_while_waiting})"
     );
     assert_eq!(
         received_for(&shared, 1).await,
