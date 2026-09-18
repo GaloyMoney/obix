@@ -1,3 +1,11 @@
+# [obix release v0.12.3](https://github.com/GaloyMoney/obix/releases/tag/0.12.3)
+
+
+
+### Bug Fixes
+
+- Put the lane before Tables on Subscription
+
 # [obix release v0.12.2](https://github.com/GaloyMoney/obix/releases/tag/0.12.2)
 
 
