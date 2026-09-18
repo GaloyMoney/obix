@@ -19,25 +19,17 @@ const WIDTH: u64 = obix::DEFAULT_PARTITION_WIDTH; // 2_000_000 — the p0/p1 bou
 const PREMAKE: u64 = obix::DEFAULT_PARTITION_PREMAKE;
 const BOUNDARY: i64 = WIDTH as i64;
 
-// ── Test-only partition helpers ──────────────────────────────────────────
-//
-// The shipped migration gives every test `p0` ([0, WIDTH)) plus a DEFAULT
-// backstop. Driving the sequence up to (or past) the p0 boundary cheaply means
-// positioning the shared sequence just below WIDTH with `setval` (O(1)) rather
-// than inserting millions of rows. Because partitions the maintainer/recovery
-// create persist across serial tests, each test first resets to the migration
-// baseline (p0 + DEFAULT only).
+// Driving the sequence to the p0 boundary uses `setval` rather than millions of
+// rows; created partitions persist across serial tests, hence the reset below.
 
 async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    for table in ["persistent_outbox_events", "persistent_outbox_commit_log"] {
+    for table in ["persistent_outbox_events"] {
         // A prior recovery may have left a detached DEFAULT copy.
         sqlx::query(&format!("DROP TABLE IF EXISTS {table}_default_old"))
             .execute(pool)
             .await?;
-        // Drop every partition the maintainer / recovery created, keeping only
-        // the migration baseline (p0 + DEFAULT). Their count varies with
-        // `premake`, so enumerate them from the catalog rather than hard-coding
-        // names.
+        // Their count varies with `premake`, so enumerate them from the catalog
+        // rather than hard-coding names.
         let children = sqlx::query(
             "SELECT c.relname FROM pg_inherits i \
              JOIN pg_class c ON c.oid = i.inhrelid \
@@ -107,10 +99,8 @@ async fn reloptions(pool: &sqlx::PgPool, relname: &str) -> anyhow::Result<String
     Ok(row.get::<String, _>("opts"))
 }
 
-/// Wipe the outbox, reset to baseline partitions (p0 + DEFAULT, no explicit
-/// partition beyond p0), position the sequence at `head`, then build a fresh
-/// outbox whose cache starts at `head` (so a `None` listener never tries to
-/// backfill from 0).
+/// Wipe, reset to baseline partitions, and open an outbox whose cache starts at
+/// `head`, so a `None` listener never tries to backfill from 0.
 async fn prepare_outbox(
     pool: &sqlx::PgPool,
     head: i64,
@@ -128,11 +118,6 @@ async fn prepare_outbox(
     Ok(outbox)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
-
-/// The maintainer, run synchronously at registration, pre-creates a runway of
-/// partitions ahead of the head (with their storage params) before the head
-/// reaches them.
 #[tokio::test]
 #[file_serial]
 async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
@@ -170,9 +155,8 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Both the next partition AND the full premake runway exist, on the
-    // events table and on the commit log that indexes it.
-    for table in ["persistent_outbox_events", "persistent_outbox_commit_log"] {
+    // Both the next partition AND the full premake runway exist.
+    for table in ["persistent_outbox_events"] {
         assert!(
             relation_exists(&pool, &format!("{table}_p1")).await?,
             "{table}_p1 pre-created before the head reaches the boundary"
@@ -183,8 +167,6 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
             "premake keeps {PREMAKE} partitions ahead ({deepest})"
         );
 
-        // Per-partition storage params present on a maintainer-created
-        // partition.
         let opts = reloptions(&pool, &format!("{table}_p1")).await?;
         assert!(
             opts.contains("autovacuum_freeze_min_age=0"),
@@ -200,9 +182,6 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rows stranded in DEFAULT (maintainer behind) are recovered into explicit
-/// partitions in one transaction: DEFAULT empties, the rows survive intact and
-/// readable, and `MAX(sequence)` never regresses.
 #[tokio::test]
 #[file_serial]
 async fn default_fill_then_recover() -> anyhow::Result<()> {
@@ -234,7 +213,6 @@ async fn default_fill_then_recover() -> anyhow::Result<()> {
     // The stranded rows are readable before recovery.
     assert_replayable(&pool).await?;
 
-    // Recover.
     obix::out::Partitions::<TestTables>::new(&pool, PREMAKE)
         .recover_default()
         .await?;
@@ -252,83 +230,12 @@ async fn default_fill_then_recover() -> anyhow::Result<()> {
     // Recovery left no artifact behind.
     assert!(!relation_exists(&pool, "persistent_outbox_events_default_old").await?);
 
-    // The recovered rows are still readable, in order, with their payloads.
     assert_replayable(&pool).await?;
     Ok(())
 }
 
-/// The commit log strands rows in its own DEFAULT partition the same way,
-/// and is recovered in the same pass as the events table.
-#[tokio::test]
-#[file_serial]
-async fn commit_log_default_fill_then_recover() -> anyhow::Result<()> {
-    let pool = init_pool().await?;
-    wipeout_outbox_tables(&pool).await?;
-    reset_partitions_to_baseline(&pool).await?;
-    set_sequence(&pool, BOUNDARY - 2).await?;
-    // The sequencer resumes at the stored cursor, so it must start next to
-    // the jumped-forward sequence rather than replaying from zero; `head`
-    // past the log's p0 range is what strands the appends in DEFAULT.
-    sqlx::query(
-        "UPDATE persistent_outbox_commit_log_state
-         SET last_commit_seq = $1, logged_through_sequence = $2 WHERE singleton",
-    )
-    .bind(BOUNDARY)
-    .bind(BOUNDARY - 2)
-    .execute(&pool)
-    .await?;
-    let outbox = Outbox::<TestEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
-
-    let mut op = outbox.begin_op().await?;
-    outbox
-        .publish_all_persisted(&mut op, [TestEvent::Ping(0), TestEvent::Ping(1)])
-        .await?;
-    op.commit().await?;
-
-    // The always-on sequencer appends them past the log's p0 boundary.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let stranded: i64 =
-            sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log_default")
-                .fetch_one(&pool)
-                .await?
-                .get("n");
-        if stranded == 2 {
-            break;
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the log rows never reached DEFAULT (stranded: {stranded})",
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    obix::out::Partitions::<TestTables>::new(&pool, PREMAKE)
-        .recover_default()
-        .await?;
-
-    let drained: i64 =
-        sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log_default")
-            .fetch_one(&pool)
-            .await?
-            .get("n");
-    assert_eq!(drained, 0, "the log's DEFAULT drained");
-    let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM persistent_outbox_commit_log")
-        .fetch_one(&pool)
-        .await?
-        .get("n");
-    assert_eq!(total, 2, "the log rows survived the move");
-    Ok(())
-}
-
 /// Replay the three events published around the boundary from a fresh outbox
-/// (empty cache → DB backfill) and assert order + payloads survive.
+/// (empty cache → DB backfill).
 async fn assert_replayable(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let replay = Outbox::<TestEvent, TestTables>::init(
         pool,
@@ -349,9 +256,6 @@ async fn assert_replayable(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Concurrent `ensure` calls (multi-instance startup, a maintainer tick
-/// overlapping an operator repair) must not fail with a creation race: the
-/// advisory lock serializes creators so every caller succeeds.
 #[tokio::test]
 #[file_serial]
 async fn concurrent_ensure_does_not_race() -> anyhow::Result<()> {
@@ -377,9 +281,6 @@ async fn concurrent_ensure_does_not_race() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replay-from-zero contract is unchanged by partitioning: a `BEGIN` listener
-/// returns the full contiguous stream. `TRUNCATE ... RESTART IDENTITY` on the
-/// partitioned parent cascades to every partition and resets the sequence.
 #[tokio::test]
 #[file_serial]
 async fn replay_from_begin_still_contiguous() -> anyhow::Result<()> {

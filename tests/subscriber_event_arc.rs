@@ -1,18 +1,14 @@
-//! Subscribers are handed the shared `Arc` the outbox decoded once, not a
-//! borrow of it — so a handler can retain an event past the call for the
-//! price of a refcount, and the payload type need not be `Clone`.
-//!
-//! Every subscriber in this file is generic over [`NonCloneEvent`], which
-//! deliberately does **not** derive `Clone`: a batch holding whole events
-//! could not be written at all if retaining one required copying it.
+//! Subscribers are handed the shared `Arc` the outbox decoded once, so a handler
+//! can retain an event past the call and the payload need not be `Clone`.
 
 mod helpers;
 
 use std::sync::Arc;
 
 use obix::{
-    EventCtx, FlushOp, Handled, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
-    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, SubscriptionDef, WakeKey,
+    EventCtx, EventDelivery, FlushOp, Handled, InsertOrder, KeyedEventCtx, KeyedSubscriber,
+    KeyedSubscriberConfig, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber,
+    SubscriptionDef, WakeKey,
     out::{Outbox, OutboxEventMarker, PersistentOutboxEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -43,7 +39,6 @@ impl NonCloneEvent {
 
 type Retained = Arc<PersistentOutboxEvent<NonCloneEvent>>;
 
-/// What the batch carried into `flush`, flattened for assertion.
 #[derive(Debug, PartialEq)]
 struct Flushed {
     sequence: u64,
@@ -51,9 +46,7 @@ struct Flushed {
     identity: usize,
 }
 
-/// The allocation a given `Arc` points at. Comparing this between the
-/// invocation and the flush is what distinguishes "kept the event" from
-/// "kept a copy of the event".
+/// The allocation an `Arc` points at: "kept the event" vs "kept a copy of it".
 fn identity(event: &Retained) -> usize {
     Arc::as_ptr(event) as usize
 }
@@ -62,7 +55,6 @@ fn identity(event: &Retained) -> usize {
 struct Observed {
     /// Identities in the order `handle_persistent` / `handle` saw them.
     handled: Arc<Mutex<Vec<usize>>>,
-    /// What each flush was handed.
     flushed: Arc<Mutex<Vec<Flushed>>>,
 }
 
@@ -79,29 +71,30 @@ impl Observed {
     }
 }
 
-// === Singleton ===
-
 struct RetainingSubscriber {
     observed: Observed,
 }
 
 impl SingletonSubscriber<NonCloneEvent> for RetainingSubscriber {
-    /// A batch of whole events. Unrepresentable when the handler is handed a
-    /// borrow, and uncopyable when the payload is not `Clone`.
     type Batch = Vec<Retained>;
 
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &Retained,
+        event: &EventDelivery<NonCloneEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        self.observed.handled.lock().await.push(identity(event));
-        Ok(ctx.collect(Arc::clone(event)))
+        assert_eq!(event.position(), event.sequence);
+        self.observed
+            .handled
+            .lock()
+            .await
+            .push(identity(event.inner()));
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed.record_flush(items).await;
@@ -109,8 +102,7 @@ impl SingletonSubscriber<NonCloneEvent> for RetainingSubscriber {
     }
 }
 
-/// Reads the event through the `Arc` without retaining it — the deref path
-/// every existing handler body takes unchanged.
+/// Reads the event through the delivery without retaining it.
 struct EphemeralReader {
     received: Arc<Mutex<Vec<u64>>>,
 }
@@ -126,8 +118,6 @@ impl SingletonSubscriber<NonCloneEvent> for EphemeralReader {
         Ok(())
     }
 }
-
-// === Classifying through the Arc ===
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct PingPayload {
@@ -147,11 +137,9 @@ enum ClassifiedEvent {
 
 type ClassifiedRetained = Arc<PersistentOutboxEvent<ClassifiedEvent>>;
 
-/// Classifies through the `Arc` (`event.as_event::<PingPayload>()`) and
-/// retains the same `Arc` in the batch, in the same `handle_persistent`
-/// body.
+/// Classifies through the delivery (`event.as_event::<PingPayload>()`) and
+/// retains the same `Arc` in the batch.
 struct ClassifyingSubscriber {
-    /// `n` of every `Ping` the handler classified and retained.
     classified: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -161,18 +149,18 @@ impl SingletonSubscriber<ClassifiedEvent> for ClassifyingSubscriber {
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Self::Batch>,
-        event: &ClassifiedRetained,
+        event: &EventDelivery<ClassifiedEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(ping) = event.as_event::<PingPayload>() else {
             return Ok(ctx.skip());
         };
         self.classified.lock().await.push(ping.n);
-        Ok(ctx.collect(Arc::clone(event)))
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for event in items {
@@ -185,8 +173,6 @@ impl SingletonSubscriber<ClassifiedEvent> for ClassifyingSubscriber {
         Ok(())
     }
 }
-
-// === Keyed ===
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct OwnerId(u64);
@@ -240,23 +226,25 @@ impl KeyedSubscriber<NonCloneEvent> for RetainingKeyedSubscriber {
     async fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,
-        event: &Retained,
+        event: &EventDelivery<NonCloneEvent>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
-        self.observed.handled.lock().await.push(identity(event));
-        Ok(ctx.collect(Arc::clone(event)))
+        self.observed
+            .handled
+            .lock()
+            .await
+            .push(identity(event.inner()));
+        Ok(ctx.collect(Arc::clone(event.inner())))
     }
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed.record_flush(items).await;
         Ok(())
     }
 }
-
-// === Harness ===
 
 async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
     let job_config = job::JobSvcConfig::builder()
@@ -328,8 +316,7 @@ where
     }
 }
 
-/// The `flush` saw the very allocations the invocations were handed, in the
-/// same order — the batch shares the events rather than copying them.
+/// The `flush` saw the very allocations the invocations were handed, in order.
 async fn assert_batch_retained_what_it_was_handed(observed: &Observed) {
     let handled = observed.handled.lock().await;
     let flushed = observed.flushed.lock().await;
@@ -345,11 +332,6 @@ async fn assert_batch_retained_what_it_was_handed(observed: &Observed) {
     );
 }
 
-// === Contracts ===
-
-/// A singleton subscriber batches whole events of a payload type that is not
-/// `Clone`, and `flush` receives exactly the allocations the invocations
-/// were handed.
 #[tokio::test]
 #[file_serial]
 async fn a_singleton_batch_retains_whole_events() -> anyhow::Result<()> {
@@ -394,8 +376,6 @@ async fn a_singleton_batch_retains_whole_events() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The keyed equivalent: same batch shape, same identity guarantee, on the
-/// per-key runner.
 #[tokio::test]
 #[file_serial]
 async fn a_keyed_batch_retains_whole_events() -> anyhow::Result<()> {
@@ -448,8 +428,6 @@ async fn a_keyed_batch_retains_whole_events() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ClassifyingSubscriber` classifies through the `Arc` and retains it, in
-/// the same `handle_persistent` body.
 #[tokio::test]
 #[file_serial]
 async fn a_singleton_classifies_through_the_arc_while_retaining() -> anyhow::Result<()> {
@@ -500,8 +478,6 @@ async fn a_singleton_classifies_through_the_arc_while_retaining() -> anyhow::Res
     Ok(())
 }
 
-/// Ephemeral deliveries arrive as the shared `Arc` too, and read through it
-/// unchanged.
 #[tokio::test]
 #[file_serial]
 async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {

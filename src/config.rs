@@ -1,5 +1,6 @@
 use derive_builder::Builder;
 use es_entity::clock::{Clock, ClockHandle};
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PERSIST_EVENTS_BATCH_SIZE: usize = 5000;
 
@@ -98,6 +99,48 @@ pub const DEFAULT_PARTITION_PREMAKE: u64 = 5;
 pub const DEFAULT_PARTITION_MAINTAINER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(3600);
 
+/// How many groups the commit-lane fold emits between sparse checkpoints. The
+/// order is computed, so a checkpoint only bounds how far a restart or a
+/// lagging subscriber's backfill has to re-fold.
+pub const DEFAULT_COMMIT_CHECKPOINT_EVERY: usize = 1_000;
+
+/// Longest the commit-lane fold goes without a checkpoint while emitting,
+/// regardless of group count; see [`DEFAULT_COMMIT_CHECKPOINT_EVERY`].
+pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Whether this outbox runs the commit-ordered lane. Opt-in: the fold passes
+/// over every event, in every process that runs the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitLane {
+    /// No sequencer runs here: registering a
+    /// [`CommitOrder`](crate::CommitOrder) subscriber fails with
+    /// [`CommitLaneDisabled`].
+    #[default]
+    Disabled,
+    /// This process sequences the commit lane and can host `CommitOrder`
+    /// subscribers.
+    Enabled,
+}
+
+/// Why a lane's frontier could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum FrontierError {
+    #[error("FrontierError - Sqlx: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("FrontierError - {0}")]
+    CommitLaneDisabled(#[from] CommitLaneDisabled),
+}
+
+/// The commit lane is off for this outbox. Raised at registration, before any
+/// job is spawned, so a consumer that needs the lane fails at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the commit lane is disabled on this outbox — set MailboxConfig::commit_lane = CommitLane::Enabled"
+)]
+pub struct CommitLaneDisabled;
+
 #[derive(Clone, Builder)]
 pub struct MailboxConfig {
     #[builder(default = "100")]
@@ -142,6 +185,19 @@ pub struct MailboxConfig {
     /// [`DEFAULT_PARTITION_MAINTAINER_INTERVAL`].
     #[builder(default = "DEFAULT_PARTITION_MAINTAINER_INTERVAL")]
     pub partition_maintainer_interval: std::time::Duration,
+    /// Whether this outbox runs the commit-ordered lane; see [`CommitLane`].
+    /// Defaults to [`Disabled`](CommitLane::Disabled).
+    #[builder(default)]
+    pub commit_lane: CommitLane,
+    /// Groups between sparse checkpoints of the commit-lane fold; see
+    /// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Ignored when the lane is
+    /// `Disabled`.
+    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_EVERY")]
+    pub commit_checkpoint_every: usize,
+    /// Longest the commit-lane fold goes without a checkpoint while
+    /// emitting; see [`DEFAULT_COMMIT_CHECKPOINT_INTERVAL`].
+    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_INTERVAL")]
+    pub commit_checkpoint_interval: std::time::Duration,
     #[builder(default = "Clock::handle().clone()")]
     pub clock: ClockHandle,
 }

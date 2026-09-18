@@ -1,11 +1,6 @@
 //! Partition maintenance for the RANGE-partitioned `persistent_outbox_events`
-//! table and the commit log that indexes it (Stage 1 of the partitioning
-//! plan).
-//!
-//! Both are maintained in lock-step, in one transaction under one lock.
-//! Retention must drop commit-log partitions before or together with the
-//! event partitions they reference: a log row whose event row is gone fails
-//! the join in `load_commit_ordered_page`.
+//! table — the only partitioned table, since the commit lane is computed from
+//! it rather than materialised.
 //!
 //! The table is partitioned `BY RANGE (sequence)` with a `DEFAULT` backstop.
 //! Two independent guarantees keep the synchronous write path total:
@@ -120,11 +115,6 @@ where
     /// is named `{table}_p{k}`, tiling seamlessly onto the migration's
     /// `{table}_p0` (`[0, width)`).
     ///
-    /// Covers the commit log in the same transaction and over the same `k`
-    /// range: the log holds at most one row per event, so `commit_seq` never
-    /// runs ahead of `sequence` and the events table's runway always covers
-    /// the log's.
-    ///
     /// If rows have already spilled into `DEFAULT` (the maintainer fell behind),
     /// the `CREATE` for that range **fails** — Postgres validates that `DEFAULT`
     /// holds no rows in the new range and errors. `IF NOT EXISTS` does not help
@@ -137,15 +127,11 @@ where
         let first = head / DEFAULT_PARTITION_WIDTH;
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
-        for table in [
-            Tables::persistent_outbox_events_table(),
-            Tables::persistent_outbox_commit_log_table(),
-        ] {
-            for k in first..=first + self.premake {
-                sqlx::query(&create_partition(table, k))
-                    .execute(&mut *tx)
-                    .await?;
-            }
+        let table = Tables::persistent_outbox_events_table();
+        for k in first..=first + self.premake {
+            sqlx::query(&create_partition(table, k))
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await
     }
@@ -167,18 +153,15 @@ where
     /// decision: runbook + alert first, automate only if it recurs). It is
     /// exposed for operators and exercised by the test suite. Idempotent: a
     /// no-op when `DEFAULT` is already empty.
-    ///
-    /// Repairs the events table and the commit log together, in one
-    /// transaction, so the two stay in lock-step.
     pub async fn recover_default(&self) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
-        for (table, key) in [
-            (Tables::persistent_outbox_events_table(), "sequence"),
-            (Tables::persistent_outbox_commit_log_table(), "commit_seq"),
-        ] {
-            self.recover_one(&mut tx, table, key).await?;
-        }
+        self.recover_one(
+            &mut tx,
+            Tables::persistent_outbox_events_table(),
+            "sequence",
+        )
+        .await?;
         tx.commit().await
     }
 

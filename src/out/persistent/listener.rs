@@ -1,68 +1,74 @@
 use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, task::Poll};
+use std::{collections::BTreeMap, pin::Pin, task::Poll};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError};
 
-use super::cache::CacheHandle;
-use crate::out::event::{PersistentDelivery, PersistentOutboxEvent, UndecodableEventError};
-use crate::sequence::EventSequence;
+use crate::out::event::{EventDelivery, Transport, UndecodableDelivery};
+use crate::out::lane::{CommitOrder, InsertOrder, Lane, LaneHandle};
+use crate::out::subscription::singleton::Ordering;
 
-pub struct PersistentOutboxListener<P>
+/// Delivers one lane in order, from a cursor, with a bounded in-memory view.
+/// One state machine for both lanes: a delivery arrives already positioned, so
+/// only the streams differ — the commit lane is dense, the insert lane
+/// gap-filled, so only the latter parks in the contiguity loop.
+pub struct LaneListener<L, P>
 where
+    L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    last_returned_sequence: EventSequence,
-    latest_known: EventSequence,
-    event_receiver: BroadcastStream<PersistentDelivery<P>>,
+    last_returned: L::Position,
+    latest_known: L::Position,
+    event_receiver: BroadcastStream<Transport<L, P>>,
     buffer_size: usize,
-    local_cache: BTreeMap<EventSequence, PersistentDelivery<P>>,
-    cache_handle: CacheHandle<P>,
-    /// At most one backfill request is ever outstanding, and one request
-    /// serves its whole range: the cache's backfill task delivers the
-    /// range in order and *parks* on any not-yet-servable gap (in-flight
-    /// writer, raced fill) until it resolves, rather than terminating.
-    /// The listener therefore never re-requests a range it already asked
-    /// for — gap semantics stay entirely inside the backfill task.
-    backfill_receiver: Option<ReceiverStream<PersistentDelivery<P>>>,
+    local_cache: BTreeMap<L::Position, Transport<L, P>>,
+    handle: LaneHandle<L, P>,
+    /// At most one request outstanding, serving its whole range: the backfill
+    /// task parks on an unservable gap rather than terminating, so the listener
+    /// never re-requests a range.
+    backfill_receiver: Option<ReceiverStream<Transport<L, P>>>,
 }
 
-impl<P> PersistentOutboxListener<P>
+/// The insert-ordered lane: a contiguous, gap-filled
+/// [`EventSequence`](crate::EventSequence).
+pub type PersistentOutboxListener<P> = LaneListener<InsertOrder, P>;
+
+/// The commit-ordered lane: a dense [`CommitSequence`](crate::CommitSequence),
+/// with a source transaction's events contiguous and never split.
+pub type CommitOrderedListener<P> = LaneListener<CommitOrder, P>;
+
+impl<L, P> LaneListener<L, P>
 where
+    L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pub(crate) fn new(
-        mut cache_handle: CacheHandle<P>,
-        start_after: impl Into<Option<EventSequence>>,
+        mut handle: LaneHandle<L, P>,
+        start_after: impl Into<Option<L::Position>>,
         buffer: usize,
     ) -> Self {
-        let latest_known = cache_handle.latest_known_persisted();
+        let latest_known = handle.head();
         let start_after = start_after.into().unwrap_or(latest_known);
         Self {
-            last_returned_sequence: start_after,
+            last_returned: start_after,
             latest_known,
-            event_receiver: cache_handle.persistent_event_stream(),
+            event_receiver: handle.event_stream(),
             local_cache: BTreeMap::new(),
             // At least one: the drain loop is guarded on remaining capacity,
             // so a zero-capacity cache would never poll the broadcast at all
             // — never registering a waker, never waking.
             buffer_size: buffer.max(1),
-            cache_handle,
+            handle,
             backfill_receiver: None,
         }
     }
 
-    /// Take an event into the local view.
-    ///
-    /// Eviction is a backstop: both drains in `poll_next` stop at capacity,
-    /// so the only way past `buffer_size` is the one backfill event that must
-    /// always be accepted to keep the cursor moving. Dropping the *highest* is
-    /// what makes that safe — the least urgent event held, never the one
-    /// blocking the cursor.
-    fn maybe_add_to_cache(&mut self, delivery: PersistentDelivery<P>) {
-        let sequence = delivery.sequence();
-        self.latest_known = self.latest_known.max(sequence);
-        if sequence > self.last_returned_sequence
-            && self.local_cache.insert(sequence, delivery).is_none()
+    /// Take a delivery into the local view. Evicting the *highest* is what makes
+    /// the backstop safe: never the event blocking the cursor.
+    fn maybe_add_to_cache(&mut self, delivery: Transport<L, P>) {
+        let position = delivery.position();
+        self.latest_known = self.latest_known.max(position);
+        if position > self.last_returned
+            && self.local_cache.insert(position, delivery).is_none()
             && self.local_cache.len() > self.buffer_size
         {
             self.local_cache.pop_last();
@@ -71,62 +77,64 @@ where
 
     fn request_backfill(&mut self) {
         if self.backfill_receiver.is_none() {
-            self.backfill_receiver = Some(
-                self.cache_handle
-                    .request_old_persistent_events(self.last_returned_sequence),
-            );
+            self.backfill_receiver = Some(self.handle.request_backfill(self.last_returned));
         }
-    }
-
-    /// The same contiguous stream this listener delivers, as the internal
-    /// transport rather than the public item.
-    ///
-    /// For the sequencer, which reads each delivery's group and payload
-    /// presence and must not pay the `Err`-arm clone `into_item` does.
-    pub(crate) fn deliveries(
-        cache_handle: CacheHandle<P>,
-        start_after: impl Into<Option<EventSequence>>,
-        buffer: usize,
-    ) -> DeliveryStream<P> {
-        DeliveryStream(Self::new(cache_handle, start_after, buffer))
-    }
-}
-
-/// [`PersistentOutboxListener`] yielding the internal transport; see
-/// [`deliveries`](PersistentOutboxListener::deliveries).
-pub(crate) struct DeliveryStream<P>(PersistentOutboxListener<P>)
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static;
-
-impl<P> Stream for DeliveryStream<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
-    type Item = PersistentDelivery<P>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0).poll_delivery(cx)
     }
 }
 
 impl<P> PersistentOutboxListener<P>
 where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// The same stream as the internal transport, for the sequencer: it reads
+    /// each delivery's group and must not pay `into_item`'s `Err`-arm clone.
+    pub(crate) fn transport_stream(
+        handle: LaneHandle<InsertOrder, P>,
+        start_after: impl Into<Option<<InsertOrder as Lane>::Position>>,
+        buffer: usize,
+    ) -> TransportStream<InsertOrder, P> {
+        TransportStream(Self::new(handle, start_after, buffer))
+    }
+}
+
+/// [`LaneListener`] yielding the internal transport; see
+/// [`transport_stream`](PersistentOutboxListener::transport_stream).
+pub(crate) struct TransportStream<L, P>(LaneListener<L, P>)
+where
+    L: Lane,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static;
+
+impl<L, P> Stream for TransportStream<L, P>
+where
+    L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    fn poll_delivery(
+    type Item = Transport<L, P>;
+
+    fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<PersistentDelivery<P>>> {
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0).poll_transport(cx)
+    }
+}
+
+impl<L, P> LaneListener<L, P>
+where
+    L: Lane,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+{
+    fn poll_transport(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Transport<L, P>>> {
         let this = self.as_mut().get_mut();
 
-        // Backfill first: it carries the lowest outstanding sequences, so a
+        // Backfill first: it carries the lowest outstanding positions, so a
         // cache full of newer broadcast events must never starve it.
         let mut backfill_events = Vec::new();
         let mut backfill_done = false;
-        let needed = this.last_returned_sequence.next();
+        let needed = L::next(this.last_returned);
         let mut can_deliver = this.local_cache.contains_key(&needed);
         while let Some(backfill_receiver) = this.backfill_receiver.as_mut() {
             // Stop pulling at capacity — but only once this poll is certain
@@ -148,7 +156,7 @@ where
             }
             match Pin::new(backfill_receiver).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
-                    can_deliver |= event.sequence() == needed;
+                    can_deliver |= event.position() == needed;
                     backfill_events.push(event);
                 }
                 Poll::Ready(None) => {
@@ -170,7 +178,7 @@ where
         // overflow surfaces as a visible `Lagged` rather than a silent drop.
         //
         // Breaking out on a full cache without registering a waker is safe: a
-        // full cache holds sequences above the cursor, so either the next one
+        // full cache holds positions above the cursor, so either the next one
         // is contiguous and this poll returns an event (the consumer polls
         // again), or it is not and the backfill request below registers a
         // waker for the range that unblocks it.
@@ -181,56 +189,71 @@ where
                     this.maybe_add_to_cache(event);
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    record_lagged(
+                    record_lagged::<L>(
                         n,
-                        u64::from(this.last_returned_sequence),
-                        u64::from(this.latest_known),
+                        L::position_to_u64(this.last_returned),
+                        L::position_to_u64(this.latest_known),
                     );
                 }
                 Poll::Pending => break,
             }
         }
 
-        while let Some((seq, event)) = this.local_cache.pop_first() {
-            if seq <= this.last_returned_sequence {
+        // INVARIANT: refresh from the head BEFORE the pop loop, or a listener
+        // that lagged out of the broadcast parks until the next broadcast.
+        this.latest_known = this.latest_known.max(this.handle.head());
+
+        while let Some((position, event)) = this.local_cache.pop_first() {
+            if position <= this.last_returned {
                 continue;
             }
-            if seq == this.last_returned_sequence.next() {
-                this.last_returned_sequence = seq;
+            if position == L::next(this.last_returned) {
+                this.last_returned = position;
                 return Poll::Ready(Some(event));
             }
-            this.local_cache.insert(seq, event);
+            this.local_cache.insert(position, event);
             break;
         }
 
-        if this.last_returned_sequence < this.latest_known && this.backfill_receiver.is_none() {
+        if this.last_returned < this.latest_known && this.backfill_receiver.is_none() {
             this.request_backfill();
             // need to register the cx with the backfill_receiver to get woken up
-            return self.poll_delivery(cx);
+            return self.poll_transport(cx);
         }
 
         Poll::Pending
     }
 }
 
-impl<P> Stream for PersistentOutboxListener<P>
+impl<L, P> Stream for LaneListener<L, P>
 where
+    L: Lane,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    /// An undecodable event is yielded as the `Err` arm, in its sequence
-    /// position — the delivery of that event in degraded form. The stream
-    /// continues past it; whether the *consumer* moves past it is the
-    /// consumer's explicit decision (`?` fails loudly).
-    type Item = Result<Arc<PersistentOutboxEvent<P>>, UndecodableEventError>;
+    /// An undecodable event is yielded as the `Err` arm at the position it
+    /// occupies, so moving past it is the consumer's explicit decision.
+    type Item = Result<EventDelivery<P, L>, UndecodableDelivery<L>>;
 
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.poll_delivery(cx)
-            .map(|delivery| delivery.map(PersistentDelivery::into_item))
+        self.poll_transport(cx)
+            .map(|delivery| delivery.map(Transport::into_item))
+    }
+}
+
+/// One span name per lane: `#[instrument]`'s `name` takes a literal, so the lane
+/// picks the recorder rather than supplying the string.
+fn record_lagged<L: Lane>(dropped: u64, last_returned: u64, latest_known: u64) {
+    match L::ORDERING {
+        Ordering::Insert => record_persistent_lagged(dropped, last_returned, latest_known),
+        Ordering::Commit => record_commit_lagged(dropped, last_returned, latest_known),
     }
 }
 
 #[tracing::instrument(name = "obix.persistent_listener.lagged", level = "warn")]
-fn record_lagged(dropped: u64, last_returned_sequence: u64, latest_known: u64) {}
+fn record_persistent_lagged(dropped: u64, last_returned_sequence: u64, latest_known: u64) {}
+
+#[tracing::instrument(name = "obix.commit_listener.lagged", level = "warn")]
+fn record_commit_lagged(dropped: u64, last_returned: u64, latest_known: u64) {}

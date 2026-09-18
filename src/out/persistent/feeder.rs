@@ -15,10 +15,17 @@ use tracing::Instrument;
 use crate::{
     config::MailboxConfig,
     handle::{OwnedTaskHandle, spawn_supervised},
-    out::event::{PersistentDelivery, PersistentOutboxEvent},
+    out::{
+        event::{PersistentDelivery, PersistentOutboxEvent, Transport},
+        lane::InsertOrder,
+    },
     sequence::EventSequence,
     tables::MailboxTables,
 };
+
+/// What the cache-fill broadcast carries; `cache::InsertTransport` is the same
+/// alias, private to that module.
+type InsertTransport<P> = Transport<InsertOrder, P>;
 
 /// The cache loop asking for a database read. Carries no policy — the loop
 /// already decided.
@@ -84,7 +91,7 @@ pub(crate) struct CacheFeeder<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    batches: mpsc::UnboundedSender<Vec<PersistentDelivery<P>>>,
+    batches: mpsc::UnboundedSender<Vec<InsertTransport<P>>>,
     highest_known: Arc<AtomicU64>,
     front: watch::Sender<Option<EventSequence>>,
 }
@@ -143,9 +150,9 @@ where
         });
         // `PersistentDelivery` clones cheaply (Arc) for every re-send a paced
         // feed needs, with no `P: Clone` bound.
-        let deliveries: Vec<PersistentDelivery<P>> = batch
+        let deliveries: Vec<InsertTransport<P>> = batch
             .into_iter()
-            .map(|event| PersistentDelivery::from(Ok(event)))
+            .map(|event| InsertTransport::insert(PersistentDelivery::from(Ok(event))))
             .collect();
         let _ = self.batches.send(deliveries);
     }
@@ -202,7 +209,7 @@ struct PendingBatch<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    batch: Vec<PersistentDelivery<P>>,
+    batch: Vec<InsertTransport<P>>,
     /// Opened on the first feed and reused for every later page — one
     /// `memory_feed` span per batch, never per page.
     span: Option<tracing::Span>,
@@ -213,7 +220,7 @@ impl<P> PendingBatch<P>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    fn new(batch: Vec<PersistentDelivery<P>>) -> Self {
+    fn new(batch: Vec<InsertTransport<P>>) -> Self {
         Self {
             batch,
             span: None,
@@ -234,7 +241,7 @@ where
     /// `memory_next == cursor + 1` as "feeding in progress" and stays quiet.
     fn feed_page(
         &mut self,
-        cache_fill: &broadcast::Sender<PersistentDelivery<P>>,
+        cache_fill: &broadcast::Sender<InsertTransport<P>>,
         pos: usize,
         page_size: usize,
     ) -> EventSequence {
@@ -286,7 +293,7 @@ enum Wake<P>
 where
     P: Serialize + DeserializeOwned + Send,
 {
-    Batch(Vec<PersistentDelivery<P>>),
+    Batch(Vec<InsertTransport<P>>),
     CatchUp,
     CursorMoved,
     Closed,
@@ -296,7 +303,7 @@ where
 /// [`CacheFeeder`] and the cache loop's [`FeederHandle`].
 pub(crate) fn spawn<P, Tables>(
     pool: sqlx::PgPool,
-    cache_fill: broadcast::Sender<PersistentDelivery<P>>,
+    cache_fill: broadcast::Sender<InsertTransport<P>>,
     highest_known: Arc<AtomicU64>,
     config: &MailboxConfig,
 ) -> (CacheFeeder<P>, FeederHandle, OwnedTaskHandle)
@@ -355,11 +362,11 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     pool: sqlx::PgPool,
-    cache_fill: broadcast::Sender<PersistentDelivery<P>>,
+    cache_fill: broadcast::Sender<InsertTransport<P>>,
     cursor: watch::Receiver<EventSequence>,
     highest_known: Arc<AtomicU64>,
     page_size: usize,
-    batches: mpsc::UnboundedReceiver<Vec<PersistentDelivery<P>>>,
+    batches: mpsc::UnboundedReceiver<Vec<InsertTransport<P>>>,
     requests: mpsc::UnboundedReceiver<FeedRequest>,
     outcomes: mpsc::UnboundedSender<CatchUpOutcome>,
     front: watch::Sender<Option<EventSequence>>,
@@ -501,8 +508,10 @@ where
                     };
                 pages += 1;
 
-                let deliveries: Vec<PersistentDelivery<P>> =
-                    events.into_iter().map(PersistentDelivery::from).collect();
+                let deliveries: Vec<InsertTransport<P>> = events
+                    .into_iter()
+                    .map(|event| InsertTransport::insert(PersistentDelivery::from(event)))
+                    .collect();
                 let Some(first) = deliveries.first() else {
                     break CatchUpOutcome::HoleAfter(cursor);
                 };
@@ -553,15 +562,15 @@ mod tests {
 
     /// `next_after` only inspects sequences, so a unit payload is all a batch
     /// needs here.
-    fn delivery(seq: u64) -> PersistentDelivery<()> {
-        PersistentDelivery::from(Ok(PersistentOutboxEvent {
+    fn delivery(seq: u64) -> InsertTransport<()> {
+        InsertTransport::insert(PersistentDelivery::from(Ok(PersistentOutboxEvent {
             id: OutboxEventId::new(),
             sequence: EventSequence::from(seq),
             payload: None,
             tracing_context: None,
             recorded_at: chrono::Utc::now(),
             commit_group: CommitGroupId::from(0i64),
-        }))
+        })))
     }
 
     fn batch(seqs: &[u64]) -> PendingBatch<()> {

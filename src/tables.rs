@@ -295,60 +295,41 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// Append every payload-bearing row of `group` to the commit log,
-    /// numbered from `head + 1` in `sequence` order, and set the cursor to
-    /// `at` — all in one statement, so the append and the head advance share
-    /// a fate.
-    ///
-    /// Taken only when `at` is above the stored cursor, re-checked against
-    /// the row version this call's lock wait resolved to. That condition is
-    /// what makes concurrent sequencers append each group exactly once:
-    /// `appended` comes back empty when another process got there first, and
-    /// the caller reads the log instead.
-    ///
-    /// `group_max` is reported either way, so the caller can skip the
-    /// group's remaining members without another round trip.
-    fn append_commit_group<P>(
+    /// Every payload-bearing row of each of `groups`, ordered by
+    /// `(commit_xid, sequence)` — contiguous, in the order the commit lane
+    /// emits them. `floor` is the lowest MIN among the groups asked for, which
+    /// prunes partitions below it without losing a member.
+    fn load_group_members<P>(
         pool: &sqlx::PgPool,
-        group: CommitGroupId,
-        at: EventSequence,
-    ) -> impl Future<Output = Result<CommitGroupAppend<P>, sqlx::Error>> + Send
+        groups: &[CommitGroupId],
+        floor: EventSequence,
+    ) -> impl Future<Output = Result<Vec<(CommitGroupId, PersistentEventRows<P>)>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
 
-    /// Everything the sequencer needs to resume, read in **one statement**.
-    ///
-    /// `last_commit_seq` and `logged_ahead` must come from a single
-    /// snapshot. Read separately, a peer appending between them returns a
-    /// `last_commit_seq` that does not account for rows the seed then tells
-    /// the fold to skip, and the fold has no other occasion to reconcile it
-    /// — leaving this process's published head behind the log for as long as
-    /// the stream stays quiet.
-    fn commit_log_restart_state(
+    /// Record a sparse checkpoint of the commit-lane fold. A conflict is a
+    /// no-op: a peer's row for the same position is the same row.
+    fn write_commit_checkpoint(
         pool: &sqlx::PgPool,
-    ) -> impl Future<Output = Result<CommitRestartState, sqlx::Error>> + Send;
+        checkpoint: &CommitCheckpoint,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// Load the commit-ordered page `(after, after + limit]`, joined to the
-    /// events table for payloads. Dense by construction, so a short page
-    /// means the reader has reached the head — never a gap to wait on.
-    fn load_commit_ordered_page<P>(
+    /// The newest checkpoint at or below `at_or_below` — where a fold should
+    /// resume from. `None` means fold from the beginning.
+    fn load_commit_checkpoint(
         pool: &sqlx::PgPool,
-        after: CommitSequence,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<CommitLogRow<P>>, sqlx::Error>> + Send
-    where
-        P: Serialize + DeserializeOwned + Send;
+        at_or_below: EventSequence,
+    ) -> impl Future<Output = Result<Option<CommitCheckpoint>, sqlx::Error>> + Send;
 
-    /// The sequencer's `(last_commit_seq, logged_through)`.
-    fn commit_log_state(
+    /// The newest checkpoint whose `commit_seq` is at or below `at_or_below` —
+    /// a backfill's seed, found by commit position rather than insert sequence.
+    fn load_commit_checkpoint_for(
         pool: &sqlx::PgPool,
-    ) -> impl Future<Output = Result<(CommitSequence, EventSequence), sqlx::Error>> + Send;
+        at_or_below: CommitSequence,
+    ) -> impl Future<Output = Result<Option<CommitCheckpoint>, sqlx::Error>> + Send;
 
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
-
-    /// Base name of the commit log table, for the partition maintainer.
-    fn persistent_outbox_commit_log_table() -> &'static str;
 
     /// Base name of the persistent outbox events table (honouring any table
     /// prefix). The partition maintainer derives child partition names
@@ -481,44 +462,16 @@ pub trait MailboxTables: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
 }
 
-/// One commit-log row as the loading queries report it: the lane position
-/// plus the decoded event it points at.
-#[doc(hidden)]
-pub struct CommitLogRow<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    pub commit_sequence: CommitSequence,
-    pub commit_boundary: bool,
-    pub event: Result<PersistentOutboxEvent<P>, UndecodableEventError>,
-}
-
-/// Outcome of one [`append_commit_group`](MailboxTables::append_commit_group).
-#[doc(hidden)]
-pub struct CommitGroupAppend<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    /// The group's highest insert sequence, reported whether or not the
-    /// append was taken.
-    pub group_max: EventSequence,
-    /// The rows appended, in commit order. Empty when another process had
-    /// already advanced the cursor past this group.
-    pub appended: Vec<CommitLogRow<P>>,
-}
-
-/// The sequencer's resume point, all three values from one snapshot.
+/// A sparse checkpoint of the commit-lane fold: after folding through
+/// `sequence` it had emitted `commit_seq` rows, and `open_groups` were the
+/// emitted groups still reaching above `sequence` — the ones a resumed fold
+/// must not emit twice.
 #[derive(Debug, Clone)]
-pub struct CommitRestartState {
-    /// Highest position handed out on the commit lane. The log is dense, so
-    /// this is also how many rows it holds.
-    pub last_commit_seq: CommitSequence,
-    /// Every payload-bearing event at or below this insert sequence is in
-    /// the log.
-    pub logged_through: EventSequence,
-    /// Insert sequences above `logged_through` that are already logged,
-    /// which happens when a group straddles it.
-    pub logged_ahead: Vec<EventSequence>,
+pub struct CommitCheckpoint {
+    pub sequence: EventSequence,
+    pub commit_seq: CommitSequence,
+    /// `(group, highest member)` per straddling group.
+    pub open_groups: Vec<(CommitGroupId, EventSequence)>,
 }
 
 /// One subscription's identity and terms, as stored — everything but the

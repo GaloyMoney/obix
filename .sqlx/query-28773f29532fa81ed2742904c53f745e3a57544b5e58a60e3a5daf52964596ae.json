@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "TRUNCATE persistent_outbox_commit_checkpoints",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "28773f29532fa81ed2742904c53f745e3a57544b5e58a60e3a5daf52964596ae"
+}

@@ -4,6 +4,7 @@ mod ephemeral;
 mod ephemeral_events_hook;
 mod event;
 mod gap_fill;
+mod lane;
 mod notifier;
 mod op_cursor;
 mod partition;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 pub use self::ctx::{
     EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
 };
+pub use self::lane::{CommitOrder, InsertOrder, Lane};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,
     WakeKey, WakeKeys,
@@ -30,7 +32,7 @@ pub use self::subscription::singleton::{
     Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
-    Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
 };
 use crate::{
     config::*,
@@ -46,7 +48,7 @@ use notifier::PersistentNotifier;
 pub use op_cursor::{CursorError, OpCursor};
 pub use partition::{PartitionMaintainerConfig, Partitions};
 use persistent::PersistentOutboxEventCache;
-pub use persistent::{CommitOrderedListener, PersistentOutboxListener};
+pub use persistent::{CommitOrderedListener, LaneListener, PersistentOutboxListener};
 pub use post_persist_hook::PostPersistHook;
 
 #[allow(dead_code)]
@@ -66,7 +68,10 @@ where
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     /// This process's commit-order sequencer, and the commit lane's fan-out.
-    sequencer: Arc<persistent::SequencerHandle<P>>,
+    /// `None` when [`MailboxConfig::commit_lane`] leaves the lane
+    /// [`Disabled`](CommitLane::Disabled): nothing folds, and the lane's
+    /// consumers are refused at registration.
+    sequencer: Option<Arc<persistent::SequencerHandle<P>>>,
     _pg_listener_handle: Arc<OwnedTaskHandle>,
     /// Per-process debounced NOTIFY emitter.
     notifier: PersistentNotifier,
@@ -165,13 +170,23 @@ where
         let ephemeral_cache =
             EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
-        let sequencer = persistent::spawn_sequencer::<P, Tables>(
-            &pool,
-            persistent_cache.handle(),
-            config.event_buffer_size,
-            config.backfill_page_size,
-        )
-        .await?;
+        // Shared before the sequencer starts: a commit-lane backfill re-folds the
+        // insert stream, so it opens listeners of its own.
+        let persistent_cache = Arc::new(persistent_cache);
+        let sequencer = match config.commit_lane {
+            CommitLane::Disabled => None,
+            CommitLane::Enabled => Some(Arc::new(
+                persistent::spawn_sequencer::<P, Tables>(
+                    &pool,
+                    persistent_cache.clone(),
+                    config.event_buffer_size,
+                    config.backfill_page_size,
+                    config.commit_checkpoint_every,
+                    config.commit_checkpoint_interval,
+                )
+                .await?,
+            )),
+        };
 
         let gap_filler = gap_fill::GapFiller::spawn::<P, Tables>(
             &pool,
@@ -189,9 +204,9 @@ where
             persist_events_batch_size: config.persist_events_batch_size,
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
-            persistent_cache: Arc::new(persistent_cache),
+            persistent_cache,
             ephemeral_cache: Arc::new(ephemeral_cache),
-            sequencer: Arc::new(sequencer),
+            sequencer,
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
             gap_filler,
@@ -422,25 +437,61 @@ where
         &events[cursor.pos.min(events.len())..]
     }
 
+    /// Listen on lane `L` from `start_after`. Errors with
+    /// [`CommitLaneDisabled`] only when `L` is [`CommitOrder`] and this outbox
+    /// leaves the lane [`Disabled`](CommitLane::Disabled).
+    pub fn listen<L>(
+        &self,
+        start_after: impl Into<Option<L::Position>>,
+    ) -> Result<LaneListener<L, P>, CommitLaneDisabled>
+    where
+        L: Lane,
+    {
+        Ok(LaneListener::new(
+            L::handle(self)?,
+            start_after,
+            self.event_buffer_size,
+        ))
+    }
+
     pub fn listen_persisted(
         &self,
         start_after: impl Into<Option<EventSequence>>,
     ) -> PersistentOutboxListener<P> {
-        PersistentOutboxListener::new(
-            self.persistent_cache.handle(),
-            start_after,
-            self.event_buffer_size,
-        )
+        self.listen::<InsertOrder>(start_after)
+            .expect("the insert lane is always available")
     }
 
-    /// Listen in commit order rather than insert order: a source
-    /// transaction's events arrive contiguously and are never split, and the
-    /// cursor is a dense [`CommitSequence`].
+    /// The frontier of lane `L`: the sequence generator's `last_value`, which
+    /// counts sequences assigned to uncommitted transactions, or the fold head.
+    pub async fn frontier<L>(&self) -> Result<L::Position, FrontierError>
+    where
+        L: Lane,
+    {
+        L::outbox_frontier(self).await
+    }
+
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
+    /// Listen in commit order: a source transaction's events arrive contiguously
+    /// and are never split, and the cursor is a dense [`CommitSequence`].
     pub fn listen_commit_ordered(
         &self,
         start_after: impl Into<Option<CommitSequence>>,
-    ) -> CommitOrderedListener<P> {
-        CommitOrderedListener::new(self.sequencer.lane(), start_after, self.event_buffer_size)
+    ) -> Result<CommitOrderedListener<P>, CommitLaneDisabled> {
+        self.listen::<CommitOrder>(start_after)
+    }
+
+    pub(crate) fn commit_lane(
+        &self,
+    ) -> Result<&persistent::SequencerHandle<P>, CommitLaneDisabled> {
+        self.sequencer.as_deref().ok_or(CommitLaneDisabled)
+    }
+
+    pub(crate) fn persistent_cache_handle(&self) -> lane::LaneHandle<InsertOrder, P> {
+        self.persistent_cache.handle()
     }
 
     pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
@@ -471,25 +522,36 @@ where
     /// Registration is idempotent per job type: registering the same job type
     /// twice resolves to the already-persisted job, so both calls hand back
     /// handles with the same [`job_id`](Subscription::job_id).
-    pub async fn register_singleton_subscriber<H>(
+    ///
+    /// The lane comes from the handler's impl and types the returned
+    /// [`Subscription`]. A [`CommitOrder`] handler is refused with
+    /// [`CommitLaneDisabled`] before any job is spawned when the lane is off.
+    pub async fn register_singleton_subscriber<H, L>(
         &self,
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<Subscription<P, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Subscription<P, Tables, L>, Box<dyn std::error::Error + Send + Sync>>
     where
-        H: SingletonSubscriber<P>,
+        H: SingletonSubscriber<P, L>,
+        L: Lane,
     {
-        let initializer = subscription::singleton::OutboxEventJobInitializer::<H, P, Tables>::new(
-            self.clone(),
-            handler,
-            &config,
-        );
+        L::require(self)?;
+        let initializer =
+            subscription::singleton::OutboxEventJobInitializer::<H, P, Tables, L>::new(
+                self.clone(),
+                handler,
+                &config,
+            );
         let spawner = jobs.add_resident_initializer(initializer);
         let handle = spawner
             .spawn(subscription::singleton::OutboxEventJobData::default())
             .await?;
-        Ok(Subscription::new(handle, self.pool.clone()))
+        Ok(Subscription::new(
+            handle,
+            self.pool.clone(),
+            self.sequencer.as_ref().map(|s| s.positions()),
+        ))
     }
 
     /// Register a keyed subscriber type: per-entity consumers, created and

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obix::{
-    EventCtx, FlushOp, Handled, MailboxConfig, Ordering, OutboxEventJobConfig, SingletonSubscriber,
-    out::Outbox,
+    CommitLane, CommitOrder, CommitSequence, EventCtx, EventDelivery, FlushOp, Handled,
+    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, UndecodableDelivery, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -23,20 +23,27 @@ enum TestEvent {
     Ping(u64),
 }
 
-/// Collects every event and records each flush as the group of payloads it
-/// landed, so a test can assert on batch composition rather than just on
-/// delivery.
 struct FlushRecorder {
     flushes: Arc<Mutex<Vec<Vec<u64>>>>,
+    flush_positions: Arc<Mutex<Vec<CommitSequence>>>,
 }
 
-impl SingletonSubscriber<TestEvent> for FlushRecorder {
+impl FlushRecorder {
+    fn new(flushes: Arc<Mutex<Vec<Vec<u64>>>>) -> Self {
+        Self {
+            flushes,
+            flush_positions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl SingletonSubscriber<TestEvent, CommitOrder> for FlushRecorder {
     type Batch = Vec<u64>;
 
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, Vec<u64>>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         match &event.payload {
             Some(TestEvent::Ping(n)) => {
@@ -49,10 +56,11 @@ impl SingletonSubscriber<TestEvent> for FlushRecorder {
 
     async fn flush(
         &self,
-        _op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, CommitOrder>,
         items: Vec<u64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !items.is_empty() {
+            self.flush_positions.lock().await.push(op.position());
             self.flushes.lock().await.push(items);
         }
         Ok(())
@@ -73,6 +81,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     Ok(Outbox::<TestEvent, TestTables>::init(
         pool,
         MailboxConfig::builder()
+            .commit_lane(CommitLane::Enabled)
             .build()
             .expect("Couldn't build MailboxConfig"),
     )
@@ -95,8 +104,6 @@ async fn publish_group(
     Ok(())
 }
 
-/// Poll until `f` holds, without sleeping on a fixed budget: the condition
-/// itself is the synchronisation.
 async fn until<F>(mut f: F, what: &str) -> anyhow::Result<()>
 where
     F: AsyncFnMut() -> bool,
@@ -111,8 +118,6 @@ where
     anyhow::bail!("timed out waiting for {what}")
 }
 
-/// A flush on the commit lane never lands a partial source transaction, even
-/// when the group is larger than `max_batch_size`.
 #[tokio::test]
 #[file_serial]
 async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
@@ -122,17 +127,12 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
 
     let flushes = Arc::new(Mutex::new(Vec::new()));
 
-    // Groups of three against a max batch size of two: the soft limit must
-    // give way to the group boundary.
+    // Groups of three against a max batch size of two.
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
-                .ordering(Ordering::Commit)
-                .with_max_batch_size(2),
-            FlushRecorder {
-                flushes: flushes.clone(),
-            },
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).with_max_batch_size(2),
+            FlushRecorder::new(flushes.clone()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -152,8 +152,6 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
     let delivered: Vec<u64> = flushes.iter().flatten().copied().collect();
     assert_eq!(delivered.len(), 12, "every event delivered exactly once");
 
-    // Every group of three landed inside a single flush: no flush boundary
-    // falls strictly inside {3k, 3k+1, 3k+2}.
     for group in 0..4u64 {
         let members: Vec<u64> = (group * 3..group * 3 + 3).collect();
         let containing: Vec<&Vec<u64>> = flushes
@@ -176,8 +174,6 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delivery on the commit lane survives a restart: the second run resumes
-/// from the stored commit cursor rather than replaying from the beginning.
 #[tokio::test]
 #[file_serial]
 async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
@@ -190,10 +186,8 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
         outbox
             .register_singleton_subscriber(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
-                FlushRecorder {
-                    flushes: first.clone(),
-                },
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+                FlushRecorder::new(first.clone()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -205,22 +199,18 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
             "first run delivered its events",
         )
         .await?;
-        // The first instance must stop competing for the job before the
-        // second registers, or the restart is not a restart.
+        // The first instance must stop competing for the job before the second
+        // registers, or the restart is not a restart.
         let _ = jobs.shutdown().await;
     }
 
-    // A fresh Jobs instance re-runs the same job type against the stored
-    // checkpoint.
     let second = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = init_jobs(&pool).await?;
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
-            FlushRecorder {
-                flushes: second.clone(),
-            },
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+            FlushRecorder::new(second.clone()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -241,20 +231,19 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Counts deliveries and acknowledges undecodable payloads, so a test can
-/// see whether an acknowledged one comes back after a restart.
 struct UndecodableAcker {
     seen: Arc<Mutex<Vec<u64>>>,
     undecodable: Arc<Mutex<usize>>,
+    undecodable_at: Arc<Mutex<Vec<CommitSequence>>>,
 }
 
-impl SingletonSubscriber<TestEvent> for UndecodableAcker {
+impl SingletonSubscriber<TestEvent, CommitOrder> for UndecodableAcker {
     type Batch = ();
 
     async fn handle_persistent<'inv>(
         &self,
         ctx: EventCtx<'inv, ()>,
-        event: &Arc<obix::out::PersistentOutboxEvent<TestEvent>>,
+        event: &EventDelivery<TestEvent, CommitOrder>,
     ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(TestEvent::Ping(n)) = &event.payload {
             self.seen.lock().await.push(*n);
@@ -264,16 +253,14 @@ impl SingletonSubscriber<TestEvent> for UndecodableAcker {
 
     async fn handle_undecodable(
         &self,
-        _error: &obix::UndecodableEventError,
+        error: &UndecodableDelivery<CommitOrder>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.undecodable_at.lock().await.push(error.position());
         *self.undecodable.lock().await += 1;
         Ok(())
     }
 }
 
-/// Acknowledging an undecodable payload must advance the *commit* cursor,
-/// not only the insert one: leaving it behind redelivers the event after
-/// every restart.
 #[tokio::test]
 #[file_serial]
 async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result<()> {
@@ -294,15 +281,17 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
     .await?;
 
     let undecodable = Arc::new(Mutex::new(0usize));
+    let undecodable_at = Arc::new(Mutex::new(Vec::new()));
     {
         let mut jobs = init_jobs(&pool).await?;
         outbox
             .register_singleton_subscriber(
                 &mut jobs,
-                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+                OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 UndecodableAcker {
                     seen: Arc::new(Mutex::new(Vec::new())),
                     undecodable: undecodable.clone(),
+                    undecodable_at: undecodable_at.clone(),
                 },
             )
             .await
@@ -317,6 +306,12 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
         let _ = jobs.shutdown().await;
     }
 
+    assert_eq!(
+        *undecodable_at.lock().await,
+        vec![CommitSequence::from(1u64)],
+        "an undecodable delivery must report the position it occupies on its lane",
+    );
+
     // A fresh run against the stored checkpoint must not see it again.
     let after_restart = Arc::new(Mutex::new(0usize));
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -324,18 +319,19 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
     outbox
         .register_singleton_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).ordering(Ordering::Commit),
+            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             UndecodableAcker {
                 seen: seen.clone(),
                 undecodable: after_restart.clone(),
+                undecodable_at: Arc::new(Mutex::new(Vec::new())),
             },
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     jobs.start_poll().await?;
 
-    // Publish past it and wait for that to arrive, so the restarted run has
-    // demonstrably reached the stream rather than merely not started.
+    // Publish past it, so the restarted run has demonstrably reached the
+    // stream rather than merely not started.
     publish_group(&outbox, 100, 1).await?;
     until(
         async || seen.lock().await.contains(&100),

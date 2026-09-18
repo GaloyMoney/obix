@@ -1,6 +1,5 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::Instrument;
 
 use std::sync::{
@@ -12,45 +11,22 @@ use super::feeder::{self, CacheFeeder, CatchUpOutcome, FeederHandle, FeederRepor
 use crate::{
     config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
-    out::{event::*, gap_fill::GapFillRequest, pg_notify::NotifyMessage},
+    out::{
+        event::*,
+        gap_fill::GapFillRequest,
+        lane::{InsertOrder, LaneHandle},
+        pg_notify::NotifyMessage,
+    },
     sequence::EventSequence,
 };
 
-pub struct CacheHandle<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    highest_known_sequence: Arc<AtomicU64>,
-    persistent_event_receiver: Option<broadcast::Receiver<PersistentDelivery<P>>>,
-    backfill_request: mpsc::UnboundedSender<(EventSequence, mpsc::Sender<PersistentDelivery<P>>)>,
-    backfill_buffer_size: usize,
-}
+/// What this cache hands a listener — the insert lane's
+/// [`LaneHandle`](crate::out::lane::LaneHandle).
+pub type CacheHandle<P> = LaneHandle<InsertOrder, P>;
 
-impl<P> CacheHandle<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    pub fn latest_known_persisted(&self) -> EventSequence {
-        EventSequence::from(self.highest_known_sequence.load(Ordering::Relaxed))
-    }
-
-    pub fn persistent_event_stream(&mut self) -> BroadcastStream<PersistentDelivery<P>> {
-        BroadcastStream::new(
-            self.persistent_event_receiver
-                .take()
-                .expect("receiver already taken"),
-        )
-    }
-
-    pub fn request_old_persistent_events(
-        &self,
-        start_after: EventSequence,
-    ) -> ReceiverStream<PersistentDelivery<P>> {
-        let (tx, rx) = mpsc::channel(self.backfill_buffer_size);
-        let _ = self.backfill_request.send((start_after, tx));
-        ReceiverStream::new(rx)
-    }
-}
+/// The insert lane's internal transport: a [`PersistentDelivery`] positioned
+/// at its own sequence.
+type InsertTransport<P> = Transport<InsertOrder, P>;
 
 /// Outcome of parsing a `{min_sequence, max_sequence}` notification.
 struct NotifiedRange {
@@ -193,11 +169,10 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     highest_known_sequence: Arc<AtomicU64>,
-    persistent_event_sender: broadcast::Sender<PersistentDelivery<P>>,
-    backfill_request_send:
-        mpsc::UnboundedSender<(EventSequence, mpsc::Sender<PersistentDelivery<P>>)>,
+    persistent_event_sender: broadcast::Sender<InsertTransport<P>>,
+    backfill_request_send: mpsc::UnboundedSender<(EventSequence, mpsc::Sender<InsertTransport<P>>)>,
     backfill_buffer_size: usize,
-    cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+    cache_fill_sender: broadcast::Sender<InsertTransport<P>>,
     feeder: CacheFeeder<P>,
     _cache_loop_handle: OwnedTaskHandle,
     _feeder_handle: OwnedTaskHandle,
@@ -210,15 +185,15 @@ where
     Tables: crate::tables::MailboxTables,
 {
     pub fn handle(&self) -> CacheHandle<P> {
-        CacheHandle {
-            highest_known_sequence: self.highest_known_sequence.clone(),
-            persistent_event_receiver: Some(self.persistent_event_sender.subscribe()),
-            backfill_request: self.backfill_request_send.clone(),
-            backfill_buffer_size: self.backfill_buffer_size,
-        }
+        LaneHandle::new(
+            self.highest_known_sequence.clone(),
+            self.persistent_event_sender.subscribe(),
+            self.backfill_request_send.clone(),
+            self.backfill_buffer_size,
+        )
     }
 
-    pub fn cache_fill_sender(&self) -> broadcast::Sender<PersistentDelivery<P>> {
+    pub fn cache_fill_sender(&self) -> broadcast::Sender<InsertTransport<P>> {
         self.cache_fill_sender.clone()
     }
 
@@ -277,16 +252,13 @@ where
     }
 
     fn insert_into_cache_and_maybe_broadcast(
-        cache: im::OrdMap<EventSequence, PersistentDelivery<P>>,
-        event: PersistentDelivery<P>,
+        cache: im::OrdMap<EventSequence, InsertTransport<P>>,
+        event: InsertTransport<P>,
         highest_known_sequence: &AtomicU64,
-        persistent_event_sender: &broadcast::Sender<PersistentDelivery<P>>,
+        persistent_event_sender: &broadcast::Sender<InsertTransport<P>>,
         mut last_broadcast_sequence: EventSequence,
         cache_size: usize,
-    ) -> (
-        im::OrdMap<EventSequence, PersistentDelivery<P>>,
-        EventSequence,
-    ) {
+    ) -> (im::OrdMap<EventSequence, InsertTransport<P>>, EventSequence) {
         use std::ops::Bound;
 
         let sequence = event.sequence();
@@ -353,7 +325,7 @@ where
     /// subscription is instead visible to the page read itself.
     async fn park_until_resolved(
         pool: &sqlx::PgPool,
-        mut wakeup: broadcast::Receiver<PersistentDelivery<P>>,
+        mut wakeup: broadcast::Receiver<InsertTransport<P>>,
         needed: EventSequence,
     ) {
         loop {
@@ -407,9 +379,9 @@ where
     async fn handle_backfill_request(
         pool: sqlx::PgPool,
         start_after: EventSequence,
-        sender: mpsc::Sender<PersistentDelivery<P>>,
-        cache_snapshot: im::OrdMap<EventSequence, PersistentDelivery<P>>,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+        sender: mpsc::Sender<InsertTransport<P>>,
+        cache_snapshot: im::OrdMap<EventSequence, InsertTransport<P>>,
+        cache_fill_sender: broadcast::Sender<InsertTransport<P>>,
         highest: EventSequence,
         page_size: usize,
         init_head: u64,
@@ -482,7 +454,7 @@ where
             // whatever a `MailboxTables` implementation hands back.
             let mut delivered = 0;
             for item in events {
-                let delivery = PersistentDelivery::from(item);
+                let delivery = InsertTransport::insert(PersistentDelivery::from(item));
                 if delivery.sequence() != current_sequence.next() {
                     break;
                 }
@@ -548,11 +520,12 @@ where
         pool: sqlx::PgPool,
         after: EventSequence,
         up_to: EventSequence,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+        cache_fill_sender: broadcast::Sender<InsertTransport<P>>,
     ) {
         if let Ok(events) = Tables::load_events_in_range::<P>(&pool, after, up_to).await {
             for item in events {
-                let _ = cache_fill_sender.send(PersistentDelivery::from(item));
+                let _ =
+                    cache_fill_sender.send(InsertTransport::insert(PersistentDelivery::from(item)));
             }
         }
     }
@@ -575,7 +548,7 @@ where
     /// Returns `None` for unparsable payloads.
     fn handle_notification(
         payload: &str,
-        cache: &im::OrdMap<EventSequence, PersistentDelivery<P>>,
+        cache: &im::OrdMap<EventSequence, InsertTransport<P>>,
     ) -> Option<NotifiedRange> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
@@ -609,14 +582,14 @@ where
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
         config: &MailboxConfig,
-        persistent_event_sender: broadcast::Sender<PersistentDelivery<P>>,
+        persistent_event_sender: broadcast::Sender<InsertTransport<P>>,
         highest_known_sequence: Arc<AtomicU64>,
         mut backfill_request: mpsc::UnboundedReceiver<(
             EventSequence,
-            mpsc::Sender<PersistentDelivery<P>>,
+            mpsc::Sender<InsertTransport<P>>,
         )>,
-        mut cache_fill_receiver: broadcast::Receiver<PersistentDelivery<P>>,
-        cache_fill_sender: broadcast::Sender<PersistentDelivery<P>>,
+        mut cache_fill_receiver: broadcast::Receiver<InsertTransport<P>>,
+        cache_fill_sender: broadcast::Sender<InsertTransport<P>>,
         mut notification_receiver: mpsc::Receiver<NotifyMessage>,
         gap_fill_tx: mpsc::UnboundedSender<GapFillRequest>,
         mut feeder: FeederHandle,
@@ -632,7 +605,7 @@ where
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
         let handle = spawn_supervised("obix::persistent_cache_loop", async move {
-            let mut persistent_cache: im::OrdMap<EventSequence, PersistentDelivery<P>> =
+            let mut persistent_cache: im::OrdMap<EventSequence, InsertTransport<P>> =
                 im::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
             let mut stall = StallTracker::default();

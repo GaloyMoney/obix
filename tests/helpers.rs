@@ -56,20 +56,12 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reset the commit-ordered lane: the log and the sequencer's state row.
-/// The state row must be reset alongside the events table — a surviving
-/// `head`/`cursor` would sit past the sequences a truncated stream reissues
-/// and the sequencer would never log them.
+/// Reset the commit-ordered lane's checkpoints; they must go alongside the
+/// events table, or a fold seeded from one skips a truncated stream's reissues.
 pub async fn wipeout_commit_log(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query!("TRUNCATE persistent_outbox_commit_log")
+    sqlx::query!("TRUNCATE persistent_outbox_commit_checkpoints")
         .execute(pool)
         .await?;
-    sqlx::query!(
-        "UPDATE persistent_outbox_commit_log_state
-         SET last_commit_seq = 0, logged_through_sequence = 0 WHERE singleton"
-    )
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -106,7 +98,6 @@ where
     Ok(inbox)
 }
 
-/// Wipe every subscription row for one keyed subscriber type.
 pub async fn wipeout_subscriptions(
     pool: &sqlx::PgPool,
     subscriber_type: &str,
@@ -118,18 +109,11 @@ pub async fn wipeout_subscriptions(
     Ok(())
 }
 
-/// The waker's job type: one per outbox rather than one per subscriber
-/// type, derived from the persistent table name.
+/// The waker's job type: one per outbox rather than one per subscriber type.
 pub const KEYED_WAKER_JOB_TYPE: &str = "persistent_outbox_events.keyed-waker";
 
-/// [`wipeout_outbox_job_tables`] for every job type a keyed subscriber
-/// registration touches: the per-key job type itself, its derived
-/// and the outbox-wide waker.
-///
-/// The waker must be wiped along with the outbox tables it tracks — it is
-/// shared across subscriber types and holds a durable checkpoint, so a
-/// surviving one would sit past the sequences a truncated stream reissues
-/// and silently stop waking anything.
+/// [`wipeout_outbox_job_tables`] for the per-key job type and the shared waker,
+/// whose durable checkpoint must not outlive a truncated stream.
 pub async fn wipeout_keyed_subscriber_job_tables(
     pool: &sqlx::PgPool,
     job_type: &str,

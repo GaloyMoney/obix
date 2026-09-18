@@ -22,13 +22,14 @@ mod runner;
 mod waker;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, time::Duration};
 
 use job::JobType;
 
 use crate::out::Subscription;
 use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
-use crate::out::event::{PersistentOutboxEvent, UndecodableEventError};
+use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
+use crate::out::lane::InsertOrder;
 use crate::tables::MailboxTables;
 
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
@@ -197,13 +198,13 @@ where
     /// [`SingletonSubscriber::Batch`](crate::out::SingletonSubscriber::Batch).
     type Batch: Default + Send + 'static;
 
-    /// The event arrives as the shared [`Arc`] the outbox decoded once and
-    /// broadcast to every subscriber — see
+    /// The event and its insert-lane position — see
     /// [`SingletonSubscriber::handle_persistent`](crate::out::SingletonSubscriber::handle_persistent).
+    /// Keyed subscribers are insert-lane only, so there is no lane parameter.
     fn handle<'inv>(
         &self,
         ctx: KeyedEventCtx<'inv, Self::Batch>,
-        event: &Arc<PersistentOutboxEvent<P>>,
+        event: &EventDelivery<P>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
@@ -213,10 +214,10 @@ where
     /// fails with the error as-is, parking the cursor before the poison event.
     fn handle_undecodable(
         &self,
-        error: &UndecodableEventError,
+        error: &UndecodableDelivery,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {
-        let error = error.clone();
+        let error = error.inner().clone();
         async move { Err(error.into()) }
     }
 
@@ -224,7 +225,7 @@ where
     /// [`SingletonSubscriber::flush`](crate::out::SingletonSubscriber::flush).
     fn flush(
         &self,
-        op: &mut FlushOp<'_>,
+        op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
     {

@@ -19,6 +19,8 @@ use job::{CurrentJob, Job, JobType, RetrySettings};
 use super::{KeyMsg, KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef};
 use crate::out::Outbox;
 use crate::out::ctx::*;
+use crate::out::lane::InsertOrder;
+use crate::out::subscription::StreamPosition;
 use crate::tables::MailboxTables;
 
 // === Object-safe flush bridge ===
@@ -37,11 +39,16 @@ where
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: S::Batch,
+        state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
-            let mut op = FlushOp::new(op);
+            let mut op = FlushOp::<InsertOrder>::new(op, state.sequence);
             self.subscriber.flush(&mut op, items).await
         })
+    }
+
+    fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition {
+        StreamPosition::Insert(state.sequence)
     }
 }
 
@@ -244,8 +251,7 @@ where
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
             collected: 0,
-            persisted_seq: state.position(),
-            persisted_insert_seq: state.sequence,
+            persisted: StreamPosition::Insert(state.sequence),
             last_persist: tokio::time::Instant::now(),
         };
         let mut batch = <D::Subscriber as KeyedSubscriber<P>>::Batch::default();
@@ -307,7 +313,7 @@ where
                 tokio::select! {
                     biased;
                     _ = current_job.shutdown_requested() => {
-                        if tracker.persisted_seq < state.position() {
+                        if tracker.persisted < StreamPosition::Insert(state.sequence) {
                             persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                 .await
                                 .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -335,7 +341,7 @@ where
                             // Not idle after all — drop through and handle it.
                             Some(Some(item)) => item,
                             Some(None) => {
-                                if tracker.persisted_seq < state.position() {
+                                if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                         .await
                                         .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -359,7 +365,7 @@ where
                                     current_job.clock(),
                                 )
                                 .await?;
-                                if tracker.persisted_seq < state.position() {
+                                if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     current_job
                                         .update_execution_state_in_op(&mut op, &state)
                                         .await?;
@@ -370,12 +376,11 @@ where
                         }
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
-                        if tracker.persisted_seq < state.position() => {
+                        if tracker.persisted < StreamPosition::Insert(state.sequence) => {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
                             .map_err(|e| e as Box<dyn std::error::Error>)?;
-                        tracker.persisted_seq = state.position();
-                        tracker.persisted_insert_seq = state.sequence;
+                        tracker.persisted = StreamPosition::Insert(state.sequence);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
                     }
@@ -391,7 +396,7 @@ where
                         match event {
                             Some(item) => item,
                             None => {
-                                if tracker.persisted_seq < state.position() {
+                                if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                         .await
                                         .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -422,7 +427,7 @@ where
                             continue;
                         }
                         Err(error) => {
-                            if tracker.persisted_seq < state.position() {
+                            if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                 persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                     .await
                                     .map_err(|e| e as Box<dyn std::error::Error>)?;

@@ -67,6 +67,8 @@ use std::marker::PhantomData;
 
 use job::CurrentJob;
 
+use crate::out::lane::{InsertOrder, Lane};
+use crate::out::subscription::StreamPosition;
 use crate::sequence::{CommitSequence, EventSequence};
 
 /// Error type shared with the handler trait methods.
@@ -95,17 +97,6 @@ pub(crate) struct OutboxEventJobState {
     pub(crate) paused: Option<PausedState>,
 }
 
-impl OutboxEventJobState {
-    /// The position the runner compares and persists: the commit cursor when
-    /// the subscription is on the commit lane, else the insert cursor.
-    pub(crate) fn position(&self) -> i64 {
-        match self.commit_sequence {
-            Some(commit_sequence) => i64::from(commit_sequence),
-            None => u64::from(self.sequence) as i64,
-        }
-    }
-}
-
 /// The pause slot: the event the cursor is parked before, and the instant
 /// the member asked to be woken at.
 #[derive(Clone, Serialize, Deserialize)]
@@ -122,14 +113,9 @@ pub(crate) struct BatchTracker {
     /// `max_batch_size` bounds — with no deferred ops, the pending batch is
     /// exactly its collected events.
     pub(crate) collected: usize,
-    /// Highest position whose checkpoint has been persisted to the database.
-    /// Lane-agnostic, so it holds whichever cursor
-    /// [`OutboxEventJobState::position`] reports.
-    pub(crate) persisted_seq: i64,
-    /// The same checkpoint expressed as an insert sequence, for
-    /// [`FlushError`] attribution only — that range is reported in insert
-    /// sequences on both lanes.
-    pub(crate) persisted_insert_seq: EventSequence,
+    /// Highest position whose checkpoint has been persisted, on the
+    /// subscription's own lane. Dynamic because the ctx types are lane-free.
+    pub(crate) persisted: StreamPosition,
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
 }
@@ -384,32 +370,54 @@ pub(crate) type BoxFuture<'a, T> =
 /// Object-safe bridge from the runner (and [`EventCtx::consume`]'s
 /// entry fence) to the handler's typed
 /// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
-/// [`EventCtx`] only needs to know the accumulator `B`.
+/// [`EventCtx`] only needs to know the accumulator `B`. The whole
+/// [`OutboxEventJobState`] is passed because only the implementor knows its `L`.
 pub(crate) trait ItemFlush<B>: Send + Sync {
     fn flush_items<'a>(
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: B,
+        state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
+
+    /// Where the subscription's cursor sits, on the handler's own lane.
+    fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition;
 }
 
 /// Restricted view of the batch op handed to
 /// [`flush`](super::SingletonSubscriber::flush) — everything an
-/// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else.
+/// [`AtomicOperation`](es_entity::AtomicOperation) can do, and nothing else —
+/// plus the lane position this batch lands at.
 ///
 /// Committing belongs to the runner: after `flush` returns `Ok`, the
 /// checkpoint is written and the transaction commits — items, work and
 /// pointer land atomically. There is no access to the raw
 /// [`es_entity::DbOp`], mirroring [`IsolatedOp`]'s sealing.
-pub struct FlushOp<'a>(&'a mut es_entity::DbOp<'static>);
+pub struct FlushOp<'a, L = InsertOrder>
+where
+    L: Lane,
+{
+    op: &'a mut es_entity::DbOp<'static>,
+    position: L::Position,
+}
 
-impl<'a> FlushOp<'a> {
-    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>) -> Self {
-        Self(op)
+impl<'a, L> FlushOp<'a, L>
+where
+    L: Lane,
+{
+    pub(crate) fn new(op: &'a mut es_entity::DbOp<'static>, position: L::Position) -> Self {
+        Self { op, position }
+    }
+
+    /// Where this batch lands: the last *fully handled* event on this lane, and
+    /// the checkpoint this transaction is about to commit. Folding `max` over the
+    /// flushed items understates it when the batch ended on skipped events.
+    pub fn position(&self) -> L::Position {
+        self.position
     }
 }
 
-es_entity::delegate_atomic_operation!(FlushOp<'_>, { s => s.0 });
+es_entity::delegate_atomic_operation!([<L: Lane>] FlushOp<'_, L>, { s => s.op });
 
 /// A batch flush failed. Carries the sequence range actually at fault, so
 /// the failure is not misattributed to the (innocent) event whose verb
@@ -425,11 +433,11 @@ pub struct FlushError {
     /// `"undecodable_event"`, and for keyed subscribers `"pause_entry"` and
     /// `"staged_pause"`).
     pub reason: &'static str,
-    /// The batch covers sequences strictly after this (the last durable
+    /// The batch covers positions strictly after this (the last durable
     /// checkpoint)…
-    pub after: EventSequence,
+    pub after: StreamPosition,
     /// …through this (the last fully handled event).
-    pub through: EventSequence,
+    pub through: StreamPosition,
     pub source: HandlerError,
 }
 
@@ -487,12 +495,14 @@ pub(crate) async fn flush_batch<B: Default>(
         // leaks stale state into a retry.
         let items = std::mem::take(batch);
         parts.tracker.collected = 0;
+        let state = &*parts.state;
         let op = parts.op_slot.as_mut().expect("op was materialized above");
-        if let Err(source) = flusher.flush_items(op, items).await {
+        let through = flusher.position_of(state);
+        if let Err(source) = flusher.flush_items(op, items, state).await {
             return Err(Box::new(FlushError {
                 reason,
-                after: parts.tracker.persisted_insert_seq,
-                through: parts.state.sequence,
+                after: parts.tracker.persisted,
+                through,
                 source,
             }));
         }
@@ -509,8 +519,7 @@ pub(crate) async fn flush_batch<B: Default>(
         mirror.mirror(&mut op, parts.state.sequence).await?;
     }
     op.commit().await?;
-    parts.tracker.persisted_seq = parts.state.position();
-    parts.tracker.persisted_insert_seq = parts.state.sequence;
+    parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
 }
