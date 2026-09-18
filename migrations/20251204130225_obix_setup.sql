@@ -49,7 +49,12 @@ CREATE TRIGGER ephemeral_outbox_events_notify
   AFTER INSERT OR UPDATE ON ephemeral_outbox_events
   FOR EACH ROW EXECUTE FUNCTION notify_ephemeral_outbox_events();
 
-CREATE TYPE InboxEventStatus AS ENUM ('pending', 'processing', 'completed', 'failed');
+-- Idempotent so that multiple scoped obix instances can be used simultaneously.
+DO $$ BEGIN
+    CREATE TYPE InboxEventStatus AS ENUM ('pending', 'processing', 'completed', 'failed');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 CREATE TABLE inbox_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
