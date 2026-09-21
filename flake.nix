@@ -375,6 +375,7 @@
       # — no Postgres. FUZZ_SECONDS etc. are passed through the environment.
       fuzz-runner = pkgs.writeShellScriptBin "fuzz" ''
         set -e
+        export SQLX_OFFLINE=true
         export PATH="${pkgs.lib.makeBinPath [
           rustToolchain
           pkgs.cargo-fuzz
