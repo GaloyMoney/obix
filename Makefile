@@ -42,4 +42,4 @@ sqlx-prepare:
 # `nix run .#fuzz` and the Concourse `fuzz` job. Auto-discovers targets via
 # `cargo fuzz list`; runs them for $(FUZZ_TIME)s. Corpus in fuzz/corpus/ (gitignored).
 fuzz:
-	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh
+	SQLX_OFFLINE=true FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh

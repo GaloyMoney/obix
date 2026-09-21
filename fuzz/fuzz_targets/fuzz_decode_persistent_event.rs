@@ -28,7 +28,7 @@ use libfuzzer_sys::fuzz_target;
 
 use chrono::Utc;
 use obix::out::OutboxEventId;
-use obix::{EventSequence, UndecodableEventError, decode_persistent_event};
+use obix::{CommitGroupId, EventSequence, UndecodableEventError, decode_persistent_event};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -58,6 +58,7 @@ fuzz_target!(|data: &[u8]| {
     let id = OutboxEventId::from(Uuid::nil());
     let sequence = 0u64;
     let recorded_at = Utc::now();
+    let commit_group = CommitGroupId::from(0i64);
 
     match decode_persistent_event::<FuzzPayload>(
         id,
@@ -65,6 +66,7 @@ fuzz_target!(|data: &[u8]| {
         recorded_at,
         None,
         payload.clone(),
+        commit_group,
     ) {
         Ok(event) => {
             if must_be_ok_with_none {
@@ -86,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(event.id, id);
             assert_eq!(u64::from(event.sequence), sequence);
             assert_eq!(event.recorded_at, recorded_at);
+            assert_eq!(event.commit_group, commit_group);
             assert!(event.tracing_context.is_none());
         }
         Err(UndecodableEventError {
@@ -93,6 +96,7 @@ fuzz_target!(|data: &[u8]| {
             sequence: err_seq,
             recorded_at: err_ts,
             failure,
+            commit_group: err_cg,
         }) => {
             // `None` can never be undecodable — that's the placeholder path.
             let raw = payload
@@ -107,6 +111,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(err_id, id);
             assert_eq!(err_seq, EventSequence::from(sequence));
             assert_eq!(err_ts, recorded_at);
+            assert_eq!(err_cg, commit_group);
         }
     }
 });
