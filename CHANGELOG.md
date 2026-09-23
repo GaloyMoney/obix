@@ -1,3 +1,15 @@
+# [obix release v0.13.0](https://github.com/GaloyMoney/obix/releases/tag/0.13.0)
+
+
+
+### Bug Fixes
+
+- Repair API drift, make fuzz hermetic, add GHA smoke test (#162)
+
+### Miscellaneous Tasks
+
+- [**breaking**] Upgrade to es-entity 0.14.0 and Job 0.16.0 (#161)
+
 # [obix release v0.12.3](https://github.com/GaloyMoney/obix/releases/tag/0.12.3)
 
 
