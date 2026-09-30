@@ -481,7 +481,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "errlanes"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=a5f224b1c56b56b6374f214cddb791b6aea99a87#a5f224b1c56b56b6374f214cddb791b6aea99a87"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=800d1582acbb811f3ffa9cc227cc0f728789cf23#800d1582acbb811f3ffa9cc227cc0f728789cf23"
 dependencies = [
  "errlanes-derive",
  "sqlx",
@@ -490,7 +490,7 @@ dependencies = [
 [[package]]
 name = "errlanes-derive"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=a5f224b1c56b56b6374f214cddb791b6aea99a87#a5f224b1c56b56b6374f214cddb791b6aea99a87"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=800d1582acbb811f3ffa9cc227cc0f728789cf23#800d1582acbb811f3ffa9cc227cc0f728789cf23"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -503,7 +503,7 @@ dependencies = [
 [[package]]
 name = "es-entity"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=a5f224b1c56b56b6374f214cddb791b6aea99a87#a5f224b1c56b56b6374f214cddb791b6aea99a87"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=800d1582acbb811f3ffa9cc227cc0f728789cf23#800d1582acbb811f3ffa9cc227cc0f728789cf23"
 dependencies = [
  "async-stream",
  "chrono",
@@ -530,7 +530,7 @@ dependencies = [
 [[package]]
 name = "es-entity-macros"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=a5f224b1c56b56b6374f214cddb791b6aea99a87#a5f224b1c56b56b6374f214cddb791b6aea99a87"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=800d1582acbb811f3ffa9cc227cc0f728789cf23#800d1582acbb811f3ffa9cc227cc0f728789cf23"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -1014,7 +1014,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "job"
 version = "0.16.2-dev"
-source = "git+https://github.com/GaloyMoney/job?rev=30f96bc6e15efae4d1e779bca24fdcc0319b808c#30f96bc6e15efae4d1e779bca24fdcc0319b808c"
+source = "git+https://github.com/GaloyMoney/job?rev=3e2733a61986fc922f3c19b9f64df17fbc35462f#3e2733a61986fc922f3c19b9f64df17fbc35462f"
 dependencies = [
  "async-trait",
  "chrono",
