@@ -69,10 +69,11 @@ thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
 
-# Temporary pre-release validation pins; remove when es-entity #245 and job #226
+# Temporary v2 validation pins; remove when es-entity #246 and job #228
 # are released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
-job = { git = "https://github.com/GaloyMoney/job", branch = "refactor/errlanes-job" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+job = { git = "https://github.com/GaloyMoney/job", rev = "5bdf0ed6264b23ac9563c59db2c17dd885e60bc6" }
