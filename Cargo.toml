@@ -72,8 +72,8 @@ derive_builder = "0.20"
 # Temporary v2 validation pins; remove when es-entity #246 and job #228
 # are released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
-es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
-job = { git = "https://github.com/GaloyMoney/job", rev = "5bdf0ed6264b23ac9563c59db2c17dd885e60bc6" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "a6b4ffcf1c40d906ea78e030ed04ea40188f79d0" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "a6b4ffcf1c40d906ea78e030ed04ea40188f79d0" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "a6b4ffcf1c40d906ea78e030ed04ea40188f79d0" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "a6b4ffcf1c40d906ea78e030ed04ea40188f79d0" }
+job = { git = "https://github.com/GaloyMoney/job", rev = "bfe07b22a18903a6f265de3f3de92ce1d4c91340" }
