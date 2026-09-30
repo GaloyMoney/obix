@@ -30,7 +30,7 @@ pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxResult,
 };
-pub use obix_macros::{MailboxTables, OutboxEvent};
+pub use obix_macros::{MailboxTables, OutboxEvent, OutboxEventKind};
 pub use out::{
     CommitOrder, CursorError, DecodeFailure, Delivery, EventCtx, EventDelivery, FlushError,
     FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx, KeyedSubscriber,
