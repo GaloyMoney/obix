@@ -12,8 +12,7 @@ use futures::{StreamExt, TryStreamExt};
 use obix::{
     CommitLane, CommitLaneDisabled, CommitOrder, CommitSequence, EventCtx, EventDelivery,
     EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, Ordering, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, SubscriptionRejection, UndecodableDelivery,
-    out::Outbox,
+    SingletonSubscriber, StreamPosition, SubscriptionRejection, UndecodableDelivery, out::Outbox,
     prelude::es_entity::errlanes::Fail,
 };
 use serde::{Deserialize, Serialize};
@@ -160,10 +159,14 @@ where
     anyhow::bail!("timed out waiting for {what}")
 }
 
+/// `(position, last_handled, collected items)` recorded by one
+/// [`InsertPositionRecorder::flush`] call.
+type InsertFlush = (EventSequence, Option<EventSequence>, Vec<u64>);
+
 struct InsertPositionRecorder {
     seen: Arc<Mutex<Vec<(EventSequence, EventSequence)>>>,
     last_handled: Arc<Mutex<Option<EventSequence>>>,
-    flushes: Arc<Mutex<Vec<(EventSequence, Option<EventSequence>, Vec<u64>)>>>,
+    flushes: Arc<Mutex<Vec<InsertFlush>>>,
 }
 
 impl SingletonSubscriber<TestEvent> for InsertPositionRecorder {
@@ -366,9 +369,12 @@ async fn commit_lane_position_is_dense_and_groups_are_contiguous() -> anyhow::Re
     Ok(())
 }
 
+/// `(position, collected items)` recorded by one [`GroupFlusher::flush`] call.
+type CommitFlush = (CommitSequence, Vec<u64>);
+
 struct GroupFlusher {
     seen: Arc<Mutex<Vec<(u64, CommitSequence, bool)>>>,
-    flushes: Arc<Mutex<Vec<(CommitSequence, Vec<u64>)>>>,
+    flushes: Arc<Mutex<Vec<CommitFlush>>>,
 }
 
 impl SingletonSubscriber<TestEvent, CommitOrder> for GroupFlusher {
@@ -1163,7 +1169,7 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
             Skipper,
         )
         .await;
-    let error = refused.err().expect("registration must be refused");
+    let error = refused.expect_err("registration must be refused");
     assert!(
         error.downcast_ref::<CommitLaneDisabled>().is_some(),
         "registration must fail with CommitLaneDisabled, got: {error}",
