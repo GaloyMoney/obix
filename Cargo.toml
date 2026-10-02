@@ -15,6 +15,7 @@ default = ["default-tables"]
 fail-on-warnings = ["obix-macros/fail-on-warnings"]
 tracing = [
   "es-entity/tracing-context",
+  "es-entity/errlanes-tracing",
   "obix-macros/tracing"
 ]
 default-tables = []
@@ -55,7 +56,7 @@ obix-macros = { path = "obix-macros", version = "0.13.2-dev" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-es-entity = "0.14.1"
+es-entity = "0.15.0"
 anyhow = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -64,7 +65,7 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
-job = { version = "0.16.1", features = ["es-entity"] }
+job = { git = "https://github.com/GaloyMoney/job", branch = "refactor/errlanes-v2-job", features = ["es-entity"] }
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"
