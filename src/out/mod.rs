@@ -41,6 +41,17 @@ use crate::{
     sequence::{CommitSequence, EventSequence},
     tables::*,
 };
+/// A raw infrastructure fault with nothing for the caller to correct —
+/// what a `sqlx::Error` becomes at [`Outbox`]'s and [`Partitions`]'s own
+/// hand-written API, via errlanes' blanket classification on bare `?`.
+///
+/// Deliberately **not** the error type of the [`MailboxTables`] trait
+/// itself: that trait is implemented by downstream crates via
+/// `#[derive(obix_macros::MailboxTables)]`, so changing its associated
+/// error type is a far larger, separately-coordinated breaking change —
+/// see the adoption PR description.
+pub type OutboxError = es_entity::errlanes::Fault<es_entity::errlanes::lanes!(Transient, Fatal)>;
+
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
@@ -140,7 +151,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
+    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, OutboxError> {
         let pool = pool.clone();
 
         let (persistent_notification_tx, persistent_notification_rx) =
@@ -274,10 +285,17 @@ where
         *deps = rebuilt.into();
     }
 
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
-        es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, OutboxError> {
+        Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
     }
 
+    // `publish_persisted_in_op`/`publish_all_persisted` deliberately keep
+    // returning `sqlx::Error` rather than `OutboxError`: a `PostPersistHook`
+    // implementation is documented to call back into either from inside its
+    // own `on_persisted`, whose return type is in turn fixed to
+    // `sqlx::Error` by `es_entity::operation::hooks::CommitHook::pre_commit`
+    // (an es-entity trait, not yet errlanes-aware, out of scope here per the
+    // adoption's constraints — see the PR description).
     pub async fn publish_persisted_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -323,7 +341,7 @@ where
         &self,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), OutboxError> {
         let now = self.clock.manual_now();
         let event =
             Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
@@ -339,7 +357,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), OutboxError> {
         let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
             self.ephemeral_cache.cache_fill_sender().clone(),
             event_type,
@@ -634,8 +652,8 @@ where
     /// yet, and needs no table scan. This is the same value
     /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
-    pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        subscription::read_frontier::<Tables>(&self.pool).await
+    pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, OutboxError> {
+        Ok(subscription::read_frontier::<Tables>(&self.pool).await?)
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a

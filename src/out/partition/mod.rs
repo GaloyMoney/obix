@@ -91,7 +91,7 @@ where
     async fn ddl_lock(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), super::OutboxError> {
         let table = Tables::persistent_outbox_events_table();
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("obix:partition-ddl:{table}"))
@@ -122,7 +122,7 @@ where
     /// That failure is intentional: it surfaces the stall as a failing job (the
     /// alert) rather than being silently absorbed. Run
     /// [`recover_default`](Self::recover_default) to repair.
-    pub async fn ensure(&self) -> Result<(), sqlx::Error> {
+    pub async fn ensure(&self) -> Result<(), super::OutboxError> {
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
         let first = head / DEFAULT_PARTITION_WIDTH;
         let mut tx = self.pool.begin().await?;
@@ -133,7 +133,7 @@ where
                 .execute(&mut *tx)
                 .await?;
         }
-        tx.commit().await
+        Ok(tx.commit().await?)
     }
 
     /// Repair a non-empty `DEFAULT` partition: rows landed there because the
@@ -153,7 +153,7 @@ where
     /// decision: runbook + alert first, automate only if it recurs). It is
     /// exposed for operators and exercised by the test suite. Idempotent: a
     /// no-op when `DEFAULT` is already empty.
-    pub async fn recover_default(&self) -> Result<(), sqlx::Error> {
+    pub async fn recover_default(&self) -> Result<(), super::OutboxError> {
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
         self.recover_one(
@@ -162,7 +162,7 @@ where
             "sequence",
         )
         .await?;
-        tx.commit().await
+        Ok(tx.commit().await?)
     }
 
     /// One table's DEFAULT repair, inside the caller's locked transaction.
@@ -177,7 +177,7 @@ where
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         table: &str,
         key: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), super::OutboxError> {
         let default_child = format!("{table}_default");
         let default_old = format!("{table}_default_old");
 

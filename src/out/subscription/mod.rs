@@ -517,9 +517,8 @@ where
             .await
             .map_err(::job::JobError::narrow_rejected)?;
         let state = decode_state(&job)?;
-        L::resume_from(state.sequence, state.commit_sequence).map_err(|e| {
-            SubscriptionError::from(SubscriptionRejection::LaneMismatch(e))
-        })?;
+        L::resume_from(state.sequence, state.commit_sequence)
+            .map_err(|e| SubscriptionError::from(SubscriptionRejection::LaneMismatch(e)))?;
         let checkpoint = L::checkpoint(state.sequence, state.commit_sequence);
         let frontier = self.frontier().await?;
         Ok(SubscriptionSnapshot {

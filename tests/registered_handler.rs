@@ -9,8 +9,7 @@ use std::time::Duration;
 use obix::{
     EventCtx, EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, OutboxEventJobConfig,
     SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionRejection,
-    SubscriptionSnapshot, SubscriptionStreamStatus,
-    out::Outbox,
+    SubscriptionSnapshot, SubscriptionStreamStatus, out::Outbox,
     prelude::es_entity::errlanes::Fail,
 };
 use serde::{Deserialize, Serialize};
