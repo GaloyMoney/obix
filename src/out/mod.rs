@@ -696,3 +696,33 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::OutboxError;
+    use es_entity::errlanes::{Fault, Transient, TransientKind};
+
+    /// `OutboxError` never rejects — a `sqlx::Error` enters it straight
+    /// through errlanes' own blanket classification via bare `?`/`.into()`,
+    /// with no obix-specific conversion in between.
+    #[test]
+    fn a_pool_timeout_classifies_as_transient() {
+        let err: OutboxError = sqlx::Error::PoolTimedOut.into();
+        assert!(matches!(err, Fault::Transient(_)));
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn row_not_found_classifies_as_fatal() {
+        let err: OutboxError = sqlx::Error::RowNotFound.into();
+        assert!(err.is_fatal());
+    }
+
+    /// An already-laned value widens in directly, unchanged — the same
+    /// path a `sqlx::Error` takes, just skipping the classification step.
+    #[test]
+    fn an_already_laned_transient_widens_in_unchanged() {
+        let err: OutboxError = Transient::new(TransientKind::Deadlock).into();
+        assert!(err.is_contention());
+    }
+}

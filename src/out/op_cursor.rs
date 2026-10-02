@@ -66,3 +66,15 @@ pub enum CursorError {
     #[rejection(code = "OBIX_CURSOR_HOOKS_UNSUPPORTED")]
     HooksUnsupported,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_entity::errlanes::Rejection;
+
+    #[test]
+    fn has_a_stable_code() {
+        let code: &'static str = CursorError::HooksUnsupported.code().into();
+        assert_eq!(code, "OBIX_CURSOR_HOOKS_UNSUPPORTED");
+    }
+}

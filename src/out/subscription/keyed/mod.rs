@@ -314,6 +314,18 @@ pub enum SubscribeError {
     EmptyWakeKeys,
 }
 
+#[cfg(test)]
+mod subscribe_error_tests {
+    use super::*;
+    use es_entity::errlanes::Rejection;
+
+    #[test]
+    fn has_a_stable_code() {
+        let code: &'static str = SubscribeError::EmptyWakeKeys.code().into();
+        assert_eq!(code, "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS");
+    }
+}
+
 // === Configuration ===
 
 const DEFAULT_LINGER: Duration = Duration::from_secs(30);

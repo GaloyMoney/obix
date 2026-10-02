@@ -19,3 +19,37 @@ pub enum InboxRejection {
 
 pub type InboxError =
     es_entity::errlanes::Fail<InboxRejection, es_entity::errlanes::lanes!(Transient, Fatal)>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_entity::errlanes::{Fail, Rejection};
+
+    #[test]
+    fn not_found_enters_inbox_error_as_rejected() {
+        let id = super::super::InboxEventId::new();
+        let err: InboxError = InboxRejection::NotFound(id).into();
+        assert!(matches!(err, Fail::Rejected(InboxRejection::NotFound(found)) if found == id));
+    }
+
+    #[test]
+    fn rejection_codes_are_stable() {
+        let id = super::super::InboxEventId::new();
+        let not_found: &'static str = InboxRejection::NotFound(id).code().into();
+        assert_eq!(not_found, "OBIX_INBOX_EVENT_NOT_FOUND");
+
+        let invalid: &'static str = InboxRejection::InvalidStatus("bogus".to_string())
+            .code()
+            .into();
+        assert_eq!(invalid, "OBIX_INBOX_INVALID_STATUS");
+    }
+
+    /// A raw sqlx fault never rejects — it enters InboxError's fault lanes
+    /// through errlanes' own blanket classification, with no inbox-specific
+    /// conversion in between.
+    #[test]
+    fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
+        let err: InboxError = sqlx::Error::PoolTimedOut.into();
+        assert!(err.is_transient());
+    }
+}

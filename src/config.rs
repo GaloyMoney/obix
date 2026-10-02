@@ -211,3 +211,24 @@ impl MailboxConfig {
         MailboxConfigBuilder::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_entity::errlanes::{Fail, Rejection};
+
+    /// `CommitLaneDisabled` is the one rejected case `FrontierError` can
+    /// carry — a bare `?`/`.into()` must land it in the `Rejected` lane,
+    /// not get swallowed into `Fatal` as an unclassified error would.
+    #[test]
+    fn commit_lane_disabled_enters_frontier_error_as_rejected() {
+        let err: FrontierError = CommitLaneDisabled.into();
+        assert!(matches!(err, Fail::Rejected(CommitLaneDisabled)));
+    }
+
+    #[test]
+    fn commit_lane_disabled_has_a_stable_code() {
+        let code: &'static str = CommitLaneDisabled.code().into();
+        assert_eq!(code, "OBIX_COMMIT_LANE_DISABLED");
+    }
+}

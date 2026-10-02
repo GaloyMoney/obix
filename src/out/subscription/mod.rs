@@ -776,3 +776,53 @@ fn decode_state(job: &::job::JobSnapshot) -> Result<OutboxEventJobState, Subscri
         .execution_state::<OutboxEventJobState>()?
         .unwrap_or_default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_entity::errlanes::{Fail, Rejection};
+
+    #[test]
+    fn lane_mismatch_enters_subscription_error_as_rejected() {
+        let err: SubscriptionError =
+            SubscriptionRejection::LaneMismatch("wrong lane".into()).into();
+        assert!(matches!(
+            err,
+            Fail::Rejected(SubscriptionRejection::LaneMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn rejection_codes_are_stable() {
+        let mismatch: &'static str = SubscriptionRejection::LaneMismatch(String::new())
+            .code()
+            .into();
+        assert_eq!(mismatch, "OBIX_SUBSCRIPTION_LANE_MISMATCH");
+
+        let no_such_job: &'static str = SubscriptionRejection::NoSuchJob {
+            subscriber_type: String::new(),
+            key: String::new(),
+        }
+        .code()
+        .into();
+        assert_eq!(no_such_job, "OBIX_SUBSCRIPTION_NO_SUCH_JOB");
+
+        let timeout: &'static str = SubscriptionRejection::CaughtUpTimeout {
+            checkpoint: StreamPosition::Insert(EventSequence::BEGIN),
+            target: StreamPosition::Insert(EventSequence::BEGIN),
+            waited: Duration::ZERO,
+        }
+        .code()
+        .into();
+        assert_eq!(timeout, "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT");
+    }
+
+    /// A raw sqlx fault never rejects — it enters SubscriptionError's fault
+    /// lanes through errlanes' own blanket classification, with no
+    /// subscription-specific conversion in between.
+    #[test]
+    fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
+        let err: SubscriptionError = sqlx::Error::RowNotFound.into();
+        assert!(err.is_fatal());
+    }
+}
