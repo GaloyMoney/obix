@@ -1213,10 +1213,14 @@ FROM {}persistent_outbox_events_sequence_seq",
                         )
                         .fetch_optional(&pool)
                         .await?
-                        .ok_or(#crate_name::inbox::InboxError::NotFound(id))?;
+                        .ok_or_else(|| {
+                            #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::NotFound(id))
+                        })?;
 
                         let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                            .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
+                            .map_err(|e| {
+                                #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::InvalidStatus(e))
+                            })?;
 
                         Ok(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
@@ -1251,7 +1255,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| {
                                 let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                                    .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
+                                    .map_err(|e| {
+                                        #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::InvalidStatus(e))
+                                    })?;
 
                                 Ok(#crate_name::inbox::InboxEvent {
                                     id: #crate_name::inbox::InboxEventId::from(row.id),
