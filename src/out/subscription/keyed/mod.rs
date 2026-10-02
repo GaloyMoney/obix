@@ -284,7 +284,11 @@ where
 // === Errors ===
 
 /// Why a set of wake keys could not be accepted.
-#[derive(Debug, thiserror::Error)]
+///
+/// Purely caller-correctable — the caller built a bad set of wake keys — so
+/// this is a bare [`errlanes::Rejection`](es_entity::errlanes::Rejection)
+/// rather than a `Fail`/`Fault`: nothing else can go wrong here.
+#[derive(Debug, es_entity::errlanes::Rejection)]
 pub enum SubscribeError {
     /// A runtime-built collection of wake keys turned out to be empty.
     ///
@@ -306,6 +310,7 @@ pub enum SubscribeError {
     /// event by construction, which is the point — the price is visible in
     /// the caller's own code instead of hidden in an empty vector.
     #[error("SubscribeError - EmptyWakeKeys: a subscription must declare at least one wake key")]
+    #[rejection(code = "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS")]
     EmptyWakeKeys,
 }
 

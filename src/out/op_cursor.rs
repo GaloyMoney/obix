@@ -51,12 +51,18 @@ impl<P, Tables> OpCursor<P, Tables> {
 }
 
 /// Error returned by [`Outbox::cursor`](super::Outbox::cursor).
-#[derive(Debug, thiserror::Error)]
+///
+/// Purely caller-correctable — the caller passed an op of the wrong kind —
+/// so this is a bare [`errlanes::Rejection`](es_entity::errlanes::Rejection)
+/// rather than a `Fail`/`Fault`: nothing about obtaining a cursor can fail in
+/// any other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, es_entity::errlanes::Rejection)]
 pub enum CursorError {
     /// The operation does not support commit hooks, so there is no op-local
     /// publish buffer to position into. Use an op that supports hooks — e.g.
     /// one from [`Outbox::begin_op`](super::Outbox::begin_op) — rather than a
     /// bare `sqlx::Transaction`.
     #[error("OpCursor requires an operation that supports commit hooks; this operation does not")]
+    #[rejection(code = "OBIX_CURSOR_HOOKS_UNSUPPORTED")]
     HooksUnsupported,
 }
