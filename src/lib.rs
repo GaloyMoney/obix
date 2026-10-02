@@ -28,7 +28,7 @@ pub use config::{
 
 pub use inbox::{
     Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
-    InboxIdempotencyKey, InboxResult,
+    InboxIdempotencyKey, InboxRejection, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
@@ -37,8 +37,8 @@ pub use out::{
     KeyedSubscriberConfig, Lane, OpCursor, Ordering, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
     StreamPosition, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
-    SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
-    UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
+    SubscriptionError, SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus,
+    Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]

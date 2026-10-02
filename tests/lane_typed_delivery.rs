@@ -12,7 +12,9 @@ use futures::{StreamExt, TryStreamExt};
 use obix::{
     CommitLane, CommitLaneDisabled, CommitOrder, CommitSequence, EventCtx, EventDelivery,
     EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, Ordering, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, SubscriptionError, UndecodableDelivery, out::Outbox,
+    SingletonSubscriber, StreamPosition, SubscriptionRejection, UndecodableDelivery,
+    out::Outbox,
+    prelude::es_entity::errlanes::Fail,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -1073,7 +1075,7 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match commit.load().await {
-        Err(SubscriptionError::LaneMismatch(message)) => {
+        Err(Fail::Rejected(SubscriptionRejection::LaneMismatch(message))) => {
             assert!(
                 message.contains("register a new job type"),
                 "the refusal must say what to do instead: {message}",
@@ -1103,11 +1105,11 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
 
     let target = CommitSequence::from(999u64);
     match commit.await_position(target, Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint,
             target: reported,
             ..
-        }) => {
+        })) => {
             assert_eq!(reported, StreamPosition::Commit(target));
             assert!(matches!(checkpoint, StreamPosition::Commit(_)));
         }
@@ -1127,11 +1129,11 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
 
     let target = EventSequence::from(999u64);
     match insert.await_position(target, Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint,
             target: reported,
             ..
-        }) => {
+        })) => {
             assert_eq!(reported, StreamPosition::Insert(target));
             assert!(matches!(checkpoint, StreamPosition::Insert(_)));
         }

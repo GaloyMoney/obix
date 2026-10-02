@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use obix::{
     EventCtx, EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot,
-    SubscriptionStreamStatus, out::Outbox,
+    SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionRejection,
+    SubscriptionSnapshot, SubscriptionStreamStatus,
+    out::Outbox,
+    prelude::es_entity::errlanes::Fail,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -471,7 +473,7 @@ async fn wedged_handler_is_distinguishable_from_a_slow_one() -> anyhow::Result<(
 
     // A plain timeout, indistinguishable from a backlogged handler.
     match handle.await_caught_up(Duration::from_millis(200)).await {
-        Err(SubscriptionError::CaughtUpTimeout { checkpoint, .. }) => {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout { checkpoint, .. })) => {
             assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
@@ -509,9 +511,9 @@ async fn await_position_fences_on_a_caller_chosen_target() -> anyhow::Result<()>
     // A target the stream has not reached times out rather than erroring.
     let beyond = EventSequence::from(999u64);
     match handle.await_position(beyond, Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint, target, ..
-        }) => {
+        })) => {
             assert_eq!(target, StreamPosition::Insert(beyond));
             assert!(checkpoint < StreamPosition::Insert(beyond));
         }
@@ -546,9 +548,9 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
     publish_pings(&outbox, 1..=3).await?;
 
     match handle.await_caught_up(Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint, target, ..
-        }) => {
+        })) => {
             assert_eq!(checkpoint, StreamPosition::Insert(EventSequence::BEGIN));
             // `await_caught_up`'s target is the call-time frontier.
             assert_eq!(target, StreamPosition::Insert(EventSequence::from(3u64)));
@@ -559,7 +561,7 @@ async fn await_caught_up_times_out_with_real_numbers() -> anyhow::Result<()> {
     let timeout = Duration::from_millis(300);
     let started = std::time::Instant::now();
     match handle.await_caught_up(timeout).await {
-        Err(SubscriptionError::CaughtUpTimeout { waited, .. }) => {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout { waited, .. })) => {
             assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
         }
         other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),

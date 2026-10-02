@@ -32,7 +32,8 @@ pub use self::subscription::singleton::{
     Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
-    StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    StreamPosition, Subscription, SubscriptionError, SubscriptionRejection, SubscriptionSnapshot,
+    SubscriptionStreamStatus,
 };
 use crate::{
     config::*,

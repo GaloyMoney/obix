@@ -110,30 +110,30 @@ impl std::fmt::Display for StreamPosition {
     }
 }
 
-/// Failure modes of the checkpoint read-back and the caught-up barrier.
-#[derive(Debug, thiserror::Error)]
-pub enum SubscriptionError {
-    /// Reading the stream frontier failed.
-    #[error("SubscriptionError - Sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
+/// Caller-correctable outcomes of the checkpoint read-back and the
+/// caught-up barrier. Everything else — a raw sqlx fault, an undecodable
+/// stored execution state, the handler job's own failure — travels as
+/// `Transient`/`Fatal` in [`SubscriptionError`] instead of as a variant
+/// here.
+///
+/// The handler job's own `JobError` is deliberately narrowed into the fault
+/// lanes (`::job::JobError::narrow_rejected`) at every call site, never
+/// lifted into a variant here: a failure reading the handler job is
+/// subscription-internal plumbing, not one of the subscription's own domain
+/// outcomes.
+#[derive(Debug, es_entity::errlanes::Rejection)]
+pub enum SubscriptionRejection {
     /// The stored checkpoint is on the other [`Lane`] from the one this handle
     /// is typed for; the two cursors count different things.
     #[error("SubscriptionError - LaneMismatch: {0}")]
+    #[rejection(code = "OBIX_SUBSCRIPTION_LANE_MISMATCH")]
     LaneMismatch(String),
-    /// Reading the handler job failed — a snapshot load (including the job
-    /// never having existed), or a checkpoint point-read whose stored state
-    /// did not decode.
-    #[error("SubscriptionError - Job: {0}")]
-    Job(#[from] ::job::JobError),
-    /// The committed execution state did not decode as the handler job's
-    /// state type — the checkpoint is unreadable rather than absent.
-    #[error("SubscriptionError - StateDecode: {0}")]
-    StateDecode(#[from] serde_json::Error),
     /// A keyed member's job could not be resolved from
     /// `(subscriber_type, key)` — no job of that type has ever been spawned
     /// under the key. Distinct from a cancelled subscription, whose job rows
     /// outlive the `subscriptions` row.
     #[error("SubscriptionError - NoSuchJob: no job for ({subscriber_type}, {key})")]
+    #[rejection(code = "OBIX_SUBSCRIPTION_NO_SUCH_JOB")]
     NoSuchJob {
         subscriber_type: String,
         key: String,
@@ -150,12 +150,17 @@ pub enum SubscriptionError {
     #[error(
         "SubscriptionError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
     )]
+    #[rejection(code = "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT")]
     CaughtUpTimeout {
         checkpoint: StreamPosition,
         target: StreamPosition,
         waited: Duration,
     },
 }
+
+/// Failure modes of the checkpoint read-back and the caught-up barrier.
+pub type SubscriptionError =
+    es_entity::errlanes::Fail<SubscriptionRejection, es_entity::errlanes::lanes!(Transient, Fatal)>;
 
 /// A `{ checkpoint, frontier }` pair sampled by
 /// [`SubscriptionSnapshot::stream_status`], on the subscription's own lane.
@@ -482,10 +487,13 @@ where
             JobAnchor::Keyed(anchor) => anchor
                 .jobs
                 .keyed_handle(anchor.job_type.clone(), anchor.key.clone())
-                .await?
-                .ok_or_else(|| SubscriptionError::NoSuchJob {
-                    subscriber_type: anchor.job_type.to_string(),
-                    key: anchor.key.clone(),
+                .await
+                .map_err(::job::JobError::narrow_rejected)?
+                .ok_or_else(|| {
+                    SubscriptionError::from(SubscriptionRejection::NoSuchJob {
+                        subscriber_type: anchor.job_type.to_string(),
+                        key: anchor.key.clone(),
+                    })
                 }),
         }
     }
@@ -502,10 +510,16 @@ where
     /// refused with [`SubscriptionError::LaneMismatch`] rather than reported.
     #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
     pub async fn load(&self) -> Result<SubscriptionSnapshot<L>, SubscriptionError> {
-        let job = self.handle().await?.load().await?;
+        let job = self
+            .handle()
+            .await?
+            .load()
+            .await
+            .map_err(::job::JobError::narrow_rejected)?;
         let state = decode_state(&job)?;
-        L::resume_from(state.sequence, state.commit_sequence)
-            .map_err(SubscriptionError::LaneMismatch)?;
+        L::resume_from(state.sequence, state.commit_sequence).map_err(|e| {
+            SubscriptionError::from(SubscriptionRejection::LaneMismatch(e))
+        })?;
         let checkpoint = L::checkpoint(state.sequence, state.commit_sequence);
         let frontier = self.frontier().await?;
         Ok(SubscriptionSnapshot {
@@ -575,11 +589,13 @@ where
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(SubscriptionError::CaughtUpTimeout {
-                    checkpoint: checkpoint.into(),
-                    target: target.into(),
-                    waited: now.duration_since(start),
-                });
+                return Err(SubscriptionError::from(
+                    SubscriptionRejection::CaughtUpTimeout {
+                        checkpoint: checkpoint.into(),
+                        target: target.into(),
+                        waited: now.duration_since(start),
+                    },
+                ));
             }
 
             // Never sleep past the deadline: a long interval must not delay
@@ -641,7 +657,8 @@ where
             .handle()
             .await?
             .execution_state::<OutboxEventJobState>()
-            .await?
+            .await
+            .map_err(::job::JobError::narrow_rejected)?
             .unwrap_or_default();
         Ok(L::checkpoint(state.sequence, state.commit_sequence))
     }
@@ -658,12 +675,12 @@ where
     /// already rules the commit lane out.
     pub(crate) fn sequencer_positions(&self) -> Result<&SequencerPositions, SubscriptionError> {
         self.positions.as_ref().ok_or_else(|| {
-            SubscriptionError::LaneMismatch(
+            SubscriptionError::from(SubscriptionRejection::LaneMismatch(
                 "a commit-lane subscription without sequencer positions is unreachable: the lane \
                  cannot be registered on an outbox that runs no sequencer, and keyed \
                  subscriptions are insert-lane by construction"
                     .to_string(),
-            )
+            ))
         })
     }
 }
@@ -710,11 +727,13 @@ where
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(SubscriptionError::CaughtUpTimeout {
-                checkpoint: folded.into(),
-                target: insert_frontier.into(),
-                waited: now.duration_since(start),
-            });
+            return Err(SubscriptionError::from(
+                SubscriptionRejection::CaughtUpTimeout {
+                    checkpoint: folded.into(),
+                    target: insert_frontier.into(),
+                    waited: now.duration_since(start),
+                },
+            ));
         }
         tokio::time::sleep(interval.min(deadline - now)).await;
         interval = (interval * 2).min(MAX_POLL_INTERVAL);
