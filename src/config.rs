@@ -124,18 +124,22 @@ pub enum CommitLane {
     Enabled,
 }
 
-/// Why a lane's frontier could not be read.
-#[derive(Debug, thiserror::Error)]
-pub enum FrontierError {
-    #[error("FrontierError - Sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("FrontierError - {0}")]
-    CommitLaneDisabled(#[from] CommitLaneDisabled),
-}
+/// Why a lane's frontier could not be read: either the lane is disabled
+/// ([`CommitLaneDisabled`], the one caller-correctable case), or reading it
+/// hit an infrastructure fault — a raw `sqlx::Error` enters either lane
+/// through the blanket `errlanes` classification for it, via bare `?`.
+pub type FrontierError =
+    es_entity::errlanes::Fail<CommitLaneDisabled, es_entity::errlanes::lanes!(Transient, Fatal)>;
 
 /// The commit lane is off for this outbox. Raised at registration, before any
 /// job is spawned, so a consumer that needs the lane fails at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+///
+/// Purely caller-correctable (enable the lane in config), so it is a bare
+/// [`errlanes::Rejection`](es_entity::errlanes::Rejection) — both on its own,
+/// where it is returned directly throughout [`out::lane`](crate::out), and
+/// lifted into [`FrontierError`] where a frontier read can also fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, es_entity::errlanes::Rejection)]
+#[rejection(code = "OBIX_COMMIT_LANE_DISABLED")]
 #[error(
     "the commit lane is disabled on this outbox — set MailboxConfig::commit_lane = CommitLane::Enabled"
 )]
