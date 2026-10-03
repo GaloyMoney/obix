@@ -49,6 +49,6 @@ pub use tables::MailboxTables;
 pub use tables::{PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
-    decode_inbox_status, decode_persistent_event, record_ephemeral_event_type_undecodable,
+    decode_persistent_event, record_ephemeral_event_type_undecodable,
     record_ephemeral_payload_undecodable, record_tracing_context_undecodable,
 };

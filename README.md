@@ -199,10 +199,9 @@ pins it: `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.
 
 The `MailboxTables` storage trait is `sqlx::Error` throughout — it classifies
 nothing. Absence comes back as `Option` and becomes
-`InboxRejection::NotFound` at `Inbox::find_event_by_id`; an unreadable
-`inbox_events.status` comes back as `sqlx::Error::ColumnDecode` wrapping
-`CouldNotDecodeStored::InboxStatus`, which errlanes lanes as
-`Fatal(CorruptState)` one level up.
+`InboxRejection::NotFound` at `Inbox::find_event_by_id`, and a column sqlx
+cannot decode comes back as `sqlx::Error::ColumnDecode`, which errlanes lanes
+as `Fatal(CorruptState)` one level up.
 
 Stored data that fails to decode (a subscriber job's execution state, a keyed
 subscription's `instance_config` or persisted key, an inbox event's status

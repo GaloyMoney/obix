@@ -109,7 +109,7 @@ where
         &self,
         id: InboxEventId,
     ) -> Result<InboxEvent, Fail<InboxRejection, lanes!(Transient, Fatal)>> {
-        Tables::find_inbox_event_by_id(&self.pool, id)
+        Tables::maybe_find_inbox_event_by_id(&self.pool, id)
             .await?
             .ok_or(Fail::Rejected(InboxRejection::NotFound(id)))
     }

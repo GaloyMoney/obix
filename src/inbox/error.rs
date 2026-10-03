@@ -20,7 +20,7 @@ pub enum InboxRejection {
 #[cfg(test)]
 mod tests {
     use super::{InboxEventId, InboxRejection};
-    use crate::error::{CouldNotDecodeStored, ObixFault};
+    use crate::error::ObixFault;
     use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, lanes};
     use std::error::Error as _;
 
@@ -48,30 +48,28 @@ mod tests {
         assert!(err.is_transient());
     }
 
-    /// Rule 4 survives the storage layer staying on `sqlx::Error`: an
-    /// unreadable `inbox_events.status` is handed over as a `ColumnDecode`,
-    /// which errlanes lanes as `Fatal(CorruptState)` one level up, with the
-    /// named wrapper still in the chain to say which column it was.
+    /// A column sqlx itself refuses to decode — `inbox_events.status`
+    /// carrying a label this binary does not know — needs no obix wrapper to
+    /// reach rule 4's lane: errlanes lanes `ColumnDecode` as
+    /// `Fatal(CorruptState)` on its own.
     #[test]
-    fn an_unreadable_stored_status_stays_fatal_corrupt_state_through_sqlx() {
-        let err = crate::decode_inbox_status("bogus").expect_err("not a known status");
-        assert!(matches!(err, sqlx::Error::ColumnDecode { .. }));
-
+    fn an_undecodable_column_is_fatal_corrupt_state_with_no_wrapper() {
+        let err = sqlx::Error::ColumnDecode {
+            index: "status".to_string(),
+            source: "invalid value \"bogus\" for enum InboxEventStatus".into(),
+        };
         let fault: ObixFault = err.into();
         let Fault::Fatal(fatal) = fault else {
             panic!("expected Fatal(CorruptState), got {fault:?}")
         };
         assert_eq!(fatal.kind, FatalKind::CorruptState);
-
-        let mut link = fatal.source();
-        while let Some(e) = link {
-            if let Some(wrapper) = e.downcast_ref::<CouldNotDecodeStored>() {
-                assert!(wrapper.to_string().contains("bogus"));
-                return;
-            }
-            link = e.source();
-        }
-        panic!("the named wrapper must stay in the chain");
+        assert!(
+            fatal
+                .source()
+                .expect("the sqlx error stays in the chain")
+                .to_string()
+                .contains("status")
+        );
     }
 
     /// job's own id-choosing spawn rejects with `JobRejection::DuplicateId`
@@ -100,10 +98,5 @@ mod tests {
             }
             other => panic!("expected Fatal(Invariant), got {other:?}"),
         }
-        // Sanity: a `CouldNotDecodeStored` fault that bare-`?`s into the
-        // inbox's carrier is unaffected by this narrowing path — the two are
-        // independent entry points into the same fault lanes.
-        let _: Fail<InboxRejection, lanes!(Transient, Fatal)> =
-            CouldNotDecodeStored::InboxStatus("bogus".into()).into();
     }
 }

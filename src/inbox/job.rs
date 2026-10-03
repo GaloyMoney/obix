@@ -144,7 +144,7 @@ where
         // Not `InboxRejection::NotFound`: this job was spawned in the same
         // op that inserted the row, so there is no caller left to correct
         // its absence — the row was deleted under a live job.
-        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
+        let event = Tables::maybe_find_inbox_event_by_id(&self.pool, self.inbox_event_id)
             .await
             .map_err(ObixFault::from)?
             .ok_or_else(|| {

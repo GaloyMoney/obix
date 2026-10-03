@@ -119,26 +119,6 @@ pub fn record_ephemeral_event_type_undecodable(error: &serde_json::Error, event_
 )]
 pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 
-/// Decode a stored `inbox_events.status`, invoked from `MailboxTables`
-/// derive output.
-///
-/// The failure travels as `sqlx::Error::ColumnDecode` carrying
-/// [`CouldNotDecodeStored::InboxStatus`](crate::CouldNotDecodeStored) as its
-/// source. That keeps the storage layer uniformly on `sqlx::Error` —
-/// `MailboxTables` classifies nothing — without losing rule 4: errlanes
-/// lanes `ColumnDecode` as `Fatal(CorruptState)` where the inbox classifies
-/// one level up, and the named wrapper stays in the chain to say which
-/// column was unreadable.
-#[doc(hidden)]
-pub fn decode_inbox_status(stored: &str) -> Result<InboxEventStatus, sqlx::Error> {
-    stored.parse().map_err(
-        |source: crate::error::CouldNotDecodeStored| sqlx::Error::ColumnDecode {
-            index: "status".to_string(),
-            source: Box::new(source),
-        },
-    )
-}
-
 /// One page/batch of decoded persistent rows: each item is one committed
 /// sequence position — `Ok` for a decoded event or a placeholder, `Err`
 /// for a stored payload that does not decode into `P`.
@@ -376,7 +356,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// outcome ([`InboxRejection::NotFound`](crate::InboxRejection), at
     /// `Inbox::find_event_by_id`) or an invariant (the handler job, reading
     /// the row it was spawned beside) is not the storage layer's call.
-    fn find_inbox_event_by_id(
+    fn maybe_find_inbox_event_by_id(
         pool: &sqlx::PgPool,
         id: InboxEventId,
     ) -> impl Future<Output = Result<Option<InboxEvent>, sqlx::Error>> + Send;

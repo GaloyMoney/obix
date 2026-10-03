@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -59,22 +57,6 @@ impl InboxEventStatus {
             Self::Processing => "processing",
             Self::Completed => "completed",
             Self::Failed => "failed",
-        }
-    }
-}
-
-impl FromStr for InboxEventStatus {
-    type Err = crate::error::CouldNotDecodeStored;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "processing" => Ok(Self::Processing),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            _ => Err(crate::error::CouldNotDecodeStored::InboxStatus(
-                s.to_string(),
-            )),
         }
     }
 }

@@ -61,11 +61,12 @@
 //!   it returns `sqlx::Error`, with no exceptions. obix classifies one level
 //!   up, exactly as es-entity's own repo layer does, which is also where
 //!   absence becomes a rejection ([`crate::inbox::InboxRejection::NotFound`]
-//!   at `Inbox::find_event_by_id`, over the trait's plain `Option`) and where
-//!   an unreadable `inbox_events.status` becomes `Fatal(CorruptState)` (the
-//!   trait hands it over as a `sqlx::Error::ColumnDecode` carrying
-//!   [`CouldNotDecodeStored::InboxStatus`] — see
-//!   [`decode_inbox_status`](crate::decode_inbox_status)).
+//!   at `Inbox::find_event_by_id`, over the trait's plain `Option`).
+//!   Nothing the trait reads needs an obix-authored decode error:
+//!   `inbox_events.status` is a Postgres enum that sqlx decodes itself, and
+//!   a label this binary does not know arrives as `ColumnDecode`, which
+//!   errlanes already lanes as `Fatal(CorruptState)` — rule 4 without a
+//!   wrapper.
 //!
 //! # Which carrier each public method returns
 //!
@@ -208,11 +209,15 @@ pub struct LaneMismatch {
 /// nothing, for a non-serde decode) is the variant's source and appears
 /// exactly once below it.
 ///
+/// Every variant here exists to *override* a classification: errlanes lanes
+/// a bare `serde_json::Error` as `Fatal(Invariant)`, and these bytes came
+/// out of Postgres, so they are `Fatal(CorruptState)` instead (rule 4). A
+/// decode failure that already classifies correctly on its own — anything
+/// sqlx itself refuses to decode — needs no variant here.
+///
 /// `Key`'s message deliberately does not include the stored key string —
 /// it is caller data, and a `Fatal`'s `exception.message` is operator-facing
 /// (see the display-discipline note on [`errlanes::Rejection`]).
-/// `InboxStatus`'s message does include the stored string: the status
-/// column holds a bounded set of obix-authored tokens, not caller data.
 #[derive(Debug, errlanes::Classify)]
 pub enum CouldNotDecodeStored {
     #[classify(fatal(CorruptState))]
@@ -224,9 +229,6 @@ pub enum CouldNotDecodeStored {
     #[classify(fatal(CorruptState))]
     #[error("could not parse a keyed subscription's persisted key for {job_type}")]
     Key { job_type: ::job::JobType },
-    #[classify(fatal(CorruptState))]
-    #[error("inbox_events.status holds an unknown value: {0}")]
-    InboxStatus(String),
 }
 
 #[cfg(test)]
@@ -351,14 +353,18 @@ mod tests {
         }
     }
 
+    /// The same override reached through a `Fail` carrier rather than a
+    /// `Fault`, since the inbox's by-id read is the one laned site that has
+    /// a rejection lane beside these faults.
     #[test]
-    fn inbox_status_decode_failure_is_fatal_corrupt_state() {
+    fn a_stored_decode_failure_is_fatal_corrupt_state_in_a_fail_carrier_too() {
+        let decode_failure =
+            serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err();
         let err: Fail<InboxRejection, lanes!(Transient, Fatal)> =
-            CouldNotDecodeStored::InboxStatus("bogus".to_string()).into();
+            CouldNotDecodeStored::ExecutionState(decode_failure).into();
         match err {
             Fail::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::CorruptState);
-                assert!(fatal.source().unwrap().to_string().contains("bogus"));
             }
             other => panic!("expected Fatal(CorruptState), got {other:?}"),
         }
