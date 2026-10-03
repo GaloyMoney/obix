@@ -192,7 +192,7 @@ re-exported as `obix::prelude::es_entity::errlanes` — a downstream signature
 that spells a `Fail` carrier names them from there.
 
 A handful of methods return a bare `errlanes::Rejection` on its own
-(`Outbox::cursor` → `CursorError`, `WakeKeys::try_from` → `SubscribeError`,
+(`WakeKeys::try_from` → `SubscribeError`,
 `Outbox::listen`/`listen_commit_ordered` → `CommitLaneDisabled`), and two
 methods stay on `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit`
 pins it: `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.

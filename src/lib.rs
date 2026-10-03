@@ -34,9 +34,9 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, CursorError, DecodeFailure, Delivery,
-    EventCtx, EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
-    KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, OpCursor, Ordering, Outbox,
+    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery, EventCtx,
+    EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
+    KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox,
     OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
     SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, SubscribeError, Subscription,
     SubscriptionDef, SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus,

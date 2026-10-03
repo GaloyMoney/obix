@@ -76,7 +76,7 @@
 //! | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
 //! | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
 //! | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` — the only method that can reject it |
-//! | bare rejection | `Outbox::cursor` (`CursorError`), `WakeKeys::try_from` (`SubscribeError`), `Outbox::listen`/`listen_commit_ordered` (`CommitLaneDisabled`) |
+//! | bare rejection | `WakeKeys::try_from` (`SubscribeError`), `Outbox::listen`/`listen_commit_ordered` (`CommitLaneDisabled`) |
 //! | `sqlx::Error` | `Outbox::publish_persisted_in_op`, `Outbox::publish_all_persisted` (hook-pinned) |
 //! | raw `serde_json::Error` | `InboxEvent::payload` (the only error that site can produce) |
 

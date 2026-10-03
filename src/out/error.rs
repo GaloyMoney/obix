@@ -23,22 +23,6 @@ use super::Ordering;
 )]
 pub struct CommitLaneDisabled;
 
-/// Error returned by [`Outbox::cursor`](super::Outbox::cursor).
-///
-/// Purely caller-correctable — the caller passed an op of the wrong kind —
-/// so this is a bare [`errlanes::Rejection`] rather than a `Fail`/`Fault`:
-/// nothing about obtaining a cursor can fail in any other way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, errlanes::Rejection)]
-pub enum CursorError {
-    /// The operation does not support commit hooks, so there is no op-local
-    /// publish buffer to position into. Use an op that supports hooks — e.g.
-    /// one from [`Outbox::begin_op`](super::Outbox::begin_op) — rather
-    /// than a bare `sqlx::Transaction`.
-    #[error("OpCursor requires an operation that supports commit hooks; this operation does not")]
-    #[rejection(code = "OBIX_CURSOR_HOOKS_UNSUPPORTED")]
-    HooksUnsupported,
-}
-
 /// Why a set of wake keys could not be accepted.
 ///
 /// Purely caller-correctable — the caller built a bad set of wake keys — so
@@ -151,12 +135,6 @@ mod tests {
     fn commit_lane_disabled_has_a_stable_code() {
         let code: &'static str = CommitLaneDisabled.code().into();
         assert_eq!(code, "OBIX_COMMIT_LANE_DISABLED");
-    }
-
-    #[test]
-    fn cursor_error_has_a_stable_code() {
-        let code: &'static str = CursorError::HooksUnsupported.code().into();
-        assert_eq!(code, "OBIX_CURSOR_HOOKS_UNSUPPORTED");
     }
 
     #[test]
