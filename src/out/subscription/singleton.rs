@@ -494,8 +494,7 @@ where
                     Some(event) => {
                         self.handler
                             .handle_ephemeral(&event)
-                            .await
-                            .map_err(widen_handler_error)?;
+                            .await?;
                     }
                     None => return Ok(ResidentJobCompletion::RescheduleNow),
                 },
@@ -564,9 +563,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     None if in_group => match persistent.next().await {
@@ -579,9 +576,7 @@ where
                                 tracker: &mut tracker,
                                 mirror: None,
                             };
-                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
-                                .await
-                                .map_err(widen_handler_error)?;
+                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
                     },
@@ -593,9 +588,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
                         continue;
                     }
                 }
@@ -605,16 +598,14 @@ where
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
-                                .await
-                                .map_err(widen_handler_error)?;
+                                .await?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted < checkpoint_of::<L>(&state) => {
                         persist_checkpoint(&mut current_job, &state, None)
-                            .await
-                            .map_err(widen_handler_error)?;
+                            .await?;
                         tracker.persisted = checkpoint_of::<L>(&state);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
@@ -640,18 +631,13 @@ where
                     // transaction spans the foreign `handle_ephemeral` await
                     // and a failure discards no batch work.
                     NextDelivery::Ephemeral(event) => {
-                        self.handler
-                            .handle_ephemeral(&event)
-                            .await
-                            .map_err(widen_handler_error)?;
+                        self.handler.handle_ephemeral(&event).await?;
                         continue;
                     }
                     NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
-                            persist_checkpoint(&mut current_job, &state, None)
-                                .await
-                                .map_err(widen_handler_error)?;
+                            persist_checkpoint(&mut current_job, &state, None).await?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
@@ -678,9 +664,7 @@ where
                         tracker: &mut tracker,
                         mirror: None,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
                     match self.handler.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             // INVARIANT: both cursors advance. Leaving
@@ -692,9 +676,7 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted < checkpoint_of::<L>(&state) {
-                                persist_checkpoint(&mut current_job, &state, None)
-                                    .await
-                                    .map_err(widen_handler_error)?;
+                                persist_checkpoint(&mut current_job, &state, None).await?;
                             }
                             return Err(error);
                         }
@@ -718,12 +700,7 @@ where
             // the ctx — so the outcome is authentic by construction. Extract
             // it in the same statement so the token (and with it the ctx
             // borrows) ends before the state advance below.
-            let outcome = self
-                .handler
-                .handle_persistent(ctx, &event)
-                .await
-                .map_err(widen_handler_error)?
-                .outcome;
+            let outcome = self.handler.handle_persistent(ctx, &event).await?.outcome;
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
             in_group = !event.is_boundary();
@@ -737,9 +714,7 @@ where
                         tracker: &mut tracker,
                         mirror: None,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
                 }
                 Outcome::Collect => {
                     if tracker.collected >= self.max_batch_size && !in_group {
@@ -750,9 +725,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
                     }
                 }
                 Outcome::Pause(_) | Outcome::CommitAndPause(_) => {

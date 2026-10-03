@@ -75,14 +75,6 @@ use crate::sequence::{CommitSequence, EventSequence};
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Identity on [`HandlerError`], left over from job 0.17.0's narrower
-/// runner error type. job 0.18.0 widened the runner traits to
-/// `Box<dyn Error + Send + Sync>`, so there is no longer a coercion to
-/// perform here and every call site can drop to a plain `?`.
-pub(crate) fn widen_handler_error(e: HandlerError) -> HandlerError {
-    e
-}
-
 /// Persisted execution state of an outbox event-handler job: the sequence of
 /// the last fully handled persistent event, plus (keyed subscribers only)
 /// where the member last paused.

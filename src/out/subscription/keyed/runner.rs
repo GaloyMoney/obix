@@ -284,9 +284,7 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
                     None => {
@@ -297,9 +295,7 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
                         continue;
                     }
                 }
@@ -324,8 +320,7 @@ where
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < StreamPosition::Insert(state.sequence) {
                             persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                                .await
-                                .map_err(widen_handler_error)?;
+                                .await?;
                         }
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
@@ -352,8 +347,7 @@ where
                             Some(None) => {
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                                        .await
-                                        .map_err(widen_handler_error)?;
+                                        .await?;
                                 }
                                 return Ok(job::JobCompletion::RescheduleNow);
                             }
@@ -391,8 +385,7 @@ where
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted < StreamPosition::Insert(state.sequence) => {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                            .await
-                            .map_err(widen_handler_error)?;
+                            .await?;
                         tracker.persisted = StreamPosition::Insert(state.sequence);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
@@ -411,8 +404,7 @@ where
                             None => {
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                                        .await
-                                        .map_err(widen_handler_error)?;
+                                        .await?;
                                 }
                                 return Ok(job::JobCompletion::RescheduleNow);
                             }
@@ -431,9 +423,7 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
                     match subscriber.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             state.sequence = undecodable.sequence;
@@ -441,9 +431,7 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted < StreamPosition::Insert(state.sequence) {
-                                persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                                    .await
-                                    .map_err(widen_handler_error)?;
+                                persist_checkpoint(&mut current_job, &state, Some(&mirror)).await?;
                             }
                             return Err(error);
                         }
@@ -463,11 +451,7 @@ where
                 flusher: &flusher,
                 event_seq: event.sequence,
             };
-            let outcome = subscriber
-                .handle(ctx, &event)
-                .await
-                .map_err(widen_handler_error)?
-                .outcome;
+            let outcome = subscriber.handle(ctx, &event).await?.outcome;
 
             match outcome {
                 Outcome::Pause(at) => {
@@ -483,13 +467,9 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "pause_entry")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "pause_entry").await?;
                     if !landed {
-                        persist_checkpoint(&mut current_job, &state, Some(&mirror))
-                            .await
-                            .map_err(widen_handler_error)?;
+                        persist_checkpoint(&mut current_job, &state, Some(&mirror)).await?;
                     }
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
@@ -503,9 +483,7 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "staged_pause")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "staged_pause").await?;
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
                 Outcome::Skip => {
@@ -525,9 +503,7 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit")
-                        .await
-                        .map_err(widen_handler_error)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
                 }
                 Outcome::Collect => {
                     // Real work — this member is not idle. Restart linger.
@@ -541,9 +517,7 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
-                            .await
-                            .map_err(widen_handler_error)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
                     }
                 }
             }
