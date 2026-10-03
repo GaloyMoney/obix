@@ -123,7 +123,7 @@ pub enum CouldNotDecodeStored {
 mod tests {
     use super::*;
     use crate::error::ObixFault;
-    use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, lanes};
+    use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, ResultExt, lanes};
     use std::error::Error as _;
 
     #[test]
@@ -203,34 +203,36 @@ mod tests {
         }
     }
 
-    /// Why the conversions at the keyed runner's decode sites are not
-    /// ceremony: a `Classify` wrapper is not a lane payload, so boxing one
-    /// raw at a `Box<dyn Error>` boundary lets the boundary's own
-    /// `Fault::classify` walk straight past it to the `serde_json::Error`
-    /// underneath — and lane *that*, as `Fatal(Invariant)`. The
-    /// `Fatal(CorruptState)` override only survives if the wrapper reaches a
-    /// carrier first (rule 6).
+    /// Why `.widen::<ObixFault>()` at the keyed runner's decode sites is not
+    /// ceremony: a `Classify` wrapper carries its classification in its
+    /// `impl`, not in the value, so one boxed raw is neither a lane payload
+    /// nor a blessed foreign type — the boundary's `Fault::classify` walks
+    /// straight past it to the `serde_json::Error` underneath and lanes
+    /// *that*, as `Fatal(Invariant)`. The `Fatal(CorruptState)` override only
+    /// survives if the wrapper reaches a carrier first (rule 6).
     #[test]
     fn a_decode_wrapper_must_reach_a_carrier_before_it_reaches_a_box() {
-        let boxed: Box<dyn std::error::Error + Send + Sync> =
-            Box::new(CouldNotDecodeStored::ExecutionState(
+        fn undecodable() -> CouldNotDecodeStored {
+            CouldNotDecodeStored::ExecutionState(
                 serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err(),
-            ));
-        let recovered = Fault::classify(&*boxed).narrow_denied();
+            )
+        }
+        fn boxed(e: impl std::error::Error + Send + Sync + 'static) -> ObixFault {
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+            Fault::classify(&*boxed).narrow_denied()
+        }
+
         assert!(
-            matches!(recovered, Fault::Fatal(f) if f.kind == FatalKind::Invariant),
-            "boxing the wrapper raw loses the override — so the conversion at \
-             the call site is load-bearing, not ceremony",
+            matches!(boxed(undecodable()), Fault::Fatal(f) if f.kind == FatalKind::Invariant),
+            "boxing the wrapper raw loses the override — so naming the carrier \
+             at the call site is load-bearing, not ceremony",
         );
 
-        // Laned first, the same wrapper keeps its kind across the box.
-        let laned: ObixFault = CouldNotDecodeStored::ExecutionState(
-            serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err(),
-        )
-        .into();
-        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(laned);
-        let recovered = Fault::classify(&*boxed).narrow_denied();
-        assert!(matches!(recovered, Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
+        // Through the verb the runner actually uses, the kind survives.
+        let laned = Err::<(), _>(undecodable())
+            .widen::<ObixFault>()
+            .expect_err("still an error");
+        assert!(matches!(boxed(laned), Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
     }
 
     /// The converse, and why obix's own storage calls inside those same

@@ -47,14 +47,20 @@
 //!      same table `From<sqlx::Error>` uses. An eager `ObixFault::from` buys
 //!      nothing there, so obix's own storage calls inside a
 //!      `Box<dyn Error>`-returning method use plain `?`.
-//!    - *A [`Classify`](es_entity::errlanes::Classify) wrapper does.* It is
-//!      not a lane payload, so the boundary's walk steps straight past it to
-//!      the foreign error underneath — and lanes *that*. A
-//!      [`CouldNotDecodeStored`] boxed raw therefore arrives as
-//!      `Fatal(Invariant)` (serde's default), silently losing the
-//!      `Fatal(CorruptState)` rule 4 exists to assert. Every wrapper whose
-//!      whole purpose is to *override* a classification must reach a carrier
-//!      before it reaches a box.
+//!    - *A [`Classify`](es_entity::errlanes::Classify) wrapper does.* Its
+//!      classification lives in its `impl Classify`, not in the value, so a
+//!      wrapper boxed raw is neither a lane payload nor a blessed foreign
+//!      type: the boundary's walk steps straight past it to the foreign error
+//!      underneath — and lanes *that*. A [`CouldNotDecodeStored`] boxed raw
+//!      arrives as `Fatal(Invariant)` (serde's default), silently losing the
+//!      `Fatal(CorruptState)` rule 4 exists to assert.
+//!
+//!      The verb is `.widen::<ObixFault>()?` (errlanes ≥ 0.16.4). The
+//!      destination is spelled because `?` into a box leaves it
+//!      unconstrained — the same reason `.classify::<W>()` spells its
+//!      wrapper. Where a laned signature *does* infer it, as in
+//!      [`decode_execution_state`](crate::out::ctx), plain
+//!      `.map_err(Variant)?` is enough.
 //! 7. **Every `Fail` signature spells its carrier.** No `pub type FooError
 //!    = Fail<..>` aliases: a reader of a signature must see which rejection
 //!    it is being handed, since that is exactly what they have to branch on.

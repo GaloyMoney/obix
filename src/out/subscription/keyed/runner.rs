@@ -12,6 +12,7 @@
 
 use crate::error::ObixFault;
 use crate::out::error::CouldNotDecodeStored as Undecodable;
+use es_entity::errlanes::ResultExt;
 use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -127,15 +128,17 @@ where
         _spawner: job::KeyedJobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let KeyMsg { key } = job.config()?;
-        // The `FromStr` error is dropped deliberately: it quotes the key, and
-        // the key is caller data (see `Undecodable::Key`). Laned before the
-        // box for the same reason as `instance_config` in `run` below.
-        let Ok(key) = key.parse::<D::Key>() else {
-            return Err(ObixFault::from(Undecodable::Key {
+        // `.ok()` drops the `FromStr` error deliberately: it quotes the key,
+        // and the key is caller data (see `Undecodable::Key`). `.widen()`
+        // names the destination because `?` into a box would not — see
+        // `instance_config` in `run` below.
+        let key: D::Key = key
+            .parse()
+            .ok()
+            .ok_or(Undecodable::Key {
                 job_type: self.job_type.clone(),
             })
-            .into());
-        };
+            .widen::<ObixFault>()?;
         Ok(Box::new(KeyedSubscriberJobRunner {
             outbox: self.outbox.clone(),
             def: self.def.clone(),
@@ -217,12 +220,14 @@ where
         // The factory runs fresh every run: every wake, pause expiry, retry,
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
-        // Laned right here, not on the way out: `run` returns a box, and a
-        // raw `Undecodable` reaching it would be re-classified from the
+        // `.widen()` names the carrier because nothing here would infer it:
+        // `run` returns a box, and `?` on the bare wrapper would box it
+        // unlaned, leaving the boundary to re-classify from the
         // `serde_json::Error` underneath — `Fatal(Invariant)`, losing the
         // `Fatal(CorruptState)` these bytes earn by coming out of Postgres.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
-            .map_err(|e| ObixFault::from(Undecodable::InstanceConfig(e)))?;
+            .map_err(Undecodable::InstanceConfig)
+            .widen::<ObixFault>()?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),
