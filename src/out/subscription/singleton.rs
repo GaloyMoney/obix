@@ -1,7 +1,6 @@
 use crate::error::ObixFault;
 use async_trait::async_trait;
 use es_entity::ResultExt;
-use es_entity::errlanes::Fail;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -510,10 +509,7 @@ where
         let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
         // `L::require` ran at registration, so the lane being off by the time
         // this job runs has no caller left to correct it.
-        self.outbox
-            .listen::<L>(start_after)
-            .map_err(Fail::Rejected)
-            .narrow_rejected()
+        Ok(self.outbox.listen::<L>(start_after).narrow_rejected()?)
     }
 
     async fn run_with_persistent(
