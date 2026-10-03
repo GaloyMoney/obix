@@ -1,7 +1,6 @@
 use crate::error::ObixFault;
 use async_trait::async_trait;
-use es_entity::ResultExt;
-use es_entity::errlanes::{Fail, lanes};
+use es_entity::errlanes::Fatal;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -506,10 +505,17 @@ where
     fn select_lane(
         &self,
         state: &OutboxEventJobState,
-    ) -> Result<crate::out::LaneListener<L, P>, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
-    {
+    ) -> Result<crate::out::LaneListener<L, P>, ObixFault> {
         let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
-        Ok(self.outbox.listen::<L>(start_after)?)
+        match self.outbox.listen::<L>(start_after) {
+            Ok(listener) => Ok(listener),
+            // `L::require` ran at registration, so the lane being off by the
+            // time this job runs is an invariant, not a caller's to correct.
+            Err(CommitLaneDisabled) => Err(Fatal::invariant(
+                "a commit-lane subscriber is running on an outbox whose commit lane is disabled",
+            )
+            .into()),
+        }
     }
 
     async fn run_with_persistent(
@@ -528,9 +534,7 @@ where
         // and ephemerals are only handled while nothing is pending. A
         // `PersistentOnly` handler never subscribes the ephemeral stream at
         // all.
-        // The lane was required at registration, so there is no caller left
-        // here to correct it being off.
-        let mut persistent = self.select_lane(&state).narrow_rejected()?;
+        let mut persistent = self.select_lane(&state)?;
         let mut ephemeral =
             (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 

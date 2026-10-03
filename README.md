@@ -182,7 +182,7 @@ returns it) and re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`begin_op`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
 | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
@@ -192,9 +192,11 @@ re-exported as `obix::prelude::es_entity::errlanes` — a downstream signature
 that spells a `Fail` carrier names them from there.
 
 `Outbox::listen` / `listen_commit_ordered` return a bare
-`errlanes::Rejection` on its own (`CommitLaneDisabled`), and two methods stay
-on `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit` pins it:
-`Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.
+`errlanes::Rejection` on its own (`CommitLaneDisabled`). Two methods stay on
+`sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit` pins it:
+`Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`. And
+`Outbox::begin_op` / `Inbox::begin_op` keep it by rule 3 — opening an op can
+fail no other way, so there is nothing to classify it against.
 
 The `MailboxTables` storage trait is `sqlx::Error` throughout — it classifies
 nothing. Absence comes back as `Option` and becomes

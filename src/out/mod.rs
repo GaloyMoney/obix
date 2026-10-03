@@ -276,8 +276,11 @@ where
         *deps = rebuilt.into();
     }
 
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, ObixFault> {
-        Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
+    /// Raw `sqlx::Error` (rule 3): opening an op is the one thing here that
+    /// can fail no other way, and [`Inbox::begin_op`](crate::Inbox::begin_op)
+    /// says the same.
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
+        es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
     }
 
     // `publish_persisted_in_op`/`publish_all_persisted` deliberately keep

@@ -72,12 +72,12 @@
 //!
 //! | Carrier | Returned by |
 //! |---|---|
-//! | [`ObixFault`] | every method that cannot reject: `Outbox::init`, `begin_op`, `publish_ephemeral*`, `highest_known_persistent_sequence`, `register_keyed_subscriber`, `register_partition_maintainer`, `Partitions::ensure`, `recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+//! | [`ObixFault`] | every method that cannot reject: `Outbox::init`, `publish_ephemeral*`, `highest_known_persistent_sequence`, `register_keyed_subscriber`, `register_partition_maintainer`, `Partitions::ensure`, `recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 //! | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
 //! | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
 //! | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` — the only method that can reject it |
 //! | bare rejection | `Outbox::listen`/`listen_commit_ordered` (`CommitLaneDisabled`) |
-//! | `sqlx::Error` | `Outbox::publish_persisted_in_op`, `Outbox::publish_all_persisted` (hook-pinned) |
+//! | `sqlx::Error` | `Outbox::publish_persisted_in_op`, `Outbox::publish_all_persisted` (hook-pinned); `Outbox::begin_op`, `Inbox::begin_op` (rule 3) |
 //! | raw `serde_json::Error` | `InboxEvent::payload` (the only error that site can produce) |
 
 use es_entity::errlanes::{Fault, lanes};
