@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::Fatal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -88,7 +89,7 @@ where
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: InboxJobData<Tables> = job.config()?;
 
         Ok(Box::new(InboxJobRunner::<H, Tables> {
@@ -122,7 +123,7 @@ where
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         if current_job.is_shutdown_requested() {
             return Ok(JobCompletion::RescheduleNow);
         }
@@ -136,12 +137,16 @@ where
             InboxEventStatus::Processing,
             None,
         )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        .await?;
 
-        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        // Not `InboxRejection::NotFound`: this job was spawned in the same
+        // op that inserted the row, so there is no caller left to correct
+        // its absence — the row was deleted under a live job.
+        let event = Tables::maybe_find_inbox_event_by_id(&self.pool, self.inbox_event_id)
+            .await?
+            .ok_or_else(|| {
+                Fatal::invariant("the inbox event row this job was spawned beside is gone")
+            })?;
 
         let result = self.handler.handle(&event).await;
 
@@ -154,8 +159,7 @@ where
                     InboxEventStatus::Completed,
                     None,
                 )
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .await?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
@@ -166,8 +170,7 @@ where
                     InboxEventStatus::Pending,
                     None,
                 )
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .await?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
@@ -178,8 +181,7 @@ where
                     InboxEventStatus::Pending,
                     None,
                 )
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .await?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
@@ -190,8 +192,7 @@ where
                     InboxEventStatus::Failed,
                     Some(&e.to_string()),
                 )
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .await?;
                 Err(e)
             }
         }

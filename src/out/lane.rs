@@ -3,6 +3,7 @@
 //! lane is a type parameter on everything a subscriber touches, so the compiler
 //! refuses to run a commit-lane handler on the insert lane.
 
+use es_entity::errlanes::{Fail, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
@@ -14,13 +15,13 @@ use std::sync::{
 use std::time::Duration;
 
 use super::Outbox;
+pub use super::error::CommitLaneDisabled;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
-    StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
+    StreamPosition, Subscription, SubscriptionRejection, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use crate::config::{CommitLaneDisabled, FrontierError};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
@@ -81,7 +82,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<Self::Position, String>;
+    ) -> Result<Self::Position, super::error::LaneMismatch>;
 
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
@@ -90,7 +91,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn frontier<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
-    ) -> impl std::future::Future<Output = Result<Self::Position, SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<Self::Position, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -98,7 +102,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn outbox_frontier<'a, P, Tables>(
         outbox: &'a Outbox<P, Tables>,
-    ) -> impl std::future::Future<Output = Result<Self::Position, FrontierError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<Self::Position, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -107,7 +114,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -170,17 +180,17 @@ impl Lane for InsertOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<EventSequence, String> {
-        decide_lane(commit, sequence, Self::ORDERING)?
+    ) -> Result<EventSequence, super::error::LaneMismatch> {
+        Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .insert()
-            .ok_or_else(|| lane_choice_mismatch(Self::ORDERING))
+            .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))
     }
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
-    ) -> Result<EventSequence, SubscriptionError>
+    ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -190,7 +200,7 @@ impl Lane for InsertOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<EventSequence, FrontierError>
+    ) -> Result<EventSequence, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -201,7 +211,10 @@ impl Lane for InsertOrder {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -256,10 +269,10 @@ impl Lane for CommitOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<CommitSequence, String> {
-        decide_lane(commit, sequence, Self::ORDERING)?
+    ) -> Result<CommitSequence, super::error::LaneMismatch> {
+        Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .commit()
-            .ok_or_else(|| lane_choice_mismatch(Self::ORDERING))
+            .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))
     }
 
     fn record(commit_cursor: &mut Option<CommitSequence>, position: CommitSequence) {
@@ -268,7 +281,7 @@ impl Lane for CommitOrder {
 
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
-    ) -> Result<CommitSequence, SubscriptionError>
+    ) -> Result<CommitSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -278,7 +291,7 @@ impl Lane for CommitOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<CommitSequence, FrontierError>
+    ) -> Result<CommitSequence, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -289,7 +302,10 @@ impl Lane for CommitOrder {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -354,9 +370,14 @@ where
     }
 }
 
-/// Unreachable: `decide_lane` is total on each `(state, ordering)` pair.
-fn lane_choice_mismatch(ordering: Ordering) -> String {
-    format!("lane resolution yielded the other lane's cursor for Ordering::{ordering:?}")
+/// Unreachable: `decide_lane` is total on each `(state, ordering)` pair —
+/// the `LaneChoice` variant it returns always matches `configured`, so
+/// `.insert()`/`.commit()` on that result can never miss. A panic, not a
+/// typed error: nothing a caller could act on, and the whole point of
+/// `resume_from`'s `LaneMismatch` is to carry a real `(stored, configured)`
+/// pair, which this call site does not have.
+fn unreachable_lane_choice(ordering: Ordering) -> ! {
+    unreachable!("lane resolution yielded the other lane's cursor for Ordering::{ordering:?}")
 }
 
 impl LaneChoice {

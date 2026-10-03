@@ -59,6 +59,10 @@ impl ToTokens for MailboxTables {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let ident = &self.ident;
         let crate_name: syn::Path = self.crate_name.parse().expect("invalid crate path");
+        // The same path as a string, for sqlx output-type overrides: the
+        // `AS "col!: Type"` syntax resolves `Type` in the *expanded* scope,
+        // which is the downstream crate, so it has to be fully qualified.
+        let crate_path = self.crate_name.value();
 
         #[cfg(feature = "tracing")]
         let (extract_tracing, set_context, deserialize_context) = (
@@ -342,8 +346,8 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        let find_inbox_event_by_id_query = format!(
-            r#"SELECT id, idempotency_key, payload, status::text AS "status!", error, recorded_at, processed_at
+        let maybe_find_inbox_event_by_id_query = format!(
+            r#"SELECT id, idempotency_key, payload, status AS "status!: {crate_path}::inbox::InboxEventStatus", error, recorded_at, processed_at
             FROM {tbl}inbox_events
             WHERE id = $1"#,
             tbl = table_prefix
@@ -359,7 +363,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         );
 
         let list_inbox_events_by_status_query = format!(
-            r#"SELECT id, idempotency_key, payload, status::text AS "status!", error, recorded_at, processed_at
+            r#"SELECT id, idempotency_key, payload, status AS "status!: {crate_path}::inbox::InboxEventStatus", error, recorded_at, processed_at
             FROM {tbl}inbox_events
             WHERE status = $1
             ORDER BY recorded_at ASC
@@ -1199,34 +1203,33 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn find_inbox_event_by_id(
+                fn maybe_find_inbox_event_by_id(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     id: #crate_name::inbox::InboxEventId,
-                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEvent, #crate_name::inbox::InboxError>> + Send
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::inbox::InboxEvent>, sqlx::Error>> + Send
                 {
                     let pool = pool.clone();
 
                     async move {
-                        let row = sqlx::query!(
-                            #find_inbox_event_by_id_query,
+                        let Some(row) = sqlx::query!(
+                            #maybe_find_inbox_event_by_id_query,
                             id as #crate_name::inbox::InboxEventId
                         )
                         .fetch_optional(&pool)
                         .await?
-                        .ok_or(#crate_name::inbox::InboxError::NotFound(id))?;
+                        else {
+                            return Ok(None);
+                        };
 
-                        let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                            .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
-
-                        Ok(#crate_name::inbox::InboxEvent {
+                        Ok(Some(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
                             idempotency_key: row.idempotency_key,
                             payload: row.payload,
-                            status,
+                            status: row.status,
                             error: row.error,
                             recorded_at: row.recorded_at,
                             processed_at: row.processed_at,
-                        })
+                        }))
                     }
                 }
 
@@ -1234,7 +1237,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     status: #crate_name::inbox::InboxEventStatus,
                     limit: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent>, #crate_name::inbox::InboxError>> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent>, sqlx::Error>> + Send
                 {
                     let pool = pool.clone();
 
@@ -1247,23 +1250,18 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .fetch_all(&pool)
                         .await?;
 
-                        let events = rows
-                            .into_iter()
-                            .map(|row| {
-                                let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                                    .map_err(#crate_name::inbox::InboxError::InvalidStatus)?;
-
-                                Ok(#crate_name::inbox::InboxEvent {
-                                    id: #crate_name::inbox::InboxEventId::from(row.id),
-                                    idempotency_key: row.idempotency_key,
-                                    payload: row.payload,
-                                    status,
-                                    error: row.error,
-                                    recorded_at: row.recorded_at,
-                                    processed_at: row.processed_at,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, #crate_name::inbox::InboxError>>()?;
+                        let mut events = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            events.push(#crate_name::inbox::InboxEvent {
+                                id: #crate_name::inbox::InboxEventId::from(row.id),
+                                idempotency_key: row.idempotency_key,
+                                payload: row.payload,
+                                status: row.status,
+                                error: row.error,
+                                recorded_at: row.recorded_at,
+                                processed_at: row.processed_at,
+                            });
+                        }
 
                         Ok(events)
                     }

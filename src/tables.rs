@@ -3,7 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use es_entity::hooks::HookOperation;
 
 use crate::{
-    inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
+    inbox::{InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{
         DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
         PersistentOutboxEvent, UndecodableEventError,
@@ -352,10 +352,14 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + Send + Sync;
 
-    fn find_inbox_event_by_id(
+    /// `None` is the plain absence of a row. Whether that is a caller
+    /// outcome ([`InboxRejection::NotFound`](crate::InboxRejection), at
+    /// `Inbox::find_event_by_id`) or an invariant (the handler job, reading
+    /// the row it was spawned beside) is not the storage layer's call.
+    fn maybe_find_inbox_event_by_id(
         pool: &sqlx::PgPool,
         id: InboxEventId,
-    ) -> impl Future<Output = Result<InboxEvent, InboxError>> + Send;
+    ) -> impl Future<Output = Result<Option<InboxEvent>, sqlx::Error>> + Send;
 
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
@@ -376,7 +380,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         status: InboxEventStatus,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<InboxEvent>, InboxError>> + Send;
+    ) -> impl Future<Output = Result<Vec<InboxEvent>, sqlx::Error>> + Send;
 
     // === Keyed-subscriber subscription methods ===
 

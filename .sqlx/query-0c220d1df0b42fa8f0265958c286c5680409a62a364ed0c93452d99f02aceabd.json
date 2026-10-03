@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, idempotency_key, payload, status AS \"status!: obix::inbox::InboxEventStatus\", error, recorded_at, processed_at\n            FROM inbox_events\n            WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "idempotency_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "status!: obix::inbox::InboxEventStatus",
+        "type_info": {
+          "Custom": {
+            "name": "inboxeventstatus",
+            "kind": {
+              "Enum": [
+                "pending",
+                "processing",
+                "completed",
+                "failed"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "error",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "processed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "0c220d1df0b42fa8f0265958c286c5680409a62a364ed0c93452d99f02aceabd"
+}

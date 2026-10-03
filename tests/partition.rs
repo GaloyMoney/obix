@@ -152,8 +152,7 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
             &mut jobs,
             PartitionMaintainerConfig::new(job::JobType::new(job_type)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     // Both the next partition AND the full premake runway exist.
     for table in ["persistent_outbox_events"] {

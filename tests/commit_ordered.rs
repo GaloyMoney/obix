@@ -80,8 +80,7 @@ async fn lane_rows(pool: &sqlx::PgPool, count: usize) -> anyhow::Result<Vec<(i64
         let item = tokio::time::timeout(std::time::Duration::from_secs(20), listener.next())
             .await
             .map_err(|_| anyhow::anyhow!("the lane stopped after {} of {count} rows", rows.len()))?
-            .expect("the stream stays open")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .expect("the stream stays open")?;
         rows.push((
             i64::from(item.position()),
             u64::from(item.sequence) as i64,

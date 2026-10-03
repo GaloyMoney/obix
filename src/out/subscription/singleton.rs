@@ -1,4 +1,6 @@
+use crate::error::ObixFault;
 use async_trait::async_trait;
+use es_entity::ResultExt;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -265,7 +267,7 @@ pub(crate) fn decide_lane(
     stored_commit: Option<CommitSequence>,
     stored_insert: EventSequence,
     configured: Ordering,
-) -> Result<LaneChoice, String> {
+) -> Result<LaneChoice, crate::out::error::LaneMismatch> {
     match (stored_commit, configured) {
         (None, Ordering::Insert) => Ok(LaneChoice::Insert(stored_insert)),
         (Some(commit_sequence), Ordering::Commit) => Ok(LaneChoice::Commit(commit_sequence)),
@@ -273,18 +275,16 @@ pub(crate) fn decide_lane(
             if stored_insert == EventSequence::BEGIN {
                 Ok(LaneChoice::Commit(CommitSequence::BEGIN))
             } else {
-                Err(format!(
-                    "subscription is checkpointed on the insert lane at sequence \
-                     {stored_insert}; switching lanes is unsupported — register a new job \
-                     type instead"
-                ))
+                Err(crate::out::error::LaneMismatch {
+                    stored: Ordering::Insert,
+                    configured: Ordering::Commit,
+                })
             }
         }
-        (Some(_), Ordering::Insert) => Err(
-            "subscription was checkpointed under Ordering::Commit; switching back to \
-             Ordering::Insert is unsupported — register a new job type instead"
-                .to_string(),
-        ),
+        (Some(_), Ordering::Insert) => Err(crate::out::error::LaneMismatch {
+            stored: Ordering::Commit,
+            configured: Ordering::Insert,
+        }),
     }
 }
 
@@ -308,6 +308,15 @@ pub enum Ordering {
     /// source transaction's events are contiguous and a batch flush never
     /// splits one.
     Commit,
+}
+
+impl std::fmt::Display for Ordering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insert => f.write_str("insert"),
+            Self::Commit => f.write_str("commit"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -411,7 +420,10 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        _job: &Job,
+    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(OutboxEventJobRunner::<H, P, Tables, L> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
@@ -447,7 +459,7 @@ where
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         match H::SUBSCRIPTION {
             StreamSelection::EphemeralOnly => self.run_ephemeral_only(current_job).await,
             StreamSelection::All | StreamSelection::PersistentOnly => {
@@ -470,7 +482,7 @@ where
     async fn run_ephemeral_only(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut ephemeral = self.outbox.listen_ephemeral();
         loop {
             tokio::select! {
@@ -482,8 +494,7 @@ where
                     Some(event) => {
                         self.handler
                             .handle_ephemeral(&event)
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .await?;
                     }
                     None => return Ok(ResidentJobCompletion::RescheduleNow),
                 },
@@ -496,18 +507,18 @@ where
     fn select_lane(
         &self,
         state: &OutboxEventJobState,
-    ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
+    ) -> Result<crate::out::LaneListener<L, P>, ObixFault> {
         let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
-        Ok(self.outbox.listen::<L>(start_after)?)
+        // `L::require` ran at registration, so the lane being off by the time
+        // this job runs has no caller left to correct it.
+        Ok(self.outbox.listen::<L>(start_after).narrow_rejected()?)
     }
 
     async fn run_with_persistent(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
-        let mut state = current_job
-            .execution_state::<OutboxEventJobState>()?
-            .unwrap_or_default();
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
 
         // Two independent streams: the persistent backlog alone governs the
         // batch lifecycle, so ephemeral traffic can never shrink a batch —
@@ -547,9 +558,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     None if in_group => match persistent.next().await {
@@ -562,9 +571,7 @@ where
                                 tracker: &mut tracker,
                                 mirror: None,
                             };
-                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
-                                .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
                     },
@@ -576,9 +583,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
                         continue;
                     }
                 }
@@ -588,16 +593,14 @@ where
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
-                                .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                .await?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
                         if tracker.persisted < checkpoint_of::<L>(&state) => {
                         persist_checkpoint(&mut current_job, &state, None)
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .await?;
                         tracker.persisted = checkpoint_of::<L>(&state);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
@@ -623,18 +626,13 @@ where
                     // transaction spans the foreign `handle_ephemeral` await
                     // and a failure discards no batch work.
                     NextDelivery::Ephemeral(event) => {
-                        self.handler
-                            .handle_ephemeral(&event)
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        self.handler.handle_ephemeral(&event).await?;
                         continue;
                     }
                     NextDelivery::Persistent(Some(item)) => item,
                     NextDelivery::Persistent(None) => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
-                            persist_checkpoint(&mut current_job, &state, None)
-                                .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            persist_checkpoint(&mut current_job, &state, None).await?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
@@ -661,9 +659,7 @@ where
                         tracker: &mut tracker,
                         mirror: None,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
-                        .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
                     match self.handler.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             // INVARIANT: both cursors advance. Leaving
@@ -675,11 +671,9 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted < checkpoint_of::<L>(&state) {
-                                persist_checkpoint(&mut current_job, &state, None)
-                                    .await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                persist_checkpoint(&mut current_job, &state, None).await?;
                             }
-                            return Err(error as Box<dyn std::error::Error>);
+                            return Err(error);
                         }
                     }
                 }
@@ -701,12 +695,7 @@ where
             // the ctx — so the outcome is authentic by construction. Extract
             // it in the same statement so the token (and with it the ctx
             // borrows) ends before the state advance below.
-            let outcome = self
-                .handler
-                .handle_persistent(ctx, &event)
-                .await
-                .map_err(|e| e as Box<dyn std::error::Error>)?
-                .outcome;
+            let outcome = self.handler.handle_persistent(ctx, &event).await?.outcome;
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
             in_group = !event.is_boundary();
@@ -720,9 +709,7 @@ where
                         tracker: &mut tracker,
                         mirror: None,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit")
-                        .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                    flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
                 }
                 Outcome::Collect => {
                     if tracker.collected >= self.max_batch_size && !in_group {
@@ -733,9 +720,7 @@ where
                             tracker: &mut tracker,
                             mirror: None,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
-                            .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
                     }
                 }
                 Outcome::Pause(_) | Outcome::CommitAndPause(_) => {
@@ -786,7 +771,14 @@ mod tests {
     fn switching_an_established_subscription_to_commit_is_refused() {
         let error =
             decide_lane(None, EventSequence::from(12u64), Ordering::Commit).expect_err("refuses");
-        assert!(error.contains("register a new job type"), "{error}");
+        assert_eq!(
+            error,
+            crate::out::error::LaneMismatch {
+                stored: Ordering::Insert,
+                configured: Ordering::Commit,
+            }
+        );
+        assert!(error.to_string().contains("register a new job type"));
     }
 
     #[test]
@@ -797,6 +789,13 @@ mod tests {
             Ordering::Insert,
         )
         .expect_err("refuses");
-        assert!(error.contains("register a new job type"), "{error}");
+        assert_eq!(
+            error,
+            crate::out::error::LaneMismatch {
+                stored: Ordering::Commit,
+                configured: Ordering::Insert,
+            }
+        );
+        assert!(error.to_string().contains("register a new job type"));
     }
 }

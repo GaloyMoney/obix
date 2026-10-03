@@ -1,3 +1,5 @@
+use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -323,7 +325,7 @@ where
                     }
                     Err(error) => {
                         attempts += 1;
-                        record_compensation_failed(&error, attempts);
+                        record_compensation_failed(error, attempts);
                         if attempts >= Self::COMPENSATION_MAX_ATTEMPTS {
                             // The stall episode proves and fills them later.
                             return;
@@ -364,7 +366,7 @@ where
                     (marker, head)
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&error);
+                    record_gap_fill_failed(error);
                     return Vec::new();
                 }
             },
@@ -389,7 +391,7 @@ where
             {
                 Ok(events) => events,
                 Err(error) => {
-                    record_gap_fill_failed(&error);
+                    record_gap_fill_failed(error);
                     return Vec::new();
                 }
             };
@@ -423,7 +425,7 @@ where
             // meanwhile.
             Ok(false) => Vec::new(),
             Err(error) => {
-                record_gap_fill_failed(&error);
+                record_gap_fill_failed(error);
                 Vec::new()
             }
         }
@@ -454,7 +456,7 @@ where
                         marker
                     }
                     Err(error) => {
-                        record_gap_fill_failed(&error);
+                        record_gap_fill_failed(error);
                         self.historical_due = Some(now + Self::REFILL_INTERVAL);
                         return Vec::new();
                     }
@@ -467,7 +469,7 @@ where
                     return Vec::new();
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&error);
+                    record_gap_fill_failed(error);
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                     return Vec::new();
                 }
@@ -546,7 +548,7 @@ where
                 }
             }
             Err(error) => {
-                record_gap_fill_failed(&error);
+                record_gap_fill_failed(error);
                 if !historical_batch.is_empty() {
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                 }
@@ -584,14 +586,33 @@ fn deliver_and_notify<P>(
     name = "obix.gap_filler.compensation_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, attempts = attempts),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        attempts = attempts,
+    ),
 )]
-fn record_compensation_failed(error: &sqlx::Error, attempts: u32) {}
+fn record_compensation_failed(fault: impl Into<ObixFault>, attempts: u32) {
+    fault.into().record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.gap_filler.fill_failed",
     level = "warn",
     skip_all,
-    fields(error = %error),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_gap_fill_failed(error: &sqlx::Error) {}
+fn record_gap_fill_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
+}

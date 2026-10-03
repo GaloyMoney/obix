@@ -3,7 +3,10 @@ mod error;
 mod event;
 mod job;
 
-use es_entity::clock::ClockHandle;
+use es_entity::errlanes::{Fail, lanes};
+use es_entity::{ResultExt, clock::ClockHandle};
+
+use crate::error::ObixFault;
 use serde::Serialize;
 
 pub use config::*;
@@ -60,7 +63,7 @@ where
         &self,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: P,
-    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    ) -> Result<es_entity::Idempotent<InboxEventId>, ObixFault>
     where
         P: Serialize + Send + Sync,
     {
@@ -77,7 +80,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: P,
-    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    ) -> Result<es_entity::Idempotent<InboxEventId>, ObixFault>
     where
         P: Serialize + Send + Sync,
     {
@@ -92,16 +95,29 @@ where
             _phantom: std::marker::PhantomData,
         };
 
-        self.spawner.spawn_in_op(op, id, config).await?;
+        self.spawner
+            .spawn_in_op(op, id, config)
+            .await
+            .narrow_rejected()?;
 
         Ok(es_entity::Idempotent::Executed(id))
     }
 
-    pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent, InboxError> {
-        Tables::find_inbox_event_by_id(&self.pool, id).await
+    /// Rejects with [`InboxRejection::NotFound`] when no event has that id.
+    /// The only method that can.
+    pub async fn find_event_by_id(
+        &self,
+        id: InboxEventId,
+    ) -> Result<InboxEvent, Fail<InboxRejection, lanes!(Transient, Fatal)>> {
+        Tables::maybe_find_inbox_event_by_id(&self.pool, id)
+            .await?
+            .ok_or(Fail::Rejected(InboxRejection::NotFound(id)))
     }
 
-    pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, InboxError> {
-        Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit).await
+    pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, ObixFault> {
+        Ok(
+            Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit)
+                .await?,
+        )
     }
 }

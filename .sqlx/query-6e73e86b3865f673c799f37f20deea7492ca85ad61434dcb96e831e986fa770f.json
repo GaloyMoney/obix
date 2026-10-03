@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, idempotency_key, payload, status::text AS \"status!\", error, recorded_at, processed_at\n            FROM inbox_events\n            WHERE status = $1\n            ORDER BY recorded_at ASC\n            LIMIT $2",
+  "query": "SELECT id, idempotency_key, payload, status AS \"status!: obix::inbox::InboxEventStatus\", error, recorded_at, processed_at\n            FROM inbox_events\n            WHERE status = $1\n            ORDER BY recorded_at ASC\n            LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -20,8 +20,20 @@
       },
       {
         "ordinal": 3,
-        "name": "status!",
-        "type_info": "Text"
+        "name": "status!: obix::inbox::InboxEventStatus",
+        "type_info": {
+          "Custom": {
+            "name": "inboxeventstatus",
+            "kind": {
+              "Enum": [
+                "pending",
+                "processing",
+                "completed",
+                "failed"
+              ]
+            }
+          }
+        }
       },
       {
         "ordinal": 4,
@@ -61,11 +73,11 @@
       false,
       true,
       false,
-      null,
+      false,
       true,
       false,
       true
     ]
   },
-  "hash": "9b746123dd59acea292129ca38e99866a5cbb931bfc86464394bb405f0c4717c"
+  "hash": "6e73e86b3865f673c799f37f20deea7492ca85ad61434dcb96e831e986fa770f"
 }

@@ -1,3 +1,10 @@
+use crate::error::ObixFault;
+// `record` is a method on `Laned`, not an inherent method on `Fault`: it is
+// the one trait that covers both carrier shapes — every `Failure` (so
+// `Fail<D, L>`) and `Fault<L>` — and the two need different bodies (a `Fail`
+// has a `Rejected` arm to key `error.code` from, a `Fault` does not). errlanes'
+// own generic machinery is written against `Laned` for the same reason.
+use es_entity::errlanes::Laned;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -441,7 +448,7 @@ where
             {
                 Ok(events) => events,
                 Err(e) => {
-                    record_backfill_failed(&e, u64::from(current_sequence));
+                    record_backfill_failed(e, u64::from(current_sequence));
                     tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -496,7 +503,7 @@ where
                             let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
                         }
                         Ok(_) => {}
-                        Err(e) => record_backfill_failed(&e, next_needed),
+                        Err(e) => record_backfill_failed(e, next_needed),
                     }
                 }
             }
@@ -536,7 +543,7 @@ where
         match Tables::highest_known_persistent_sequence(pool).await {
             Ok(head) => Some(head),
             Err(e) => {
-                record_resync_failed(&e);
+                record_resync_failed(e);
                 None
             }
         }
@@ -920,9 +927,19 @@ fn record_no_receivers(sequence: u64) {}
     name = "obix.persistent_cache.backfill_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, current_sequence = current_sequence),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        current_sequence = current_sequence,
+    ),
 )]
-fn record_backfill_failed(error: &sqlx::Error, current_sequence: u64) {}
+fn record_backfill_failed(fault: impl Into<ObixFault>, current_sequence: u64) {
+    fault.into().record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.persistent_cache.backfill_channel_closed",
@@ -963,9 +980,19 @@ fn record_feeder_gone() {}
     name = "obix.persistent_cache.resync_failed",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error),
+    fields(
+        otel.status_code = "ERROR",
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_resync_failed(error: &sqlx::Error) {}
+fn record_resync_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
+}
 
 #[cfg(test)]
 mod tests {
