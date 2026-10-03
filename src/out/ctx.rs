@@ -75,21 +75,11 @@ use crate::sequence::{CommitSequence, EventSequence};
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Widen a [`HandlerError`] into the plain `Box<dyn Error>` the runner
-/// traits return (fixed by `job`, which does not widen to `+ Send + Sync`;
-/// see job 0.17.0's `JobRunner`/`ResidentJobRunner`).
-///
-/// A coercion, not a `From` conversion: dropping the `Send + Sync` auto
-/// traits from a trait object is a coercion the compiler performs at
-/// specific sites (a let binding or return with an explicit type, a
-/// function argument) — there is no `impl From<Box<dyn Error + Send +
-/// Sync>> for Box<dyn Error>` to ride a bare `?` on (both types are
-/// foreign, so such an impl would violate the orphan rule even if errlanes
-/// wanted to supply one). This function's return-type annotation is that
-/// coercion site, named once so every runner's `?` sites after a
-/// `HandlerError`-returning call stay a plain `.map_err(widen_handler_error)?`
-/// rather than an inline cast expression repeated at every call site.
-pub(crate) fn widen_handler_error(e: HandlerError) -> Box<dyn std::error::Error> {
+/// Identity on [`HandlerError`], left over from job 0.17.0's narrower
+/// runner error type. job 0.18.0 widened the runner traits to
+/// `Box<dyn Error + Send + Sync>`, so there is no longer a coercion to
+/// perform here and every call site can drop to a plain `?`.
+pub(crate) fn widen_handler_error(e: HandlerError) -> HandlerError {
     e
 }
 

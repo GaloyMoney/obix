@@ -91,7 +91,10 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        _job: &Job,
+    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(PartitionMaintainerJobRunner::<Tables> {
             partitions: self.partitions.clone(),
             interval: self.interval,
@@ -115,7 +118,7 @@ where
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Re-run on an internal timer rather than round-tripping through the job
         // scheduler each tick: the job stays resident and only falls out of the
         // loop on shutdown (reschedule to resume after restart) or on an

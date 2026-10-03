@@ -124,7 +124,7 @@ where
         &self,
         job: &Job,
         _spawner: job::KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let KeyMsg { key } = job.config()?;
         let key: D::Key = key.parse().map_err(|_| {
             ObixFault::from(crate::out::error::CouldNotDecodeStored::Key {
@@ -196,7 +196,7 @@ where
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<job::JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<job::JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let key_str = self.key.to_string();
 
         // Run start: the subscriptions row is the truth. Missing → cancelled;

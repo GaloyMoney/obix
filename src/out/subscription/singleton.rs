@@ -420,7 +420,10 @@ where
         self.retry_settings.clone()
     }
 
-    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        _job: &Job,
+    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(OutboxEventJobRunner::<H, P, Tables, L> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
@@ -456,7 +459,7 @@ where
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         match H::SUBSCRIPTION {
             StreamSelection::EphemeralOnly => self.run_ephemeral_only(current_job).await,
             StreamSelection::All | StreamSelection::PersistentOnly => {
@@ -479,7 +482,7 @@ where
     async fn run_ephemeral_only(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut ephemeral = self.outbox.listen_ephemeral();
         loop {
             tokio::select! {
@@ -515,7 +518,7 @@ where
     async fn run_with_persistent(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
             .map_err(|e| {

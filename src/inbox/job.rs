@@ -90,7 +90,7 @@ where
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: InboxJobData<Tables> = job.config()?;
 
         Ok(Box::new(InboxJobRunner::<H, Tables> {
@@ -124,7 +124,7 @@ where
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         if current_job.is_shutdown_requested() {
             return Ok(JobCompletion::RescheduleNow);
         }
