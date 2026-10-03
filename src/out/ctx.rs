@@ -86,8 +86,8 @@ pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 /// foreign, so such an impl would violate the orphan rule even if errlanes
 /// wanted to supply one). This function's return-type annotation is that
 /// coercion site, named once so every runner's `?` sites after a
-/// `HandlerError`-returning call stay bare `.map_err(widen_handler_error)?`
-/// rather than repeating `as Box<dyn std::error::Error>` everywhere.
+/// `HandlerError`-returning call stay a plain `.map_err(widen_handler_error)?`
+/// rather than an inline cast expression repeated at every call site.
 pub(crate) fn widen_handler_error(e: HandlerError) -> Box<dyn std::error::Error> {
     e
 }
