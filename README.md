@@ -191,11 +191,10 @@ returns it) and re-exported from `obix::`, `obix::out::` and
 re-exported as `obix::prelude::es_entity::errlanes` — a downstream signature
 that spells a `Fail` carrier names them from there.
 
-A handful of methods return a bare `errlanes::Rejection` on its own
-(`WakeKeys::try_from` → `SubscribeError`,
-`Outbox::listen`/`listen_commit_ordered` → `CommitLaneDisabled`), and two
-methods stay on `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit`
-pins it: `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.
+`Outbox::listen` / `listen_commit_ordered` return a bare
+`errlanes::Rejection` on its own (`CommitLaneDisabled`), and two methods stay
+on `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit` pins it:
+`Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.
 
 The `MailboxTables` storage trait is `sqlx::Error` throughout — it classifies
 nothing. Absence comes back as `Option` and becomes

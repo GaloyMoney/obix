@@ -23,22 +23,6 @@ use super::Ordering;
 )]
 pub struct CommitLaneDisabled;
 
-/// Why a set of wake keys could not be accepted.
-///
-/// Purely caller-correctable — the caller built a bad set of wake keys — so
-/// this is a bare [`errlanes::Rejection`] rather than a `Fail`/`Fault`:
-/// nothing else can go wrong here.
-#[derive(Debug, errlanes::Rejection)]
-pub enum SubscribeError {
-    /// A runtime-built collection of wake keys turned out to be empty. See
-    /// [`WakeKeys`](super::WakeKeys) for why an empty set is
-    /// unrepresentable at the call site and how to build one from runtime
-    /// data.
-    #[error("a subscription must declare at least one wake key")]
-    #[rejection(code = "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS")]
-    EmptyWakeKeys,
-}
-
 // --- rejection families ---
 
 /// Caller-correctable outcomes of the checkpoint read-back and the
@@ -135,12 +119,6 @@ mod tests {
     fn commit_lane_disabled_has_a_stable_code() {
         let code: &'static str = CommitLaneDisabled.code().into();
         assert_eq!(code, "OBIX_COMMIT_LANE_DISABLED");
-    }
-
-    #[test]
-    fn subscribe_error_has_a_stable_code() {
-        let code: &'static str = SubscribeError::EmptyWakeKeys.code().into();
-        assert_eq!(code, "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS");
     }
 
     #[test]

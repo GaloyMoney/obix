@@ -99,15 +99,23 @@ impl From<&str> for WakeKey {
 /// takes(Vec::<WakeKey>::new());
 /// ```
 ///
-/// Keys computed from runtime data are the one case a type cannot decide:
-/// build with [`try_from`](Self::try_from) and handle the empty case where
-/// the domain context to interpret it actually lives.
+/// Keys computed from runtime data decide the empty case where the domain
+/// context to interpret it actually lives — obix offers no conversion that
+/// would have to invent a rejection for it:
 ///
 /// ```
 /// use obix::{WakeKey, WakeKeys};
+/// # fn main() -> Result<(), &'static str> {
+/// let configured: Vec<WakeKey> = vec![WakeKey::from("7"), WakeKey::from("8")];
 ///
-/// let configured: Vec<WakeKey> = vec![];
-/// assert!(WakeKeys::try_from(configured).is_err());
+/// let (first, rest) = configured.split_first().ok_or("no wake keys configured")?;
+/// let keys = rest
+///     .iter()
+///     .cloned()
+///     .fold(WakeKeys::new(first.clone()), WakeKeys::and);
+/// assert_eq!(keys.len(), 2);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeKeys(Vec<WakeKey>);
@@ -146,17 +154,6 @@ impl WakeKeys {
 impl From<WakeKey> for WakeKeys {
     fn from(key: WakeKey) -> Self {
         Self::new(key)
-    }
-}
-
-impl TryFrom<Vec<WakeKey>> for WakeKeys {
-    type Error = SubscribeError;
-
-    fn try_from(keys: Vec<WakeKey>) -> Result<Self, Self::Error> {
-        if keys.is_empty() {
-            return Err(SubscribeError::EmptyWakeKeys);
-        }
-        Ok(Self(keys))
     }
 }
 
@@ -282,14 +279,6 @@ where
     /// never anything held in the instance itself.
     fn instantiate(&self, key: Self::Key, cfg: Self::InstanceConfig) -> Self::Subscriber;
 }
-
-// === Errors ===
-
-/// Why a set of wake keys could not be accepted. See
-/// [`crate::out::error::SubscribeError`]'s doc for the full rationale ([`WakeKeys`]
-/// makes the empty case unrepresentable at the call site, so this is
-/// reachable only through [`WakeKeys::try_from`]).
-pub use crate::out::error::SubscribeError;
 
 // === Configuration ===
 

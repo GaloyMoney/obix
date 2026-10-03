@@ -290,18 +290,6 @@ async fn received_for(shared: &Shared, owner: u64) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-/// An empty wake-key set can never be matched (`{} && {anything}` is false), and
-/// only runtime-built keys can reach one — the type rejects the rest.
-#[test]
-fn an_empty_wake_key_set_cannot_be_built() {
-    let from_data: Vec<WakeKey> = vec![];
-    let err = WakeKeys::try_from(from_data).expect_err("empty must not convert");
-    assert!(matches!(err, obix::SubscribeError::EmptyWakeKeys));
-
-    let ok = WakeKeys::try_from(vec![WakeKey::from("7")]).expect("one key is a valid set");
-    assert_eq!(ok.len(), 1);
-}
-
 #[tokio::test]
 #[file_serial]
 async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<()> {

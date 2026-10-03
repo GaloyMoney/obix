@@ -38,9 +38,9 @@ pub use out::{
     EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
     KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox,
     OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
-    SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, SubscribeError, Subscription,
-    SubscriptionDef, SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus,
-    Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
+    SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, Subscription, SubscriptionDef,
+    SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
+    Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
