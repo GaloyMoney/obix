@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use es_entity::errlanes::{Fault, lanes};
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -505,7 +506,7 @@ where
         state: &OutboxEventJobState,
     ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
         let start_after = L::resume_from(state.sequence, state.commit_sequence)
-            .map_err(crate::error::OutboxFault::from)?;
+            .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
         Ok(self.outbox.listen::<L>(start_after)?)
     }
 
@@ -516,9 +517,9 @@ where
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
             .map_err(|e| {
-                crate::error::OutboxFault::from(crate::error::CouldNotDecodeStored::ExecutionState(
-                    e,
-                ))
+                Fault::<lanes!(Transient, Fatal)>::from(
+                    crate::error::CouldNotDecodeStored::ExecutionState(e),
+                )
             })?
             .unwrap_or_default();
 

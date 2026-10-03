@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use obix::{
     EventCtx, EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, Subscription, SubscriptionError, SubscriptionRejection,
-    SubscriptionSnapshot, SubscriptionStreamStatus, out::Outbox,
-    prelude::es_entity::errlanes::Fail,
+    SingletonSubscriber, StreamPosition, Subscription, SubscriptionRejection, SubscriptionSnapshot,
+    SubscriptionStreamStatus,
+    out::Outbox,
+    prelude::es_entity::errlanes::{Fail, lanes},
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -179,7 +180,7 @@ async fn publish_pings(
 /// `tokio::spawn` (an inline `async move` hits rust-lang/rust#100013 here).
 async fn load_owned(
     handle: Subscription<TestEvent, InsertOrder, TestTables>,
-) -> Result<SubscriptionSnapshot, SubscriptionError> {
+) -> Result<SubscriptionSnapshot, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
     handle.load().await
 }
 

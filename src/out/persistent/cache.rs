@@ -1,3 +1,4 @@
+use es_entity::errlanes::{Fault, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -441,10 +442,7 @@ where
             {
                 Ok(events) => events,
                 Err(e) => {
-                    record_backfill_failed(
-                        &crate::error::OutboxFault::from(e),
-                        u64::from(current_sequence),
-                    );
+                    record_backfill_failed(&Fault::from(e), u64::from(current_sequence));
                     tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -499,9 +497,7 @@ where
                             let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
                         }
                         Ok(_) => {}
-                        Err(e) => {
-                            record_backfill_failed(&crate::error::OutboxFault::from(e), next_needed)
-                        }
+                        Err(e) => record_backfill_failed(&Fault::from(e), next_needed),
                     }
                 }
             }
@@ -541,7 +537,7 @@ where
         match Tables::highest_known_persistent_sequence(pool).await {
             Ok(head) => Some(head),
             Err(e) => {
-                record_resync_failed(&crate::error::OutboxFault::from(e));
+                record_resync_failed(&Fault::from(e));
                 None
             }
         }
@@ -935,7 +931,7 @@ fn record_no_receivers(sequence: u64) {}
         current_sequence = current_sequence,
     ),
 )]
-fn record_backfill_failed(fault: &crate::error::OutboxFault, current_sequence: u64) {
+fn record_backfill_failed(fault: &Fault<lanes!(Transient, Fatal)>, current_sequence: u64) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }
@@ -989,7 +985,7 @@ fn record_feeder_gone() {}
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_resync_failed(fault: &crate::error::OutboxFault) {
+fn record_resync_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

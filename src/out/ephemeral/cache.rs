@@ -1,3 +1,4 @@
+use es_entity::errlanes::{Fault, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -304,7 +305,7 @@ where
                                             }
                                         }
                                         Err(e) => {
-                                            record_resync_failed(&crate::error::OutboxFault::from(e))
+                                            record_resync_failed(&Fault::from(e))
                                         }
                                     }
                                 }
@@ -364,7 +365,7 @@ fn record_notification_channel_closed() {}
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_resync_failed(fault: &crate::error::OutboxFault) {
+fn record_resync_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

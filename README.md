@@ -171,16 +171,24 @@ let mut listener = outbox.listen_all(None);
 
 ## Errors and telemetry
 
-obix's public methods return one of four `errlanes` aliases, each defined in
-`src/error.rs` and re-exported from `obix::`, `obix::out::` and
+obix's public methods return one of four `errlanes` carriers. There are no
+`FooError` type aliases: every signature spells its carrier, so a reader sees
+which rejection — if any — and which fault lanes they are handed, which is
+exactly what they have to branch on. The rejections and fault wrappers the
+carriers name are documented in `src/error.rs` (`InboxRejection` beside the
+inbox API that returns it) and re-exported from `obix::`, `obix::out::` and
 `obix::inbox::`:
 
-| alias | shape | returned by |
-|---|---|---|
-| `OutboxFault` | `Fault<lanes!(Transient, Fatal)>` | every method that cannot reject: `Outbox::init`/`begin_op`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op` |
-| `LaneError` | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-| `SubscriptionError` | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
-| `InboxError` | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id`/`list_failed`/`persist_and_queue_job*` |
+| carrier | returned by |
+|---|---|
+| `Fault<lanes!(Transient, Fatal)>` | every method that cannot reject: `Outbox::init`/`begin_op`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::list_failed` |
+| `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
+| `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id`/`persist_and_queue_job*` |
+
+`Fail` and `Fault` come from `errlanes`, re-exported as
+`obix::prelude::es_entity::errlanes` — a downstream signature that mentions a
+carrier names it from there.
 
 A handful of methods return a bare `errlanes::Rejection` on its own
 (`Outbox::cursor` → `CursorError`, `WakeKeys::try_from` → `SubscribeError`,

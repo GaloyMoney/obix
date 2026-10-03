@@ -26,10 +26,10 @@ pub use config::{
     DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
     DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
 };
-pub use error::{CommitLaneDisabled, CouldNotDecodeStored, LaneError, LaneMismatch, OutboxFault};
+pub use error::{CommitLaneDisabled, CouldNotDecodeStored, LaneMismatch};
 
 pub use inbox::{
-    Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
+    Inbox, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxRejection, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
@@ -39,8 +39,8 @@ pub use out::{
     KeyedSubscriberConfig, Lane, OpCursor, Ordering, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
     StreamPosition, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
-    SubscriptionError, SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus,
-    Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
+    SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
+    Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]

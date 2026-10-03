@@ -1,9 +1,10 @@
 use serde::{Serialize, de::DeserializeOwned};
 
+use es_entity::errlanes::{Fail, Fault, lanes};
 use es_entity::hooks::HookOperation;
 
 use crate::{
-    inbox::{InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
+    inbox::{InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey, InboxRejection},
     out::{
         DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
         PersistentOutboxEvent, UndecodableEventError,
@@ -355,7 +356,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     fn find_inbox_event_by_id(
         pool: &sqlx::PgPool,
         id: InboxEventId,
-    ) -> impl Future<Output = Result<InboxEvent, InboxError>> + Send;
+    ) -> impl Future<Output = Result<InboxEvent, Fail<InboxRejection, lanes!(Transient, Fatal)>>> + Send;
 
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
@@ -376,7 +377,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         status: InboxEventStatus,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<InboxEvent>, InboxError>> + Send;
+    ) -> impl Future<Output = Result<Vec<InboxEvent>, Fault<lanes!(Transient, Fatal)>>> + Send;
 
     // === Keyed-subscriber subscription methods ===
 

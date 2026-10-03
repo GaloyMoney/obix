@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::{Fault, lanes};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -137,7 +138,7 @@ where
             None,
         )
         .await
-        .map_err(crate::error::OutboxFault::from)?;
+        .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
 
         let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id).await?;
 
@@ -153,7 +154,7 @@ where
                     None,
                 )
                 .await
-                .map_err(crate::error::OutboxFault::from)?;
+                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
@@ -165,7 +166,7 @@ where
                     None,
                 )
                 .await
-                .map_err(crate::error::OutboxFault::from)?;
+                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
@@ -177,7 +178,7 @@ where
                     None,
                 )
                 .await
-                .map_err(crate::error::OutboxFault::from)?;
+                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
@@ -189,7 +190,7 @@ where
                     Some(&e.to_string()),
                 )
                 .await
-                .map_err(crate::error::OutboxFault::from)?;
+                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
                 Err(e)
             }
         }

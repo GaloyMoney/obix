@@ -43,6 +43,7 @@
 pub(crate) mod keyed;
 pub(crate) mod singleton;
 
+use es_entity::errlanes::{Fail, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 
 use std::{marker::PhantomData, time::Duration};
@@ -114,9 +115,6 @@ impl std::fmt::Display for StreamPosition {
 /// caught-up barrier. See [`crate::error::SubscriptionRejection`]'s doc for
 /// the full rationale.
 pub use crate::error::SubscriptionRejection;
-
-/// Failure modes of the checkpoint read-back and the caught-up barrier.
-pub use crate::error::SubscriptionError;
 
 /// A `{ checkpoint, frontier }` pair sampled by
 /// [`SubscriptionSnapshot::stream_status`], on the subscription's own lane.
@@ -437,7 +435,9 @@ where
     /// Resolve the job to read. For a keyed member this re-resolves
     /// `(subscriber_type, key)` on every call — see [`JobAnchor::Keyed`] for
     /// why holding the resolved handle is wrong.
-    async fn handle(&self) -> Result<::job::JobHandle, SubscriptionError> {
+    async fn handle(
+        &self,
+    ) -> Result<::job::JobHandle, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         match &self.anchor {
             JobAnchor::Resident(job) => Ok(job.clone()),
             JobAnchor::Keyed(anchor) => anchor
@@ -445,7 +445,7 @@ where
                 .keyed_handle(anchor.job_type.clone(), anchor.key.clone())
                 .await?
                 .ok_or_else(|| {
-                    SubscriptionError::from(SubscriptionRejection::NoSuchJob {
+                    Fail::Rejected(SubscriptionRejection::NoSuchJob {
                         subscriber_type: anchor.job_type.to_string(),
                         key: anchor.key.clone(),
                     })
@@ -466,7 +466,10 @@ where
     /// than reported as a rejection — the remedy is a code change, not a
     /// caller action.
     #[es_entity::errlanes::instrument(name = "obix.registered_handler.load", skip_all)]
-    pub async fn load(&self) -> Result<SubscriptionSnapshot<L>, SubscriptionError> {
+    pub async fn load(
+        &self,
+    ) -> Result<SubscriptionSnapshot<L>, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
+    {
         let job = self.handle().await?.load().await?;
         let state = decode_state(&job)?;
         L::resume_from(state.sequence, state.commit_sequence)?;
@@ -515,7 +518,7 @@ where
         &self,
         target: L::Position,
         timeout: Duration,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         let start = tokio::time::Instant::now();
         self.poll_checkpoint_until(target, start, start + timeout)
             .await
@@ -528,7 +531,7 @@ where
         target: L::Position,
         start: tokio::time::Instant,
         deadline: tokio::time::Instant,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
             let checkpoint = self.checkpoint().await?;
@@ -538,13 +541,11 @@ where
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(SubscriptionError::from(
-                    SubscriptionRejection::CaughtUpTimeout {
-                        checkpoint: checkpoint.into(),
-                        target: target.into(),
-                        waited: now.duration_since(start),
-                    },
-                ));
+                return Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
+                    checkpoint: checkpoint.into(),
+                    target: target.into(),
+                    waited: now.duration_since(start),
+                }));
             }
 
             // Never sleep past the deadline: a long interval must not delay
@@ -580,7 +581,10 @@ where
         skip_all,
         fields(timeout_ms = timeout.as_millis())
     )]
-    pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), SubscriptionError> {
+    pub async fn await_caught_up(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         L::await_caught_up(self, timeout).await
     }
 
@@ -600,7 +604,9 @@ where
     /// mid-transition row reads `None` ⇒ the lane's beginning, which can
     /// only under-report progress, and under-reporting preserves the
     /// barrier's never-return-early invariant.
-    async fn checkpoint(&self) -> Result<L::Position, SubscriptionError> {
+    async fn checkpoint(
+        &self,
+    ) -> Result<L::Position, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         let state = self
             .handle()
             .await?
@@ -610,7 +616,9 @@ where
         Ok(L::checkpoint(state.sequence, state.commit_sequence))
     }
 
-    async fn frontier(&self) -> Result<L::Position, SubscriptionError> {
+    async fn frontier(
+        &self,
+    ) -> Result<L::Position, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         L::frontier(self).await
     }
 
@@ -620,9 +628,11 @@ where
 
     /// This process's sequencer positions; absent only where the type system
     /// already rules the commit lane out.
-    pub(crate) fn sequencer_positions(&self) -> Result<&SequencerPositions, SubscriptionError> {
+    pub(crate) fn sequencer_positions(
+        &self,
+    ) -> Result<&SequencerPositions, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         self.positions.as_ref().ok_or_else(|| {
-            SubscriptionError::from(es_entity::errlanes::Fatal::invariant(
+            Fail::from(es_entity::errlanes::Fatal::invariant(
                 "a commit-lane subscription without sequencer positions is unreachable: the lane \
                  cannot be registered on an outbox that runs no sequencer, and keyed \
                  subscriptions are insert-lane by construction",
@@ -636,7 +646,7 @@ where
 pub(crate) async fn await_caught_up_insert_lane<P, Tables>(
     subscription: &Subscription<P, InsertOrder, Tables>,
     timeout: Duration,
-) -> Result<(), SubscriptionError>
+) -> Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -654,7 +664,7 @@ where
 pub(crate) async fn await_caught_up_commit_lane<P, Tables>(
     subscription: &Subscription<P, CommitOrder, Tables>,
     timeout: Duration,
-) -> Result<(), SubscriptionError>
+) -> Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -673,13 +683,11 @@ where
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(SubscriptionError::from(
-                SubscriptionRejection::CaughtUpTimeout {
-                    checkpoint: folded.into(),
-                    target: insert_frontier.into(),
-                    waited: now.duration_since(start),
-                },
-            ));
+            return Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
+                checkpoint: folded.into(),
+                target: insert_frontier.into(),
+                waited: now.duration_since(start),
+            }));
         }
         tokio::time::sleep(interval.min(deadline - now)).await;
         interval = (interval * 2).min(MAX_POLL_INTERVAL);
@@ -718,7 +726,9 @@ pub(super) async fn read_frontier<Tables: MailboxTables>(
 /// Decode a handler job's committed state. Absent — no execution row, or a
 /// job that has not checkpointed yet — reads as the default, whose cursors
 /// are both at the beginning (semantics 4).
-fn decode_state(job: &::job::JobSnapshot) -> Result<OutboxEventJobState, SubscriptionError> {
+fn decode_state(
+    job: &::job::JobSnapshot,
+) -> Result<OutboxEventJobState, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
     Ok(job
         .execution_state::<OutboxEventJobState>()
         .map_err(crate::error::CouldNotDecodeStored::ExecutionState)?
@@ -729,14 +739,15 @@ fn decode_state(job: &::job::JobSnapshot) -> Result<OutboxEventJobState, Subscri
 mod tests {
     use super::*;
 
-    /// A raw sqlx fault never rejects — it enters SubscriptionError's fault
-    /// lanes through errlanes' own blanket classification, with no
+    /// A raw sqlx fault never rejects — it enters the subscription carrier's
+    /// fault lanes through errlanes' own blanket classification, with no
     /// subscription-specific conversion in between. Rejection codes and the
     /// `LaneMismatch`/`CouldNotDecodeStored` fault wrappers are tested in
     /// `crate::error`, where those types live.
     #[test]
     fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
-        let err: SubscriptionError = sqlx::Error::RowNotFound.into();
+        let err: Fail<SubscriptionRejection, lanes!(Transient, Fatal)> =
+            sqlx::Error::RowNotFound.into();
         assert!(err.is_fatal());
     }
 }

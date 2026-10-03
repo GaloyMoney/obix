@@ -1,6 +1,11 @@
-//! Every carrier, rejection and fault wrapper obix returns, collected in one
-//! place. Re-exported from the paths downstream code already uses
-//! (`obix::`, `obix::out::`, `obix::inbox::`).
+//! The rejections and fault wrappers obix's carriers name, and the rules
+//! that decide which carrier a method gets. Re-exported from the paths
+//! downstream code already uses (`obix::`, `obix::out::`, `obix::inbox::`).
+//!
+//! Carriers themselves are not named here: there are no `FooError` aliases
+//! (rule 7) — every signature spells its own `Fail`/`Fault`. A rejection
+//! returned by exactly one module's API may live beside it instead
+//! ([`InboxRejection`](crate::inbox::InboxRejection), in `src/inbox`).
 //!
 //! # The rule
 //!
@@ -21,8 +26,9 @@
 //!    than propagating them.
 //! 1. **A rejection exists only where a caller can branch on it in code.**
 //!    Rejections are scoped to the methods that can produce them.
-//! 2. **A method that cannot reject returns [`OutboxFault`]**, never a
-//!    `Fail` with an empty rejection and never a boxed error.
+//! 2. **A method that cannot reject returns `Fault<lanes!(Transient,
+//!    Fatal)>`**, never a `Fail` with an empty rejection and never a boxed
+//!    error.
 //! 3. **Foreign errors stay raw on a `pub fn` only when they are the only
 //!    error that site can produce**, or when a trait pins them (the two
 //!    boundaries below). Everywhere else a foreign error is laned at birth.
@@ -35,6 +41,12 @@
 //!    `Subscriptions::subscription` rejecting).
 //! 6. **Classify once, where the error is born; box once, at the trait
 //!    boundary.**
+//! 7. **Every signature spells its carrier.** No `pub type FooError = ..`
+//!    aliases: a reader of a signature must see which rejection — if any —
+//!    and which fault lanes it is being handed, since that is exactly what
+//!    they have to branch on. The cost is a long `Result` type; the thing
+//!    bought is that rule 1 and rule 2 are *visible* at every method rather
+//!    than hidden behind a name.
 //!
 //! # Two boundaries pinned by es-entity, not obix's to move
 //!
@@ -47,37 +59,24 @@
 //! - `MailboxTables` is generated into downstream crates via
 //!   `#[derive(MailboxTables)]` and is the storage layer; it keeps
 //!   `sqlx::Error`. obix classifies one level up, exactly as es-entity's own
-//!   repo layer does. Its two inbox methods already return [`InboxError`]
-//!   and move with it.
+//!   repo layer does. Its two inbox methods already return the inbox's
+//!   carriers and move with them.
 //!
-//! # Which alias each public method returns
+//! # Which carrier each public method returns
 //!
-//! | Alias | Returned by |
+//! | Carrier | Returned by |
 //! |---|---|
-//! | [`OutboxFault`] | `Outbox::init`, `begin_op`, `publish_ephemeral*`, `highest_known_persistent_sequence`, `register_keyed_subscriber`, `register_partition_maintainer`, `Partitions::ensure`, `recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op` |
-//! | [`LaneError`] | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-//! | [`SubscriptionError`] | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
-//! | [`InboxError`] | `Inbox::find_event_by_id`/`list_failed`/`persist_and_queue_job*` |
+//! | `Fault<lanes!(Transient, Fatal)>` | every method that cannot reject: `Outbox::init`, `begin_op`, `publish_ephemeral*`, `highest_known_persistent_sequence`, `register_keyed_subscriber`, `register_partition_maintainer`, `Partitions::ensure`, `recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::list_failed` |
+//! | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
+//! | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
+//! | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id`/`persist_and_queue_job*` |
 //! | bare rejection | `Outbox::cursor` (`CursorError`), `WakeKeys::try_from` (`SubscribeError`), `Outbox::listen`/`listen_commit_ordered` (`CommitLaneDisabled`) |
 //! | `sqlx::Error` | `Outbox::publish_persisted_in_op`, `Outbox::publish_all_persisted` (hook-pinned) |
 //! | raw `serde_json::Error` | `InboxEvent::payload` (the only error that site can produce) |
 
-use es_entity::errlanes::{self, Fail, Fault, lanes};
+use es_entity::errlanes;
 
 use crate::out::Ordering;
-
-/// Every method that cannot reject.
-pub type OutboxFault = Fault<lanes!(Transient, Fatal)>;
-
-/// Methods whose only rejection is the commit lane being off.
-pub type LaneError = Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>;
-
-/// `Subscription::load` / `await_position` / `await_caught_up` and
-/// `Subscriptions::subscription`.
-pub type SubscriptionError = Fail<SubscriptionRejection, lanes!(Transient, Fatal)>;
-
-/// `Inbox::find_event_by_id` / `list_failed` / `persist_and_queue_job*`.
-pub type InboxError = Fail<InboxRejection, lanes!(Transient, Fatal)>;
 
 // --- bare rejections (no fault lanes at the sites that return them) ---
 
@@ -86,8 +85,9 @@ pub type InboxError = Fail<InboxRejection, lanes!(Transient, Fatal)>;
 ///
 /// Purely caller-correctable (enable the lane in config), so it is a bare
 /// [`errlanes::Rejection`] — both on its own, where it is returned directly
-/// throughout [`out::lane`](crate::out), and lifted into [`LaneError`] where
-/// a frontier read or a registration can also fault.
+/// throughout [`out::lane`](crate::out), and lifted into
+/// `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` where a frontier
+/// read or a registration can also fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, errlanes::Rejection)]
 #[rejection(code = "OBIX_COMMIT_LANE_DISABLED")]
 #[error(
@@ -128,23 +128,16 @@ pub enum SubscribeError {
 }
 
 // --- rejection families ---
-
-/// Caller-correctable outcomes of an inbox operation. Everything else —
-/// sqlx faults, an undecodable stored payload, the handler job's own
-/// failure — travels as `Transient`/`Fatal` in [`InboxError`] instead of as
-/// a variant here.
-#[derive(Debug, errlanes::Rejection)]
-pub enum InboxRejection {
-    #[error("inbox event {0} not found")]
-    #[rejection(code = "OBIX_INBOX_EVENT_NOT_FOUND")]
-    NotFound(crate::inbox::InboxEventId),
-}
+//
+// [`InboxRejection`](crate::inbox::InboxRejection) is the exception: it is
+// defined in `crate::inbox`, beside the only API that returns it.
 
 /// Caller-correctable outcomes of the checkpoint read-back and the
 /// caught-up barrier. Everything else — a raw sqlx fault, an undecodable
 /// stored execution state, a stored checkpoint on the wrong lane, the
 /// handler job's own failure — travels as `Transient`/`Fatal` in
-/// [`SubscriptionError`] instead of as a variant here.
+/// `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` instead of as a
+/// variant here.
 #[derive(Debug, errlanes::Rejection)]
 pub enum SubscriptionRejection {
     /// A keyed member's job could not be resolved from
@@ -183,8 +176,8 @@ pub enum SubscriptionRejection {
 
 /// A subscription checkpointed on one stream lane was opened under the
 /// other [`Ordering`]. The remedy is a code change (register a new job
-/// type), so this is configuration, not a caller outcome — it enters
-/// [`SubscriptionError`] as `Fatal(Config)`.
+/// type), so this is configuration, not a caller outcome — it enters the
+/// subscription carrier as `Fatal(Config)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, errlanes::Classify)]
 #[classify(fatal(Config))]
 #[error(
@@ -224,7 +217,8 @@ pub enum CouldNotDecodeStored {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use es_entity::errlanes::{FatalKind, Rejection};
+    use crate::inbox::InboxRejection;
+    use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, lanes};
     use std::error::Error as _;
 
     #[test]
@@ -243,13 +237,6 @@ mod tests {
     fn subscribe_error_has_a_stable_code() {
         let code: &'static str = SubscribeError::EmptyWakeKeys.code().into();
         assert_eq!(code, "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS");
-    }
-
-    #[test]
-    fn inbox_rejection_codes_are_stable() {
-        let id = crate::inbox::InboxEventId::new();
-        let not_found: &'static str = InboxRejection::NotFound(id).code().into();
-        assert_eq!(not_found, "OBIX_INBOX_EVENT_NOT_FOUND");
     }
 
     #[test]
@@ -283,15 +270,15 @@ mod tests {
         assert_eq!(timeout, "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT");
     }
 
-    /// `LaneMismatch` is configuration, not a caller outcome: it enters
-    /// `SubscriptionError` as `Fatal(Config)`, never `Rejected`.
+    /// `LaneMismatch` is configuration, not a caller outcome: it enters the
+    /// subscription carrier as `Fatal(Config)`, never `Rejected`.
     #[test]
     fn lane_mismatch_is_fatal_config() {
         let mismatch = LaneMismatch {
             stored: Ordering::Insert,
             configured: Ordering::Commit,
         };
-        let err: SubscriptionError = mismatch.into();
+        let err: Fail<SubscriptionRejection, lanes!(Transient, Fatal)> = mismatch.into();
         match err {
             Fail::Fatal(f) => {
                 assert_eq!(f.kind, FatalKind::Config);
@@ -308,7 +295,8 @@ mod tests {
     fn execution_state_decode_failure_is_fatal_corrupt_state() {
         let decode_failure =
             serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err();
-        let err: OutboxFault = CouldNotDecodeStored::ExecutionState(decode_failure).into();
+        let err: Fault<lanes!(Transient, Fatal)> =
+            CouldNotDecodeStored::ExecutionState(decode_failure).into();
         match err {
             Fault::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::CorruptState);
@@ -327,7 +315,8 @@ mod tests {
     fn instance_config_decode_failure_is_fatal_corrupt_state() {
         let decode_failure =
             serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err();
-        let err: OutboxFault = CouldNotDecodeStored::InstanceConfig(decode_failure).into();
+        let err: Fault<lanes!(Transient, Fatal)> =
+            CouldNotDecodeStored::InstanceConfig(decode_failure).into();
         assert!(matches!(err, Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
     }
 
@@ -335,7 +324,7 @@ mod tests {
     /// message — only in the `job_type` the operator can already see.
     #[test]
     fn key_decode_failure_is_fatal_corrupt_state_and_hides_no_message_it_should_not() {
-        let err: OutboxFault = CouldNotDecodeStored::Key {
+        let err: Fault<lanes!(Transient, Fatal)> = CouldNotDecodeStored::Key {
             job_type: ::job::JobType::new("test-job-type"),
         }
         .into();
@@ -351,7 +340,8 @@ mod tests {
 
     #[test]
     fn inbox_status_decode_failure_is_fatal_corrupt_state() {
-        let err: InboxError = CouldNotDecodeStored::InboxStatus("bogus".to_string()).into();
+        let err: Fail<InboxRejection, lanes!(Transient, Fatal)> =
+            CouldNotDecodeStored::InboxStatus("bogus".to_string()).into();
         match err {
             Fail::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::CorruptState);
@@ -366,9 +356,9 @@ mod tests {
     /// obix-specific conversion in between.
     #[test]
     fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
-        let err: OutboxFault = sqlx::Error::PoolTimedOut.into();
+        let err: Fault<lanes!(Transient, Fatal)> = sqlx::Error::PoolTimedOut.into();
         assert!(err.is_transient());
-        let err: InboxError = sqlx::Error::RowNotFound.into();
+        let err: Fail<InboxRejection, lanes!(Transient, Fatal)> = sqlx::Error::RowNotFound.into();
         assert!(err.is_fatal());
     }
 }

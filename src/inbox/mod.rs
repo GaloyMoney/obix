@@ -3,7 +3,8 @@ mod error;
 mod event;
 mod job;
 
-use es_entity::clock::ClockHandle;
+use es_entity::errlanes::{Fail, Fault, lanes};
+use es_entity::{ResultExt, clock::ClockHandle};
 use serde::Serialize;
 
 pub use config::*;
@@ -60,7 +61,7 @@ where
         &self,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: P,
-    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    ) -> Result<es_entity::Idempotent<InboxEventId>, Fail<InboxRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + Send + Sync,
     {
@@ -77,7 +78,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         idempotency_key: impl Into<InboxIdempotencyKey>,
         event: P,
-    ) -> Result<es_entity::Idempotent<InboxEventId>, InboxError>
+    ) -> Result<es_entity::Idempotent<InboxEventId>, Fail<InboxRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + Send + Sync,
     {
@@ -98,16 +99,26 @@ where
         self.spawner
             .spawn_in_op(op, id, config)
             .await
-            .map_err(::job::JobError::narrow_rejected)?;
+            .narrow_rejected()?;
 
         Ok(es_entity::Idempotent::Executed(id))
     }
 
-    pub async fn find_event_by_id(&self, id: InboxEventId) -> Result<InboxEvent, InboxError> {
+    pub async fn find_event_by_id(
+        &self,
+        id: InboxEventId,
+    ) -> Result<InboxEvent, Fail<InboxRejection, lanes!(Transient, Fatal)>> {
         Tables::find_inbox_event_by_id(&self.pool, id).await
     }
 
-    pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, InboxError> {
+    /// Nothing here is the caller's to correct: a status the caller did not
+    /// choose, over rows the caller does not name. So this is fault-only —
+    /// [`InboxRejection::NotFound`], which only a by-id read can raise, is
+    /// not in the carrier.
+    pub async fn list_failed(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<InboxEvent>, Fault<lanes!(Transient, Fatal)>> {
         Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit).await
     }
 }

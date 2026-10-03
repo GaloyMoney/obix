@@ -1,3 +1,4 @@
+use es_entity::errlanes::{Fault, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -323,10 +324,7 @@ where
                     }
                     Err(error) => {
                         attempts += 1;
-                        record_compensation_failed(
-                            &crate::error::OutboxFault::from(error),
-                            attempts,
-                        );
+                        record_compensation_failed(&Fault::from(error), attempts);
                         if attempts >= Self::COMPENSATION_MAX_ATTEMPTS {
                             // The stall episode proves and fills them later.
                             return;
@@ -367,7 +365,7 @@ where
                     (marker, head)
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                    record_gap_fill_failed(&Fault::from(error));
                     return Vec::new();
                 }
             },
@@ -392,7 +390,7 @@ where
             {
                 Ok(events) => events,
                 Err(error) => {
-                    record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                    record_gap_fill_failed(&Fault::from(error));
                     return Vec::new();
                 }
             };
@@ -426,7 +424,7 @@ where
             // meanwhile.
             Ok(false) => Vec::new(),
             Err(error) => {
-                record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                record_gap_fill_failed(&Fault::from(error));
                 Vec::new()
             }
         }
@@ -457,7 +455,7 @@ where
                         marker
                     }
                     Err(error) => {
-                        record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                        record_gap_fill_failed(&Fault::from(error));
                         self.historical_due = Some(now + Self::REFILL_INTERVAL);
                         return Vec::new();
                     }
@@ -470,7 +468,7 @@ where
                     return Vec::new();
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                    record_gap_fill_failed(&Fault::from(error));
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                     return Vec::new();
                 }
@@ -549,7 +547,7 @@ where
                 }
             }
             Err(error) => {
-                record_gap_fill_failed(&crate::error::OutboxFault::from(error));
+                record_gap_fill_failed(&Fault::from(error));
                 if !historical_batch.is_empty() {
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                 }
@@ -597,7 +595,7 @@ fn deliver_and_notify<P>(
         attempts = attempts,
     ),
 )]
-fn record_compensation_failed(fault: &crate::error::OutboxFault, attempts: u32) {
+fn record_compensation_failed(fault: &Fault<lanes!(Transient, Fatal)>, attempts: u32) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }
@@ -615,7 +613,7 @@ fn record_compensation_failed(fault: &crate::error::OutboxFault, attempts: u32) 
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_gap_fill_failed(fault: &crate::error::OutboxFault) {
+fn record_gap_fill_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

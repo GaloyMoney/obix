@@ -3,6 +3,7 @@
 //! lane is a type parameter on everything a subscriber touches, so the compiler
 //! refuses to run a commit-lane handler on the insert lane.
 
+use es_entity::errlanes::{Fail, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
@@ -17,10 +18,10 @@ use super::Outbox;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
-    StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
+    StreamPosition, Subscription, SubscriptionRejection, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use crate::error::{CommitLaneDisabled, LaneError};
+use crate::error::CommitLaneDisabled;
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
@@ -90,7 +91,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn frontier<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
-    ) -> impl std::future::Future<Output = Result<Self::Position, SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<Self::Position, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -98,7 +102,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn outbox_frontier<'a, P, Tables>(
         outbox: &'a Outbox<P, Tables>,
-    ) -> impl std::future::Future<Output = Result<Self::Position, LaneError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<Self::Position, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -107,7 +114,10 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -180,7 +190,7 @@ impl Lane for InsertOrder {
 
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
-    ) -> Result<EventSequence, SubscriptionError>
+    ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -190,7 +200,7 @@ impl Lane for InsertOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<EventSequence, LaneError>
+    ) -> Result<EventSequence, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -201,7 +211,10 @@ impl Lane for InsertOrder {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -268,7 +281,7 @@ impl Lane for CommitOrder {
 
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
-    ) -> Result<CommitSequence, SubscriptionError>
+    ) -> Result<CommitSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -278,7 +291,7 @@ impl Lane for CommitOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<CommitSequence, LaneError>
+    ) -> Result<CommitSequence, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -289,7 +302,10 @@ impl Lane for CommitOrder {
     fn await_caught_up<'a, P, Tables>(
         subscription: &'a Subscription<P, Self, Tables>,
         timeout: Duration,
-    ) -> impl std::future::Future<Output = Result<(), SubscriptionError>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<(), Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>,
+    > + Send
+    + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,

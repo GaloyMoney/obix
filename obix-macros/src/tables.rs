@@ -1202,7 +1202,13 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn find_inbox_event_by_id(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     id: #crate_name::inbox::InboxEventId,
-                ) -> impl std::future::Future<Output = Result<#crate_name::inbox::InboxEvent, #crate_name::inbox::InboxError>> + Send
+                ) -> impl std::future::Future<Output = Result<
+                    #crate_name::inbox::InboxEvent,
+                    #crate_name::prelude::es_entity::errlanes::Fail<
+                        #crate_name::inbox::InboxRejection,
+                        #crate_name::prelude::es_entity::errlanes::lanes!(Transient, Fatal),
+                    >,
+                >> + Send
                 {
                     let pool = pool.clone();
 
@@ -1214,7 +1220,9 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .fetch_optional(&pool)
                         .await?
                         .ok_or_else(|| {
-                            #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::NotFound(id))
+                            #crate_name::prelude::es_entity::errlanes::Fail::Rejected(
+                                #crate_name::inbox::InboxRejection::NotFound(id)
+                            )
                         })?;
 
                         let status: #crate_name::inbox::InboxEventStatus = row.status.parse()?;
@@ -1235,7 +1243,12 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     status: #crate_name::inbox::InboxEventStatus,
                     limit: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent>, #crate_name::inbox::InboxError>> + Send
+                ) -> impl std::future::Future<Output = Result<
+                    Vec<#crate_name::inbox::InboxEvent>,
+                    #crate_name::prelude::es_entity::errlanes::Fault<
+                        #crate_name::prelude::es_entity::errlanes::lanes!(Transient, Fatal),
+                    >,
+                >> + Send
                 {
                     let pool = pool.clone();
 
@@ -1248,23 +1261,25 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .fetch_all(&pool)
                         .await?;
 
-                        let events = rows
-                            .into_iter()
-                            .map(|row| {
-                                let status: #crate_name::inbox::InboxEventStatus =
-                                    row.status.parse()?;
+                        // A `for` loop rather than `.map(..).collect()`: the
+                        // async block's own return type then carries each
+                        // `?`, so the carrier is spelled once — in the
+                        // signature — instead of again as a collect turbofish.
+                        let mut events = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            let status: #crate_name::inbox::InboxEventStatus =
+                                row.status.parse()?;
 
-                                Ok(#crate_name::inbox::InboxEvent {
-                                    id: #crate_name::inbox::InboxEventId::from(row.id),
-                                    idempotency_key: row.idempotency_key,
-                                    payload: row.payload,
-                                    status,
-                                    error: row.error,
-                                    recorded_at: row.recorded_at,
-                                    processed_at: row.processed_at,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, #crate_name::inbox::InboxError>>()?;
+                            events.push(#crate_name::inbox::InboxEvent {
+                                id: #crate_name::inbox::InboxEventId::from(row.id),
+                                idempotency_key: row.idempotency_key,
+                                payload: row.payload,
+                                status,
+                                error: row.error,
+                                recorded_at: row.recorded_at,
+                                processed_at: row.processed_at,
+                            });
+                        }
 
                         Ok(events)
                     }

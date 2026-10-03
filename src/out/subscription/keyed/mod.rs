@@ -21,15 +21,16 @@
 mod runner;
 mod waker;
 
+use es_entity::errlanes::{Fail, Fault, lanes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
 
 use job::JobType;
 
-use crate::out::Subscription;
 use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
 use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
+use crate::out::{Subscription, SubscriptionRejection};
 use crate::tables::MailboxTables;
 
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
@@ -466,7 +467,7 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, crate::error::OutboxFault> {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, Fault<lanes!(Transient, Fatal)>> {
         let key_str = key.to_string();
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
@@ -537,14 +538,14 @@ where
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: &D::Key,
-    ) -> Result<(), crate::error::OutboxFault> {
+    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
         Tables::delete_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
         Ok(())
     }
 
     /// [`cancel_in_op`](Self::cancel_in_op), standalone.
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel", skip_all)]
-    pub async fn cancel(&self, key: &D::Key) -> Result<(), crate::error::OutboxFault> {
+    pub async fn cancel(&self, key: &D::Key) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
         let mut op = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
         self.cancel_in_op(&mut op, key).await?;
         op.commit().await?;
@@ -563,7 +564,10 @@ where
     pub async fn subscription(
         &self,
         key: &D::Key,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, crate::error::SubscriptionError> {
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
         let key_str = key.to_string();
         // Resolved once here only to report "never subscribed" as an error
         // rather than deferring it to the first read.

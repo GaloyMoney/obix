@@ -1,3 +1,4 @@
+use es_entity::errlanes::{Fault, lanes};
 use tokio::sync::mpsc;
 
 use std::time::Duration;
@@ -93,7 +94,7 @@ where
                         {
                             Ok(listener) => break listener,
                             Err(error) => {
-                                let fault = crate::error::OutboxFault::from(error);
+                                let fault = Fault::from(error);
                                 record_reconnect_failed(&fault);
                                 backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                             }
@@ -172,7 +173,7 @@ fn record_connection_lost() {}
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_reconnect_failed(fault: &crate::error::OutboxFault) {
+fn record_reconnect_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

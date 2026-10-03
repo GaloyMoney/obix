@@ -193,15 +193,15 @@ impl MailboxConfig {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::{CommitLaneDisabled, LaneError};
-    use es_entity::errlanes::Fail;
+    use crate::error::CommitLaneDisabled;
+    use es_entity::errlanes::{Fail, lanes};
 
-    /// `CommitLaneDisabled` is the one rejected case `LaneError` can carry —
-    /// a bare `?`/`.into()` must land it in the `Rejected` lane, not get
-    /// swallowed into `Fatal` as an unclassified error would.
+    /// `CommitLaneDisabled` is the one rejected case the lane carrier can
+    /// carry — a bare `?`/`.into()` must land it in the `Rejected` lane, not
+    /// get swallowed into `Fatal` as an unclassified error would.
     #[test]
-    fn commit_lane_disabled_enters_lane_error_as_rejected() {
-        let err: LaneError = CommitLaneDisabled.into();
+    fn commit_lane_disabled_enters_the_lane_carrier_as_rejected() {
+        let err: Fail<CommitLaneDisabled, lanes!(Transient, Fatal)> = CommitLaneDisabled.into();
         assert!(matches!(err, Fail::Rejected(CommitLaneDisabled)));
     }
 }
