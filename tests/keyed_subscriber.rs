@@ -307,8 +307,7 @@ async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<(
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -317,8 +316,7 @@ async fn subscription_delivers_in_order_from_its_own_birth() -> anyhow::Result<(
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -351,8 +349,7 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -361,16 +358,14 @@ async fn independent_keys_do_not_interfere() -> anyhow::Result<()> {
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     subs.subscribe_in_op(
         &mut op,
         OwnerId(2),
         InstanceConfig::default(),
         wake_keys_for(OwnerId(2)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -402,8 +397,7 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -412,8 +406,7 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     // A hold on the first event this key sees, well past the checkpoint interval
@@ -424,10 +417,7 @@ async fn pause_until_parks_the_cursor_and_redelivers_on_resume() -> anyhow::Resu
     jobs.start_poll().await?;
     publish_ping(&outbox, 1, 7).await?;
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
 
     eventually(Duration::from_secs(5), || {
         let subscription = subscription.clone();
@@ -477,8 +467,7 @@ async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Resul
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -487,8 +476,7 @@ async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Resul
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     let pause_until = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -497,10 +485,7 @@ async fn traffic_behind_a_paused_event_wakes_the_member_early() -> anyhow::Resul
     jobs.start_poll().await?;
     publish_ping(&outbox, 1, 7).await?;
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
 
     // The only wake so far is the match for the paused event itself, which must
     // not have cut the pause short.
@@ -543,8 +528,7 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -553,16 +537,14 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     subs.subscribe_in_op(
         &mut op,
         OwnerId(2),
         InstanceConfig::default(),
         wake_keys_for(OwnerId(2)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -574,13 +556,8 @@ async fn cancel_stops_delivery_and_no_wake_revives_it() -> anyhow::Result<()> {
 
     // Captured before cancelling and deliberately not re-resolved: this
     // generation going terminal is the signal that the run has ended.
-    let cancelled = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    subs.cancel(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cancelled = subs.subscription(&OwnerId(1)).await?;
+    subs.cancel(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let cancelled = cancelled.clone();
         async move { Ok(cancelled.load().await?.job_status().is_terminal()) }
@@ -633,8 +610,7 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     };
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, test_config(), def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -643,8 +619,7 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -655,10 +630,7 @@ async fn dormant_member_retains_its_watermark_and_drains_the_backlog() -> anyhow
     .await?;
 
     // Idle past `linger`, so the member passivates to Dormant.
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
         async move { Ok(subscription.load().await?.job_status().is_terminal()) }
@@ -700,8 +672,7 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -710,8 +681,7 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
         InstanceConfig::default(),
         WakeKey::from(OwnerId(1).to_string()),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -721,10 +691,7 @@ async fn the_waker_wakes_a_dormant_member_on_a_matching_event() -> anyhow::Resul
     })
     .await?;
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
         async move { Ok(subscription.load().await?.job_status().is_terminal()) }
@@ -761,8 +728,7 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -771,8 +737,7 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -782,10 +747,7 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
     })
     .await?;
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
         async move { Ok(subscription.load().await?.job_status().is_terminal()) }
@@ -805,10 +767,7 @@ async fn a_member_drifting_out_of_the_cache_is_woken_to_catch_up() -> anyhow::Re
     eventually(Duration::from_secs(10), || {
         let subs_probe = subs_probe.clone();
         async move {
-            let subscription = subs_probe
-                .subscription(&OwnerId(1))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let subscription = subs_probe.subscription(&OwnerId(1)).await?;
             Ok(subscription.load().await?.checkpoint() > dormant_at)
         }
     })
@@ -846,8 +805,7 @@ async fn a_ready_backlog_defeats_the_linger_deadline() -> anyhow::Result<()> {
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -859,8 +817,7 @@ async fn a_ready_backlog_defeats_the_linger_deadline() -> anyhow::Result<()> {
         },
         WakeKey::from("a-partition-nothing-publishes-to"),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -913,8 +870,7 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -923,8 +879,7 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -934,10 +889,7 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
     })
     .await?;
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
         async move { Ok(subscription.load().await?.job_status().is_terminal()) }
@@ -955,10 +907,7 @@ async fn an_unregistered_type_cannot_starve_the_catch_up_scan() -> anyhow::Resul
     eventually(Duration::from_secs(10), || {
         let subs_probe = subs_probe.clone();
         async move {
-            let subscription = subs_probe
-                .subscription(&OwnerId(1))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let subscription = subs_probe.subscription(&OwnerId(1)).await?;
             Ok(subscription.load().await?.checkpoint() > dormant_at)
         }
     })
@@ -988,8 +937,7 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
                 shared: first_shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     let second = outbox
         .register_keyed_subscriber(
             &mut jobs,
@@ -1000,8 +948,7 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
                 shared: second_shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     first
@@ -1011,8 +958,7 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
             InstanceConfig::default(),
             wake_keys_for(OwnerId(1)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     second
         .subscribe_in_op(
             &mut op,
@@ -1020,8 +966,7 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
             InstanceConfig::default(),
             wake_keys_for(OwnerId(1)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1044,14 +989,8 @@ async fn two_subscriber_types_share_one_waker() -> anyhow::Result<()> {
     );
 
     // Both passivate, then a single event revives both through the one waker.
-    let first_sub = first
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let second_sub = second
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let first_sub = first.subscription(&OwnerId(1)).await?;
+    let second_sub = second.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let (first_sub, second_sub) = (first_sub.clone(), second_sub.clone());
         async move {
@@ -1092,8 +1031,7 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
                 shared: plain_shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     let prefixed = outbox
         .register_keyed_subscriber(
             &mut jobs,
@@ -1104,8 +1042,7 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
                 shared: prefixed_shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     plain
@@ -1115,8 +1052,7 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
             InstanceConfig::default(),
             wake_keys_for(OwnerId(1)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     // Deliberately the *other* type's wake key: `PrefixedDef` classifies this
     // event to "p:1" and never to "1".
     prefixed
@@ -1126,8 +1062,7 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
             InstanceConfig::default(),
             WakeKey::from("1"),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     op.commit().await?;
 
     // Both are Active on subscribe and a live member reads the whole stream, so
@@ -1140,14 +1075,8 @@ async fn a_wake_key_matches_only_within_its_own_subscriber_type() -> anyhow::Res
     })
     .await?;
 
-    let plain_sub = plain
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prefixed_sub = prefixed
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plain_sub = plain.subscription(&OwnerId(1)).await?;
+    let prefixed_sub = prefixed.subscription(&OwnerId(1)).await?;
     eventually(Duration::from_secs(10), || {
         let (plain_sub, prefixed_sub) = (plain_sub.clone(), prefixed_sub.clone());
         async move {
@@ -1191,8 +1120,7 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL);
     let subs = outbox
         .register_keyed_subscriber(&mut jobs, config, def)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     // The watcher's key (10) is none of the partitions it watches (7 and 8), so
     // conflating the domain key with a wake key cannot pass.
@@ -1206,8 +1134,7 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         },
         WakeKeys::new(WakeKey::from("7")).and(WakeKey::from("8")),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     subs.subscribe_in_op(
         &mut op,
         OwnerId(20),
@@ -1217,22 +1144,15 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
         },
         WakeKeys::new(WakeKey::from("21")).and(WakeKey::from("22")),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
 
     // Both passivate before anything is published, so every delivery below
     // requires a wake rather than an already-running member.
-    let watcher = subs
-        .subscription(&OwnerId(10))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bystander = subs
-        .subscription(&OwnerId(20))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let watcher = subs.subscription(&OwnerId(10)).await?;
+    let bystander = subs.subscription(&OwnerId(20)).await?;
     let both_dormant = || {
         let watcher = watcher.clone();
         let bystander = bystander.clone();
@@ -1275,8 +1195,7 @@ async fn a_subscription_wakes_on_any_of_its_wake_keys_and_only_on_those() -> any
     );
     assert_eq!(
         subs.subscription(&OwnerId(20))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .await?
             .load()
             .await?
             .checkpoint(),
@@ -1467,8 +1386,7 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -1477,8 +1395,7 @@ async fn staged_entry_lands_collected_items_before_stage_one() -> anyhow::Result
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1520,8 +1437,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyho
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -1530,8 +1446,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyho
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1574,8 +1489,7 @@ async fn a_hold_between_stages_replays_the_event_from_its_first_stage() -> anyho
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -1584,8 +1498,7 @@ async fn a_hold_between_stages_replays_the_event_from_its_first_stage() -> anyho
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1652,8 +1565,7 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let spawned_outbox = outbox.clone();
     let spawned_subs = subs.clone();
@@ -1666,18 +1578,11 @@ async fn the_subscriptions_capability_survives_tokio_spawn() -> anyhow::Result<(
                 InstanceConfig::default(),
                 wake_keys_for(OwnerId(1)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         op.commit().await?;
 
-        spawned_subs
-            .subscription(&OwnerId(1))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        spawned_subs
-            .cancel(&OwnerId(1))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        spawned_subs.subscription(&OwnerId(1)).await?;
+        spawned_subs.cancel(&OwnerId(1)).await?;
         Ok::<_, anyhow::Error>(())
     })
     .await??;
@@ -1707,8 +1612,7 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -1717,8 +1621,7 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1751,10 +1654,7 @@ async fn a_member_passivates_while_the_shared_stream_stays_busy() -> anyhow::Res
         })
     };
 
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     let passivated = eventually(Duration::from_secs(10), || {
         let subscription = subscription.clone();
         async move { Ok(subscription.load().await?.job_status().is_terminal()) }
@@ -1812,8 +1712,7 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
                 shared: shared.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(
@@ -1822,8 +1721,7 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
         InstanceConfig::default(),
         wake_keys_for(OwnerId(1)),
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -1838,10 +1736,7 @@ async fn always_on_linger_delivers_and_never_passivates() -> anyhow::Result<()> 
 
     // And it stays resident well past what any finite linger would allow.
     tokio::time::sleep(TEST_LINGER * 10).await;
-    let subscription = subs
-        .subscription(&OwnerId(1))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let subscription = subs.subscription(&OwnerId(1)).await?;
     assert!(
         !subscription.load().await?.job_status().is_terminal(),
         "an always-on member must not passivate"

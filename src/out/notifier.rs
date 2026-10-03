@@ -1,4 +1,5 @@
 use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use tokio::sync::mpsc;
 
 use std::{sync::Arc, time::Duration};
@@ -82,7 +83,7 @@ impl PersistentNotifier {
             let (min, max) = pending.expect("pending set before emit");
             match Self::emit(&pool, channel, min, max).await {
                 Ok(()) => pending = None,
-                Err(error) => record_notify_emit_failed(&ObixFault::from(error)),
+                Err(error) => record_notify_emit_failed(error),
             }
         }
     }
@@ -135,7 +136,6 @@ impl PersistentNotifier {
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_notify_emit_failed(fault: &ObixFault) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_notify_emit_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
 }

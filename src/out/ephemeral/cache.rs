@@ -1,4 +1,5 @@
 use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -305,7 +306,7 @@ where
                                             }
                                         }
                                         Err(e) => {
-                                            record_resync_failed(&ObixFault::from(e))
+                                            record_resync_failed(e)
                                         }
                                     }
                                 }
@@ -365,9 +366,8 @@ fn record_notification_channel_closed() {}
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_resync_failed(fault: &ObixFault) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_resync_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
 }
 
 #[tracing::instrument(

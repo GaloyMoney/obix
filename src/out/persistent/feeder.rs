@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument;
@@ -502,7 +503,7 @@ where
                     {
                         Ok(events) => events,
                         Err(e) => {
-                            record_catch_up_failed(&ObixFault::from(e), u64::from(cursor));
+                            record_catch_up_failed(e, u64::from(cursor));
                             tokio::time::sleep(RETRY_INTERVAL).await;
                             continue;
                         }
@@ -562,9 +563,8 @@ where
         from = from,
     ),
 )]
-fn record_catch_up_failed(fault: &ObixFault, from: u64) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_catch_up_failed(fault: impl Into<ObixFault>, from: u64) {
+    fault.into().record(&tracing::Span::current());
 }
 
 #[cfg(test)]

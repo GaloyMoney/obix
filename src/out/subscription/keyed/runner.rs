@@ -11,6 +11,7 @@
 //! expiry and retry, so nothing may be cached in the instance between runs.
 
 use crate::error::ObixFault;
+use crate::out::error::CouldNotDecodeStored as Undecodable;
 use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -126,11 +127,15 @@ where
         _spawner: job::KeyedJobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let KeyMsg { key } = job.config()?;
-        let key: D::Key = key.parse().map_err(|_| {
-            ObixFault::from(crate::out::error::CouldNotDecodeStored::Key {
+        // The `FromStr` error is dropped deliberately: it quotes the key, and
+        // the key is caller data (see `Undecodable::Key`). Laned before the
+        // box for the same reason as `instance_config` in `run` below.
+        let Ok(key) = key.parse::<D::Key>() else {
+            return Err(ObixFault::from(Undecodable::Key {
                 job_type: self.job_type.clone(),
             })
-        })?;
+            .into());
+        };
         Ok(Box::new(KeyedSubscriberJobRunner {
             outbox: self.outbox.clone(),
             def: self.def.clone(),
@@ -212,26 +217,23 @@ where
         // The factory runs fresh every run: every wake, pause expiry, retry,
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
+        // Laned right here, not on the way out: `run` returns a box, and a
+        // raw `Undecodable` reaching it would be re-classified from the
+        // `serde_json::Error` underneath — `Fatal(Invariant)`, losing the
+        // `Fatal(CorruptState)` these bytes earn by coming out of Postgres.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
-            .map_err(|e| {
-                ObixFault::from(crate::out::error::CouldNotDecodeStored::InstanceConfig(e))
-            })?;
+            .map_err(|e| ObixFault::from(Undecodable::InstanceConfig(e)))?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),
             _payload: PhantomData,
         };
 
-        let mut state = current_job
-            .execution_state::<OutboxEventJobState>()
-            .map_err(|e| {
-                ObixFault::from(crate::out::error::CouldNotDecodeStored::ExecutionState(e))
-            })?
-            .unwrap_or(OutboxEventJobState {
-                sequence: row.start_after,
-                commit_sequence: None,
-                paused: None,
-            });
+        let mut state = decode_execution_state(&current_job)?.unwrap_or(OutboxEventJobState {
+            sequence: row.start_after,
+            commit_sequence: None,
+            paused: None,
+        });
 
         // A wake that lands on a pause with nothing persisted beyond the
         // paused event is the match for that event itself, not traffic
@@ -367,17 +369,13 @@ where
                                     current_job.pool(),
                                     current_job.clock(),
                                 )
-                                .await
-                                .map_err(ObixFault::from)?;
+                                .await?;
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     current_job
                                         .update_execution_state_in_op(&mut op, &state)
                                         .await?;
                                 }
-                                mirror
-                                    .mirror(&mut op, state.sequence)
-                                    .await
-                                    .map_err(ObixFault::from)?;
+                                mirror.mirror(&mut op, state.sequence).await?;
                                 return Ok(job::JobCompletion::CompleteWithOp(op));
                             }
                         }

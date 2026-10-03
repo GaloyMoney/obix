@@ -1,4 +1,5 @@
 use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
@@ -213,7 +214,7 @@ where
             match Tables::load_group_members::<P>(&self.pool, &wanted, floor).await {
                 Ok(groups) => return groups.into_iter().collect(),
                 Err(error) => {
-                    record_fetch_failed(&ObixFault::from(error), u64::from(floor));
+                    record_fetch_failed(error, u64::from(floor));
                     tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
                 }
             }
@@ -299,7 +300,7 @@ where
                     }
                     record_empty_group_fetch(u64::from(floor), i64::from(group));
                 }
-                Err(error) => record_fetch_failed(&ObixFault::from(error), u64::from(floor)),
+                Err(error) => record_fetch_failed(error, u64::from(floor)),
             }
             tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
         }
@@ -321,7 +322,7 @@ where
         let pool = self.pool.clone();
         tokio::spawn(async move {
             if let Err(error) = Tables::write_commit_checkpoint(&pool, &checkpoint).await {
-                record_checkpoint_failed(&ObixFault::from(error), u64::from(checkpoint.sequence));
+                record_checkpoint_failed(error, u64::from(checkpoint.sequence));
             }
         });
     }
@@ -374,7 +375,7 @@ async fn serve_commit_backfill<P, Tables>(
     let seed = match Tables::load_commit_checkpoint_for(&pool, after).await {
         Ok(seed) => seed,
         Err(error) => {
-            record_checkpoint_read_failed(&ObixFault::from(error), u64::from(after));
+            record_checkpoint_read_failed(error, u64::from(after));
             return;
         }
     };
@@ -580,9 +581,8 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
         floor = floor,
     ),
 )]
-fn record_fetch_failed(fault: &ObixFault, floor: u64) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_fetch_failed(fault: impl Into<ObixFault>, floor: u64) {
+    fault.into().record(&tracing::Span::current());
 }
 
 /// Should never fire: see the INVARIANT in `Sequencer::place`.
@@ -607,9 +607,8 @@ fn record_empty_group_fetch(floor: u64, group: i64) {}
         sequence = sequence,
     ),
 )]
-fn record_checkpoint_failed(fault: &ObixFault, sequence: u64) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_checkpoint_failed(fault: impl Into<ObixFault>, sequence: u64) {
+    fault.into().record(&tracing::Span::current());
 }
 
 #[tracing::instrument(
@@ -626,9 +625,8 @@ fn record_checkpoint_failed(fault: &ObixFault, sequence: u64) {
         after = after,
     ),
 )]
-fn record_checkpoint_read_failed(fault: &ObixFault, after: u64) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_checkpoint_read_failed(fault: impl Into<ObixFault>, after: u64) {
+    fault.into().record(&tracing::Span::current());
 }
 
 #[tracing::instrument(

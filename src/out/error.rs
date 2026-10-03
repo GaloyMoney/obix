@@ -34,9 +34,20 @@ pub struct CommitLaneDisabled;
 #[derive(Debug, errlanes::Rejection)]
 pub enum SubscriptionRejection {
     /// A keyed member's job could not be resolved from
-    /// `(subscriber_type, key)` — no job of that type has ever been spawned
-    /// under the key. Distinct from a cancelled subscription, whose job rows
-    /// outlive the `subscriptions` row.
+    /// `(subscriber_type, key)` — no job row of that type is visible under
+    /// the key.
+    ///
+    /// In practice this means reading through the [`Subscription`] that
+    /// [`subscribe_in_op`] returned before the enclosing transaction has
+    /// committed: that handle comes back from inside the caller's op, while
+    /// the lookup reads on the pool. Remedy: commit, then read. Past the
+    /// commit the `subscriptions` row and the job row are atomic (one op
+    /// inserts and spawns), and a cancelled subscription's job rows outlive
+    /// its `subscriptions` row — so no other sequence leaves a subscription
+    /// without a job.
+    ///
+    /// [`Subscription`]: super::Subscription
+    /// [`subscribe_in_op`]: super::Subscriptions::subscribe_in_op
     #[error("no job for ({subscriber_type}, {key})")]
     #[rejection(code = "OBIX_SUBSCRIPTION_NO_SUCH_JOB")]
     NoSuchJob {
@@ -189,6 +200,70 @@ mod tests {
                 assert!(wrapper.source().is_some(), "serde error stays in the chain");
             }
             other => panic!("expected Fatal(CorruptState), got {other:?}"),
+        }
+    }
+
+    /// Why the conversions at the keyed runner's decode sites are not
+    /// ceremony: a `Classify` wrapper is not a lane payload, so boxing one
+    /// raw at a `Box<dyn Error>` boundary lets the boundary's own
+    /// `Fault::classify` walk straight past it to the `serde_json::Error`
+    /// underneath — and lane *that*, as `Fatal(Invariant)`. The
+    /// `Fatal(CorruptState)` override only survives if the wrapper reaches a
+    /// carrier first (rule 6).
+    #[test]
+    fn a_decode_wrapper_must_reach_a_carrier_before_it_reaches_a_box() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(CouldNotDecodeStored::ExecutionState(
+                serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err(),
+            ));
+        let recovered = Fault::classify(&*boxed).narrow_denied();
+        assert!(
+            matches!(recovered, Fault::Fatal(f) if f.kind == FatalKind::Invariant),
+            "boxing the wrapper raw loses the override — so the conversion at \
+             the call site is load-bearing, not ceremony",
+        );
+
+        // Laned first, the same wrapper keeps its kind across the box.
+        let laned: ObixFault = CouldNotDecodeStored::ExecutionState(
+            serde_json::from_value::<u64>(serde_json::json!("not a number")).unwrap_err(),
+        )
+        .into();
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(laned);
+        let recovered = Fault::classify(&*boxed).narrow_denied();
+        assert!(matches!(recovered, Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
+    }
+
+    /// The converse, and why obix's own storage calls inside those same
+    /// boxed methods need no conversion: a raw `sqlx::Error` is recovered
+    /// from the box with the identical lane and kind, because
+    /// `Fault::classify` reads the same table `From<sqlx::Error>` does.
+    #[test]
+    fn a_raw_sqlx_error_keeps_its_lane_across_a_box() {
+        for error in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol("synthesized".into()),
+        ] {
+            let eager: ObixFault = clone_shape(&error).into();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+            let recovered = Fault::classify(&*boxed).narrow_denied();
+            assert_eq!(recovered.lane(), eager.lane());
+            match (recovered, eager) {
+                (Fault::Fatal(a), Fault::Fatal(b)) => assert_eq!(a.kind, b.kind),
+                (Fault::Transient(a), Fault::Transient(b)) => assert_eq!(a.kind, b.kind),
+                (a, b) => panic!("lane mismatch: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    /// `sqlx::Error` is not `Clone`, and the test above needs the same
+    /// variant twice.
+    fn clone_shape(error: &sqlx::Error) -> sqlx::Error {
+        match error {
+            sqlx::Error::PoolTimedOut => sqlx::Error::PoolTimedOut,
+            sqlx::Error::RowNotFound => sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol(m) => sqlx::Error::Protocol(m.clone()),
+            other => panic!("unhandled shape {other:?}"),
         }
     }
 

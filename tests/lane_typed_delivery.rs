@@ -224,8 +224,7 @@ async fn insert_lane_position_is_the_sequence() -> anyhow::Result<()> {
                 flushes: flushes.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     // One source transaction: the insert lane promises no group atomicity, so
@@ -338,8 +337,7 @@ async fn commit_lane_position_is_dense_and_groups_are_contiguous() -> anyhow::Re
                 recorded: recorded.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -436,8 +434,7 @@ async fn commit_lane_flush_position_is_the_boundary_not_the_max() -> anyhow::Res
                 flushes: flushes.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -573,8 +570,7 @@ async fn undecodable_delivery_carries_the_lane_position() -> anyhow::Result<()> 
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             UndecodableRecorder::<CommitOrder>::new(seen.clone(), at.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -615,8 +611,7 @@ async fn undecodable_delivery_carries_the_lane_position() -> anyhow::Result<()> 
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             UndecodableRecorder::<CommitOrder>::new(seen_again.clone(), at_again.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
     publish_group(&outbox, [99]).await?;
     until(
@@ -646,8 +641,7 @@ async fn undecodable_delivery_carries_the_lane_position() -> anyhow::Result<()> 
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             UndecodableRecorder::<InsertOrder>::new(seen.clone(), at.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
     until(
         async || seen.lock().await.len() >= 3,
@@ -683,11 +677,7 @@ async fn raw_listener_try_next_fails_with_position() -> anyhow::Result<()> {
 
     let mut commit = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
     for expected in [1u64, 2] {
-        let item = commit
-            .try_next()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .expect("a commit-lane item");
+        let item = commit.try_next().await?.expect("a commit-lane item");
         assert_eq!(item.position(), CommitSequence::from(expected));
     }
     let failure = commit
@@ -701,10 +691,7 @@ async fn raw_listener_try_next_fails_with_position() -> anyhow::Result<()> {
     );
 
     let mut insert = outbox.listen_persisted(EventSequence::BEGIN);
-    let first = insert
-        .try_next()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let first = insert.try_next().await?;
     assert_eq!(
         first.expect("first insert-lane item").position(),
         EventSequence::from(1u64),
@@ -792,8 +779,7 @@ async fn caught_up_fence_on_the_commit_lane_does_not_return_early() -> anyhow::R
                 received: received.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -896,8 +882,7 @@ async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()
                 received: received.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, [1, 2]).await?;
@@ -975,8 +960,7 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             Skipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     // `is_caught_up()` alone is trivially true before anything is sequenced.
@@ -1029,8 +1013,7 @@ async fn snapshot_reports_lane_typed_positions() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             InsertSkipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     let snapshot = insert.load().await?;
     assert_eq!(snapshot.ordering(), Ordering::Insert);
     assert_eq!(
@@ -1056,8 +1039,7 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             InsertSkipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, [1, 2, 3]).await?;
@@ -1080,8 +1062,7 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             Skipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     match commit.load().await {
         Err(Fail::Fatal(f)) => {
             assert_eq!(f.kind, FatalKind::Config);
@@ -1115,8 +1096,7 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             Skipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let target = CommitSequence::from(999u64);
     match commit.await_position(target, Duration::ZERO).await {
@@ -1139,8 +1119,7 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(INSERT_JOB_TYPE)),
             InsertSkipper,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let target = EventSequence::from(999u64);
     match insert.await_position(target, Duration::ZERO).await {
@@ -1219,8 +1198,7 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
                 received: received.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, [1, 2, 3]).await?;
@@ -1283,8 +1261,7 @@ async fn enabling_the_lane_later_sequences_the_full_history_in_the_same_order() 
                 recorded: recorded.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -1374,8 +1351,7 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
                     received: received.clone(),
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         jobs.start_poll().await?;
 
         for n in 1..=3u64 {
@@ -1421,8 +1397,7 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
                 received: received.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -1478,8 +1453,7 @@ async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()
                      publish to wake it",
                     received.len()
                 )
-            })?
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            })??
             .expect("the stream stays open");
         received.push(u64::from(item.position()));
     }
@@ -1498,11 +1472,7 @@ async fn both_lanes_share_one_listener_state_machine() -> anyhow::Result<()> {
     async fn first_position<L: obix::Lane>(
         listener: &mut obix::out::LaneListener<L, TestEvent>,
     ) -> anyhow::Result<L::Position> {
-        let item = listener
-            .try_next()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .expect("an item");
+        let item = listener.try_next().await?.expect("an item");
         Ok(item.position())
     }
 
@@ -1611,8 +1581,7 @@ async fn insert_lane_delivery_is_always_a_boundary() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             BoundaryFlusher::<InsertOrder>::new(flushes.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, [1, 2, 3]).await?;
@@ -1645,8 +1614,7 @@ async fn insert_lane_delivery_is_always_a_boundary() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             BoundaryFlusher::<CommitOrder>::new(flushes.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(
@@ -1734,8 +1702,7 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             FailingFlusher::<InsertOrder>::new(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, [1]).await?;
@@ -1783,8 +1750,7 @@ async fn flush_error_reports_lane_positions() -> anyhow::Result<()> {
                 .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL),
             FailingFlusher::<CommitOrder>::new(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     let mut reported = String::new();
@@ -1873,8 +1839,7 @@ async fn positions_equal_the_first_sight_numbering() -> anyhow::Result<()> {
                 recorded: recorded.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     until(

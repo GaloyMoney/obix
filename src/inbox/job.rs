@@ -10,7 +10,6 @@ use job::{
 };
 
 use super::{InboxEvent, InboxEventId, InboxEventStatus};
-use crate::error::ObixFault;
 use crate::tables::MailboxTables;
 
 pub enum InboxResult {
@@ -138,15 +137,13 @@ where
             InboxEventStatus::Processing,
             None,
         )
-        .await
-        .map_err(ObixFault::from)?;
+        .await?;
 
         // Not `InboxRejection::NotFound`: this job was spawned in the same
         // op that inserted the row, so there is no caller left to correct
         // its absence — the row was deleted under a live job.
         let event = Tables::maybe_find_inbox_event_by_id(&self.pool, self.inbox_event_id)
-            .await
-            .map_err(ObixFault::from)?
+            .await?
             .ok_or_else(|| {
                 Fatal::invariant("the inbox event row this job was spawned beside is gone")
             })?;
@@ -162,8 +159,7 @@ where
                     InboxEventStatus::Completed,
                     None,
                 )
-                .await
-                .map_err(ObixFault::from)?;
+                .await?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
@@ -174,8 +170,7 @@ where
                     InboxEventStatus::Pending,
                     None,
                 )
-                .await
-                .map_err(ObixFault::from)?;
+                .await?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
@@ -186,8 +181,7 @@ where
                     InboxEventStatus::Pending,
                     None,
                 )
-                .await
-                .map_err(ObixFault::from)?;
+                .await?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
@@ -198,8 +192,7 @@ where
                     InboxEventStatus::Failed,
                     Some(&e.to_string()),
                 )
-                .await
-                .map_err(ObixFault::from)?;
+                .await?;
                 Err(e)
             }
         }

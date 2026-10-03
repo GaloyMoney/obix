@@ -1,4 +1,5 @@
 use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use tokio::sync::mpsc;
 
 use std::time::Duration;
@@ -94,8 +95,7 @@ where
                         {
                             Ok(listener) => break listener,
                             Err(error) => {
-                                let fault = ObixFault::from(error);
-                                record_reconnect_failed(&fault);
+                                record_reconnect_failed(error);
                                 backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                             }
                         }
@@ -173,9 +173,8 @@ fn record_connection_lost() {}
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_reconnect_failed(fault: &ObixFault) {
-    use es_entity::errlanes::Laned;
-    fault.record(&tracing::Span::current());
+fn record_reconnect_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
 }
 
 #[tracing::instrument(name = "obix.pg_listener.reconnected", level = "warn")]

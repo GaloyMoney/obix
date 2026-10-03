@@ -156,10 +156,9 @@ async fn register_with<H: SingletonSubscriber<TestEvent>>(
     config: OutboxEventJobConfig,
     handler: H,
 ) -> anyhow::Result<Subscription<TestEvent, InsertOrder, TestTables>> {
-    outbox
+    Ok(outbox
         .register_singleton_subscriber(jobs, config, handler)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .await?)
 }
 
 async fn publish_pings(

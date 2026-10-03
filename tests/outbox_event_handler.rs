@@ -519,8 +519,7 @@ async fn init_outbox_with_handler_config<H: SingletonSubscriber<TestEvent>>(
 
     outbox
         .register_singleton_subscriber(jobs, config, handler)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     Ok(outbox)
 }
@@ -771,8 +770,7 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
                     received: received_second.clone(),
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         jobs.start_poll().await?;
 
@@ -1615,8 +1613,7 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
                     received: received_after.clone(),
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         jobs.start_poll().await?;
 

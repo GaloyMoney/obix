@@ -348,8 +348,7 @@ async fn a_singleton_batch_retains_whole_events() -> anyhow::Result<()> {
                 observed: observed.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     jobs.start_poll().await?;
 
@@ -394,13 +393,11 @@ async fn a_keyed_batch_retains_whole_events() -> anyhow::Result<()> {
                 observed: observed.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     let mut op = outbox.begin_op().await?;
     subs.subscribe_in_op(&mut op, OwnerId(1), (), WakeKey::from("1"))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     op.commit().await?;
 
     jobs.start_poll().await?;
@@ -444,8 +441,7 @@ async fn a_singleton_classifies_through_the_arc_while_retaining() -> anyhow::Res
                 classified: classified.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     jobs.start_poll().await?;
 
@@ -494,8 +490,7 @@ async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {
                 received: received.clone(),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
 
     jobs.start_poll().await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

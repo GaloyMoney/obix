@@ -445,6 +445,17 @@ where
                 .keyed_handle(anchor.job_type.clone(), anchor.key.clone())
                 .await?
                 .ok_or_else(|| {
+                    // Reachable, and caller-correctable, which is why it is a
+                    // rejection: `Subscriptions::subscribe_in_op` hands back
+                    // this `Subscription` from *inside* the caller's open
+                    // transaction, while `Jobs::keyed_handle` reads on the
+                    // pool. Reading through the handle before committing the
+                    // subscribe therefore finds no job row — remedy: commit
+                    // first. Past that commit the two rows are atomic (the
+                    // row insert and the spawn share one op), and a cancelled
+                    // subscription's job rows outlive its `subscriptions`
+                    // row, so nothing else leaves a subscription without a
+                    // job.
                     Fail::Rejected(SubscriptionRejection::NoSuchJob {
                         subscriber_type: anchor.job_type.to_string(),
                         key: anchor.key.clone(),

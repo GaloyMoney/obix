@@ -518,12 +518,7 @@ where
         &self,
         mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let mut state = current_job
-            .execution_state::<OutboxEventJobState>()
-            .map_err(|e| {
-                ObixFault::from(crate::out::error::CouldNotDecodeStored::ExecutionState(e))
-            })?
-            .unwrap_or_default();
+        let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
 
         // Two independent streams: the persistent backlog alone governs the
         // batch lifecycle, so ephemeral traffic can never shrink a batch —

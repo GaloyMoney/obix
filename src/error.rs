@@ -39,7 +39,22 @@
 //!    instead (`Jobs::keyed_handle` returning `Option`,
 //!    `Subscriptions::subscription` rejecting).
 //! 6. **Classify once, where the error is born; box once, at the trait
-//!    boundary.**
+//!    boundary.** With one exception and one trap, both about the boxed
+//!    boundaries rule 0 fixes:
+//!    - *A raw foreign error needs no conversion on its way into a box.*
+//!      `Fault::classify` walks the boxed chain at job's boundary, finds the
+//!      `sqlx::Error` (or `serde_json::Error`) and lanes it from the very
+//!      same table `From<sqlx::Error>` uses. An eager `ObixFault::from` buys
+//!      nothing there, so obix's own storage calls inside a
+//!      `Box<dyn Error>`-returning method use plain `?`.
+//!    - *A [`Classify`](es_entity::errlanes::Classify) wrapper does.* It is
+//!      not a lane payload, so the boundary's walk steps straight past it to
+//!      the foreign error underneath — and lanes *that*. A
+//!      [`CouldNotDecodeStored`] boxed raw therefore arrives as
+//!      `Fatal(Invariant)` (serde's default), silently losing the
+//!      `Fatal(CorruptState)` rule 4 exists to assert. Every wrapper whose
+//!      whole purpose is to *override* a classification must reach a carrier
+//!      before it reaches a box.
 //! 7. **Every `Fail` signature spells its carrier.** No `pub type FooError
 //!    = Fail<..>` aliases: a reader of a signature must see which rejection
 //!    it is being handed, since that is exactly what they have to branch on.
@@ -52,10 +67,16 @@
 //!
 //! - `es_entity::hooks::CommitHook::pre_commit` returns `sqlx::Error`. That
 //!   fixes [`PostPersistHook::on_persisted`](crate::out::PostPersistHook::on_persisted),
-//!   `CheckpointMirror::mirror`, `Outbox::publish_persisted_in_op` and
-//!   `Outbox::publish_all_persisted` (a hook is documented to call back into
-//!   both from inside its own `on_persisted`). A broader hook error type is
-//!   an es-entity change, not an obix one.
+//!   `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`
+//!   (a hook is documented to call back into both from inside its own
+//!   `on_persisted`). A broader hook error type is an es-entity change, not
+//!   an obix one.
+//!
+//!   `CheckpointMirror::mirror` is **not** one of these: obix owns that
+//!   trait and the runner drives it, never a `CommitHook`. It returns
+//!   `sqlx::Error` by rule 3 — every implementation is a single `Tables::`
+//!   call, so sqlx is the only error it can produce — and its one caller is
+//!   laned, so `?` classifies it there.
 //! - `MailboxTables` is generated into downstream crates via
 //!   `#[derive(MailboxTables)]` and is the storage layer; **every** method on
 //!   it returns `sqlx::Error`, with no exceptions. obix classifies one level
