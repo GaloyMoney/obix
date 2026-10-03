@@ -1,6 +1,7 @@
 use crate::error::ObixFault;
 use async_trait::async_trait;
-use es_entity::errlanes::Fatal;
+use es_entity::ResultExt;
+use es_entity::errlanes::Fail;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use job::{
 };
 
 use crate::out::ctx::*;
-use crate::out::lane::{CommitLaneDisabled, InsertOrder, Lane};
+use crate::out::lane::{InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
 use crate::out::{EphemeralOutboxListener, Outbox, event::*};
 use crate::sequence::{CommitSequence, EventSequence};
@@ -507,15 +508,12 @@ where
         state: &OutboxEventJobState,
     ) -> Result<crate::out::LaneListener<L, P>, ObixFault> {
         let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
-        match self.outbox.listen::<L>(start_after) {
-            Ok(listener) => Ok(listener),
-            // `L::require` ran at registration, so the lane being off by the
-            // time this job runs is an invariant, not a caller's to correct.
-            Err(CommitLaneDisabled) => Err(Fatal::invariant(
-                "a commit-lane subscriber is running on an outbox whose commit lane is disabled",
-            )
-            .into()),
-        }
+        // `L::require` ran at registration, so the lane being off by the time
+        // this job runs has no caller left to correct it.
+        self.outbox
+            .listen::<L>(start_after)
+            .map_err(Fail::Rejected)
+            .narrow_rejected()
     }
 
     async fn run_with_persistent(
