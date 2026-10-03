@@ -212,7 +212,7 @@ where
             match Tables::load_group_members::<P>(&self.pool, &wanted, floor).await {
                 Ok(groups) => return groups.into_iter().collect(),
                 Err(error) => {
-                    record_fetch_failed(&error, u64::from(floor));
+                    record_fetch_failed(&crate::error::OutboxFault::from(error), u64::from(floor));
                     tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
                 }
             }
@@ -298,7 +298,9 @@ where
                     }
                     record_empty_group_fetch(u64::from(floor), i64::from(group));
                 }
-                Err(error) => record_fetch_failed(&error, u64::from(floor)),
+                Err(error) => {
+                    record_fetch_failed(&crate::error::OutboxFault::from(error), u64::from(floor))
+                }
             }
             tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
         }
@@ -320,7 +322,10 @@ where
         let pool = self.pool.clone();
         tokio::spawn(async move {
             if let Err(error) = Tables::write_commit_checkpoint(&pool, &checkpoint).await {
-                record_checkpoint_failed(&error, u64::from(checkpoint.sequence));
+                record_checkpoint_failed(
+                    &crate::error::OutboxFault::from(error),
+                    u64::from(checkpoint.sequence),
+                );
             }
         });
     }
@@ -373,7 +378,10 @@ async fn serve_commit_backfill<P, Tables>(
     let seed = match Tables::load_commit_checkpoint_for(&pool, after).await {
         Ok(seed) => seed,
         Err(error) => {
-            record_checkpoint_read_failed(&error, u64::from(after));
+            record_checkpoint_read_failed(
+                &crate::error::OutboxFault::from(error),
+                u64::from(after),
+            );
             return;
         }
     };
@@ -569,9 +577,20 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
     name = "obix.sequencer.fetch_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, floor = floor),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        floor = floor,
+    ),
 )]
-fn record_fetch_failed(error: &sqlx::Error, floor: u64) {}
+fn record_fetch_failed(fault: &crate::error::OutboxFault, floor: u64) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 /// Should never fire: see the INVARIANT in `Sequencer::place`.
 #[tracing::instrument(
@@ -585,17 +604,39 @@ fn record_empty_group_fetch(floor: u64, group: i64) {}
     name = "obix.sequencer.checkpoint_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, sequence = sequence),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        sequence = sequence,
+    ),
 )]
-fn record_checkpoint_failed(error: &sqlx::Error, sequence: u64) {}
+fn record_checkpoint_failed(fault: &crate::error::OutboxFault, sequence: u64) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.sequencer.checkpoint_read_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, after = after),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        after = after,
+    ),
 )]
-fn record_checkpoint_read_failed(error: &sqlx::Error, after: u64) {}
+fn record_checkpoint_read_failed(fault: &crate::error::OutboxFault, after: u64) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.sequencer.stream_closed",

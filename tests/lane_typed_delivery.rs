@@ -11,8 +11,11 @@ use std::time::Duration;
 use futures::{StreamExt, TryStreamExt};
 use obix::{
     CommitLane, CommitLaneDisabled, CommitOrder, CommitSequence, EventCtx, EventDelivery,
-    EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, Ordering, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, SubscriptionError, UndecodableDelivery, out::Outbox,
+    EventSequence, FlushOp, Handled, InsertOrder, LaneMismatch, MailboxConfig, Ordering,
+    OutboxEventJobConfig, SingletonSubscriber, StreamPosition, SubscriptionRejection,
+    UndecodableDelivery,
+    out::Outbox,
+    prelude::es_entity::errlanes::{Fail, FatalKind},
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -158,10 +161,14 @@ where
     anyhow::bail!("timed out waiting for {what}")
 }
 
+/// `(position, last_handled, collected items)` recorded by one
+/// [`InsertPositionRecorder::flush`] call.
+type InsertFlush = (EventSequence, Option<EventSequence>, Vec<u64>);
+
 struct InsertPositionRecorder {
     seen: Arc<Mutex<Vec<(EventSequence, EventSequence)>>>,
     last_handled: Arc<Mutex<Option<EventSequence>>>,
-    flushes: Arc<Mutex<Vec<(EventSequence, Option<EventSequence>, Vec<u64>)>>>,
+    flushes: Arc<Mutex<Vec<InsertFlush>>>,
 }
 
 impl SingletonSubscriber<TestEvent> for InsertPositionRecorder {
@@ -364,9 +371,12 @@ async fn commit_lane_position_is_dense_and_groups_are_contiguous() -> anyhow::Re
     Ok(())
 }
 
+/// `(position, collected items)` recorded by one [`GroupFlusher::flush`] call.
+type CommitFlush = (CommitSequence, Vec<u64>);
+
 struct GroupFlusher {
     seen: Arc<Mutex<Vec<(u64, CommitSequence, bool)>>>,
-    flushes: Arc<Mutex<Vec<(CommitSequence, Vec<u64>)>>>,
+    flushes: Arc<Mutex<Vec<CommitFlush>>>,
 }
 
 impl SingletonSubscriber<TestEvent, CommitOrder> for GroupFlusher {
@@ -1073,13 +1083,20 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match commit.load().await {
-        Err(SubscriptionError::LaneMismatch(message)) => {
+        Err(Fail::Fatal(f)) => {
+            assert_eq!(f.kind, FatalKind::Config);
+            let mismatch = std::error::Error::source(&f)
+                .and_then(|s| s.downcast_ref::<LaneMismatch>())
+                .expect("LaneMismatch must be the Fatal's source");
             assert!(
-                message.contains("register a new job type"),
-                "the refusal must say what to do instead: {message}",
+                mismatch.to_string().contains("register a new job type"),
+                "the refusal must say what to do instead: {mismatch}",
             );
         }
-        other => anyhow::bail!("expected LaneMismatch, got {other:?}", other = other.err()),
+        other => anyhow::bail!(
+            "expected Fatal(Config)/LaneMismatch, got {other:?}",
+            other = other.err()
+        ),
     }
 
     Ok(())
@@ -1103,11 +1120,11 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
 
     let target = CommitSequence::from(999u64);
     match commit.await_position(target, Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint,
             target: reported,
             ..
-        }) => {
+        })) => {
             assert_eq!(reported, StreamPosition::Commit(target));
             assert!(matches!(checkpoint, StreamPosition::Commit(_)));
         }
@@ -1127,11 +1144,11 @@ async fn await_position_on_each_lane() -> anyhow::Result<()> {
 
     let target = EventSequence::from(999u64);
     match insert.await_position(target, Duration::ZERO).await {
-        Err(SubscriptionError::CaughtUpTimeout {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
             checkpoint,
             target: reported,
             ..
-        }) => {
+        })) => {
             assert_eq!(reported, StreamPosition::Insert(target));
             assert!(matches!(checkpoint, StreamPosition::Insert(_)));
         }
@@ -1161,10 +1178,9 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
             Skipper,
         )
         .await;
-    let error = refused.err().expect("registration must be refused");
     assert!(
-        error.downcast_ref::<CommitLaneDisabled>().is_some(),
-        "registration must fail with CommitLaneDisabled, got: {error}",
+        matches!(refused, Err(Fail::Rejected(CommitLaneDisabled))),
+        "registration must fail with CommitLaneDisabled, got: {refused:?}",
     );
     let jobs_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1")
         .bind(JOB_TYPE)

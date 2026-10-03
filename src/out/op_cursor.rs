@@ -50,13 +50,4 @@ impl<P, Tables> OpCursor<P, Tables> {
     }
 }
 
-/// Error returned by [`Outbox::cursor`](super::Outbox::cursor).
-#[derive(Debug, thiserror::Error)]
-pub enum CursorError {
-    /// The operation does not support commit hooks, so there is no op-local
-    /// publish buffer to position into. Use an op that supports hooks — e.g.
-    /// one from [`Outbox::begin_op`](super::Outbox::begin_op) — rather than a
-    /// bare `sqlx::Transaction`.
-    #[error("OpCursor requires an operation that supports commit hooks; this operation does not")]
-    HooksUnsupported,
-}
+pub use crate::error::CursorError;

@@ -441,7 +441,10 @@ where
             {
                 Ok(events) => events,
                 Err(e) => {
-                    record_backfill_failed(&e, u64::from(current_sequence));
+                    record_backfill_failed(
+                        &crate::error::OutboxFault::from(e),
+                        u64::from(current_sequence),
+                    );
                     tokio::time::sleep(Self::BACKFILL_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -496,7 +499,9 @@ where
                             let _ = gap_fill_tx.send(GapFillRequest::Historical(missing));
                         }
                         Ok(_) => {}
-                        Err(e) => record_backfill_failed(&e, next_needed),
+                        Err(e) => {
+                            record_backfill_failed(&crate::error::OutboxFault::from(e), next_needed)
+                        }
                     }
                 }
             }
@@ -536,7 +541,7 @@ where
         match Tables::highest_known_persistent_sequence(pool).await {
             Ok(head) => Some(head),
             Err(e) => {
-                record_resync_failed(&e);
+                record_resync_failed(&crate::error::OutboxFault::from(e));
                 None
             }
         }
@@ -920,9 +925,20 @@ fn record_no_receivers(sequence: u64) {}
     name = "obix.persistent_cache.backfill_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, current_sequence = current_sequence),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        current_sequence = current_sequence,
+    ),
 )]
-fn record_backfill_failed(error: &sqlx::Error, current_sequence: u64) {}
+fn record_backfill_failed(fault: &crate::error::OutboxFault, current_sequence: u64) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.persistent_cache.backfill_channel_closed",
@@ -963,9 +979,20 @@ fn record_feeder_gone() {}
     name = "obix.persistent_cache.resync_failed",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error),
+    fields(
+        otel.status_code = "ERROR",
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_resync_failed(error: &sqlx::Error) {}
+fn record_resync_failed(fault: &crate::error::OutboxFault) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[cfg(test)]
 mod tests {

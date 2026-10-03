@@ -81,7 +81,7 @@ impl PersistentNotifier {
             let (min, max) = pending.expect("pending set before emit");
             match Self::emit(&pool, channel, min, max).await {
                 Ok(()) => pending = None,
-                Err(error) => record_notify_emit_failed(&error),
+                Err(error) => record_notify_emit_failed(&crate::error::OutboxFault::from(error)),
             }
         }
     }
@@ -125,6 +125,16 @@ impl PersistentNotifier {
     name = "obix.persistent_notifier.emit_failed",
     level = "warn",
     skip_all,
-    fields(error = %error),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_notify_emit_failed(error: &sqlx::Error) {}
+fn record_notify_emit_failed(fault: &crate::error::OutboxFault) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}

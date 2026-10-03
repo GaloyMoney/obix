@@ -169,6 +169,69 @@ let mut listener = outbox.listen_ephemeral();
 let mut listener = outbox.listen_all(None);
 ```
 
+## Errors and telemetry
+
+obix's public methods return one of four `errlanes` aliases, each defined in
+`src/error.rs` and re-exported from `obix::`, `obix::out::` and
+`obix::inbox::`:
+
+| alias | shape | returned by |
+|---|---|---|
+| `OutboxFault` | `Fault<lanes!(Transient, Fatal)>` | every method that cannot reject: `Outbox::init`/`begin_op`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op` |
+| `LaneError` | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
+| `SubscriptionError` | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
+| `InboxError` | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id`/`list_failed`/`persist_and_queue_job*` |
+
+A handful of methods return a bare `errlanes::Rejection` on its own
+(`Outbox::cursor` → `CursorError`, `WakeKeys::try_from` → `SubscribeError`,
+`Outbox::listen`/`listen_commit_ordered` → `CommitLaneDisabled`), and two
+methods stay on `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit`
+pins it: `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`.
+
+Stored data that fails to decode (a subscriber job's execution state, a keyed
+subscription's `instance_config` or persisted key, an inbox event's status
+column) always classifies as `Fatal(CorruptState)`, never the serde default
+of `Fatal(Invariant)` — the same override job makes for its own persisted
+execution state, via the named wrapper `CouldNotDecodeStored`.
+
+### For implementors
+
+Anything *you* implement — `SingletonSubscriber`, `KeyedSubscriber`,
+`InboxHandler`, `SubscriptionDef`'s `Subscriber` — returns
+`Box<dyn std::error::Error + Send + Sync>` from every fallible method, and
+`PostPersistHook::on_persisted` returns `sqlx::Error` (pinned by es-entity).
+obix never asks an implementor to classify or lane an error. If you return a
+laned `errlanes::Fail`/`Fault` (or let one propagate through `?`) it travels
+through the box unchanged, and job's `Fault::classify` finds it in the
+chain — which is how a handler reaches job's dispositions: a `Transient`
+congestion kind reschedules without spending an attempt, and
+`terminal_on_fatal` (a `RetrySettings` field you already pass through
+`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`, forced off
+for resident types — singleton subscribers and the partition maintainer) acts
+on a `Fatal`. A boxed `Fail::Rejected` has **no surviving marker** and simply
+retries per policy, so resolve your own rejections inside the handler body
+(skip, ack, or map them) rather than propagating them.
+
+### Boundary spans
+
+Every laned boundary is instrumented with `#[es_entity::errlanes::instrument]`
+rather than `#[tracing::instrument(.., err)]`: the attribute declares and
+records `error`, `error.lane`, `error.code`, `error.level`,
+`exception.message` and `exception.type` from the returned `Fail`/`Fault`
+itself, so the lane is on the span before the error is ever logged.
+`PostPersistHook`'s two sqlx-pinned functions (`flush_batch`,
+`persist_checkpoint` on the batch op) keep plain `#[tracing::instrument(err)]`
+— job's finalizer is the boundary that disposes of the handler's own error
+and records its lane. Background loops (the pg listener, the debounced
+notifier, the persistent cache, feeder and sequencer, the gap filler) report
+a fault's lane on their own `warn`-level spans without changing retry
+behaviour — a dropped-table `Fatal(Config)` and a `Transient(ConnectionLost)`
+used to look identical in the logs; they no longer do.
+
+This requires the `es-entity/errlanes-tracing` feature, which is on
+unconditionally (not gated behind obix's own optional `tracing` feature,
+which only adds span/trace-context propagation on top).
+
 ## License
 
 Licensed under the Apache License, Version 2.0.

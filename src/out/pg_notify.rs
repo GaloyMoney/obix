@@ -93,7 +93,8 @@ where
                         {
                             Ok(listener) => break listener,
                             Err(error) => {
-                                record_reconnect_failed(&error);
+                                let fault = crate::error::OutboxFault::from(error);
+                                record_reconnect_failed(&fault);
                                 backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                             }
                         }
@@ -161,9 +162,20 @@ fn record_connection_lost() {}
     name = "obix.pg_listener.reconnect_failed",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error),
+    fields(
+        otel.status_code = "ERROR",
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_reconnect_failed(error: &sqlx::Error) {}
+fn record_reconnect_failed(fault: &crate::error::OutboxFault) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[tracing::instrument(name = "obix.pg_listener.reconnected", level = "warn")]
 fn record_reconnected() {}

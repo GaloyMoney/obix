@@ -303,7 +303,9 @@ where
                                                 }
                                             }
                                         }
-                                        Err(e) => record_resync_failed(&e),
+                                        Err(e) => {
+                                            record_resync_failed(&crate::error::OutboxFault::from(e))
+                                        }
                                     }
                                 }
                             }
@@ -352,9 +354,20 @@ fn record_notification_channel_closed() {}
     name = "obix.ephemeral_cache.resync_failed",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error),
+    fields(
+        otel.status_code = "ERROR",
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_resync_failed(error: &sqlx::Error) {}
+fn record_resync_failed(fault: &crate::error::OutboxFault) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.ephemeral_cache.notification_undecodable",

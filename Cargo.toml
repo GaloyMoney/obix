@@ -23,8 +23,13 @@ test-utils = ["tokio/time"]
 [dependencies]
 obix-macros = { workspace = true }
 
-es-entity = { workspace = true }
+es-entity = { workspace = true, features = ["errlanes-tracing"] }
 
+# Kept: `test_utils::ExpectEventError<E>` and `UndecodableEventError`
+# (`src/out/event.rs`, alongside `#[derive(errlanes::Classify)]` with
+# `error = manual`) still derive `thiserror::Error` for their hand-written
+# `Display`. Everything else that used to derive it now derives
+# `errlanes::Rejection`/`Classify` instead.
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -55,7 +60,7 @@ obix-macros = { path = "obix-macros", version = "0.13.2-dev" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-es-entity = "0.14.1"
+es-entity = "0.16.1"
 anyhow = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -64,7 +69,7 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 im = { version = "15.1", features = ["serde"] }
-job = { version = "0.16.1", features = ["es-entity"] }
+job = { version = "0.17.0", features = ["es-entity"] }
 thiserror = "2.0"
 async-trait = "0.1"
 derive_builder = "0.20"

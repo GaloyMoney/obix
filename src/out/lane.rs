@@ -20,7 +20,7 @@ use super::subscription::{
     StreamPosition, Subscription, SubscriptionError, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use crate::config::{CommitLaneDisabled, FrontierError};
+use crate::error::{CommitLaneDisabled, LaneError};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
@@ -81,7 +81,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<Self::Position, String>;
+    ) -> Result<Self::Position, crate::error::LaneMismatch>;
 
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
@@ -98,7 +98,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn outbox_frontier<'a, P, Tables>(
         outbox: &'a Outbox<P, Tables>,
-    ) -> impl std::future::Future<Output = Result<Self::Position, FrontierError>> + Send + 'a
+    ) -> impl std::future::Future<Output = Result<Self::Position, LaneError>> + Send + 'a
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables;
@@ -170,10 +170,10 @@ impl Lane for InsertOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<EventSequence, String> {
-        decide_lane(commit, sequence, Self::ORDERING)?
+    ) -> Result<EventSequence, crate::error::LaneMismatch> {
+        Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .insert()
-            .ok_or_else(|| lane_choice_mismatch(Self::ORDERING))
+            .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))
     }
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
@@ -190,7 +190,7 @@ impl Lane for InsertOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<EventSequence, FrontierError>
+    ) -> Result<EventSequence, LaneError>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -256,10 +256,10 @@ impl Lane for CommitOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<CommitSequence, String> {
-        decide_lane(commit, sequence, Self::ORDERING)?
+    ) -> Result<CommitSequence, crate::error::LaneMismatch> {
+        Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .commit()
-            .ok_or_else(|| lane_choice_mismatch(Self::ORDERING))
+            .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))
     }
 
     fn record(commit_cursor: &mut Option<CommitSequence>, position: CommitSequence) {
@@ -278,7 +278,7 @@ impl Lane for CommitOrder {
 
     async fn outbox_frontier<P, Tables>(
         outbox: &Outbox<P, Tables>,
-    ) -> Result<CommitSequence, FrontierError>
+    ) -> Result<CommitSequence, LaneError>
     where
         P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
         Tables: MailboxTables,
@@ -354,9 +354,14 @@ where
     }
 }
 
-/// Unreachable: `decide_lane` is total on each `(state, ordering)` pair.
-fn lane_choice_mismatch(ordering: Ordering) -> String {
-    format!("lane resolution yielded the other lane's cursor for Ordering::{ordering:?}")
+/// Unreachable: `decide_lane` is total on each `(state, ordering)` pair —
+/// the `LaneChoice` variant it returns always matches `configured`, so
+/// `.insert()`/`.commit()` on that result can never miss. A panic, not a
+/// typed error: nothing a caller could act on, and the whole point of
+/// `resume_from`'s `LaneMismatch` is to carry a real `(stored, configured)`
+/// pair, which this call site does not have.
+fn unreachable_lane_choice(ordering: Ordering) -> ! {
+    unreachable!("lane resolution yielded the other lane's cursor for Ordering::{ordering:?}")
 }
 
 impl LaneChoice {

@@ -137,11 +137,9 @@ where
             None,
         )
         .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        .map_err(crate::error::OutboxFault::from)?;
 
-        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id).await?;
 
         let result = self.handler.handle(&event).await;
 
@@ -155,7 +153,7 @@ where
                     None,
                 )
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .map_err(crate::error::OutboxFault::from)?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
@@ -167,7 +165,7 @@ where
                     None,
                 )
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .map_err(crate::error::OutboxFault::from)?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
@@ -179,7 +177,7 @@ where
                     None,
                 )
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .map_err(crate::error::OutboxFault::from)?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
@@ -191,7 +189,7 @@ where
                     Some(&e.to_string()),
                 )
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                .map_err(crate::error::OutboxFault::from)?;
                 Err(e)
             }
         }

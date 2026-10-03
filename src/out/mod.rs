@@ -32,14 +32,30 @@ pub use self::subscription::singleton::{
     Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
 };
 pub use self::subscription::{
-    StreamPosition, Subscription, SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus,
+    StreamPosition, Subscription, SubscriptionError, SubscriptionRejection, SubscriptionSnapshot,
+    SubscriptionStreamStatus,
 };
+/// Failure modes of a method whose only rejection is the commit lane being
+/// off: [`Outbox::frontier`] and [`Outbox::register_singleton_subscriber`].
+pub use crate::error::LaneError;
+/// A raw infrastructure fault with nothing for the caller to correct —
+/// what a `sqlx::Error` becomes at [`Outbox`]'s and [`Partitions`]'s own
+/// hand-written API, via errlanes' blanket classification on bare `?`.
+///
+/// Deliberately **not** the error type of the [`MailboxTables`] trait
+/// itself: that trait is implemented by downstream crates via
+/// `#[derive(obix_macros::MailboxTables)]`, so changing its associated
+/// error type is a far larger, separately-coordinated breaking change —
+/// see the adoption PR description.
+pub use crate::error::OutboxFault;
 use crate::{
     config::*,
+    error::CommitLaneDisabled,
     handle::OwnedTaskHandle,
     sequence::{CommitSequence, EventSequence},
     tables::*,
 };
+
 pub use all_listener::AllOutboxListener;
 use ephemeral::EphemeralOutboxEventCache;
 pub use ephemeral::EphemeralOutboxListener;
@@ -139,7 +155,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, sqlx::Error> {
+    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, OutboxFault> {
         let pool = pool.clone();
 
         let (persistent_notification_tx, persistent_notification_rx) =
@@ -273,10 +289,17 @@ where
         *deps = rebuilt.into();
     }
 
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
-        es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, OutboxFault> {
+        Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
     }
 
+    // `publish_persisted_in_op`/`publish_all_persisted` deliberately keep
+    // returning `sqlx::Error` rather than `OutboxFault`: a `PostPersistHook`
+    // implementation is documented to call back into either from inside its
+    // own `on_persisted`, whose return type is in turn fixed to
+    // `sqlx::Error` by `es_entity::operation::hooks::CommitHook::pre_commit`
+    // (an es-entity trait, not yet errlanes-aware, out of scope here per the
+    // adoption's constraints — see the PR description).
     pub async fn publish_persisted_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -322,7 +345,7 @@ where
         &self,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), OutboxFault> {
         let now = self.clock.manual_now();
         let event =
             Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
@@ -338,7 +361,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), OutboxFault> {
         let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
             self.ephemeral_cache.cache_fill_sender().clone(),
             event_type,
@@ -464,7 +487,7 @@ where
 
     /// The frontier of lane `L`: the sequence generator's `last_value`, which
     /// counts sequences assigned to uncommitted transactions, or the fold head.
-    pub async fn frontier<L>(&self) -> Result<L::Position, FrontierError>
+    pub async fn frontier<L>(&self) -> Result<L::Position, LaneError>
     where
         L: Lane,
     {
@@ -531,7 +554,7 @@ where
         jobs: &mut ::job::Jobs,
         config: OutboxEventJobConfig,
         handler: H,
-    ) -> Result<Subscription<P, L, Tables>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Subscription<P, L, Tables>, LaneError>
     where
         H: SingletonSubscriber<P, L>,
         L: Lane,
@@ -578,7 +601,7 @@ where
         jobs: &mut ::job::Jobs,
         config: subscription::keyed::KeyedSubscriberConfig,
         def: D,
-    ) -> Result<Subscriptions<D, P, Tables>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Subscriptions<D, P, Tables>, OutboxFault> {
         let def = Arc::new(def);
         let initializer = subscription::keyed::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
             self.clone(),
@@ -608,12 +631,20 @@ where
                 self.keyed_routes.clone(),
                 self.event_cache_size,
             );
+            // The waker is always InsertOrder, whose `L::require` is `Ok`
+            // unconditionally, so `CommitLaneDisabled` can never actually be
+            // rejected here. `narrow_rejected` expresses that: the only
+            // outcome a caller of `register_keyed_subscriber` could act on is
+            // not reachable through this internal registration, so an
+            // (impossible) rejection becomes `Fatal(Invariant)` rather than
+            // leaving this function's own fault-only signature lying.
             self.register_singleton_subscriber(
                 jobs,
                 OutboxEventJobConfig::new(subscription::keyed::waker_job_type::<Tables>()),
                 waker,
             )
-            .await?;
+            .await
+            .map_err(LaneError::narrow_rejected)?;
         }
 
         Ok(Subscriptions::new(
@@ -633,8 +664,8 @@ where
     /// yet, and needs no table scan. This is the same value
     /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
-    pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, sqlx::Error> {
-        subscription::read_frontier::<Tables>(&self.pool).await
+    pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, OutboxFault> {
+        Ok(subscription::read_frontier::<Tables>(&self.pool).await?)
     }
 
     /// Register the partition maintainer for `persistent_outbox_events`: a
@@ -658,7 +689,7 @@ where
         &self,
         jobs: &mut ::job::Jobs,
         config: PartitionMaintainerConfig,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), OutboxFault> {
         let partitions = Partitions::<Tables>::new(&self.pool, self.partition_premake);
 
         // The synchronous write path must never wait on the async maintainer,
@@ -675,5 +706,35 @@ where
             .spawn(partition::PartitionMaintainerJobData::default())
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutboxFault;
+    use es_entity::errlanes::{Fault, Transient, TransientKind};
+
+    /// `OutboxFault` never rejects — a `sqlx::Error` enters it straight
+    /// through errlanes' own blanket classification via bare `?`/`.into()`,
+    /// with no obix-specific conversion in between.
+    #[test]
+    fn a_pool_timeout_classifies_as_transient() {
+        let err: OutboxFault = sqlx::Error::PoolTimedOut.into();
+        assert!(matches!(err, Fault::Transient(_)));
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn row_not_found_classifies_as_fatal() {
+        let err: OutboxFault = sqlx::Error::RowNotFound.into();
+        assert!(err.is_fatal());
+    }
+
+    /// An already-laned value widens in directly, unchanged — the same
+    /// path a `sqlx::Error` takes, just skipping the classification step.
+    #[test]
+    fn an_already_laned_transient_widens_in_unchanged() {
+        let err: OutboxFault = Transient::new(TransientKind::Deadlock).into();
+        assert!(err.is_contention());
     }
 }

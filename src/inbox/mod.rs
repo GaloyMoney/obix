@@ -92,7 +92,13 @@ where
             _phantom: std::marker::PhantomData,
         };
 
-        self.spawner.spawn_in_op(op, id, config).await?;
+        // The handler job's own domain rejections are not the inbox's: a
+        // failure spawning it is inbox-internal plumbing, so it is narrowed
+        // into the fault lanes rather than lifted into `InboxRejection`.
+        self.spawner
+            .spawn_in_op(op, id, config)
+            .await
+            .map_err(::job::JobError::narrow_rejected)?;
 
         Ok(es_entity::Idempotent::Executed(id))
     }
