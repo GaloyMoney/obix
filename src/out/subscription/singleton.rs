@@ -1,5 +1,7 @@
 use crate::error::ObixFault;
 use async_trait::async_trait;
+use es_entity::ResultExt;
+use es_entity::errlanes::{Fail, lanes};
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -10,7 +12,7 @@ use job::{
 };
 
 use crate::out::ctx::*;
-use crate::out::lane::{InsertOrder, Lane};
+use crate::out::lane::{CommitLaneDisabled, InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
 use crate::out::{EphemeralOutboxListener, Outbox, event::*};
 use crate::sequence::{CommitSequence, EventSequence};
@@ -504,9 +506,9 @@ where
     fn select_lane(
         &self,
         state: &OutboxEventJobState,
-    ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
-        let start_after =
-            L::resume_from(state.sequence, state.commit_sequence).map_err(ObixFault::from)?;
+    ) -> Result<crate::out::LaneListener<L, P>, Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>>
+    {
+        let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
         Ok(self.outbox.listen::<L>(start_after)?)
     }
 
@@ -526,7 +528,9 @@ where
         // and ephemerals are only handled while nothing is pending. A
         // `PersistentOnly` handler never subscribes the ephemeral stream at
         // all.
-        let mut persistent = self.select_lane(&state)?;
+        // The lane was required at registration, so there is no caller left
+        // here to correct it being off.
+        let mut persistent = self.select_lane(&state).narrow_rejected()?;
         let mut ephemeral =
             (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 
