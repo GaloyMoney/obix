@@ -112,9 +112,9 @@ impl std::fmt::Display for StreamPosition {
 }
 
 /// Caller-correctable outcomes of the checkpoint read-back and the
-/// caught-up barrier. See [`crate::error::SubscriptionRejection`]'s doc for
+/// caught-up barrier. See [`super::error::SubscriptionRejection`]'s doc for
 /// the full rationale.
-pub use crate::error::SubscriptionRejection;
+pub use super::error::SubscriptionRejection;
 
 /// A `{ checkpoint, frontier }` pair sampled by
 /// [`SubscriptionSnapshot::stream_status`], on the subscription's own lane.
@@ -462,7 +462,7 @@ where
     /// understate it. A caller acting on
     /// [`is_caught_up`](SubscriptionSnapshot::is_caught_up) therefore never acts
     /// on an optimistic reading. A stored checkpoint on the other lane is
-    /// refused as `Fatal(Config)` ([`crate::error::LaneMismatch`]) rather
+    /// refused as `Fatal(Config)` ([`crate::out::LaneMismatch`]) rather
     /// than reported as a rejection — the remedy is a code change, not a
     /// caller action.
     #[es_entity::errlanes::instrument(name = "obix.registered_handler.load", skip_all)]
@@ -731,7 +731,7 @@ fn decode_state(
 ) -> Result<OutboxEventJobState, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
     Ok(job
         .execution_state::<OutboxEventJobState>()
-        .map_err(crate::error::CouldNotDecodeStored::ExecutionState)?
+        .map_err(super::error::CouldNotDecodeStored::ExecutionState)?
         .unwrap_or_default())
 }
 

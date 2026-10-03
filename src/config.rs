@@ -116,7 +116,7 @@ pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
 pub enum CommitLane {
     /// No sequencer runs here: registering a
     /// [`CommitOrder`](crate::CommitOrder) subscriber fails with
-    /// [`CommitLaneDisabled`](crate::error::CommitLaneDisabled).
+    /// [`CommitLaneDisabled`](crate::out::CommitLaneDisabled).
     #[default]
     Disabled,
     /// This process sequences the commit lane and can host `CommitOrder`
@@ -193,7 +193,7 @@ impl MailboxConfig {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::CommitLaneDisabled;
+    use crate::out::CommitLaneDisabled;
     use es_entity::errlanes::{Fail, lanes};
 
     /// `CommitLaneDisabled` is the one rejected case the lane carrier can

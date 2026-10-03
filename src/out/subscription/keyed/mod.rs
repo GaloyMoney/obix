@@ -286,10 +286,10 @@ where
 // === Errors ===
 
 /// Why a set of wake keys could not be accepted. See
-/// [`crate::error::SubscribeError`]'s doc for the full rationale ([`WakeKeys`]
+/// [`crate::out::error::SubscribeError`]'s doc for the full rationale ([`WakeKeys`]
 /// makes the empty case unrepresentable at the call site, so this is
 /// reachable only through [`WakeKeys::try_from`]).
-pub use crate::error::SubscribeError;
+pub use crate::out::error::SubscribeError;
 
 // === Configuration ===
 
@@ -575,7 +575,7 @@ where
         self.jobs
             .keyed_handle(self.job_type.clone(), key_str.clone())
             .await?
-            .ok_or_else(|| crate::error::SubscriptionRejection::NoSuchSubscription {
+            .ok_or_else(|| SubscriptionRejection::NoSuchSubscription {
                 subscriber_type: self.job_type.to_string(),
                 key: key_str.clone(),
             })?;

@@ -15,13 +15,13 @@ use std::sync::{
 use std::time::Duration;
 
 use super::Outbox;
+pub use super::error::CommitLaneDisabled;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
     StreamPosition, Subscription, SubscriptionRejection, await_caught_up_commit_lane,
     await_caught_up_insert_lane, read_frontier,
 };
-use crate::error::CommitLaneDisabled;
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
 
@@ -82,7 +82,7 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<Self::Position, crate::error::LaneMismatch>;
+    ) -> Result<Self::Position, super::error::LaneMismatch>;
 
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
@@ -180,7 +180,7 @@ impl Lane for InsertOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<EventSequence, crate::error::LaneMismatch> {
+    ) -> Result<EventSequence, super::error::LaneMismatch> {
         Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .insert()
             .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))
@@ -269,7 +269,7 @@ impl Lane for CommitOrder {
     fn resume_from(
         sequence: EventSequence,
         commit: Option<CommitSequence>,
-    ) -> Result<CommitSequence, crate::error::LaneMismatch> {
+    ) -> Result<CommitSequence, super::error::LaneMismatch> {
         Ok(decide_lane(commit, sequence, Self::ORDERING)?
             .commit()
             .unwrap_or_else(|| unreachable_lane_choice(Self::ORDERING)))

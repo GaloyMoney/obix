@@ -266,7 +266,7 @@ pub(crate) fn decide_lane(
     stored_commit: Option<CommitSequence>,
     stored_insert: EventSequence,
     configured: Ordering,
-) -> Result<LaneChoice, crate::error::LaneMismatch> {
+) -> Result<LaneChoice, crate::out::error::LaneMismatch> {
     match (stored_commit, configured) {
         (None, Ordering::Insert) => Ok(LaneChoice::Insert(stored_insert)),
         (Some(commit_sequence), Ordering::Commit) => Ok(LaneChoice::Commit(commit_sequence)),
@@ -274,13 +274,13 @@ pub(crate) fn decide_lane(
             if stored_insert == EventSequence::BEGIN {
                 Ok(LaneChoice::Commit(CommitSequence::BEGIN))
             } else {
-                Err(crate::error::LaneMismatch {
+                Err(crate::out::error::LaneMismatch {
                     stored: Ordering::Insert,
                     configured: Ordering::Commit,
                 })
             }
         }
-        (Some(_), Ordering::Insert) => Err(crate::error::LaneMismatch {
+        (Some(_), Ordering::Insert) => Err(crate::out::error::LaneMismatch {
             stored: Ordering::Commit,
             configured: Ordering::Insert,
         }),
@@ -516,7 +516,9 @@ where
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
-            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::ExecutionState(e)))?
+            .map_err(|e| {
+                ObixFault::from(crate::out::error::CouldNotDecodeStored::ExecutionState(e))
+            })?
             .unwrap_or_default();
 
         // Two independent streams: the persistent backlog alone governs the
@@ -798,7 +800,7 @@ mod tests {
             decide_lane(None, EventSequence::from(12u64), Ordering::Commit).expect_err("refuses");
         assert_eq!(
             error,
-            crate::error::LaneMismatch {
+            crate::out::error::LaneMismatch {
                 stored: Ordering::Insert,
                 configured: Ordering::Commit,
             }
@@ -816,7 +818,7 @@ mod tests {
         .expect_err("refuses");
         assert_eq!(
             error,
-            crate::error::LaneMismatch {
+            crate::out::error::LaneMismatch {
                 stored: Ordering::Commit,
                 configured: Ordering::Insert,
             }

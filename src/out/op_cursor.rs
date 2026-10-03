@@ -50,4 +50,4 @@ impl<P, Tables> OpCursor<P, Tables> {
     }
 }
 
-pub use crate::error::CursorError;
+pub use super::error::CursorError;

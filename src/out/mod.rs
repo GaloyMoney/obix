@@ -2,6 +2,7 @@ mod all_listener;
 mod ctx;
 mod ephemeral;
 mod ephemeral_events_hook;
+mod error;
 mod event;
 mod gap_fill;
 mod lane;
@@ -24,7 +25,8 @@ use std::sync::Arc;
 pub use self::ctx::{
     EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
 };
-pub use self::lane::{CommitOrder, InsertOrder, Lane};
+pub use self::error::{CouldNotDecodeStored, LaneMismatch};
+pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscribeError, SubscriptionDef, Subscriptions,
     WakeKey, WakeKeys,
@@ -38,7 +40,7 @@ pub use self::subscription::{
 };
 use crate::{
     config::*,
-    error::{CommitLaneDisabled, ObixFault},
+    error::ObixFault,
     handle::OwnedTaskHandle,
     sequence::{CommitSequence, EventSequence},
     tables::*,
@@ -378,6 +380,8 @@ where
     /// via [`AtomicOperation::supports_hooks`](es_entity::AtomicOperation::supports_hooks),
     /// which is unambiguous where [`commit_hook`](es_entity::AtomicOperation::commit_hook)
     /// returning `None` is not (unsupported vs. supported-but-nothing-published-yet).
+    /// // @@ lets delete the entire cursor surface
+    /// we use the post-persist-hook mechanism instead.
     pub fn cursor(
         &self,
         op: &impl es_entity::AtomicOperation,

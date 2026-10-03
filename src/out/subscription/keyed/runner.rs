@@ -127,7 +127,7 @@ where
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
         let KeyMsg { key } = job.config()?;
         let key: D::Key = key.parse().map_err(|_| {
-            ObixFault::from(crate::error::CouldNotDecodeStored::Key {
+            ObixFault::from(crate::out::error::CouldNotDecodeStored::Key {
                 job_type: self.job_type.clone(),
             })
         })?;
@@ -213,7 +213,9 @@ where
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
-            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::InstanceConfig(e)))?;
+            .map_err(|e| {
+                ObixFault::from(crate::out::error::CouldNotDecodeStored::InstanceConfig(e))
+            })?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),
@@ -222,7 +224,9 @@ where
 
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
-            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::ExecutionState(e)))?
+            .map_err(|e| {
+                ObixFault::from(crate::out::error::CouldNotDecodeStored::ExecutionState(e))
+            })?
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
                 commit_sequence: None,
