@@ -1,4 +1,4 @@
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 use tokio::sync::mpsc;
 
 use std::{sync::Arc, time::Duration};
@@ -82,7 +82,7 @@ impl PersistentNotifier {
             let (min, max) = pending.expect("pending set before emit");
             match Self::emit(&pool, channel, min, max).await {
                 Ok(()) => pending = None,
-                Err(error) => record_notify_emit_failed(&Fault::from(error)),
+                Err(error) => record_notify_emit_failed(&ObixFault::from(error)),
             }
         }
     }
@@ -135,7 +135,7 @@ impl PersistentNotifier {
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_notify_emit_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
+fn record_notify_emit_failed(fault: &ObixFault) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

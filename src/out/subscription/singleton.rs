@@ -1,5 +1,5 @@
+use crate::error::ObixFault;
 use async_trait::async_trait;
-use es_entity::errlanes::{Fault, lanes};
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -505,8 +505,8 @@ where
         &self,
         state: &OutboxEventJobState,
     ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
-        let start_after = L::resume_from(state.sequence, state.commit_sequence)
-            .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+        let start_after =
+            L::resume_from(state.sequence, state.commit_sequence).map_err(ObixFault::from)?;
         Ok(self.outbox.listen::<L>(start_after)?)
     }
 
@@ -516,11 +516,7 @@ where
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
-            .map_err(|e| {
-                Fault::<lanes!(Transient, Fatal)>::from(
-                    crate::error::CouldNotDecodeStored::ExecutionState(e),
-                )
-            })?
+            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::ExecutionState(e)))?
             .unwrap_or_default();
 
         // Two independent streams: the persistent backlog alone governs the

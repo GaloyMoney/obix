@@ -26,7 +26,7 @@ pub use config::{
     DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
     DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
 };
-pub use error::{CommitLaneDisabled, CouldNotDecodeStored, LaneMismatch};
+pub use error::{CommitLaneDisabled, CouldNotDecodeStored, LaneMismatch, ObixFault};
 
 pub use inbox::{
     Inbox, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
@@ -49,6 +49,6 @@ pub use tables::MailboxTables;
 pub use tables::{PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
-    decode_persistent_event, record_ephemeral_event_type_undecodable,
+    decode_inbox_status, decode_persistent_event, record_ephemeral_event_type_undecodable,
     record_ephemeral_payload_undecodable, record_tracing_context_undecodable,
 };

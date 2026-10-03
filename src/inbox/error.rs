@@ -20,7 +20,7 @@ pub enum InboxRejection {
 #[cfg(test)]
 mod tests {
     use super::{InboxEventId, InboxRejection};
-    use crate::error::CouldNotDecodeStored;
+    use crate::error::{CouldNotDecodeStored, ObixFault};
     use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, lanes};
     use std::error::Error as _;
 
@@ -46,6 +46,32 @@ mod tests {
     fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
         let err: Fail<InboxRejection, lanes!(Transient, Fatal)> = sqlx::Error::PoolTimedOut.into();
         assert!(err.is_transient());
+    }
+
+    /// Rule 4 survives the storage layer staying on `sqlx::Error`: an
+    /// unreadable `inbox_events.status` is handed over as a `ColumnDecode`,
+    /// which errlanes lanes as `Fatal(CorruptState)` one level up, with the
+    /// named wrapper still in the chain to say which column it was.
+    #[test]
+    fn an_unreadable_stored_status_stays_fatal_corrupt_state_through_sqlx() {
+        let err = crate::decode_inbox_status("bogus").expect_err("not a known status");
+        assert!(matches!(err, sqlx::Error::ColumnDecode { .. }));
+
+        let fault: ObixFault = err.into();
+        let Fault::Fatal(fatal) = fault else {
+            panic!("expected Fatal(CorruptState), got {fault:?}")
+        };
+        assert_eq!(fatal.kind, FatalKind::CorruptState);
+
+        let mut link = fatal.source();
+        while let Some(e) = link {
+            if let Some(wrapper) = e.downcast_ref::<CouldNotDecodeStored>() {
+                assert!(wrapper.to_string().contains("bogus"));
+                return;
+            }
+            link = e.source();
+        }
+        panic!("the named wrapper must stay in the chain");
     }
 
     /// job's own id-choosing spawn rejects with `JobRejection::DuplicateId`

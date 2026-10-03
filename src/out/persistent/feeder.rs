@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument;
@@ -502,7 +502,7 @@ where
                     {
                         Ok(events) => events,
                         Err(e) => {
-                            record_catch_up_failed(&Fault::from(e), u64::from(cursor));
+                            record_catch_up_failed(&ObixFault::from(e), u64::from(cursor));
                             tokio::time::sleep(RETRY_INTERVAL).await;
                             continue;
                         }
@@ -562,7 +562,7 @@ where
         from = from,
     ),
 )]
-fn record_catch_up_failed(fault: &Fault<lanes!(Transient, Fatal)>, from: u64) {
+fn record_catch_up_failed(fault: &ObixFault, from: u64) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

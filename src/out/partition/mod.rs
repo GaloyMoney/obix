@@ -27,7 +27,7 @@ mod job;
 pub use job::PartitionMaintainerConfig;
 pub(crate) use job::{PartitionMaintainerJobData, PartitionMaintainerJobInitializer};
 
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 
 use std::marker::PhantomData;
 
@@ -93,7 +93,7 @@ where
     async fn ddl_lock(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         let table = Tables::persistent_outbox_events_table();
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("obix:partition-ddl:{table}"))
@@ -124,7 +124,7 @@ where
     /// That failure is intentional: it surfaces the stall as a failing job (the
     /// alert) rather than being silently absorbed. Run
     /// [`recover_default`](Self::recover_default) to repair.
-    pub async fn ensure(&self) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    pub async fn ensure(&self) -> Result<(), ObixFault> {
         let head = u64::from(Tables::highest_known_persistent_sequence(&self.pool).await?);
         let first = head / DEFAULT_PARTITION_WIDTH;
         let mut tx = self.pool.begin().await?;
@@ -155,7 +155,7 @@ where
     /// decision: runbook + alert first, automate only if it recurs). It is
     /// exposed for operators and exercised by the test suite. Idempotent: a
     /// no-op when `DEFAULT` is already empty.
-    pub async fn recover_default(&self) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    pub async fn recover_default(&self) -> Result<(), ObixFault> {
         let mut tx = self.pool.begin().await?;
         self.ddl_lock(&mut tx).await?;
         self.recover_one(
@@ -179,7 +179,7 @@ where
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         table: &str,
         key: &str,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         let default_child = format!("{table}_default");
         let default_old = format!("{table}_default_old");
 

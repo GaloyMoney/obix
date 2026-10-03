@@ -1202,32 +1202,24 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn find_inbox_event_by_id(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     id: #crate_name::inbox::InboxEventId,
-                ) -> impl std::future::Future<Output = Result<
-                    #crate_name::inbox::InboxEvent,
-                    #crate_name::prelude::es_entity::errlanes::Fail<
-                        #crate_name::inbox::InboxRejection,
-                        #crate_name::prelude::es_entity::errlanes::lanes!(Transient, Fatal),
-                    >,
-                >> + Send
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::inbox::InboxEvent>, sqlx::Error>> + Send
                 {
                     let pool = pool.clone();
 
                     async move {
-                        let row = sqlx::query!(
+                        let Some(row) = sqlx::query!(
                             #find_inbox_event_by_id_query,
                             id as #crate_name::inbox::InboxEventId
                         )
                         .fetch_optional(&pool)
                         .await?
-                        .ok_or_else(|| {
-                            #crate_name::prelude::es_entity::errlanes::Fail::Rejected(
-                                #crate_name::inbox::InboxRejection::NotFound(id)
-                            )
-                        })?;
+                        else {
+                            return Ok(None);
+                        };
 
-                        let status: #crate_name::inbox::InboxEventStatus = row.status.parse()?;
+                        let status = #crate_name::decode_inbox_status(&row.status)?;
 
-                        Ok(#crate_name::inbox::InboxEvent {
+                        Ok(Some(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
                             idempotency_key: row.idempotency_key,
                             payload: row.payload,
@@ -1235,7 +1227,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             error: row.error,
                             recorded_at: row.recorded_at,
                             processed_at: row.processed_at,
-                        })
+                        }))
                     }
                 }
 
@@ -1243,12 +1235,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     status: #crate_name::inbox::InboxEventStatus,
                     limit: usize,
-                ) -> impl std::future::Future<Output = Result<
-                    Vec<#crate_name::inbox::InboxEvent>,
-                    #crate_name::prelude::es_entity::errlanes::Fault<
-                        #crate_name::prelude::es_entity::errlanes::lanes!(Transient, Fatal),
-                    >,
-                >> + Send
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::inbox::InboxEvent>, sqlx::Error>> + Send
                 {
                     let pool = pool.clone();
 
@@ -1263,12 +1250,10 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                         // A `for` loop rather than `.map(..).collect()`: the
                         // async block's own return type then carries each
-                        // `?`, so the carrier is spelled once — in the
-                        // signature — instead of again as a collect turbofish.
+                        // `?`, with no error type spelled in the body.
                         let mut events = Vec::with_capacity(rows.len());
                         for row in rows {
-                            let status: #crate_name::inbox::InboxEventStatus =
-                                row.status.parse()?;
+                            let status = #crate_name::decode_inbox_status(&row.status)?;
 
                             events.push(#crate_name::inbox::InboxEvent {
                                 id: #crate_name::inbox::InboxEventId::from(row.id),

@@ -10,7 +10,7 @@
 //! rebuilt from it via [`SubscriptionDef::instantiate`] on every wake, pause
 //! expiry and retry, so nothing may be cached in the instance between runs.
 
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -127,7 +127,7 @@ where
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
         let KeyMsg { key } = job.config()?;
         let key: D::Key = key.parse().map_err(|_| {
-            Fault::<lanes!(Transient, Fatal)>::from(crate::error::CouldNotDecodeStored::Key {
+            ObixFault::from(crate::error::CouldNotDecodeStored::Key {
                 job_type: self.job_type.clone(),
             })
         })?;
@@ -213,11 +213,7 @@ where
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
-            .map_err(|e| {
-                Fault::<lanes!(Transient, Fatal)>::from(
-                    crate::error::CouldNotDecodeStored::InstanceConfig(e),
-                )
-            })?;
+            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::InstanceConfig(e)))?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),
@@ -226,11 +222,7 @@ where
 
         let mut state = current_job
             .execution_state::<OutboxEventJobState>()
-            .map_err(|e| {
-                Fault::<lanes!(Transient, Fatal)>::from(
-                    crate::error::CouldNotDecodeStored::ExecutionState(e),
-                )
-            })?
+            .map_err(|e| ObixFault::from(crate::error::CouldNotDecodeStored::ExecutionState(e)))?
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
                 commit_sequence: None,
@@ -378,7 +370,7 @@ where
                                     current_job.clock(),
                                 )
                                 .await
-                                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                                .map_err(ObixFault::from)?;
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     current_job
                                         .update_execution_state_in_op(&mut op, &state)
@@ -387,7 +379,7 @@ where
                                 mirror
                                     .mirror(&mut op, state.sequence)
                                     .await
-                                    .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                                    .map_err(ObixFault::from)?;
                                 return Ok(job::JobCompletion::CompleteWithOp(op));
                             }
                         }

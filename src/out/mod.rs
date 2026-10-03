@@ -14,7 +14,7 @@ mod pg_notify;
 mod post_persist_hook;
 mod subscription;
 
-use es_entity::errlanes::{Fail, Fault, lanes};
+use es_entity::errlanes::{Fail, lanes};
 use es_entity::{ResultExt, clock::ClockHandle};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -38,7 +38,7 @@ pub use self::subscription::{
 };
 use crate::{
     config::*,
-    error::CommitLaneDisabled,
+    error::{CommitLaneDisabled, ObixFault},
     handle::OwnedTaskHandle,
     sequence::{CommitSequence, EventSequence},
     tables::*,
@@ -143,10 +143,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub async fn init(
-        pool: &sqlx::PgPool,
-        config: MailboxConfig,
-    ) -> Result<Self, Fault<lanes!(Transient, Fatal)>> {
+    pub async fn init(pool: &sqlx::PgPool, config: MailboxConfig) -> Result<Self, ObixFault> {
         let pool = pool.clone();
 
         let (persistent_notification_tx, persistent_notification_rx) =
@@ -280,9 +277,7 @@ where
         *deps = rebuilt.into();
     }
 
-    pub async fn begin_op(
-        &self,
-    ) -> Result<es_entity::DbOp<'static>, Fault<lanes!(Transient, Fatal)>> {
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, ObixFault> {
         Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
     }
 
@@ -338,7 +333,7 @@ where
         &self,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         let now = self.clock.manual_now();
         let event =
             Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
@@ -354,7 +349,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         event_type: EphemeralEventType,
         event: impl Into<P>,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
             self.ephemeral_cache.cache_fill_sender().clone(),
             event_type,
@@ -596,7 +591,7 @@ where
         jobs: &mut ::job::Jobs,
         config: subscription::keyed::KeyedSubscriberConfig,
         def: D,
-    ) -> Result<Subscriptions<D, P, Tables>, Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<Subscriptions<D, P, Tables>, ObixFault> {
         let def = Arc::new(def);
         let initializer = subscription::keyed::KeyedSubscriberJobInitializer::<D, P, Tables>::new(
             self.clone(),
@@ -659,9 +654,7 @@ where
     /// yet, and needs no table scan. This is the same value
     /// [`SubscriptionSnapshot::stream_status`] compares a handler's checkpoint
     /// against.
-    pub async fn highest_known_persistent_sequence(
-        &self,
-    ) -> Result<EventSequence, Fault<lanes!(Transient, Fatal)>> {
+    pub async fn highest_known_persistent_sequence(&self) -> Result<EventSequence, ObixFault> {
         Ok(subscription::read_frontier::<Tables>(&self.pool).await?)
     }
 
@@ -686,7 +679,7 @@ where
         &self,
         jobs: &mut ::job::Jobs,
         config: PartitionMaintainerConfig,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         let partitions = Partitions::<Tables>::new(&self.pool, self.partition_premake);
 
         // The synchronous write path must never wait on the async maintainer,
@@ -708,21 +701,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use es_entity::errlanes::{Fault, Transient, TransientKind, lanes};
+    use crate::error::ObixFault;
+    use es_entity::errlanes::{Fault, Transient, TransientKind};
 
     /// A fault-only carrier never rejects — a `sqlx::Error` enters it
     /// straight through errlanes' own blanket classification via bare
     /// `?`/`.into()`, with no obix-specific conversion in between.
     #[test]
     fn a_pool_timeout_classifies_as_transient() {
-        let err: Fault<lanes!(Transient, Fatal)> = sqlx::Error::PoolTimedOut.into();
+        let err: ObixFault = sqlx::Error::PoolTimedOut.into();
         assert!(matches!(err, Fault::Transient(_)));
         assert!(err.is_transient());
     }
 
     #[test]
     fn row_not_found_classifies_as_fatal() {
-        let err: Fault<lanes!(Transient, Fatal)> = sqlx::Error::RowNotFound.into();
+        let err: ObixFault = sqlx::Error::RowNotFound.into();
         assert!(err.is_fatal());
     }
 
@@ -730,7 +724,7 @@ mod tests {
     /// path a `sqlx::Error` takes, just skipping the classification step.
     #[test]
     fn an_already_laned_transient_widens_in_unchanged() {
-        let err: Fault<lanes!(Transient, Fatal)> = Transient::new(TransientKind::Deadlock).into();
+        let err: ObixFault = Transient::new(TransientKind::Deadlock).into();
         assert!(err.is_contention());
     }
 }

@@ -1,10 +1,9 @@
 use serde::{Serialize, de::DeserializeOwned};
 
-use es_entity::errlanes::{Fail, Fault, lanes};
 use es_entity::hooks::HookOperation;
 
 use crate::{
-    inbox::{InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey, InboxRejection},
+    inbox::{InboxEvent, InboxEventId, InboxEventStatus, InboxIdempotencyKey},
     out::{
         DecodeFailure, EphemeralEventType, EphemeralOutboxEvent, OutboxEventId,
         PersistentOutboxEvent, UndecodableEventError,
@@ -119,6 +118,26 @@ pub fn record_ephemeral_event_type_undecodable(error: &serde_json::Error, event_
     fields(otel.status_code = "ERROR", error = %error)
 )]
 pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
+
+/// Decode a stored `inbox_events.status`, invoked from `MailboxTables`
+/// derive output.
+///
+/// The failure travels as `sqlx::Error::ColumnDecode` carrying
+/// [`CouldNotDecodeStored::InboxStatus`](crate::CouldNotDecodeStored) as its
+/// source. That keeps the storage layer uniformly on `sqlx::Error` —
+/// `MailboxTables` classifies nothing — without losing rule 4: errlanes
+/// lanes `ColumnDecode` as `Fatal(CorruptState)` where the inbox classifies
+/// one level up, and the named wrapper stays in the chain to say which
+/// column was unreadable.
+#[doc(hidden)]
+pub fn decode_inbox_status(stored: &str) -> Result<InboxEventStatus, sqlx::Error> {
+    stored.parse().map_err(
+        |source: crate::error::CouldNotDecodeStored| sqlx::Error::ColumnDecode {
+            index: "status".to_string(),
+            source: Box::new(source),
+        },
+    )
+}
 
 /// One page/batch of decoded persistent rows: each item is one committed
 /// sequence position — `Ok` for a decoded event or a placeholder, `Err`
@@ -353,10 +372,14 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + Send + Sync;
 
+    /// `None` is the plain absence of a row. Whether that is a caller
+    /// outcome ([`InboxRejection::NotFound`](crate::InboxRejection), at
+    /// `Inbox::find_event_by_id`) or an invariant (the handler job, reading
+    /// the row it was spawned beside) is not the storage layer's call.
     fn find_inbox_event_by_id(
         pool: &sqlx::PgPool,
         id: InboxEventId,
-    ) -> impl Future<Output = Result<InboxEvent, Fail<InboxRejection, lanes!(Transient, Fatal)>>> + Send;
+    ) -> impl Future<Output = Result<Option<InboxEvent>, sqlx::Error>> + Send;
 
     fn update_inbox_event_status(
         pool: &sqlx::PgPool,
@@ -377,7 +400,7 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         status: InboxEventStatus,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<InboxEvent>, Fault<lanes!(Transient, Fatal)>>> + Send;
+    ) -> impl Future<Output = Result<Vec<InboxEvent>, sqlx::Error>> + Send;
 
     // === Keyed-subscriber subscription methods ===
 

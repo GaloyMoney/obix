@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::{Fault, lanes};
+use es_entity::errlanes::Fatal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use job::{
 };
 
 use super::{InboxEvent, InboxEventId, InboxEventStatus};
+use crate::error::ObixFault;
 use crate::tables::MailboxTables;
 
 pub enum InboxResult {
@@ -138,9 +139,17 @@ where
             None,
         )
         .await
-        .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+        .map_err(ObixFault::from)?;
 
-        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id).await?;
+        // Not `InboxRejection::NotFound`: this job was spawned in the same
+        // op that inserted the row, so there is no caller left to correct
+        // its absence — the row was deleted under a live job.
+        let event = Tables::find_inbox_event_by_id(&self.pool, self.inbox_event_id)
+            .await
+            .map_err(ObixFault::from)?
+            .ok_or_else(|| {
+                Fatal::invariant("the inbox event row this job was spawned beside is gone")
+            })?;
 
         let result = self.handler.handle(&event).await;
 
@@ -154,7 +163,7 @@ where
                     None,
                 )
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
                 Ok(JobCompletion::Complete)
             }
             Ok(InboxResult::ReprocessNow) => {
@@ -166,7 +175,7 @@ where
                     None,
                 )
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
                 Ok(JobCompletion::RescheduleNow)
             }
             Ok(InboxResult::ReprocessIn(duration)) => {
@@ -178,7 +187,7 @@ where
                     None,
                 )
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
             Err(e) => {
@@ -190,7 +199,7 @@ where
                     Some(&e.to_string()),
                 )
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
                 Err(e)
             }
         }

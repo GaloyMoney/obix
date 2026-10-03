@@ -1,4 +1,4 @@
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -324,7 +324,7 @@ where
                     }
                     Err(error) => {
                         attempts += 1;
-                        record_compensation_failed(&Fault::from(error), attempts);
+                        record_compensation_failed(&ObixFault::from(error), attempts);
                         if attempts >= Self::COMPENSATION_MAX_ATTEMPTS {
                             // The stall episode proves and fills them later.
                             return;
@@ -365,7 +365,7 @@ where
                     (marker, head)
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&Fault::from(error));
+                    record_gap_fill_failed(&ObixFault::from(error));
                     return Vec::new();
                 }
             },
@@ -390,7 +390,7 @@ where
             {
                 Ok(events) => events,
                 Err(error) => {
-                    record_gap_fill_failed(&Fault::from(error));
+                    record_gap_fill_failed(&ObixFault::from(error));
                     return Vec::new();
                 }
             };
@@ -424,7 +424,7 @@ where
             // meanwhile.
             Ok(false) => Vec::new(),
             Err(error) => {
-                record_gap_fill_failed(&Fault::from(error));
+                record_gap_fill_failed(&ObixFault::from(error));
                 Vec::new()
             }
         }
@@ -455,7 +455,7 @@ where
                         marker
                     }
                     Err(error) => {
-                        record_gap_fill_failed(&Fault::from(error));
+                        record_gap_fill_failed(&ObixFault::from(error));
                         self.historical_due = Some(now + Self::REFILL_INTERVAL);
                         return Vec::new();
                     }
@@ -468,7 +468,7 @@ where
                     return Vec::new();
                 }
                 Err(error) => {
-                    record_gap_fill_failed(&Fault::from(error));
+                    record_gap_fill_failed(&ObixFault::from(error));
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                     return Vec::new();
                 }
@@ -547,7 +547,7 @@ where
                 }
             }
             Err(error) => {
-                record_gap_fill_failed(&Fault::from(error));
+                record_gap_fill_failed(&ObixFault::from(error));
                 if !historical_batch.is_empty() {
                     self.historical_due = Some(now + Self::REFILL_INTERVAL);
                 }
@@ -595,7 +595,7 @@ fn deliver_and_notify<P>(
         attempts = attempts,
     ),
 )]
-fn record_compensation_failed(fault: &Fault<lanes!(Transient, Fatal)>, attempts: u32) {
+fn record_compensation_failed(fault: &ObixFault, attempts: u32) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }
@@ -613,7 +613,7 @@ fn record_compensation_failed(fault: &Fault<lanes!(Transient, Fatal)>, attempts:
         exception.type = tracing::field::Empty,
     ),
 )]
-fn record_gap_fill_failed(fault: &Fault<lanes!(Transient, Fatal)>) {
+fn record_gap_fill_failed(fault: &ObixFault) {
     use es_entity::errlanes::Laned;
     fault.record(&tracing::Span::current());
 }

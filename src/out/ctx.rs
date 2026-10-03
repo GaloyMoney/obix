@@ -61,7 +61,7 @@
 //! backpressure, single-instance exporters), which also brings dormancy for
 //! free.
 
-use es_entity::errlanes::{Fault, lanes};
+use crate::error::ObixFault;
 use serde::{Deserialize, Serialize};
 
 use std::marker::PhantomData;
@@ -319,7 +319,7 @@ impl<'inv, B> EventCtx<'inv, B> {
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?,
+                .map_err(ObixFault::from)?,
         );
         let op = parts.op_slot.as_mut().expect("just materialized above");
         Ok(IsolatedOp { op })
@@ -508,7 +508,7 @@ pub(crate) async fn flush_batch<B: Default>(
                     parts.current_job.clock(),
                 )
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?,
+                .map_err(ObixFault::from)?,
             );
         }
         // Drain before the call: on error the items are dropped with the op,
@@ -540,11 +540,9 @@ pub(crate) async fn flush_batch<B: Default>(
         mirror
             .mirror(&mut op, parts.state.sequence)
             .await
-            .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+            .map_err(ObixFault::from)?;
     }
-    op.commit()
-        .await
-        .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+    op.commit().await.map_err(ObixFault::from)?;
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
@@ -565,7 +563,7 @@ pub(crate) async fn persist_checkpoint(
 ) -> Result<(), HandlerError> {
     let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock())
         .await
-        .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+        .map_err(ObixFault::from)?;
     current_job
         .update_execution_state_in_op(&mut op, state)
         .await?;
@@ -573,11 +571,9 @@ pub(crate) async fn persist_checkpoint(
         mirror
             .mirror(&mut op, state.sequence)
             .await
-            .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+            .map_err(ObixFault::from)?;
     }
-    op.commit()
-        .await
-        .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+    op.commit().await.map_err(ObixFault::from)?;
     Ok(())
 }
 
@@ -670,7 +666,7 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
         let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
         Ok(StagedOp {
             op,
             parts,
@@ -793,9 +789,7 @@ impl<'inv> StagedOp<'inv> {
             parts,
             event_seq,
         } = self;
-        op.commit()
-            .await
-            .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+        op.commit().await.map_err(ObixFault::from)?;
         Ok(Suspended { parts, event_seq })
     }
 
@@ -882,7 +876,7 @@ impl<'inv> Suspended<'inv> {
         let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await
-                .map_err(Fault::<lanes!(Transient, Fatal)>::from)?;
+                .map_err(ObixFault::from)?;
         Ok(StagedOp {
             op,
             parts,

@@ -21,12 +21,13 @@
 mod runner;
 mod waker;
 
-use es_entity::errlanes::{Fail, Fault, lanes};
+use es_entity::errlanes::{Fail, lanes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
 
 use job::JobType;
 
+use crate::error::ObixFault;
 use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
 use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
@@ -467,7 +468,7 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, ObixFault> {
         let key_str = key.to_string();
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
@@ -538,14 +539,14 @@ where
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: &D::Key,
-    ) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    ) -> Result<(), ObixFault> {
         Tables::delete_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
         Ok(())
     }
 
     /// [`cancel_in_op`](Self::cancel_in_op), standalone.
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel", skip_all)]
-    pub async fn cancel(&self, key: &D::Key) -> Result<(), Fault<lanes!(Transient, Fatal)>> {
+    pub async fn cancel(&self, key: &D::Key) -> Result<(), ObixFault> {
         let mut op = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
         self.cancel_in_op(&mut op, key).await?;
         op.commit().await?;
