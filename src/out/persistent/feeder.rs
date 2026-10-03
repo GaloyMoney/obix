@@ -501,7 +501,10 @@ where
                     {
                         Ok(events) => events,
                         Err(e) => {
-                            record_catch_up_failed(&e, u64::from(cursor));
+                            record_catch_up_failed(
+                                &crate::error::OutboxFault::from(e),
+                                u64::from(cursor),
+                            );
                             tokio::time::sleep(RETRY_INTERVAL).await;
                             continue;
                         }
@@ -551,9 +554,20 @@ where
     name = "obix.persistent_cache.catch_up_failed",
     level = "warn",
     skip_all,
-    fields(error = %error, from = from),
+    fields(
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        from = from,
+    ),
 )]
-fn record_catch_up_failed(error: &sqlx::Error, from: u64) {}
+fn record_catch_up_failed(fault: &crate::error::OutboxFault, from: u64) {
+    use es_entity::errlanes::Laned;
+    fault.record(&tracing::Span::current());
+}
 
 #[cfg(test)]
 mod tests {
