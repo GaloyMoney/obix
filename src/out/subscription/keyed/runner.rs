@@ -125,8 +125,10 @@ where
         _spawner: job::KeyedJobSpawner<Self::Config>,
     ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
         let KeyMsg { key } = job.config()?;
-        let key: D::Key = key.parse().map_err(|_| -> Box<dyn std::error::Error> {
-            "keyed subscriber: could not parse the persisted key".into()
+        let key: D::Key = key.parse().map_err(|_| {
+            crate::error::OutboxFault::from(crate::error::CouldNotDecodeStored::Key {
+                job_type: self.job_type.clone(),
+            })
         })?;
         Ok(Box::new(KeyedSubscriberJobRunner {
             outbox: self.outbox.clone(),
@@ -209,7 +211,12 @@ where
         // The factory runs fresh every run: every wake, pause expiry, retry,
         // on any node. The subscriber must be cheap to build and stateless
         // between runs — durable state is the cursor plus its own entities.
-        let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)?;
+        let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
+            .map_err(|e| {
+                crate::error::OutboxFault::from(crate::error::CouldNotDecodeStored::InstanceConfig(
+                    e,
+                ))
+            })?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),
@@ -217,7 +224,12 @@ where
         };
 
         let mut state = current_job
-            .execution_state::<OutboxEventJobState>()?
+            .execution_state::<OutboxEventJobState>()
+            .map_err(|e| {
+                crate::error::OutboxFault::from(crate::error::CouldNotDecodeStored::ExecutionState(
+                    e,
+                ))
+            })?
             .unwrap_or(OutboxEventJobState {
                 sequence: row.start_after,
                 commit_sequence: None,
@@ -277,7 +289,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
                     None => {
@@ -290,7 +302,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         continue;
                     }
                 }
@@ -316,7 +328,7 @@ where
                         if tracker.persisted < StreamPosition::Insert(state.sequence) {
                             persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                 .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                .map_err(widen_handler_error)?;
                         }
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
@@ -344,7 +356,7 @@ where
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                         .await
-                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                        .map_err(widen_handler_error)?;
                                 }
                                 return Ok(job::JobCompletion::RescheduleNow);
                             }
@@ -364,13 +376,17 @@ where
                                     current_job.pool(),
                                     current_job.clock(),
                                 )
-                                .await?;
+                                .await
+                                .map_err(crate::error::OutboxFault::from)?;
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     current_job
                                         .update_execution_state_in_op(&mut op, &state)
                                         .await?;
                                 }
-                                mirror.mirror(&mut op, state.sequence).await?;
+                                mirror
+                                    .mirror(&mut op, state.sequence)
+                                    .await
+                                    .map_err(crate::error::OutboxFault::from)?;
                                 return Ok(job::JobCompletion::CompleteWithOp(op));
                             }
                         }
@@ -379,7 +395,7 @@ where
                         if tracker.persisted < StreamPosition::Insert(state.sequence) => {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         tracker.persisted = StreamPosition::Insert(state.sequence);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
@@ -399,7 +415,7 @@ where
                                 if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                     persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                         .await
-                                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                        .map_err(widen_handler_error)?;
                                 }
                                 return Ok(job::JobCompletion::RescheduleNow);
                             }
@@ -420,7 +436,7 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                     match subscriber.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             state.sequence = undecodable.sequence;
@@ -430,9 +446,9 @@ where
                             if tracker.persisted < StreamPosition::Insert(state.sequence) {
                                 persist_checkpoint(&mut current_job, &state, Some(&mirror))
                                     .await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                    .map_err(widen_handler_error)?;
                             }
-                            return Err(error as Box<dyn std::error::Error>);
+                            return Err(error);
                         }
                     }
                 }
@@ -453,7 +469,7 @@ where
             let outcome = subscriber
                 .handle(ctx, &event)
                 .await
-                .map_err(|e| e as Box<dyn std::error::Error>)?
+                .map_err(widen_handler_error)?
                 .outcome;
 
             match outcome {
@@ -472,11 +488,11 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "pause_entry")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                     if !landed {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror))
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                     }
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
@@ -492,7 +508,7 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "staged_pause")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
                 Outcome::Skip => {
@@ -514,7 +530,7 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                 }
                 Outcome::Collect => {
                     // Real work — this member is not idle. Restart linger.
@@ -530,7 +546,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                     }
                 }
             }

@@ -111,56 +111,12 @@ impl std::fmt::Display for StreamPosition {
 }
 
 /// Caller-correctable outcomes of the checkpoint read-back and the
-/// caught-up barrier. Everything else — a raw sqlx fault, an undecodable
-/// stored execution state, the handler job's own failure — travels as
-/// `Transient`/`Fatal` in [`SubscriptionError`] instead of as a variant
-/// here.
-///
-/// The handler job's own `JobError` is deliberately narrowed into the fault
-/// lanes (`::job::JobError::narrow_rejected`) at every call site, never
-/// lifted into a variant here: a failure reading the handler job is
-/// subscription-internal plumbing, not one of the subscription's own domain
-/// outcomes.
-#[derive(Debug, es_entity::errlanes::Rejection)]
-pub enum SubscriptionRejection {
-    /// The stored checkpoint is on the other [`Lane`] from the one this handle
-    /// is typed for; the two cursors count different things.
-    #[error("SubscriptionError - LaneMismatch: {0}")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_LANE_MISMATCH")]
-    LaneMismatch(String),
-    /// A keyed member's job could not be resolved from
-    /// `(subscriber_type, key)` — no job of that type has ever been spawned
-    /// under the key. Distinct from a cancelled subscription, whose job rows
-    /// outlive the `subscriptions` row.
-    #[error("SubscriptionError - NoSuchJob: no job for ({subscriber_type}, {key})")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_NO_SUCH_JOB")]
-    NoSuchJob {
-        subscriber_type: String,
-        key: String,
-    },
-    /// [`Subscription::await_position`] — or
-    /// [`await_caught_up`](Subscription::await_caught_up), which
-    /// delegates to it — hit its deadline. Carries the observed lag so the
-    /// caller can alert with real numbers instead of reporting a bare
-    /// timeout.
-    ///
-    /// `target` is the position being awaited: the caller's own for
-    /// `await_position`, the call-time frontier for `await_caught_up`. It names
-    /// its lane, so on the commit lane it says which half of the fence ran out.
-    #[error(
-        "SubscriptionError - CaughtUpTimeout: checkpoint {checkpoint} behind target {target} after {waited:?}"
-    )]
-    #[rejection(code = "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT")]
-    CaughtUpTimeout {
-        checkpoint: StreamPosition,
-        target: StreamPosition,
-        waited: Duration,
-    },
-}
+/// caught-up barrier. See [`crate::error::SubscriptionRejection`]'s doc for
+/// the full rationale.
+pub use crate::error::SubscriptionRejection;
 
 /// Failure modes of the checkpoint read-back and the caught-up barrier.
-pub type SubscriptionError =
-    es_entity::errlanes::Fail<SubscriptionRejection, es_entity::errlanes::lanes!(Transient, Fatal)>;
+pub use crate::error::SubscriptionError;
 
 /// A `{ checkpoint, frontier }` pair sampled by
 /// [`SubscriptionSnapshot::stream_status`], on the subscription's own lane.
@@ -487,8 +443,7 @@ where
             JobAnchor::Keyed(anchor) => anchor
                 .jobs
                 .keyed_handle(anchor.job_type.clone(), anchor.key.clone())
-                .await
-                .map_err(::job::JobError::narrow_rejected)?
+                .await?
                 .ok_or_else(|| {
                     SubscriptionError::from(SubscriptionRejection::NoSuchJob {
                         subscriber_type: anchor.job_type.to_string(),
@@ -507,18 +462,14 @@ where
     /// understate it. A caller acting on
     /// [`is_caught_up`](SubscriptionSnapshot::is_caught_up) therefore never acts
     /// on an optimistic reading. A stored checkpoint on the other lane is
-    /// refused with [`SubscriptionError::LaneMismatch`] rather than reported.
-    #[tracing::instrument(name = "obix.registered_handler.load", skip_all, err)]
+    /// refused as `Fatal(Config)` ([`crate::error::LaneMismatch`]) rather
+    /// than reported as a rejection — the remedy is a code change, not a
+    /// caller action.
+    #[es_entity::errlanes::instrument(name = "obix.registered_handler.load", skip_all)]
     pub async fn load(&self) -> Result<SubscriptionSnapshot<L>, SubscriptionError> {
-        let job = self
-            .handle()
-            .await?
-            .load()
-            .await
-            .map_err(::job::JobError::narrow_rejected)?;
+        let job = self.handle().await?.load().await?;
         let state = decode_state(&job)?;
-        L::resume_from(state.sequence, state.commit_sequence)
-            .map_err(|e| SubscriptionError::from(SubscriptionRejection::LaneMismatch(e)))?;
+        L::resume_from(state.sequence, state.commit_sequence)?;
         let checkpoint = L::checkpoint(state.sequence, state.commit_sequence);
         let frontier = self.frontier().await?;
         Ok(SubscriptionSnapshot {
@@ -550,16 +501,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`SubscriptionError::CaughtUpTimeout`] — carrying the
+    /// Returns [`SubscriptionRejection::CaughtUpTimeout`] — carrying the
     /// observed checkpoint, the target and the elapsed wait — if the deadline
     /// passes first.
-    #[tracing::instrument(
+    #[es_entity::errlanes::instrument(
         name = "obix.registered_handler.await_position",
         skip_all,
         // Not `target`: that name collides with `instrument`'s own span-target
         // argument.
-        fields(target_position = %target, timeout_ms = timeout.as_millis()),
-        err
+        fields(target_position = %target, timeout_ms = timeout.as_millis())
     )]
     pub async fn await_position(
         &self,
@@ -623,13 +573,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`SubscriptionError::CaughtUpTimeout`] — where `target`
+    /// Returns [`SubscriptionRejection::CaughtUpTimeout`] — where `target`
     /// is the sampled frontier — if the deadline passes first.
-    #[tracing::instrument(
+    #[es_entity::errlanes::instrument(
         name = "obix.registered_handler.await_caught_up",
         skip_all,
-        fields(timeout_ms = timeout.as_millis()),
-        err
+        fields(timeout_ms = timeout.as_millis())
     )]
     pub async fn await_caught_up(&self, timeout: Duration) -> Result<(), SubscriptionError> {
         L::await_caught_up(self, timeout).await
@@ -656,8 +605,7 @@ where
             .handle()
             .await?
             .execution_state::<OutboxEventJobState>()
-            .await
-            .map_err(::job::JobError::narrow_rejected)?
+            .await?
             .unwrap_or_default();
         Ok(L::checkpoint(state.sequence, state.commit_sequence))
     }
@@ -674,11 +622,10 @@ where
     /// already rules the commit lane out.
     pub(crate) fn sequencer_positions(&self) -> Result<&SequencerPositions, SubscriptionError> {
         self.positions.as_ref().ok_or_else(|| {
-            SubscriptionError::from(SubscriptionRejection::LaneMismatch(
+            SubscriptionError::from(es_entity::errlanes::Fatal::invariant(
                 "a commit-lane subscription without sequencer positions is unreachable: the lane \
                  cannot be registered on an outbox that runs no sequencer, and keyed \
-                 subscriptions are insert-lane by construction"
-                    .to_string(),
+                 subscriptions are insert-lane by construction",
             ))
         })
     }
@@ -773,53 +720,20 @@ pub(super) async fn read_frontier<Tables: MailboxTables>(
 /// are both at the beginning (semantics 4).
 fn decode_state(job: &::job::JobSnapshot) -> Result<OutboxEventJobState, SubscriptionError> {
     Ok(job
-        .execution_state::<OutboxEventJobState>()?
+        .execution_state::<OutboxEventJobState>()
+        .map_err(crate::error::CouldNotDecodeStored::ExecutionState)?
         .unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use es_entity::errlanes::{Fail, Rejection};
-
-    #[test]
-    fn lane_mismatch_enters_subscription_error_as_rejected() {
-        let err: SubscriptionError =
-            SubscriptionRejection::LaneMismatch("wrong lane".into()).into();
-        assert!(matches!(
-            err,
-            Fail::Rejected(SubscriptionRejection::LaneMismatch(_))
-        ));
-    }
-
-    #[test]
-    fn rejection_codes_are_stable() {
-        let mismatch: &'static str = SubscriptionRejection::LaneMismatch(String::new())
-            .code()
-            .into();
-        assert_eq!(mismatch, "OBIX_SUBSCRIPTION_LANE_MISMATCH");
-
-        let no_such_job: &'static str = SubscriptionRejection::NoSuchJob {
-            subscriber_type: String::new(),
-            key: String::new(),
-        }
-        .code()
-        .into();
-        assert_eq!(no_such_job, "OBIX_SUBSCRIPTION_NO_SUCH_JOB");
-
-        let timeout: &'static str = SubscriptionRejection::CaughtUpTimeout {
-            checkpoint: StreamPosition::Insert(EventSequence::BEGIN),
-            target: StreamPosition::Insert(EventSequence::BEGIN),
-            waited: Duration::ZERO,
-        }
-        .code()
-        .into();
-        assert_eq!(timeout, "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT");
-    }
 
     /// A raw sqlx fault never rejects — it enters SubscriptionError's fault
     /// lanes through errlanes' own blanket classification, with no
-    /// subscription-specific conversion in between.
+    /// subscription-specific conversion in between. Rejection codes and the
+    /// `LaneMismatch`/`CouldNotDecodeStored` fault wrappers are tested in
+    /// `crate::error`, where those types live.
     #[test]
     fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
         let err: SubscriptionError = sqlx::Error::RowNotFound.into();

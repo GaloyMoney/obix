@@ -11,9 +11,11 @@ use std::time::Duration;
 use futures::{StreamExt, TryStreamExt};
 use obix::{
     CommitLane, CommitLaneDisabled, CommitOrder, CommitSequence, EventCtx, EventDelivery,
-    EventSequence, FlushOp, Handled, InsertOrder, MailboxConfig, Ordering, OutboxEventJobConfig,
-    SingletonSubscriber, StreamPosition, SubscriptionRejection, UndecodableDelivery, out::Outbox,
-    prelude::es_entity::errlanes::Fail,
+    EventSequence, FlushOp, Handled, InsertOrder, LaneMismatch, MailboxConfig, Ordering,
+    OutboxEventJobConfig, SingletonSubscriber, StreamPosition, SubscriptionRejection,
+    UndecodableDelivery,
+    out::Outbox,
+    prelude::es_entity::errlanes::{Fail, FatalKind},
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -1081,13 +1083,20 @@ async fn registration_infers_the_lane_and_refuses_a_switch() -> anyhow::Result<(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match commit.load().await {
-        Err(Fail::Rejected(SubscriptionRejection::LaneMismatch(message))) => {
+        Err(Fail::Fatal(f)) => {
+            assert_eq!(f.kind, FatalKind::Config);
+            let mismatch = std::error::Error::source(&f)
+                .and_then(|s| s.downcast_ref::<LaneMismatch>())
+                .expect("LaneMismatch must be the Fatal's source");
             assert!(
-                message.contains("register a new job type"),
-                "the refusal must say what to do instead: {message}",
+                mismatch.to_string().contains("register a new job type"),
+                "the refusal must say what to do instead: {mismatch}",
             );
         }
-        other => anyhow::bail!("expected LaneMismatch, got {other:?}", other = other.err()),
+        other => anyhow::bail!(
+            "expected Fatal(Config)/LaneMismatch, got {other:?}",
+            other = other.err()
+        ),
     }
 
     Ok(())
@@ -1169,10 +1178,9 @@ async fn disabled_lane_refuses_commit_order_at_registration() -> anyhow::Result<
             Skipper,
         )
         .await;
-    let error = refused.expect_err("registration must be refused");
     assert!(
-        error.downcast_ref::<CommitLaneDisabled>().is_some(),
-        "registration must fail with CommitLaneDisabled, got: {error}",
+        matches!(refused, Err(Fail::Rejected(CommitLaneDisabled))),
+        "registration must fail with CommitLaneDisabled, got: {refused:?}",
     );
     let jobs_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1")
         .bind(JOB_TYPE)

@@ -1,47 +1,21 @@
-/// Caller-correctable outcomes of an inbox operation. Everything else —
-/// sqlx faults, an undecodable stored payload, the handler job's own
-/// failure — travels as `Transient`/`Fatal` in [`InboxError`] instead of as
-/// a variant here.
-///
-/// The job service's own errors are deliberately narrowed into the fault
-/// lanes rather than lifted into this rejection: a failure reading or
-/// awaiting the handler job is an inbox-internal plumbing problem, not one
-/// of the inbox's own domain outcomes.
-#[derive(Debug, es_entity::errlanes::Rejection)]
-pub enum InboxRejection {
-    #[error("InboxError - NotFound: {0}")]
-    #[rejection(code = "OBIX_INBOX_EVENT_NOT_FOUND")]
-    NotFound(super::InboxEventId),
-    #[error("InboxError - InvalidStatus: {0}")]
-    #[rejection(code = "OBIX_INBOX_INVALID_STATUS")]
-    InvalidStatus(String),
-}
+/// Caller-correctable outcomes of an inbox operation. See
+/// [`crate::error::InboxRejection`]'s doc for the full rationale.
+pub use crate::error::InboxRejection;
 
-pub type InboxError =
-    es_entity::errlanes::Fail<InboxRejection, es_entity::errlanes::lanes!(Transient, Fatal)>;
+pub use crate::error::InboxError;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use es_entity::errlanes::{Fail, Rejection};
+    use super::super::InboxEventId;
+    use crate::error::{CouldNotDecodeStored, InboxError, InboxRejection};
+    use es_entity::errlanes::{Fail, FatalKind};
+    use std::error::Error as _;
 
     #[test]
     fn not_found_enters_inbox_error_as_rejected() {
-        let id = super::super::InboxEventId::new();
+        let id = InboxEventId::new();
         let err: InboxError = InboxRejection::NotFound(id).into();
         assert!(matches!(err, Fail::Rejected(InboxRejection::NotFound(found)) if found == id));
-    }
-
-    #[test]
-    fn rejection_codes_are_stable() {
-        let id = super::super::InboxEventId::new();
-        let not_found: &'static str = InboxRejection::NotFound(id).code().into();
-        assert_eq!(not_found, "OBIX_INBOX_EVENT_NOT_FOUND");
-
-        let invalid: &'static str = InboxRejection::InvalidStatus("bogus".to_string())
-            .code()
-            .into();
-        assert_eq!(invalid, "OBIX_INBOX_INVALID_STATUS");
     }
 
     /// A raw sqlx fault never rejects — it enters InboxError's fault lanes
@@ -51,5 +25,38 @@ mod tests {
     fn a_raw_sqlx_fault_classifies_rather_than_rejects() {
         let err: InboxError = sqlx::Error::PoolTimedOut.into();
         assert!(err.is_transient());
+    }
+
+    /// job's own id-choosing spawn rejects with `JobRejection::DuplicateId`
+    /// only when the caller handed it an id it already used for a
+    /// different job; after a *fresh* `insert_inbox_event` that can only
+    /// mean the inbox's own id generation collided with a job the inbox
+    /// itself spawned earlier, which is an invariant, not something a
+    /// caller of `persist_and_queue_job*` can correct. See
+    /// `Inbox::persist_and_queue_job_in_op`, which `narrow_rejected`s the
+    /// job service's `JobError` into the fault lanes rather than lifting it
+    /// into `InboxRejection`.
+    #[test]
+    fn a_duplicate_job_id_after_a_fresh_insert_is_fatal_invariant() {
+        let job_id = ::job::JobId::new();
+        let job_error: ::job::JobError =
+            es_entity::errlanes::Fail::Rejected(::job::JobRejection::DuplicateId(job_id));
+        let fault = job_error.narrow_rejected();
+        match fault {
+            es_entity::errlanes::Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Invariant);
+                assert!(
+                    f.source()
+                        .unwrap()
+                        .downcast_ref::<::job::JobRejection>()
+                        .is_some()
+                );
+            }
+            other => panic!("expected Fatal(Invariant), got {other:?}"),
+        }
+        // Sanity: a `CouldNotDecodeStored` fault that bare-`?`s into
+        // `InboxError` is unaffected by this narrowing path — the two are
+        // independent entry points into the same fault lanes.
+        let _: InboxError = CouldNotDecodeStored::InboxStatus("bogus".into()).into();
     }
 }

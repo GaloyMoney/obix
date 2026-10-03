@@ -1217,10 +1217,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::NotFound(id))
                         })?;
 
-                        let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                            .map_err(|e| {
-                                #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::InvalidStatus(e))
-                            })?;
+                        let status: #crate_name::inbox::InboxEventStatus = row.status.parse()?;
 
                         Ok(#crate_name::inbox::InboxEvent {
                             id: #crate_name::inbox::InboxEventId::from(row.id),
@@ -1254,10 +1251,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                         let events = rows
                             .into_iter()
                             .map(|row| {
-                                let status: #crate_name::inbox::InboxEventStatus = row.status.parse()
-                                    .map_err(|e| {
-                                        #crate_name::inbox::InboxError::from(#crate_name::inbox::InboxRejection::InvalidStatus(e))
-                                    })?;
+                                let status: #crate_name::inbox::InboxEventStatus =
+                                    row.status.parse()?;
 
                                 Ok(#crate_name::inbox::InboxEvent {
                                     id: #crate_name::inbox::InboxEventId::from(row.id),

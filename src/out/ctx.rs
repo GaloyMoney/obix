@@ -74,6 +74,24 @@ use crate::sequence::{CommitSequence, EventSequence};
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Widen a [`HandlerError`] into the plain `Box<dyn Error>` the runner
+/// traits return (fixed by `job`, which does not widen to `+ Send + Sync`;
+/// see job 0.17.0's `JobRunner`/`ResidentJobRunner`).
+///
+/// A coercion, not a `From` conversion: dropping the `Send + Sync` auto
+/// traits from a trait object is a coercion the compiler performs at
+/// specific sites (a let binding or return with an explicit type, a
+/// function argument) — there is no `impl From<Box<dyn Error + Send +
+/// Sync>> for Box<dyn Error>` to ride a bare `?` on (both types are
+/// foreign, so such an impl would violate the orphan rule even if errlanes
+/// wanted to supply one). This function's return-type annotation is that
+/// coercion site, named once so every runner's `?` sites after a
+/// `HandlerError`-returning call stay bare `.map_err(widen_handler_error)?`
+/// rather than repeating `as Box<dyn std::error::Error>` everywhere.
+pub(crate) fn widen_handler_error(e: HandlerError) -> Box<dyn std::error::Error> {
+    e
+}
+
 /// Persisted execution state of an outbox event-handler job: the sequence of
 /// the last fully handled persistent event, plus (keyed subscribers only)
 /// where the member last paused.
@@ -299,7 +317,8 @@ impl<'inv, B> EventCtx<'inv, B> {
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?,
+                .await
+                .map_err(crate::error::OutboxFault::from)?,
         );
         let op = parts.op_slot.as_mut().expect("just materialized above");
         Ok(IsolatedOp { op })
@@ -487,7 +506,8 @@ pub(crate) async fn flush_batch<B: Default>(
                     parts.current_job.pool(),
                     parts.current_job.clock(),
                 )
-                .await?,
+                .await
+                .map_err(crate::error::OutboxFault::from)?,
             );
         }
         // Drain before the call: on error the items are dropped with the op,
@@ -516,9 +536,12 @@ pub(crate) async fn flush_batch<B: Default>(
         .update_execution_state_in_op(&mut op, parts.state)
         .await?;
     if let Some(mirror) = parts.mirror {
-        mirror.mirror(&mut op, parts.state.sequence).await?;
+        mirror
+            .mirror(&mut op, parts.state.sequence)
+            .await
+            .map_err(crate::error::OutboxFault::from)?;
     }
-    op.commit().await?;
+    op.commit().await.map_err(crate::error::OutboxFault::from)?;
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
@@ -537,14 +560,19 @@ pub(crate) async fn persist_checkpoint(
     state: &OutboxEventJobState,
     mirror: Option<&dyn CheckpointMirror>,
 ) -> Result<(), HandlerError> {
-    let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+    let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock())
+        .await
+        .map_err(crate::error::OutboxFault::from)?;
     current_job
         .update_execution_state_in_op(&mut op, state)
         .await?;
     if let Some(mirror) = mirror {
-        mirror.mirror(&mut op, state.sequence).await?;
+        mirror
+            .mirror(&mut op, state.sequence)
+            .await
+            .map_err(crate::error::OutboxFault::from)?;
     }
-    op.commit().await?;
+    op.commit().await.map_err(crate::error::OutboxFault::from)?;
     Ok(())
 }
 
@@ -636,7 +664,8 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?;
+                .await
+                .map_err(crate::error::OutboxFault::from)?;
         Ok(StagedOp {
             op,
             parts,
@@ -759,7 +788,7 @@ impl<'inv> StagedOp<'inv> {
             parts,
             event_seq,
         } = self;
-        op.commit().await?;
+        op.commit().await.map_err(crate::error::OutboxFault::from)?;
         Ok(Suspended { parts, event_seq })
     }
 
@@ -845,7 +874,8 @@ impl<'inv> Suspended<'inv> {
         let Suspended { parts, event_seq } = self;
         let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?;
+                .await
+                .map_err(crate::error::OutboxFault::from)?;
         Ok(StagedOp {
             op,
             parts,

@@ -116,34 +116,13 @@ pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
 pub enum CommitLane {
     /// No sequencer runs here: registering a
     /// [`CommitOrder`](crate::CommitOrder) subscriber fails with
-    /// [`CommitLaneDisabled`].
+    /// [`CommitLaneDisabled`](crate::error::CommitLaneDisabled).
     #[default]
     Disabled,
     /// This process sequences the commit lane and can host `CommitOrder`
     /// subscribers.
     Enabled,
 }
-
-/// Why a lane's frontier could not be read: either the lane is disabled
-/// ([`CommitLaneDisabled`], the one caller-correctable case), or reading it
-/// hit an infrastructure fault — a raw `sqlx::Error` enters either lane
-/// through the blanket `errlanes` classification for it, via bare `?`.
-pub type FrontierError =
-    es_entity::errlanes::Fail<CommitLaneDisabled, es_entity::errlanes::lanes!(Transient, Fatal)>;
-
-/// The commit lane is off for this outbox. Raised at registration, before any
-/// job is spawned, so a consumer that needs the lane fails at startup.
-///
-/// Purely caller-correctable (enable the lane in config), so it is a bare
-/// [`errlanes::Rejection`](es_entity::errlanes::Rejection) — both on its own,
-/// where it is returned directly throughout [`out::lane`](crate::out), and
-/// lifted into [`FrontierError`] where a frontier read can also fault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, es_entity::errlanes::Rejection)]
-#[rejection(code = "OBIX_COMMIT_LANE_DISABLED")]
-#[error(
-    "the commit lane is disabled on this outbox — set MailboxConfig::commit_lane = CommitLane::Enabled"
-)]
-pub struct CommitLaneDisabled;
 
 #[derive(Clone, Builder)]
 pub struct MailboxConfig {
@@ -214,21 +193,15 @@ impl MailboxConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use es_entity::errlanes::{Fail, Rejection};
+    use crate::error::{CommitLaneDisabled, LaneError};
+    use es_entity::errlanes::Fail;
 
-    /// `CommitLaneDisabled` is the one rejected case `FrontierError` can
-    /// carry — a bare `?`/`.into()` must land it in the `Rejected` lane,
-    /// not get swallowed into `Fatal` as an unclassified error would.
+    /// `CommitLaneDisabled` is the one rejected case `LaneError` can carry —
+    /// a bare `?`/`.into()` must land it in the `Rejected` lane, not get
+    /// swallowed into `Fatal` as an unclassified error would.
     #[test]
-    fn commit_lane_disabled_enters_frontier_error_as_rejected() {
-        let err: FrontierError = CommitLaneDisabled.into();
+    fn commit_lane_disabled_enters_lane_error_as_rejected() {
+        let err: LaneError = CommitLaneDisabled.into();
         assert!(matches!(err, Fail::Rejected(CommitLaneDisabled)));
-    }
-
-    #[test]
-    fn commit_lane_disabled_has_a_stable_code() {
-        let code: &'static str = CommitLaneDisabled.code().into();
-        assert_eq!(code, "OBIX_COMMIT_LANE_DISABLED");
     }
 }

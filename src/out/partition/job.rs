@@ -122,10 +122,7 @@ where
         // `ensure` error (propagated below — the scheduler then retries per
         // `retry_settings`, which is the alert).
         loop {
-            self.partitions
-                .ensure()
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            self.partitions.ensure().await?;
 
             tokio::select! {
                 biased;

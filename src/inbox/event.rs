@@ -64,7 +64,7 @@ impl InboxEventStatus {
 }
 
 impl FromStr for InboxEventStatus {
-    type Err = String;
+    type Err = crate::error::CouldNotDecodeStored;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -72,7 +72,9 @@ impl FromStr for InboxEventStatus {
             "processing" => Ok(Self::Processing),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            _ => Err(format!("Unknown inbox event status: {}", s)),
+            _ => Err(crate::error::CouldNotDecodeStored::InboxStatus(
+                s.to_string(),
+            )),
         }
     }
 }

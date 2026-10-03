@@ -265,7 +265,7 @@ pub(crate) fn decide_lane(
     stored_commit: Option<CommitSequence>,
     stored_insert: EventSequence,
     configured: Ordering,
-) -> Result<LaneChoice, String> {
+) -> Result<LaneChoice, crate::error::LaneMismatch> {
     match (stored_commit, configured) {
         (None, Ordering::Insert) => Ok(LaneChoice::Insert(stored_insert)),
         (Some(commit_sequence), Ordering::Commit) => Ok(LaneChoice::Commit(commit_sequence)),
@@ -273,18 +273,16 @@ pub(crate) fn decide_lane(
             if stored_insert == EventSequence::BEGIN {
                 Ok(LaneChoice::Commit(CommitSequence::BEGIN))
             } else {
-                Err(format!(
-                    "subscription is checkpointed on the insert lane at sequence \
-                     {stored_insert}; switching lanes is unsupported — register a new job \
-                     type instead"
-                ))
+                Err(crate::error::LaneMismatch {
+                    stored: Ordering::Insert,
+                    configured: Ordering::Commit,
+                })
             }
         }
-        (Some(_), Ordering::Insert) => Err(
-            "subscription was checkpointed under Ordering::Commit; switching back to \
-             Ordering::Insert is unsupported — register a new job type instead"
-                .to_string(),
-        ),
+        (Some(_), Ordering::Insert) => Err(crate::error::LaneMismatch {
+            stored: Ordering::Commit,
+            configured: Ordering::Insert,
+        }),
     }
 }
 
@@ -308,6 +306,15 @@ pub enum Ordering {
     /// source transaction's events are contiguous and a batch flush never
     /// splits one.
     Commit,
+}
+
+impl std::fmt::Display for Ordering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insert => f.write_str("insert"),
+            Self::Commit => f.write_str("commit"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -483,7 +490,7 @@ where
                         self.handler
                             .handle_ephemeral(&event)
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                     }
                     None => return Ok(ResidentJobCompletion::RescheduleNow),
                 },
@@ -497,7 +504,8 @@ where
         &self,
         state: &OutboxEventJobState,
     ) -> Result<crate::out::LaneListener<L, P>, Box<dyn std::error::Error>> {
-        let start_after = L::resume_from(state.sequence, state.commit_sequence)?;
+        let start_after = L::resume_from(state.sequence, state.commit_sequence)
+            .map_err(crate::error::OutboxFault::from)?;
         Ok(self.outbox.listen::<L>(start_after)?)
     }
 
@@ -506,7 +514,12 @@ where
         mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
         let mut state = current_job
-            .execution_state::<OutboxEventJobState>()?
+            .execution_state::<OutboxEventJobState>()
+            .map_err(|e| {
+                crate::error::OutboxFault::from(crate::error::CouldNotDecodeStored::ExecutionState(
+                    e,
+                ))
+            })?
             .unwrap_or_default();
 
         // Two independent streams: the persistent backlog alone governs the
@@ -549,7 +562,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     None if in_group => match persistent.next().await {
@@ -564,7 +577,7 @@ where
                             };
                             flush_batch(&mut parts, &mut batch, &flusher, "stream_closed")
                                 .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                .map_err(widen_handler_error)?;
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
                     },
@@ -578,7 +591,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         continue;
                     }
                 }
@@ -589,7 +602,7 @@ where
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                .map_err(widen_handler_error)?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
@@ -597,7 +610,7 @@ where
                         if tracker.persisted < checkpoint_of::<L>(&state) => {
                         persist_checkpoint(&mut current_job, &state, None)
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         tracker.persisted = checkpoint_of::<L>(&state);
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
@@ -626,7 +639,7 @@ where
                         self.handler
                             .handle_ephemeral(&event)
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                         continue;
                     }
                     NextDelivery::Persistent(Some(item)) => item,
@@ -634,7 +647,7 @@ where
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, None)
                                 .await
-                                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                .map_err(widen_handler_error)?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
@@ -663,7 +676,7 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                     match self.handler.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             // INVARIANT: both cursors advance. Leaving
@@ -677,9 +690,9 @@ where
                             if tracker.persisted < checkpoint_of::<L>(&state) {
                                 persist_checkpoint(&mut current_job, &state, None)
                                     .await
-                                    .map_err(|e| e as Box<dyn std::error::Error>)?;
+                                    .map_err(widen_handler_error)?;
                             }
-                            return Err(error as Box<dyn std::error::Error>);
+                            return Err(error);
                         }
                     }
                 }
@@ -705,7 +718,7 @@ where
                 .handler
                 .handle_persistent(ctx, &event)
                 .await
-                .map_err(|e| e as Box<dyn std::error::Error>)?
+                .map_err(widen_handler_error)?
                 .outcome;
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
@@ -722,7 +735,7 @@ where
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit")
                         .await
-                        .map_err(|e| e as Box<dyn std::error::Error>)?;
+                        .map_err(widen_handler_error)?;
                 }
                 Outcome::Collect => {
                     if tracker.collected >= self.max_batch_size && !in_group {
@@ -735,7 +748,7 @@ where
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full")
                             .await
-                            .map_err(|e| e as Box<dyn std::error::Error>)?;
+                            .map_err(widen_handler_error)?;
                     }
                 }
                 Outcome::Pause(_) | Outcome::CommitAndPause(_) => {
@@ -786,7 +799,14 @@ mod tests {
     fn switching_an_established_subscription_to_commit_is_refused() {
         let error =
             decide_lane(None, EventSequence::from(12u64), Ordering::Commit).expect_err("refuses");
-        assert!(error.contains("register a new job type"), "{error}");
+        assert_eq!(
+            error,
+            crate::error::LaneMismatch {
+                stored: Ordering::Insert,
+                configured: Ordering::Commit,
+            }
+        );
+        assert!(error.to_string().contains("register a new job type"));
     }
 
     #[test]
@@ -797,6 +817,13 @@ mod tests {
             Ordering::Insert,
         )
         .expect_err("refuses");
-        assert!(error.contains("register a new job type"), "{error}");
+        assert_eq!(
+            error,
+            crate::error::LaneMismatch {
+                stored: Ordering::Commit,
+                configured: Ordering::Insert,
+            }
+        );
+        assert!(error.to_string().contains("register a new job type"));
     }
 }

@@ -283,48 +283,11 @@ where
 
 // === Errors ===
 
-/// Why a set of wake keys could not be accepted.
-///
-/// Purely caller-correctable — the caller built a bad set of wake keys — so
-/// this is a bare [`errlanes::Rejection`](es_entity::errlanes::Rejection)
-/// rather than a `Fail`/`Fault`: nothing else can go wrong here.
-#[derive(Debug, es_entity::errlanes::Rejection)]
-pub enum SubscribeError {
-    /// A runtime-built collection of wake keys turned out to be empty.
-    ///
-    /// Matching is set overlap, so an empty set intersects nothing: no event
-    /// could ever reach such a subscription through the waker, and the first
-    /// time it passivated it would stay Dormant forever with its events
-    /// unread.
-    ///
-    /// [`WakeKeys`] makes that unrepresentable, so this is reachable only
-    /// through [`WakeKeys::try_from`] — the one place a type cannot decide,
-    /// because the keys came from data rather than from the call site. It is
-    /// deliberately raised *there* rather than inside
-    /// [`Subscriptions::subscribe_in_op`], so the caller handles it where the
-    /// domain context to interpret an empty set actually exists.
-    ///
-    /// A subscriber that genuinely wants waking on *every* event says so
-    /// explicitly: declare one constant key and return that key from
-    /// [`SubscriptionDef::wake_keys`] for every event. That costs a wake per
-    /// event by construction, which is the point — the price is visible in
-    /// the caller's own code instead of hidden in an empty vector.
-    #[error("SubscribeError - EmptyWakeKeys: a subscription must declare at least one wake key")]
-    #[rejection(code = "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS")]
-    EmptyWakeKeys,
-}
-
-#[cfg(test)]
-mod subscribe_error_tests {
-    use super::*;
-    use es_entity::errlanes::Rejection;
-
-    #[test]
-    fn has_a_stable_code() {
-        let code: &'static str = SubscribeError::EmptyWakeKeys.code().into();
-        assert_eq!(code, "OBIX_SUBSCRIBE_EMPTY_WAKE_KEYS");
-    }
-}
+/// Why a set of wake keys could not be accepted. See
+/// [`crate::error::SubscribeError`]'s doc for the full rationale ([`WakeKeys`]
+/// makes the empty case unrepresentable at the call site, so this is
+/// reachable only through [`WakeKeys::try_from`]).
+pub use crate::error::SubscribeError;
 
 // === Configuration ===
 
@@ -496,15 +459,14 @@ where
     /// non-empty by construction — a single [`WakeKey`] converts directly.
     /// See [`WakeKeys`] for why an empty set is a subscription that could
     /// never be woken, and how to build one from runtime data.
-    #[tracing::instrument(name = "obix.subscriptions.subscribe_in_op", skip_all, err)]
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscribe_in_op", skip_all)]
     pub async fn subscribe_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, crate::error::OutboxFault> {
         let key_str = key.to_string();
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
@@ -570,22 +532,19 @@ where
     /// Cancel a subscription on the caller's own operation — atomic with,
     /// e.g., deletion of the domain entity it belongs to. Row absence is the
     /// tombstone: no job-kill API exists or is needed.
-    #[tracing::instrument(name = "obix.subscriptions.cancel_in_op", skip_all, err)]
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: &D::Key,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::error::OutboxFault> {
         Tables::delete_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
         Ok(())
     }
 
     /// [`cancel_in_op`](Self::cancel_in_op), standalone.
-    #[tracing::instrument(name = "obix.subscriptions.cancel", skip_all, err)]
-    pub async fn cancel(
-        &self,
-        key: &D::Key,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel", skip_all)]
+    pub async fn cancel(&self, key: &D::Key) -> Result<(), crate::error::OutboxFault> {
         let mut op = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
         self.cancel_in_op(&mut op, key).await?;
         op.commit().await?;
@@ -600,19 +559,21 @@ where
     /// registers with `inherits_state = true`). It is safe to hold — holding
     /// a job handle instead would report checkpoint 0 from the next wake
     /// onward.
-    #[tracing::instrument(name = "obix.subscriptions.subscription", skip_all, err)]
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscription", skip_all)]
     pub async fn subscription(
         &self,
         key: &D::Key,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<Subscription<P, InsertOrder, Tables>, crate::error::SubscriptionError> {
         let key_str = key.to_string();
         // Resolved once here only to report "never subscribed" as an error
         // rather than deferring it to the first read.
         self.jobs
             .keyed_handle(self.job_type.clone(), key_str.clone())
             .await?
-            .ok_or("no subscription has ever existed for this key")?;
+            .ok_or_else(|| crate::error::SubscriptionRejection::NoSuchSubscription {
+                subscriber_type: self.job_type.to_string(),
+                key: key_str.clone(),
+            })?;
         Ok(Subscription::new_keyed(
             self.jobs.clone(),
             self.job_type.clone(),
