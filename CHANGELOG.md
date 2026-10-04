@@ -1,3 +1,11 @@
+# [obix release v0.14.0](https://github.com/GaloyMoney/obix/releases/tag/0.14.0)
+
+
+
+### Refactor
+
+- [**breaking**] Full errlanes v2 adoption across obix (#168)
+
 # [obix release v0.13.1](https://github.com/GaloyMoney/obix/releases/tag/0.13.1)
 
 
