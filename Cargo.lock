@@ -480,9 +480,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.16.4"
+version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12b0ba34b51a7b2850046fdfb47f85e2f805596b83020f263c8898cc157d019f"
+checksum = "4ad73f968958cb57e46067e7396a445a2041512a8b1fb4fce9276edb255ac568"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.16.4"
+version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21701f4b136dfe93499fe03821fe2b21bb0a0bad96a5041638ad4a9f926c3540"
+checksum = "c83273887ff3e9b7b4d8546caac81c9915c81925c7c76834e77642656315b247"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -506,9 +506,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.16.4"
+version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db94d1830e884d28f53ce97823e3e502e3f80b925ddc42c51099b78380e2cb08"
+checksum = "0b4ab68ddaa46abe700c0324ecfb96a891ef1aeaeff834130ca99507faeb9eb7"
 dependencies = [
  "async-stream",
  "chrono",
@@ -533,9 +533,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.16.4"
+version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "259aea19a4019b5f41ecc0b9f1f3c22ed182dd5764b3ec96b2bbe5edb1d66e76"
+checksum = "8278b4dad42d20b5c8e23dac2c8fea33b8485e57b0094044629494686f4e905f"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -1212,7 +1212,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tracing",
