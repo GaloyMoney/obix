@@ -168,8 +168,9 @@ pub struct DecodeFailure {
 /// [`Display`](std::fmt::Display) prints the serde error only — the raw
 /// payload is available on [`failure`](Self::failure) but never hits log
 /// lines by accident.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, es_entity::errlanes::Classify)]
 #[error("undecodable persistent outbox event {id} at sequence {sequence}: {}", failure.error)]
+#[classify(fatal(CorruptState))]
 pub struct UndecodableEventError {
     pub id: OutboxEventId,
     pub sequence: EventSequence,

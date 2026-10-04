@@ -61,6 +61,7 @@
 //! backpressure, single-instance exporters), which also brings dormancy for
 //! free.
 
+use crate::error::ObixFault;
 use serde::{Deserialize, Serialize};
 
 use std::marker::PhantomData;
@@ -73,6 +74,24 @@ use crate::sequence::{CommitSequence, EventSequence};
 
 /// Error type shared with the handler trait methods.
 pub(crate) type HandlerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Decode the running job's committed state. Absent — no execution row, or a
+/// job that has not checkpointed yet — reads as `None`, which each runner
+/// resolves to its own starting cursor.
+///
+/// Both runners decode the same type under the same rule-4 override, so it is
+/// written once; the laned return is what makes `.map_err(Variant)?` enough at
+/// the two call sites, and it has to happen in a laned frame. Boxing the
+/// wrapper raw would leave the boundary's `Fault::classify` to find the bare
+/// `serde_json::Error` underneath and lane it `Fatal(Invariant)` — silently
+/// losing the `Fatal(CorruptState)` these bytes earn by coming out of Postgres.
+pub(crate) fn decode_execution_state(
+    current_job: &CurrentJob,
+) -> Result<Option<OutboxEventJobState>, ObixFault> {
+    Ok(current_job
+        .execution_state::<OutboxEventJobState>()
+        .map_err(crate::out::error::CouldNotDecodeStored::ExecutionState)?)
+}
 
 /// Persisted execution state of an outbox event-handler job: the sequence of
 /// the last fully handled persistent event, plus (keyed subscribers only)
@@ -129,6 +148,12 @@ pub(crate) struct BatchTracker {
 /// keeps the mirror atomic with the checkpoint by construction: both writes
 /// land on the same op, so the copy can never claim progress the job did not
 /// commit.
+///
+/// `sqlx::Error`, not a laned carrier: obix owns this trait (it is driven by
+/// the runner, never by an es-entity `CommitHook`), and every implementation
+/// is a single `Tables::` call, so sqlx is the only error the method can
+/// produce — rule 3. Nothing is lost by leaving it raw: the sole caller is
+/// [`commit_checkpoint`], which is laned, so `?` classifies it there.
 pub(crate) trait CheckpointMirror: Send + Sync {
     fn mirror<'a>(
         &'a self,
@@ -507,21 +532,36 @@ pub(crate) async fn flush_batch<B: Default>(
             }));
         }
     }
-    let mut op = parts
+    let op = parts
         .op_slot
         .take()
         .expect("a pending batch always has an op by now");
-    parts
-        .current_job
-        .update_execution_state_in_op(&mut op, parts.state)
-        .await?;
-    if let Some(mirror) = parts.mirror {
-        mirror.mirror(&mut op, parts.state.sequence).await?;
-    }
-    op.commit().await?;
+    commit_checkpoint(parts.current_job, op, parts.state, parts.mirror).await?;
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(())
+}
+
+/// Write the checkpoint — and, for a keyed member, its mirrored copy — onto
+/// `op`, then commit.
+///
+/// The one place both land, which is what makes the mirror atomic with the
+/// checkpoint by construction: the copy can never claim progress the job did
+/// not commit. Shared by [`flush_batch`] (which brings the batch's own op) and
+/// [`persist_checkpoint`] (which opens one just for this).
+pub(crate) async fn commit_checkpoint(
+    current_job: &mut CurrentJob,
+    mut op: es_entity::DbOp<'static>,
+    state: &OutboxEventJobState,
+    mirror: Option<&dyn CheckpointMirror>,
+) -> Result<(), ObixFault> {
+    current_job
+        .update_execution_state_in_op(&mut op, state)
+        .await?;
+    if let Some(mirror) = mirror {
+        mirror.mirror(&mut op, state.sequence).await?;
+    }
+    Ok(op.commit().await?)
 }
 
 /// Persist the checkpoint on its own — used for skip-only stretches where no
@@ -536,16 +576,9 @@ pub(crate) async fn persist_checkpoint(
     current_job: &mut CurrentJob,
     state: &OutboxEventJobState,
     mirror: Option<&dyn CheckpointMirror>,
-) -> Result<(), HandlerError> {
-    let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
-    current_job
-        .update_execution_state_in_op(&mut op, state)
-        .await?;
-    if let Some(mirror) = mirror {
-        mirror.mirror(&mut op, state.sequence).await?;
-    }
-    op.commit().await?;
-    Ok(())
+) -> Result<(), ObixFault> {
+    let op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+    commit_checkpoint(current_job, op, state, mirror).await
 }
 
 // === Keyed subscribers ===

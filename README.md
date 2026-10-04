@@ -169,6 +169,85 @@ let mut listener = outbox.listen_ephemeral();
 let mut listener = outbox.listen_all(None);
 ```
 
+## Errors and telemetry
+
+obix's public methods return one of four `errlanes` carriers. Every `Fail`
+signature spells itself — there are no `FooError` aliases — so a reader sees
+which rejection they are handed, which is exactly what they have to branch
+on. `ObixFault`, the fault-only carrier, is the one alias: it has no
+rejection to hide. The rejections and fault wrappers the carriers name are
+documented in `src/error.rs` (`InboxRejection` beside the inbox API that
+returns it) and re-exported from `obix::`, `obix::out::` and
+`obix::inbox::`:
+
+| carrier | returned by |
+|---|---|
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
+| `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
+
+`ObixFault` is `obix::ObixFault`; `Fail` and `lanes!` come from `errlanes`,
+re-exported as `obix::prelude::es_entity::errlanes` — a downstream signature
+that spells a `Fail` carrier names them from there.
+
+`Outbox::listen` / `listen_commit_ordered` return a bare
+`errlanes::Rejection` on its own (`CommitLaneDisabled`). Two methods stay on
+`sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit` pins it:
+`Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`. And
+`Outbox::begin_op` / `Inbox::begin_op` keep it by rule 3 — opening an op can
+fail no other way, so there is nothing to classify it against.
+
+The `MailboxTables` storage trait is `sqlx::Error` throughout — it classifies
+nothing. Absence comes back as `Option` and becomes
+`InboxRejection::NotFound` at `Inbox::find_event_by_id`, and a column sqlx
+cannot decode comes back as `sqlx::Error::ColumnDecode`, which errlanes lanes
+as `Fatal(CorruptState)` one level up.
+
+Stored data that fails to decode (a subscriber job's execution state, a keyed
+subscription's `instance_config` or persisted key, an inbox event's status
+column) always classifies as `Fatal(CorruptState)`, never the serde default
+of `Fatal(Invariant)` — the same override job makes for its own persisted
+execution state, via the named wrapper `CouldNotDecodeStored`.
+
+### For implementors
+
+Anything *you* implement — `SingletonSubscriber`, `KeyedSubscriber`,
+`InboxHandler`, `SubscriptionDef`'s `Subscriber` — returns
+`Box<dyn std::error::Error + Send + Sync>` from every fallible method, and
+`PostPersistHook::on_persisted` returns `sqlx::Error` (pinned by es-entity).
+obix never asks an implementor to classify or lane an error. If you return a
+laned `errlanes::Fail`/`Fault` (or let one propagate through `?`) it travels
+through the box unchanged, and job's `Fault::classify` finds it in the
+chain — which is how a handler reaches job's dispositions: a `Transient`
+congestion kind reschedules without spending an attempt, and
+`terminal_on_fatal` (a `RetrySettings` field you already pass through
+`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`, forced off
+for resident types — singleton subscribers and the partition maintainer) acts
+on a `Fatal`. A boxed `Fail::Rejected` has **no surviving marker** and simply
+retries per policy, so resolve your own rejections inside the handler body
+(skip, ack, or map them) rather than propagating them.
+
+### Boundary spans
+
+Every laned boundary is instrumented with `#[es_entity::errlanes::instrument]`
+rather than `#[tracing::instrument(.., err)]`: the attribute declares and
+records `error`, `error.lane`, `error.code`, `error.level`,
+`exception.message` and `exception.type` from the returned `Fail`/`Fault`
+itself, so the lane is on the span before the error is ever logged.
+`PostPersistHook`'s two sqlx-pinned functions (`flush_batch`,
+`persist_checkpoint` on the batch op) keep plain `#[tracing::instrument(err)]`
+— job's finalizer is the boundary that disposes of the handler's own error
+and records its lane. Background loops (the pg listener, the debounced
+notifier, the persistent cache, feeder and sequencer, the gap filler) report
+a fault's lane on their own `warn`-level spans without changing retry
+behaviour — a dropped-table `Fatal(Config)` and a `Transient(ConnectionLost)`
+used to look identical in the logs; they no longer do.
+
+This requires the `es-entity/errlanes-tracing` feature, which is on
+unconditionally (not gated behind obix's own optional `tracing` feature,
+which only adds span/trace-context propagation on top).
+
 ## License
 
 Licensed under the Apache License, Version 2.0.

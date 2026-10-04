@@ -9,8 +9,14 @@ use tokio_stream::StreamExt;
 
 use crate::{Outbox, out::OutboxEventMarker, tables::MailboxTables};
 
-/// Error type for [`expect_event`].
-#[derive(Debug, thiserror::Error)]
+/// Error type for [`expect_event`]. Test-only, and never routed through a
+/// `Fail`/`Fault` carrier — the `#[classify(fatal(Invariant))]` default is
+/// unused today, but is what the derive needs to stay in its laned mode
+/// (plain `Display`/`Error`) rather than its pure mode, which would instead
+/// generate the full `errlanes::Rejection` surface (an error code enum and
+/// all) for a type that has no caller-correctable outcomes to code.
+#[derive(Debug, es_entity::errlanes::Classify)]
+#[classify(fatal(Invariant))]
 pub enum ExpectEventError<E> {
     /// The event was not received within the timeout period.
     #[error("Timeout waiting for event")]

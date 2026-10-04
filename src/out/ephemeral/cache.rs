@@ -1,3 +1,5 @@
+use crate::error::ObixFault;
+use es_entity::errlanes::Laned;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -303,7 +305,9 @@ where
                                                 }
                                             }
                                         }
-                                        Err(e) => record_resync_failed(&e),
+                                        Err(e) => {
+                                            record_resync_failed(e)
+                                        }
                                     }
                                 }
                             }
@@ -352,9 +356,19 @@ fn record_notification_channel_closed() {}
     name = "obix.ephemeral_cache.resync_failed",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error),
+    fields(
+        otel.status_code = "ERROR",
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+    ),
 )]
-fn record_resync_failed(error: &sqlx::Error) {}
+fn record_resync_failed(fault: impl Into<ObixFault>) {
+    fault.into().record(&tracing::Span::current());
+}
 
 #[tracing::instrument(
     name = "obix.ephemeral_cache.notification_undecodable",

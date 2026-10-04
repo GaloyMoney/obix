@@ -10,6 +10,7 @@ pub mod prelude {
 }
 
 mod config;
+mod error;
 mod handle;
 pub mod inbox;
 pub mod out;
@@ -20,25 +21,26 @@ mod tables;
 pub mod test_utils;
 
 pub use config::{
-    CommitLane, CommitLaneDisabled, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_COMMIT_CHECKPOINT_EVERY,
+    CommitLane, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_COMMIT_CHECKPOINT_EVERY,
     DEFAULT_COMMIT_CHECKPOINT_INTERVAL, DEFAULT_GAP_FILL_GRACE, DEFAULT_IDLE_RESYNC_INTERVAL,
     DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
-    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, FrontierError, MailboxConfig,
+    DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, MailboxConfig,
 };
+pub use error::ObixFault;
 
 pub use inbox::{
-    Inbox, InboxConfig, InboxError, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
-    InboxIdempotencyKey, InboxResult,
+    Inbox, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
+    InboxIdempotencyKey, InboxRejection, InboxResult,
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    CommitOrder, CursorError, DecodeFailure, Delivery, EventCtx, EventDelivery, FlushError,
-    FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx, KeyedSubscriber,
-    KeyedSubscriberConfig, Lane, OpCursor, Ordering, Outbox, OutboxEventJobConfig,
-    PartitionMaintainerConfig, Partitions, PostPersistHook, SingletonSubscriber, StagedOp,
-    StreamPosition, StreamSelection, SubscribeError, Subscription, SubscriptionDef,
-    SubscriptionError, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended,
-    UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
+    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery, EventCtx,
+    EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
+    KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox,
+    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
+    SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, Subscription, SubscriptionDef,
+    SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
+    Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]

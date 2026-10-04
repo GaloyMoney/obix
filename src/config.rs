@@ -116,30 +116,13 @@ pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
 pub enum CommitLane {
     /// No sequencer runs here: registering a
     /// [`CommitOrder`](crate::CommitOrder) subscriber fails with
-    /// [`CommitLaneDisabled`].
+    /// [`CommitLaneDisabled`](crate::out::CommitLaneDisabled).
     #[default]
     Disabled,
     /// This process sequences the commit lane and can host `CommitOrder`
     /// subscribers.
     Enabled,
 }
-
-/// Why a lane's frontier could not be read.
-#[derive(Debug, thiserror::Error)]
-pub enum FrontierError {
-    #[error("FrontierError - Sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("FrontierError - {0}")]
-    CommitLaneDisabled(#[from] CommitLaneDisabled),
-}
-
-/// The commit lane is off for this outbox. Raised at registration, before any
-/// job is spawned, so a consumer that needs the lane fails at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "the commit lane is disabled on this outbox — set MailboxConfig::commit_lane = CommitLane::Enabled"
-)]
-pub struct CommitLaneDisabled;
 
 #[derive(Clone, Builder)]
 pub struct MailboxConfig {
@@ -205,5 +188,20 @@ pub struct MailboxConfig {
 impl MailboxConfig {
     pub fn builder() -> MailboxConfigBuilder {
         MailboxConfigBuilder::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::out::CommitLaneDisabled;
+    use es_entity::errlanes::{Fail, lanes};
+
+    /// `CommitLaneDisabled` is the one rejected case the lane carrier can
+    /// carry — a bare `?`/`.into()` must land it in the `Rejected` lane, not
+    /// get swallowed into `Fatal` as an unclassified error would.
+    #[test]
+    fn commit_lane_disabled_enters_the_lane_carrier_as_rejected() {
+        let err: Fail<CommitLaneDisabled, lanes!(Transient, Fatal)> = CommitLaneDisabled.into();
+        assert!(matches!(err, Fail::Rejected(CommitLaneDisabled)));
     }
 }

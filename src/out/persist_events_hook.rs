@@ -99,12 +99,6 @@ where
         self
     }
 
-    /// Events buffered on this hook, awaiting persistence at commit.
-    /// Backs the [`Outbox::cursor`](crate::out::Outbox::cursor) read API.
-    pub(crate) fn pending(&self) -> &[P] {
-        &self.pre_commit_events
-    }
-
     /// Own-failure compensation: report the sequences persisted so far to
     /// the [`GapFiller`](crate::out::gap_fill::GapFiller) before
     /// `pre_commit` returns its error. The transaction is still open here

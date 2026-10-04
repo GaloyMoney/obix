@@ -134,8 +134,7 @@ async fn commit_ordering_never_splits_a_group() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)).with_max_batch_size(2),
             FlushRecorder::new(flushes.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     for group in 0..4u64 {
@@ -189,8 +188,7 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
                 OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
                 FlushRecorder::new(first.clone()),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         jobs.start_poll().await?;
 
         publish_group(&outbox, 0, 3).await?;
@@ -212,8 +210,7 @@ async fn commit_lane_checkpoint_resumes_across_runs() -> anyhow::Result<()> {
             OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
             FlushRecorder::new(second.clone()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     publish_group(&outbox, 100, 3).await?;
@@ -294,8 +291,7 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
                     undecodable_at: undecodable_at.clone(),
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         jobs.start_poll().await?;
 
         until(
@@ -326,8 +322,7 @@ async fn acknowledged_undecodable_advances_the_commit_cursor() -> anyhow::Result
                 undecodable_at: Arc::new(Mutex::new(Vec::new())),
             },
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
     jobs.start_poll().await?;
 
     // Publish past it, so the restarted run has demonstrably reached the
