@@ -176,8 +176,7 @@ signature spells itself — there are no `FooError` aliases — so a reader sees
 which rejection they are handed, which is exactly what they have to branch
 on. `ObixFault`, the fault-only carrier, is the one alias: it has no
 rejection to hide. The rejections and fault wrappers the carriers name are
-documented in `src/error.rs` (`InboxRejection` beside the inbox API that
-returns it) and re-exported from `obix::`, `obix::out::` and
+re-exported from `obix::`, `obix::out::` and
 `obix::inbox::`:
 
 | carrier | returned by |
@@ -195,7 +194,7 @@ that spells a `Fail` carrier names them from there.
 `errlanes::Rejection` on its own (`CommitLaneDisabled`). Two methods stay on
 `sqlx::Error` because `es_entity::hooks::CommitHook::pre_commit` pins it:
 `Outbox::publish_persisted_in_op` and `Outbox::publish_all_persisted`. And
-`Outbox::begin_op` / `Inbox::begin_op` keep it by rule 3 — opening an op can
+`Outbox::begin_op` / `Inbox::begin_op` keep it — opening an op can
 fail no other way, so there is nothing to classify it against.
 
 The `MailboxTables` storage trait is `sqlx::Error` throughout — it classifies

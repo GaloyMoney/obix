@@ -276,7 +276,7 @@ where
         *deps = rebuilt.into();
     }
 
-    /// Raw `sqlx::Error` (rule 3): opening an op is the one thing here that
+    /// Raw `sqlx::Error`: opening an op is the one thing here that
     /// can fail no other way, and [`Inbox::begin_op`](crate::Inbox::begin_op)
     /// says the same.
     pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, sqlx::Error> {

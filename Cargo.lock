@@ -480,9 +480,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.16.5"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ad73f968958cb57e46067e7396a445a2041512a8b1fb4fce9276edb255ac568"
+checksum = "9a292a6fa4bdc77d3fcc05fc1c840ab1cbc6ce3b4e4c67d65cb62fc36b6b95d9"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.16.5"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c83273887ff3e9b7b4d8546caac81c9915c81925c7c76834e77642656315b247"
+checksum = "bf1453f5f9d1491dcf08f1a42e9aac5bd960ceb995aa665dd9281284bc3e9e40"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -506,9 +506,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.16.5"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b4ab68ddaa46abe700c0324ecfb96a891ef1aeaeff834130ca99507faeb9eb7"
+checksum = "65f7005908c6c552d59cf9847989a26b5c97364f4e7bf161409413a50f81f6b0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -533,9 +533,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.16.5"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8278b4dad42d20b5c8e23dac2c8fea33b8485e57b0094044629494686f4e905f"
+checksum = "f36a42117b80d50d6413b9c76cdb48e8e9d7ce9c6aba10f9d84bc55399fa8598"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -1018,9 +1018,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "job"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39196cc12710e3707c00e133cc09f4854a76dde472f682a4f026e00f2366d8a5"
+checksum = "2ca1797961411a48ce8fd82ddc4bca8e5dea0df4426c29af52b7edf02b4b1d0d"
 dependencies = [
  "async-trait",
  "chrono",

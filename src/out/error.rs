@@ -1,6 +1,4 @@
-//! The outbox's own rejections and fault wrappers. The rules they follow —
-//! and `ObixFault`, the carrier they share with the rest of the crate — are
-//! in `src/error.rs`.
+//! The outbox's own rejections and fault wrappers.
 
 use es_entity::errlanes;
 
@@ -99,7 +97,7 @@ pub struct LaneMismatch {
 ///
 /// Every variant here exists to *override* a classification: errlanes lanes
 /// a bare `serde_json::Error` as `Fatal(Invariant)`, and these bytes came
-/// out of Postgres, so they are `Fatal(CorruptState)` instead (rule 4). A
+/// out of Postgres, so they are `Fatal(CorruptState)` instead. A
 /// decode failure that already classifies correctly on its own — anything
 /// sqlx itself refuses to decode — needs no variant here.
 ///
@@ -203,13 +201,8 @@ mod tests {
         }
     }
 
-    /// Why `.widen::<ObixFault>()` at the keyed runner's decode sites is not
-    /// ceremony: a `Classify` wrapper carries its classification in its
-    /// `impl`, not in the value, so one boxed raw is neither a lane payload
-    /// nor a blessed foreign type — the boundary's `Fault::classify` walks
-    /// straight past it to the `serde_json::Error` underneath and lanes
-    /// *that*, as `Fatal(Invariant)`. The `Fatal(CorruptState)` override only
-    /// survives if the wrapper reaches a carrier first (rule 6).
+    /// A wrapper boxed raw loses its `Fatal(CorruptState)` override; through
+    /// `.widen_via_builtin()` (as the keyed runner does) it survives the box.
     #[test]
     fn a_decode_wrapper_must_reach_a_carrier_before_it_reaches_a_box() {
         fn undecodable() -> CouldNotDecodeStored {
@@ -224,13 +217,12 @@ mod tests {
 
         assert!(
             matches!(boxed(undecodable()), Fault::Fatal(f) if f.kind == FatalKind::Invariant),
-            "boxing the wrapper raw loses the override — so naming the carrier \
-             at the call site is load-bearing, not ceremony",
+            "boxing the wrapper raw loses the override",
         );
 
         // Through the verb the runner actually uses, the kind survives.
         let laned = Err::<(), _>(undecodable())
-            .widen::<ObixFault>()
+            .widen_via_builtin()
             .expect_err("still an error");
         assert!(matches!(boxed(laned), Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
     }

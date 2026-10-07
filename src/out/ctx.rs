@@ -152,7 +152,7 @@ pub(crate) struct BatchTracker {
 /// `sqlx::Error`, not a laned carrier: obix owns this trait (it is driven by
 /// the runner, never by an es-entity `CommitHook`), and every implementation
 /// is a single `Tables::` call, so sqlx is the only error the method can
-/// produce — rule 3. Nothing is lost by leaving it raw: the sole caller is
+/// produce. Nothing is lost by leaving it raw: the sole caller is
 /// [`commit_checkpoint`], which is laned, so `?` classifies it there.
 pub(crate) trait CheckpointMirror: Send + Sync {
     fn mirror<'a>(
