@@ -1,3 +1,11 @@
+# [obix release v0.14.1](https://github.com/GaloyMoney/obix/releases/tag/0.14.1)
+
+
+
+### Refactor
+
+- Es-entity 0.17, job 0.18.1, widen_via_builtin at the box (#169)
+
 # [obix release v0.14.0](https://github.com/GaloyMoney/obix/releases/tag/0.14.0)
 
 
