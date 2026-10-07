@@ -8,8 +8,7 @@ use super::InboxEventId;
 /// `Fail<InboxRejection, lanes!(Transient, Fatal)>` instead of as a variant
 /// here.
 ///
-/// Defined beside the API that returns it; the rules every obix rejection
-/// follows are in `src/error.rs`.
+/// Defined beside the API that returns it.
 #[derive(Debug, errlanes::Rejection)]
 pub enum InboxRejection {
     #[error("inbox event {0} not found")]
@@ -49,9 +48,8 @@ mod tests {
     }
 
     /// A column sqlx itself refuses to decode — `inbox_events.status`
-    /// carrying a label this binary does not know — needs no obix wrapper to
-    /// reach rule 4's lane: errlanes lanes `ColumnDecode` as
-    /// `Fatal(CorruptState)` on its own.
+    /// carrying a label this binary does not know — needs no obix wrapper: errlanes
+    /// lanes `ColumnDecode` as `Fatal(CorruptState)` on its own.
     #[test]
     fn an_undecodable_column_is_fatal_corrupt_state_with_no_wrapper() {
         let err = sqlx::Error::ColumnDecode {
