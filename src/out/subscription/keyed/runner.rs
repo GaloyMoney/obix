@@ -135,7 +135,7 @@ where
             .ok_or(Undecodable::Key {
                 job_type: self.job_type.clone(),
             })
-            .widen_via_builtin()?;
+            .into_fault()?;
         Ok(Box::new(KeyedSubscriberJobRunner {
             outbox: self.outbox.clone(),
             def: self.def.clone(),
@@ -219,7 +219,7 @@ where
         // between runs — durable state is the cursor plus its own entities.
         let instance_config: D::InstanceConfig = serde_json::from_value(row.instance_config)
             .map_err(Undecodable::InstanceConfig)
-            .widen_via_builtin()?;
+            .into_fault()?;
         let subscriber = Arc::new(self.def.instantiate(self.key.clone(), instance_config));
         let flusher = KeyedSubscriberFlusher::<D::Subscriber, P> {
             subscriber: subscriber.clone(),

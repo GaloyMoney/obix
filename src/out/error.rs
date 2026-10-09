@@ -202,7 +202,7 @@ mod tests {
     }
 
     /// A wrapper boxed raw loses its `Fatal(CorruptState)` override; through
-    /// `.widen_via_builtin()` (as the keyed runner does) it survives the box.
+    /// `.into_fault()` (as the keyed runner does) it survives the box.
     #[test]
     fn a_decode_wrapper_must_reach_a_carrier_before_it_reaches_a_box() {
         fn undecodable() -> CouldNotDecodeStored {
@@ -222,7 +222,7 @@ mod tests {
 
         // Through the verb the runner actually uses, the kind survives.
         let laned = Err::<(), _>(undecodable())
-            .widen_via_builtin()
+            .into_fault()
             .expect_err("still an error");
         assert!(matches!(boxed(laned), Fault::Fatal(f) if f.kind == FatalKind::CorruptState));
     }
