@@ -1,3 +1,12 @@
+# [obix release v0.14.2](https://github.com/GaloyMoney/obix/releases/tag/0.14.2)
+
+
+
+### Miscellaneous Tasks
+
+- Update job, es-entity, and errlanes (#170)
+- Bump syn (#165)
+
 # [obix release v0.14.1](https://github.com/GaloyMoney/obix/releases/tag/0.14.1)
 
 
