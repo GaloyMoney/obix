@@ -44,10 +44,7 @@ async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
 }
 
 fn config(commit_lane: CommitLane) -> MailboxConfig {
-    MailboxConfig::builder()
-        .commit_lane(commit_lane)
-        .build()
-        .expect("Couldn't build MailboxConfig")
+    MailboxConfig::builder().commit_lane(commit_lane).build()
 }
 
 fn config_checkpointing_every_group() -> MailboxConfig {
@@ -55,7 +52,6 @@ fn config_checkpointing_every_group() -> MailboxConfig {
         .commit_lane(CommitLane::Enabled)
         .commit_checkpoint_every(1)
         .build()
-        .expect("Couldn't build MailboxConfig")
 }
 
 async fn wipe(pool: &sqlx::PgPool) -> anyhow::Result<()> {
@@ -867,8 +863,7 @@ async fn caught_up_fence_is_not_wedged_by_an_aborted_tail() -> anyhow::Result<()
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
             .gap_fill_grace(Duration::from_millis(100))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1428,10 +1423,7 @@ async fn lagged_listener_recovers_without_a_new_broadcast() -> anyhow::Result<()
     // inside the window.
     let outbox = Outbox::<TestEvent, TestTables>::init(
         &pool,
-        MailboxConfig::builder()
-            .event_buffer_size(4)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+        MailboxConfig::builder().event_buffer_size(4).build(),
     )
     .await?;
 

@@ -1,4 +1,3 @@
-use derive_builder::Builder;
 use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
@@ -124,49 +123,49 @@ pub enum CommitLane {
     Enabled,
 }
 
-#[derive(Clone, Builder)]
+#[derive(Clone, bon::Builder)]
 pub struct MailboxConfig {
-    #[builder(default = "100")]
+    #[builder(default = 100)]
     pub event_buffer_size: usize,
-    #[builder(default = "1000")]
+    #[builder(default = 1000)]
     pub event_cache_size: usize,
-    #[builder(default = "10")]
+    #[builder(default = 10)]
     pub event_cache_trim_percent: u8,
-    #[builder(default = "DEFAULT_PERSIST_EVENTS_BATCH_SIZE")]
+    #[builder(default = DEFAULT_PERSIST_EVENTS_BATCH_SIZE)]
     pub persist_events_batch_size: usize,
     /// Rows a single backfill page read may return; see
     /// [`DEFAULT_BACKFILL_PAGE_SIZE`]. The reader waits for the consumer to
     /// have room before issuing a read, but the read itself is this size.
-    #[builder(default = "DEFAULT_BACKFILL_PAGE_SIZE")]
+    #[builder(default = DEFAULT_BACKFILL_PAGE_SIZE)]
     pub backfill_page_size: usize,
     /// Grace period before the first proactive gap-fill attempt for a
     /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
     /// after a fill attempt are unaffected (fixed 1s interval).
-    #[builder(default = "DEFAULT_GAP_FILL_GRACE")]
+    #[builder(default = DEFAULT_GAP_FILL_GRACE)]
     pub gap_fill_grace: std::time::Duration,
     /// Maximum placeholder rows a single gap-fill query may insert; see
     /// [`DEFAULT_GAP_FILL_BATCH_LIMIT`]. The remainder is picked up by
     /// subsequent attempts — sequences are never skipped, only filled
     /// later.
-    #[builder(default = "DEFAULT_GAP_FILL_BATCH_LIMIT")]
+    #[builder(default = DEFAULT_GAP_FILL_BATCH_LIMIT)]
     pub gap_fill_batch_limit: usize,
     /// Coalescing window of the per-process debounced notifier; see
     /// [`DEFAULT_NOTIFY_DEBOUNCE`]. Deliberately no per-commit escape hatch.
-    #[builder(default = "DEFAULT_NOTIFY_DEBOUNCE")]
+    #[builder(default = DEFAULT_NOTIFY_DEBOUNCE)]
     pub notify_debounce: std::time::Duration,
     /// Progress-silence threshold before the persistent cache polls the
     /// sequence head; see [`DEFAULT_IDLE_RESYNC_INTERVAL`].
-    #[builder(default = "DEFAULT_IDLE_RESYNC_INTERVAL")]
+    #[builder(default = DEFAULT_IDLE_RESYNC_INTERVAL)]
     pub idle_resync_interval: std::time::Duration,
     /// How many partitions ahead of the head the maintainer keeps created;
     /// see [`DEFAULT_PARTITION_PREMAKE`]. (Partition *width* is the fixed
     /// [`DEFAULT_PARTITION_WIDTH`] constant, not configurable — it is coupled to
     /// the migration's `p0` range.)
-    #[builder(default = "DEFAULT_PARTITION_PREMAKE")]
+    #[builder(default = DEFAULT_PARTITION_PREMAKE)]
     pub partition_premake: u64,
     /// Poll interval of the partition maintainer job; see
     /// [`DEFAULT_PARTITION_MAINTAINER_INTERVAL`].
-    #[builder(default = "DEFAULT_PARTITION_MAINTAINER_INTERVAL")]
+    #[builder(default = DEFAULT_PARTITION_MAINTAINER_INTERVAL)]
     pub partition_maintainer_interval: std::time::Duration,
     /// Whether this outbox runs the commit-ordered lane; see [`CommitLane`].
     /// Defaults to [`Disabled`](CommitLane::Disabled).
@@ -175,20 +174,14 @@ pub struct MailboxConfig {
     /// Groups between sparse checkpoints of the commit-lane fold; see
     /// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Ignored when the lane is
     /// `Disabled`.
-    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_EVERY")]
+    #[builder(default = DEFAULT_COMMIT_CHECKPOINT_EVERY)]
     pub commit_checkpoint_every: usize,
     /// Longest the commit-lane fold goes without a checkpoint while
     /// emitting; see [`DEFAULT_COMMIT_CHECKPOINT_INTERVAL`].
-    #[builder(default = "DEFAULT_COMMIT_CHECKPOINT_INTERVAL")]
+    #[builder(default = DEFAULT_COMMIT_CHECKPOINT_INTERVAL)]
     pub commit_checkpoint_interval: std::time::Duration,
-    #[builder(default = "Clock::handle().clone()")]
+    #[builder(default = Clock::handle().clone())]
     pub clock: ClockHandle,
-}
-
-impl MailboxConfig {
-    pub fn builder() -> MailboxConfigBuilder {
-        MailboxConfigBuilder::default()
-    }
 }
 
 #[cfg(test)]

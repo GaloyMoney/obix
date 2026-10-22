@@ -74,13 +74,7 @@ fn outbox_event_derive_generates_marker_impls() {
 async fn events_via_short_circuit() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -103,13 +97,7 @@ async fn events_via_short_circuit() -> anyhow::Result<()> {
 async fn events_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -132,13 +120,7 @@ async fn events_via_pg_notify() -> anyhow::Result<()> {
 async fn event_batch_via_pg_notify() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -167,13 +149,7 @@ async fn event_batch_via_pg_notify() -> anyhow::Result<()> {
 async fn events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut pre_listener = outbox.listen_persisted(None);
 
@@ -208,8 +184,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
     let config = MailboxConfig::builder()
         .event_cache_trim_percent(50)
         .event_cache_size(2)
-        .build()
-        .expect("Couldn't build MailboxConfig");
+        .build();
     let outbox = init_outbox::<TestEvent>(&pool, config).await?;
 
     let mut pre_listener = outbox.listen_persisted(None);
@@ -248,13 +223,7 @@ async fn events_not_in_cache_backfilled_from_pg() -> anyhow::Result<()> {
 #[file_serial]
 async fn large_payload_via_pg_notify_fetches_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
     let mut listener = outbox.listen_persisted(None);
 
     let large_string = "x".repeat(10_000);
@@ -324,8 +293,7 @@ async fn large_batch_persisted_in_bounded_chunks() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .persist_events_batch_size(batch_size)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -381,8 +349,7 @@ async fn sequence_gap_from_rolled_back_transaction() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_millis(100))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -435,8 +402,7 @@ async fn gap_fill_waits_for_grace_period() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_secs(2))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -497,13 +463,7 @@ async fn in_flight_transaction_gap_resolves_without_placeholder() -> anyhow::Res
 
     // Default grace (2s): the transaction below commits well within it, so the
     // gap must resolve with the real row.
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -570,8 +530,7 @@ async fn gap_fill_defers_to_in_flight_writer() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_millis(100))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -660,13 +619,7 @@ async fn failed_commit_compensates_placeholders_reactively() -> anyhow::Result<(
     }
 
     let pool = init_pool().await?;
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
     outbox.add_post_persist_hook(FailOnceHook {
         failed: AtomicBool::new(false),
     });
@@ -729,13 +682,7 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
     }
 
     let pool = init_pool().await?;
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -784,13 +731,7 @@ async fn later_hook_failure_compensates_placeholders_reactively() -> anyhow::Res
 async fn backfill_parks_across_in_flight_frontier_gap() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     // seq 1 committed; seq 2 allocated by a writer that stays in flight; seq 3
     // committed — all after init, so seq 2 is a young gap.
@@ -869,13 +810,9 @@ async fn overlapping_backfills_share_one_historical_fill() -> anyhow::Result<()>
         .execute(&pool)
         .await?;
 
-    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, helpers::TestTables>::init(&pool, MailboxConfig::builder().build())
+            .await?;
 
     let mut listeners = [
         outbox.listen_persisted(Some(EventSequence::from(0))),
@@ -959,8 +896,7 @@ async fn gap_fill_batch_limit_fills_across_attempts() -> anyhow::Result<()> {
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_millis(100))
             .gap_fill_batch_limit(2)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1024,8 +960,7 @@ async fn batch_capped_fill_does_not_pay_grace_per_batch() -> anyhow::Result<()> 
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_millis(2500))
             .gap_fill_batch_limit(1)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1093,8 +1028,7 @@ async fn stall_past_episode_window_starts_fresh_episode() -> anyhow::Result<()> 
         MailboxConfig::builder()
             .gap_fill_grace(std::time::Duration::from_millis(100))
             .gap_fill_batch_limit(1)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1250,13 +1184,9 @@ async fn backfill_fills_historical_gap_for_replaying_listener() -> anyhow::Resul
 
     // Init AFTER the gap exists: the broadcast cursor starts at the head and
     // never visits it, so only backfill can serve a replaying listener.
-    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, helpers::TestTables>::init(&pool, MailboxConfig::builder().build())
+            .await?;
     let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
 
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -1303,13 +1233,9 @@ async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<(
 
     // The cursor initializes at the allocation head (3), so a replaying listener
     // must not stall forever on the burned tail.
-    let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, helpers::TestTables>::init(&pool, MailboxConfig::builder().build())
+            .await?;
     let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
 
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
@@ -1336,13 +1262,7 @@ async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<(
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_ephemeral();
 
@@ -1367,13 +1287,7 @@ async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
 async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let type1 = obix::out::EphemeralEventType::new("type1");
     let type2 = obix::out::EphemeralEventType::new("type2");
@@ -1411,13 +1325,7 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
 async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let event_type = obix::out::EphemeralEventType::new("replaceable");
 
@@ -1462,13 +1370,7 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
 async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_ephemeral();
 
@@ -1514,13 +1416,7 @@ async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> 
 async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_ephemeral();
 
@@ -1546,13 +1442,7 @@ async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Resu
 async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     // Populate the table so the forged range fetch has rows to amplify over if
     // the clamp were absent.
@@ -1614,13 +1504,7 @@ async fn forged_persistent_notification_does_not_stall_listener() -> anyhow::Res
 async fn delivers_events_notified_while_listen_connection_down() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -1676,9 +1560,7 @@ async fn cross_instance_delivery_via_debounced_notify() -> anyhow::Result<()> {
     use obix::out::Outbox;
 
     let pool = init_pool().await?;
-    let config = MailboxConfig::builder()
-        .build()
-        .expect("Couldn't build MailboxConfig");
+    let config = MailboxConfig::builder().build();
 
     let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
     let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
@@ -1709,8 +1591,7 @@ async fn debounced_notifier_coalesces_bursts() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .notify_debounce(std::time::Duration::from_millis(100))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1768,8 +1649,7 @@ async fn unnotified_events_delivered_via_idle_resync() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .idle_resync_interval(std::time::Duration::from_millis(500))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1801,8 +1681,7 @@ async fn junk_notifications_do_not_suppress_idle_resync() -> anyhow::Result<()> 
         &pool,
         MailboxConfig::builder()
             .idle_resync_interval(std::time::Duration::from_millis(500))
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -1843,9 +1722,7 @@ async fn bare_transaction_publish_delivers_promptly_cross_instance() -> anyhow::
     use obix::out::Outbox;
 
     let pool = init_pool().await?;
-    let config = MailboxConfig::builder()
-        .build()
-        .expect("Couldn't build MailboxConfig");
+    let config = MailboxConfig::builder().build();
 
     let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
     let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
@@ -1883,9 +1760,7 @@ async fn undecodable_payload_is_delivered_as_err_item() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     helpers::wipeout_outbox_tables(&pool).await?;
 
-    let config = MailboxConfig::builder()
-        .build()
-        .expect("Couldn't build MailboxConfig");
+    let config = MailboxConfig::builder().build();
 
     // Publish via a foreign event enum, like tests sharing the database do.
     let foreign = Outbox::<ForeignEvent, helpers::TestTables>::init(&pool, config.clone()).await?;
@@ -2114,10 +1989,7 @@ async fn backfill_replays_across_many_small_pages() -> anyhow::Result<()> {
     // A deliberately tiny page ceiling.
     let outbox = Outbox::<TestEvent, helpers::TestTables>::init(
         &pool,
-        MailboxConfig::builder()
-            .backfill_page_size(3)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+        MailboxConfig::builder().backfill_page_size(3).build(),
     )
     .await?;
     let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));
@@ -2148,8 +2020,7 @@ async fn slow_listener_receives_every_event_in_order() -> anyhow::Result<()> {
         MailboxConfig::builder()
             .event_buffer_size(16)
             .backfill_page_size(3)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
     let mut listener = outbox.listen_persisted(None);
@@ -2219,8 +2090,7 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
             .event_buffer_size(32)
             .backfill_page_size(500)
             .event_cache_size(10)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
     let mut listener = outbox.listen_persisted(Some(EventSequence::from(0)));

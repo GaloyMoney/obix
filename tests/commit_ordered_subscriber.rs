@@ -82,8 +82,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
         pool,
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?)
 }
