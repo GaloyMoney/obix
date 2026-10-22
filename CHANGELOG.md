@@ -1,3 +1,12 @@
+# [obix release v0.14.4](https://github.com/GaloyMoney/obix/releases/tag/0.14.4)
+
+
+
+### Miscellaneous Tasks
+
+- Es-entity 0.20.0, job 0.18.5; bon replaces derive_builder (#176)
+- Bump tokio (#171)
+
 # [obix release v0.14.3](https://github.com/GaloyMoney/obix/releases/tag/0.14.3)
 
 
