@@ -69,9 +69,7 @@ async fn payloads_by_sequence(pool: &sqlx::PgPool) -> anyhow::Result<Vec<serde_j
 }
 
 fn default_config() -> MailboxConfig {
-    MailboxConfig::builder()
-        .build()
-        .expect("Couldn't build MailboxConfig")
+    MailboxConfig::builder().build()
 }
 
 /// Records every chunk the hook sees (sequence + payload), plus the row
@@ -536,8 +534,7 @@ async fn merged_publishes_chunked_exactly_once() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .persist_events_batch_size(2usize)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 

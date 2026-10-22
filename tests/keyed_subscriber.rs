@@ -192,13 +192,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     wipeout_keyed_subscriber_job_tables(pool, JOB_TYPE).await?;
     wipeout_subscriptions(pool, JOB_TYPE).await?;
 
-    Ok(Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?)
+    Ok(Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
 }
 
 /// A small cache, so the waker's catch-up threshold (three quarters of it) is
@@ -215,8 +209,7 @@ async fn init_outbox_with_cache_size(
         pool,
         MailboxConfig::builder()
             .event_cache_size(event_cache_size)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?)
 }
@@ -1353,13 +1346,7 @@ async fn init_staged_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEv
     wipeout_subscriptions(pool, STAGED_JOB_TYPE).await?;
     reset_staged_effects(pool).await?;
 
-    Ok(Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?)
+    Ok(Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
 }
 
 fn staged_config() -> KeyedSubscriberConfig {

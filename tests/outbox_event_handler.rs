@@ -49,13 +49,8 @@ enum ForeignEvent {
 }
 
 async fn publish_foreign_poison(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    let foreign = Outbox::<ForeignEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let foreign =
+        Outbox::<ForeignEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?;
     let mut op = pool.begin().await?;
     foreign
         .publish_persisted_in_op(&mut op, ForeignEvent::CoreParty { id: 1 })
@@ -509,13 +504,8 @@ async fn init_outbox_with_handler_config<H: SingletonSubscriber<TestEvent>>(
     wipeout_outbox_tables(pool).await?;
     wipeout_outbox_job_tables(pool, JOB_TYPE).await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?;
 
     outbox
         .register_singleton_subscriber(jobs, config, handler)
@@ -754,13 +744,8 @@ async fn handler_resumes_from_last_sequence_on_restart() -> anyhow::Result<()> {
         let mut jobs = job::Jobs::init(job_config).await?;
 
         // Re-init without wiping: the sequence state must survive.
-        let outbox = Outbox::<TestEvent, TestTables>::init(
-            &pool,
-            MailboxConfig::builder()
-                .build()
-                .expect("Couldn't build MailboxConfig"),
-        )
-        .await?;
+        let outbox =
+            Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::builder().build()).await?;
 
         outbox
             .register_singleton_subscriber(
@@ -1596,13 +1581,8 @@ async fn undecodable_event_fails_job_and_resumes_after_fix() -> anyhow::Result<(
             .unwrap();
         let mut jobs = job::Jobs::init(job_config).await?;
 
-        let outbox = Outbox::<TestEvent, TestTables>::init(
-            &pool,
-            MailboxConfig::builder()
-                .build()
-                .expect("Couldn't build MailboxConfig"),
-        )
-        .await?;
+        let outbox =
+            Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::builder().build()).await?;
         outbox
             .register_singleton_subscriber(
                 &mut jobs,

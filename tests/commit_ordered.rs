@@ -69,8 +69,7 @@ async fn lane_rows(pool: &sqlx::PgPool, count: usize) -> anyhow::Result<Vec<(i64
         pool,
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
     let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
@@ -192,8 +191,7 @@ async fn commit_lane_delivers_published_events_end_to_end() -> anyhow::Result<()
         &pool,
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -237,8 +235,7 @@ async fn commit_lane_backfills_by_refolding() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -277,8 +274,7 @@ async fn sequencer_runs_without_a_commit_listener() -> anyhow::Result<()> {
             .commit_lane(CommitLane::Enabled)
             // Every group, so the assertion needs no timing slack.
             .commit_checkpoint_every(1)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -319,8 +315,7 @@ async fn two_processes_deliver_identical_commit_order() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let config = MailboxConfig::builder()
         .commit_lane(CommitLane::Enabled)
-        .build()
-        .expect("Couldn't build MailboxConfig");
+        .build();
     let first = init_outbox::<TestEvent>(&pool, config.clone()).await?;
     let second = Outbox::<TestEvent, TestTables>::init(&pool, config).await?;
 
@@ -372,8 +367,7 @@ async fn insert_lane_carries_group() -> anyhow::Result<()> {
         &pool,
         MailboxConfig::builder()
             .commit_lane(CommitLane::Enabled)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 

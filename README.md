@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = sqlx::PgPool::connect("postgresql://user:pass@localhost/db").await?;
 
     // Initialize outbox (uses default tables from migration)
-    let outbox = Outbox::<MyEvent>::init(&pool, MailboxConfig::builder().build().expect("Couldn't build MailboxConfig")).await?;
+    let outbox = Outbox::<MyEvent>::init(&pool, MailboxConfig::builder().build()).await?;
 
     // Start listening for events
     let mut listener = outbox.listen_persisted(None);
@@ -118,7 +118,7 @@ If you need to avoid table name conflicts or want to namespace your outbox table
 struct MyAppTables;
 
 // Initialize with custom tables
-let outbox = Outbox::<MyEvent, MyAppTables>::init(&pool, MailboxConfig::builder().build().expect("Couldn't build MailboxConfig")).await?;
+let outbox = Outbox::<MyEvent, MyAppTables>::init(&pool, MailboxConfig::builder().build()).await?;
 ```
 
 When using a custom prefix, you'll need to create a modified migration with your prefix. For example, with prefix `myapp`, the tables would be named `myapp_persistent_outbox_events` and `myapp_ephemeral_outbox_events`.

@@ -108,13 +108,8 @@ async fn prepare_outbox(
     wipeout_outbox_tables(pool).await?;
     reset_partitions_to_baseline(pool).await?;
     set_sequence(pool, head).await?;
-    let outbox = Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?;
     Ok(outbox)
 }
 
@@ -140,11 +135,8 @@ async fn maintainer_premakes_partitions_ahead() -> anyhow::Result<()> {
         .unwrap();
     let mut jobs = job::Jobs::init(job_config).await?;
 
-    let outbox = Outbox::<TestEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder().build().expect("config"),
-    )
-    .await?;
+    let outbox =
+        Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::builder().build()).await?;
 
     // Registration runs one premake pass synchronously before returning.
     outbox
@@ -236,11 +228,8 @@ async fn default_fill_then_recover() -> anyhow::Result<()> {
 /// Replay the three events published around the boundary from a fresh outbox
 /// (empty cache → DB backfill).
 async fn assert_replayable(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    let replay = Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder().build().expect("config"),
-    )
-    .await?;
+    let replay =
+        Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?;
     let mut listener = replay.listen_persisted(Some(EventSequence::from((BOUNDARY - 2) as u64)));
     for (i, expected_seq) in [BOUNDARY - 1, BOUNDARY, BOUNDARY + 1]
         .into_iter()
@@ -284,8 +273,7 @@ async fn concurrent_ensure_does_not_race() -> anyhow::Result<()> {
 #[file_serial]
 async fn replay_from_begin_still_contiguous() -> anyhow::Result<()> {
     let pool = init_pool().await?;
-    let outbox =
-        init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build().expect("config")).await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
     reset_partitions_to_baseline(&pool).await?;
 
     let mut op = outbox.begin_op().await?;
@@ -297,11 +285,8 @@ async fn replay_from_begin_still_contiguous() -> anyhow::Result<()> {
         .await?;
     op.commit().await?;
 
-    let replay = Outbox::<TestEvent, TestTables>::init(
-        &pool,
-        MailboxConfig::builder().build().expect("config"),
-    )
-    .await?;
+    let replay =
+        Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::builder().build()).await?;
     let mut listener = replay.listen_persisted(EventSequence::BEGIN);
     for i in 0..3u64 {
         let ev = tokio::time::timeout(std::time::Duration::from_secs(3), listener.next())

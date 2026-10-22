@@ -185,8 +185,7 @@ async fn bulk_commit_larger_than_buffer_drains_at_page_speed() -> anyhow::Result
             .event_buffer_size(1_000)
             .event_cache_size(1_000)
             .backfill_page_size(1_000)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -268,8 +267,7 @@ async fn local_commits_are_fed_from_memory_one_span_per_batch() -> anyhow::Resul
         MailboxConfig::builder()
             .event_buffer_size(200)
             .backfill_page_size(100)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -346,8 +344,7 @@ async fn remote_bulk_commit_is_caught_up_without_whole_range_fetch() -> anyhow::
         .event_buffer_size(1_000)
         .event_cache_size(1_000)
         .backfill_page_size(1_000)
-        .build()
-        .expect("Couldn't build MailboxConfig");
+        .build();
 
     let outbox_a = init_outbox::<TestEvent>(&pool, config.clone()).await?;
     let outbox_b = Outbox::<TestEvent, helpers::TestTables>::init(&pool, config).await?;
@@ -403,8 +400,7 @@ async fn small_buffer_large_local_commit_is_fed_from_memory() -> anyhow::Result<
         MailboxConfig::builder()
             .event_buffer_size(200)
             .backfill_page_size(100)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -490,8 +486,7 @@ async fn catch_up_page_survives_a_cache_smaller_than_the_page() -> anyhow::Resul
             .event_cache_size(50)
             .event_cache_trim_percent(50)
             .backfill_page_size(500)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 
@@ -542,13 +537,7 @@ async fn in_flight_bulk_insert_costs_one_probe_then_waits() -> anyhow::Result<()
     const BURNED: u64 = 3_000;
 
     let pool = init_pool().await?;
-    let outbox = init_outbox::<TestEvent>(
-        &pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?;
+    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
 
     let mut listener = outbox.listen_persisted(None);
 
@@ -624,8 +613,7 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
     let config = MailboxConfig::builder()
         .backfill_page_size(1)
         .gap_fill_grace(grace)
-        .build()
-        .expect("Couldn't build MailboxConfig");
+        .build();
     let outbox = init_outbox::<TestEvent>(&pool, config.clone()).await?;
 
     let mut listener = outbox.listen_persisted(None);
@@ -758,8 +746,7 @@ async fn interleaved_local_commit_below_a_parked_batch_is_fed_from_memory() -> a
             .event_cache_size(1_000)
             .backfill_page_size(1_000)
             .gap_fill_grace(GRACE)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
     outbox.add_post_persist_hook(SleepOnSingleton);
@@ -882,8 +869,7 @@ async fn remote_gap_below_a_parked_batch_is_read_bounded_then_memory_resumes() -
             .event_cache_size(1_000)
             .backfill_page_size(1_000)
             .gap_fill_grace(grace)
-            .build()
-            .expect("Couldn't build MailboxConfig"),
+            .build(),
     )
     .await?;
 

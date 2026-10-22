@@ -119,13 +119,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     wipeout_outbox_tables(pool).await?;
     wipeout_outbox_job_tables(pool, JOB_TYPE).await?;
 
-    Ok(Outbox::<TestEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?)
+    Ok(Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
 }
 
 fn test_config() -> OutboxEventJobConfig {

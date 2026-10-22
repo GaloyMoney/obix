@@ -260,13 +260,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<NonCloneEvent
     wipeout_keyed_subscriber_job_tables(pool, KEYED_JOB_TYPE).await?;
     wipeout_subscriptions(pool, KEYED_JOB_TYPE).await?;
 
-    Ok(Outbox::<NonCloneEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?)
+    Ok(Outbox::<NonCloneEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
 }
 
 async fn init_classify_outbox(
@@ -275,13 +269,7 @@ async fn init_classify_outbox(
     wipeout_outbox_tables(pool).await?;
     wipeout_outbox_job_tables(pool, CLASSIFY_JOB_TYPE).await?;
 
-    Ok(Outbox::<ClassifiedEvent, TestTables>::init(
-        pool,
-        MailboxConfig::builder()
-            .build()
-            .expect("Couldn't build MailboxConfig"),
-    )
-    .await?)
+    Ok(Outbox::<ClassifiedEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
 }
 
 async fn publish_pings(
