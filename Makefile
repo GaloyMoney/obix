@@ -35,7 +35,14 @@ check-code:
 	nix flake check
 
 sqlx-prepare:
-	cargo sqlx prepare --workspace -- --all-targets
+	# --all (before --)   : also captures dependency-side queries (e.g. job's
+	#                       own queries, vendored into obix's .sqlx) -- without
+	#                       it those entries get silently dropped.
+	# -- --all-targets     : also captures test-only queries (queries that only
+	#                       appear under tests/) -- without it those entries
+	#                       get silently dropped too.
+	# Do not "simplify" either flag away -- both have bitten us before.
+	cargo sqlx prepare --workspace --all -- --all-targets
 
 # Coverage-guided fuzzing via the shared vendored script
 # (ci/vendor/tasks/fuzz.sh, from galoy-concourse-shared), also used by
