@@ -25,7 +25,7 @@ use es_entity::errlanes::{Fail, lanes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
 
-use job::JobType;
+use job::{JobType, RetrySettings};
 
 use crate::error::ObixFault;
 use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
@@ -293,13 +293,13 @@ const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 /// its key type, instance config, batch accumulator and classification —
 /// lives on [`SubscriptionDef`]/[`KeyedSubscriber`] instead, because the
 /// compiler needs it and it cannot vary per deployment.
-///
-/// Retry settings are deliberately absent: a keyed member retries
-/// indefinitely, since giving up would leave a live subscription silently
-/// stopped with no cancellation and no error anywhere.
 #[derive(Clone)]
 pub struct KeyedSubscriberConfig {
     pub job_type: JobType,
+    /// Backoff for a member whose handler errors. A keyed member never gives
+    /// up: retrying has no cap, and a subscriber outcome is never a terminal
+    /// `Fail`. Default [`RetrySettings::default`].
+    pub retry_settings: RetrySettings,
     /// How long an idle (caught-up) member stays Active before passivating to
     /// Dormant. `Duration::MAX` = always-on. Default 30s.
     ///
@@ -332,11 +332,17 @@ impl KeyedSubscriberConfig {
     pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
+            retry_settings: RetrySettings::default(),
             linger: DEFAULT_LINGER,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_concurrent_per_process: None,
         }
+    }
+
+    pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
+        self.retry_settings = settings;
+        self
     }
 
     pub fn with_linger(mut self, linger: Duration) -> Self {
@@ -574,5 +580,33 @@ where
             key_str,
             self.pool.clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_retries_on_the_job_default() {
+        let config = KeyedSubscriberConfig::new(JobType::new("keyed-retry-default"));
+        assert_eq!(
+            format!("{:?}", config.retry_settings),
+            format!("{:?}", RetrySettings::default())
+        );
+    }
+
+    #[test]
+    fn config_carries_overridden_retry_settings() {
+        let custom = RetrySettings {
+            attempt_reset_after_healthy_run: None,
+            ..RetrySettings::default()
+        };
+        let config = KeyedSubscriberConfig::new(JobType::new("keyed-retry-custom"))
+            .with_retry_settings(custom.clone());
+        assert_eq!(
+            format!("{:?}", config.retry_settings),
+            format!("{custom:?}")
+        );
     }
 }

@@ -7,11 +7,17 @@ use tokio::sync::Mutex;
 
 use std::sync::Arc;
 
-use helpers::{init_inbox, init_inbox_with_clock, init_pool, wait_for_inbox_status};
+use helpers::{
+    TestTables, init_inbox, init_inbox_with_clock, init_pool, wait_for_inbox_status,
+    wipeout_inbox_tables,
+};
 use obix::{
     InboxEventStatus,
-    inbox::{InboxEvent, InboxHandler, InboxResult},
+    inbox::{InboxAttempt, InboxConfig, InboxEvent, InboxHandler, InboxResult},
 };
+
+const FAIL_REASON: &str = "unprocessable inbox event";
+const FLAKY_REASON: &str = "transient inbox failure";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestInboxEvent {
@@ -27,10 +33,42 @@ impl InboxHandler for TestHandler {
     async fn handle(
         &self,
         event: &InboxEvent,
+        _attempt: InboxAttempt,
     ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
         let payload: TestInboxEvent = event.payload()?;
         self.received.lock().await.push(payload);
         Ok(InboxResult::Complete)
+    }
+}
+
+struct FailHandler;
+
+impl InboxHandler for FailHandler {
+    async fn handle(
+        &self,
+        _event: &InboxEvent,
+        _attempt: InboxAttempt,
+    ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(InboxResult::Fail(FAIL_REASON.into()))
+    }
+}
+
+struct FlakyHandler {
+    attempts: Arc<Mutex<Vec<u32>>>,
+}
+
+impl InboxHandler for FlakyHandler {
+    async fn handle(
+        &self,
+        _event: &InboxEvent,
+        attempt: InboxAttempt,
+    ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.attempts.lock().await.push(attempt.attempt);
+        if attempt.attempt == 1 {
+            Err(FLAKY_REASON.into())
+        } else {
+            Ok(InboxResult::Complete)
+        }
     }
 }
 
@@ -43,6 +81,7 @@ impl InboxHandler for ReprocessHandler {
     async fn handle(
         &self,
         event: &InboxEvent,
+        _attempt: InboxAttempt,
     ) -> Result<InboxResult, Box<dyn std::error::Error + Send + Sync>> {
         let current_time = self.clock.now();
         self.execution_times.lock().await.push(current_time);
@@ -296,6 +335,174 @@ async fn inbox_reprocess_in_with_artificial_clock() -> anyhow::Result<()> {
         std::time::Duration::from_secs(5),
     )
     .await?;
+
+    Ok(())
+}
+
+async fn init_inbox_with_backoff<H: InboxHandler>(
+    pool: &sqlx::PgPool,
+    jobs: &mut job::Jobs,
+    handler: H,
+    fatal_min: std::time::Duration,
+) -> anyhow::Result<obix::Inbox<TestTables>> {
+    let retry_settings = job::RetrySettings {
+        backoff: job::Backoff::new(
+            std::time::Duration::from_millis(50),
+            fatal_min,
+            fatal_min,
+            0,
+        ),
+        ..job::RetrySettings::default()
+    };
+    wipeout_inbox_tables(pool).await?;
+    Ok(obix::Inbox::<TestTables>::new(
+        pool,
+        jobs,
+        InboxConfig::new(job::JobType::new("test-inbox")).with_retry_settings(retry_settings),
+        handler,
+    ))
+}
+
+#[tokio::test]
+#[file_serial]
+async fn inbox_fail_verdict_is_terminal() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let inbox = init_inbox(&pool, &mut jobs, FailHandler).await?;
+    jobs.start_poll().await?;
+
+    let event_id = inbox
+        .persist_and_queue_job("fail-verdict", TestInboxEvent::DoWork(1))
+        .await?
+        .expect("Event should be created");
+
+    let outcome = jobs
+        .handle(event_id)
+        .await_completion(std::time::Duration::from_secs(10))
+        .await?;
+    assert!(outcome.is_failed());
+
+    let event = inbox.find_event_by_id(event_id).await?;
+    assert_eq!(event.status, InboxEventStatus::Failed);
+    assert_eq!(event.error.as_deref(), Some(FAIL_REASON));
+
+    let failed = inbox.list_failed(10).await?;
+    assert!(failed.iter().any(|e| e.id == event_id));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn inbox_handler_error_stays_pending_and_retries() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let inbox = init_inbox_with_backoff(
+        &pool,
+        &mut jobs,
+        FlakyHandler {
+            attempts: attempts.clone(),
+        },
+        std::time::Duration::from_secs(3),
+    )
+    .await?;
+    jobs.start_poll().await?;
+
+    let event_id = inbox
+        .persist_and_queue_job("flaky", TestInboxEvent::DoWork(1))
+        .await?
+        .expect("Event should be created");
+
+    // An unlaned error retries on the fatal band, whose entry delay is the
+    // 3s given above, so the errored-but-retrying state is observable.
+    let start = std::time::Instant::now();
+    loop {
+        let event = inbox.find_event_by_id(event_id).await?;
+        if event.error.is_some() {
+            assert_eq!(event.status, InboxEventStatus::Pending);
+            assert_eq!(event.error.as_deref(), Some(FLAKY_REASON));
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "timed out waiting for the failed first attempt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let failed = inbox.list_failed(10).await?;
+    assert!(!failed.iter().any(|e| e.id == event_id));
+
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(15),
+    )
+    .await?;
+
+    let outcome = jobs
+        .handle(event_id)
+        .await_completion(std::time::Duration::from_secs(10))
+        .await?;
+    assert!(outcome.is_completed());
+
+    let failed = inbox.list_failed(10).await?;
+    assert!(!failed.iter().any(|e| e.id == event_id));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn inbox_attempt_counts_deliveries() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+
+    let job_config = job::JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .unwrap();
+    let mut jobs = job::Jobs::init(job_config).await?;
+
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let inbox = init_inbox_with_backoff(
+        &pool,
+        &mut jobs,
+        FlakyHandler {
+            attempts: attempts.clone(),
+        },
+        std::time::Duration::from_millis(100),
+    )
+    .await?;
+    jobs.start_poll().await?;
+
+    let event_id = inbox
+        .persist_and_queue_job("attempts", TestInboxEvent::DoWork(1))
+        .await?
+        .expect("Event should be created");
+
+    wait_for_inbox_status(
+        &inbox,
+        event_id,
+        InboxEventStatus::Completed,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+
+    assert_eq!(*attempts.lock().await, vec![1, 2]);
 
     Ok(())
 }

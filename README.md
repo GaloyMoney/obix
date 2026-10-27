@@ -251,11 +251,13 @@ obix never asks an implementor to classify or lane an error. If you return a
 laned `errlanes::Fail`/`Fault` (or let one propagate through `?`) it travels
 through the box unchanged, and job's `Fault::classify` finds it in the
 chain — which is how a handler reaches job's dispositions: a `Transient`
-congestion kind reschedules without spending an attempt, and
-`terminal_on_fatal` (a `RetrySettings` field you already pass through
-`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`, forced off
-for resident types — singleton subscribers and the partition maintainer) acts
-on a `Fatal`. A boxed `Fail::Rejected` has **no surviving marker** and simply
+congestion kind reschedules without spending an attempt, and the lane of any
+other error picks the retry band (`Transient` retries on the short band,
+`Fatal` on the long one) of the `RetrySettings` you pass through
+`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`. Retrying
+never stops on its own: the only terminal verdict is
+`InboxResult::Fail(error)`, which ends one inbox event and its job, and
+subscribers (singleton and keyed) have no equivalent. A boxed `Fail::Rejected` has **no surviving marker** and simply
 retries per policy, so resolve your own rejections inside the handler body
 (skip, ack, or map them) rather than propagating them.
 

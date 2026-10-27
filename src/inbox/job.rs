@@ -16,12 +16,24 @@ pub enum InboxResult {
     Complete,
     ReprocessNow,
     ReprocessIn(std::time::Duration),
+    /// The handler has concluded this event can never be processed.
+    /// Terminal for the event and its job. Boxed, not stringified, so the
+    /// job's terminal span carries the error's lane and code.
+    Fail(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// What the inbox knows about this delivery beyond the row itself.
+#[derive(Debug, Clone, Copy)]
+pub struct InboxAttempt {
+    /// 1 on the first run; counts every retry, in both bands.
+    pub attempt: u32,
 }
 
 pub trait InboxHandler: Send + Sync + 'static {
     fn handle(
         &self,
         event: &InboxEvent,
+        attempt: InboxAttempt,
     ) -> impl std::future::Future<
         Output = Result<InboxResult, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
@@ -148,7 +160,10 @@ where
                 Fatal::invariant("the inbox event row this job was spawned beside is gone")
             })?;
 
-        let result = self.handler.handle(&event).await;
+        let attempt = InboxAttempt {
+            attempt: current_job.attempt(),
+        };
+        let result = self.handler.handle(&event, attempt).await;
 
         match result {
             Ok(InboxResult::Complete) => {
@@ -184,12 +199,23 @@ where
                 .await?;
                 Ok(JobCompletion::RescheduleIn(duration))
             }
-            Err(e) => {
+            Ok(InboxResult::Fail(e)) => {
                 Tables::update_inbox_event_status(
                     &self.pool,
                     now,
                     self.inbox_event_id,
                     InboxEventStatus::Failed,
+                    Some(&e.to_string()),
+                )
+                .await?;
+                Ok(JobCompletion::Fail(e))
+            }
+            Err(e) => {
+                Tables::update_inbox_event_status(
+                    &self.pool,
+                    now,
+                    self.inbox_event_id,
+                    InboxEventStatus::Pending,
                     Some(&e.to_string()),
                 )
                 .await?;

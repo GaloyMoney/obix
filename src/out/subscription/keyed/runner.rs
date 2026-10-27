@@ -64,6 +64,7 @@ where
     outbox: Outbox<P, Tables>,
     def: Arc<D>,
     job_type: JobType,
+    retry_settings: RetrySettings,
     linger: Duration,
     checkpoint_interval: Duration,
     max_batch_size: usize,
@@ -85,6 +86,7 @@ where
             outbox,
             def,
             job_type: config.job_type.clone(),
+            retry_settings: config.retry_settings.clone(),
             linger: config.linger,
             checkpoint_interval: config.checkpoint_interval,
             max_batch_size: config.max_batch_size,
@@ -106,7 +108,7 @@ where
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings::repeat_indefinitely()
+        self.retry_settings.clone()
     }
 
     fn max_concurrent_per_process(&self) -> Option<usize> {

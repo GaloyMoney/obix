@@ -129,11 +129,15 @@ fn test_config() -> OutboxEventJobConfig {
 
 /// Retry fast enough that a crash-looping job cycles several times inside a test.
 fn fast_retry_settings() -> job::RetrySettings {
-    let mut settings = job::RetrySettings::repeat_indefinitely();
-    settings.min_backoff = Duration::from_millis(50);
-    settings.max_backoff = Duration::from_millis(100);
-    settings.backoff_jitter_pct = 0;
-    settings
+    job::RetrySettings {
+        backoff: job::Backoff::new(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            0,
+        ),
+        ..job::RetrySettings::default()
+    }
 }
 
 async fn register<H: SingletonSubscriber<TestEvent>>(

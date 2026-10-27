@@ -259,7 +259,7 @@ impl OutboxEventJobConfig {
     pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
-            retry_settings: RetrySettings::repeat_indefinitely(),
+            retry_settings: RetrySettings::default(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
         }
@@ -665,5 +665,14 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("register a new job type"));
+    }
+
+    #[test]
+    fn job_config_retries_on_the_job_default() {
+        let config = OutboxEventJobConfig::new(JobType::new("singleton-retry-default"));
+        assert_eq!(
+            format!("{:?}", config.retry_settings),
+            format!("{:?}", RetrySettings::default())
+        );
     }
 }

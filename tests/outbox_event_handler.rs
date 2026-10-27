@@ -381,11 +381,15 @@ async fn init_outbox_with_handler_config<H: SingletonSubscriber<TestEvent>>(
 }
 
 fn fast_retry_settings() -> job::RetrySettings {
-    let mut settings = job::RetrySettings::repeat_indefinitely();
-    settings.min_backoff = std::time::Duration::from_millis(50);
-    settings.max_backoff = std::time::Duration::from_millis(100);
-    settings.backoff_jitter_pct = 0;
-    settings
+    job::RetrySettings {
+        backoff: job::Backoff::new(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+            0,
+        ),
+        ..job::RetrySettings::default()
+    }
 }
 
 async fn wait_for_n_deliveries(
