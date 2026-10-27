@@ -1355,6 +1355,19 @@ fn staged_config() -> KeyedSubscriberConfig {
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
 }
 
+/// Retry fast enough that a crash-looping member cycles inside a test.
+fn fast_retry_settings() -> job::RetrySettings {
+    job::RetrySettings {
+        backoff: job::Backoff::new(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            0,
+        ),
+        ..job::RetrySettings::default()
+    }
+}
+
 /// The pending batch, items and checkpoint, lands before stage 1's op exists;
 /// asserted on commit order, so a leaked stage-1 write would be visible.
 #[tokio::test]
@@ -1419,7 +1432,7 @@ async fn a_crash_between_stages_keeps_stage_one_and_replays_the_event() -> anyho
     let subs = outbox
         .register_keyed_subscriber(
             &mut jobs,
-            staged_config(),
+            staged_config().with_retry_settings(fast_retry_settings()),
             StagedDef {
                 shared: shared.clone(),
             },

@@ -12,7 +12,7 @@ use serde::Serialize;
 pub use config::*;
 pub use error::*;
 pub use event::*;
-pub use job::{InboxHandler, InboxResult};
+pub use job::{InboxAttempt, InboxHandler, InboxResult};
 
 use crate::tables::MailboxTables;
 
@@ -114,6 +114,9 @@ where
             .ok_or(Fail::Rejected(InboxRejection::NotFound(id)))
     }
 
+    /// Lists events whose handler returned [`InboxResult::Fail`]: terminal
+    /// verdicts a human must look at. An event that is still being retried
+    /// after an error is `Pending` and is not listed.
     pub async fn list_failed(&self, limit: usize) -> Result<Vec<InboxEvent>, ObixFault> {
         Ok(
             Tables::list_inbox_events_by_status(&self.pool, InboxEventStatus::Failed, limit)

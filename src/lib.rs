@@ -29,7 +29,7 @@ pub use config::{
 pub use error::ObixFault;
 
 pub use inbox::{
-    Inbox, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
+    Inbox, InboxAttempt, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxRejection, InboxResult,
 };
 pub use obix_macros::{EphemeralSelection, MailboxTables, OutboxEvent};

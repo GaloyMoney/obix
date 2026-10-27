@@ -34,7 +34,7 @@ impl PartitionMaintainerConfig {
     pub fn new(job_type: JobType) -> Self {
         Self {
             job_type,
-            retry_settings: RetrySettings::repeat_indefinitely(),
+            retry_settings: RetrySettings::default(),
         }
     }
 
