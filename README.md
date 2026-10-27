@@ -40,6 +40,16 @@ enum MyEvent {
     OrderPlaced { order_id: String, amount: i64 },
 }
 
+// An ephemeral event is its own type; its key is written once, here
+#[derive(Debug, Serialize, Deserialize)]
+struct UserOnline {
+    user_id: String,
+}
+
+impl obix::EphemeralEvent for UserOnline {
+    const EVENT_TYPE: obix::EphemeralEventType = obix::EphemeralEventType::new("user_online_status");
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Connect to database
@@ -70,29 +80,46 @@ async fn main() -> anyhow::Result<()> {
     ).await?;
     op.commit().await?;
 
-    // The ephemeral stream has its own handle, payload type and LISTEN connection
-    let ephemeral = obix::EphemeralOutbox::<MyEvent>::init(
+    // The ephemeral stream has its own handle and LISTEN connection
+    let ephemeral = obix::EphemeralOutbox::init(
         &pool,
         obix::EphemeralConfig::builder().build(),
     ).await?;
 
     // Publish an ephemeral event (only latest per type is kept)
-    let event_type = obix::EphemeralEventType::new("user_online_status");
-    ephemeral.publish(
-        event_type,
-        MyEvent::UserRegistered {
-            user_id: "123".to_string(),
-            email: "user@example.com".to_string(),
-        },
-    ).await?;
+    ephemeral.publish(UserOnline { user_id: "123".to_string() }).await?;
 
     // Listen to ephemeral events
-    let mut ephemeral_listener = ephemeral.listen();
+    let mut ephemeral_listener = ephemeral.listen::<UserOnline>();
     while let Some(event) = ephemeral_listener.next().await {
         println!("Ephemeral event: {:?}", event.payload);
     }
 
     Ok(())
+}
+```
+
+### Several ephemeral events on one listener
+
+A listener can hear more than one published type. Declare a local enum whose
+variants each wrap a published type and derive `EphemeralSelection`; rows
+arrive in broadcast order across all of the selection's keys, and a row that
+does not decode is skipped and recorded. A selection is only for listening —
+`publish` takes a single `EphemeralEvent`.
+
+```rust
+#[derive(obix::EphemeralSelection)]
+enum Presence {
+    Online(UserOnline),
+    Offline(UserOffline),
+}
+
+let mut listener = ephemeral.listen::<Presence>();
+while let Some(event) = listener.next().await {
+    match &event.payload {
+        Presence::Online(online) => println!("online: {}", online.user_id),
+        Presence::Offline(offline) => println!("offline: {}", offline.user_id),
+    }
 }
 ```
 
@@ -154,7 +181,7 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 **Persistent Events**: Stored in the database with sequential ordering, guaranteed delivery, and replay capability. Use for critical business events that must be processed reliably.
 
-**Ephemeral Events**: Persisted to the database to enable replication across multiple runtime instances, but only the latest event per event type is kept. Later events of the same type replace earlier ones via database UPSERT. Use for current state updates like online status, real-time metrics, or any state that only needs the most recent value.
+**Ephemeral Events**: Persisted to the database to enable replication across multiple runtime instances, but only the latest event per event type is kept. Later events of the same type replace earlier ones via database UPSERT. Use for current state updates like online status, real-time metrics, or any state that only needs the most recent value. A type's key is its `EphemeralEvent::EVENT_TYPE`; one key per type.
 
 ### Listening to Events
 
@@ -169,7 +196,7 @@ let mut listener = outbox.listen_persisted(EventSequence::from(42));
 let mut listener = outbox.listen_persisted(None);
 
 // Listen to ephemeral events, on the ephemeral handle
-let mut listener = ephemeral.listen();
+let mut listener = ephemeral.listen::<UserOnline>();
 ```
 
 The two streams are never merged: hold one listener per stream.

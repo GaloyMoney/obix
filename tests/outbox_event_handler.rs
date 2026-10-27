@@ -4,14 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use obix::{
-    EphemeralConfig, EphemeralOutbox, EphemeralSubscriber, EphemeralSubscriberConfig, EventCtx,
-    Handled, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, out::Outbox,
+    EphemeralConfig, EphemeralOutbox, EphemeralSelection, EphemeralSubscriber,
+    EphemeralSubscriberConfig, EventCtx, Handled, MailboxConfig, OutboxEventJobConfig,
+    SingletonSubscriber, out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 use tokio::sync::Mutex;
 
-use helpers::{TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
+use helpers::{Status, TestTables, init_pool, wipeout_outbox_job_tables, wipeout_outbox_tables};
 
 const JOB_TYPE: &str = "test-outbox-handler";
 
@@ -114,12 +115,12 @@ struct TestEphemeralHandler {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl EphemeralSubscriber<TestEvent> for TestEphemeralHandler {
+impl EphemeralSubscriber<Status> for TestEphemeralHandler {
     async fn handle(
         &self,
-        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<Status>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
+        let Status(n) = &event.payload;
         self.received.lock().await.push(*n);
         Ok(())
     }
@@ -311,12 +312,12 @@ struct EphemeralOnlyHandler {
     ephemeral_received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl EphemeralSubscriber<TestEvent> for EphemeralOnlyHandler {
+impl EphemeralSubscriber<Status> for EphemeralOnlyHandler {
     async fn handle(
         &self,
-        event: &Arc<obix::out::EphemeralOutboxEvent<TestEvent>>,
+        event: &Arc<obix::out::EphemeralOutboxEvent<Status>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let TestEvent::Ping(n) = &event.payload;
+        let Status(n) = &event.payload;
         self.ephemeral_received.lock().await.push(*n);
         Ok(())
     }
@@ -324,20 +325,19 @@ impl EphemeralSubscriber<TestEvent> for EphemeralOnlyHandler {
 
 const EPHEMERAL_JOB_TYPE: &str = "test-ephemeral";
 
-async fn init_ephemeral_with_handler<H: EphemeralSubscriber<TestEvent>>(
+async fn init_ephemeral_with_handler<S: EphemeralSelection, H: EphemeralSubscriber<S>>(
     pool: &sqlx::PgPool,
     jobs: &mut job::Jobs,
     handler: H,
-) -> anyhow::Result<EphemeralOutbox<TestEvent, TestTables>> {
+) -> anyhow::Result<EphemeralOutbox<TestTables>> {
     wipeout_outbox_tables(pool).await?;
     wipeout_outbox_job_tables(pool, EPHEMERAL_JOB_TYPE).await?;
 
     let ephemeral =
-        EphemeralOutbox::<TestEvent, TestTables>::init(pool, EphemeralConfig::builder().build())
-            .await?;
+        EphemeralOutbox::<TestTables>::init(pool, EphemeralConfig::builder().build()).await?;
 
     ephemeral
-        .register_subscriber(
+        .register_subscriber::<S, _>(
             jobs,
             EphemeralSubscriberConfig::new(job::JobType::new(EPHEMERAL_JOB_TYPE)),
             handler,
@@ -526,7 +526,7 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
     let mut jobs = job::Jobs::init(job_config).await?;
 
     let received = Arc::new(Mutex::new(Vec::new()));
-    let ephemeral = init_ephemeral_with_handler(
+    let ephemeral = init_ephemeral_with_handler::<Status, _>(
         &pool,
         &mut jobs,
         TestEphemeralHandler {
@@ -539,10 +539,7 @@ async fn handler_receives_ephemeral_events() -> anyhow::Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let event_type = obix::out::EphemeralEventType::new("test_type");
-    ephemeral
-        .publish(event_type.clone(), TestEvent::Ping(42))
-        .await?;
+    ephemeral.publish(Status(42)).await?;
 
     let start = std::time::Instant::now();
     loop {
@@ -1108,7 +1105,7 @@ async fn ephemeral_only_handler_skips_checkpoint_machinery() -> anyhow::Result<(
     let mut jobs = job::Jobs::init(job_config).await?;
 
     let ephemeral_received = Arc::new(Mutex::new(Vec::new()));
-    let ephemeral = init_ephemeral_with_handler(
+    let ephemeral = init_ephemeral_with_handler::<Status, _>(
         &pool,
         &mut jobs,
         EphemeralOnlyHandler {
@@ -1128,8 +1125,7 @@ async fn ephemeral_only_handler_skips_checkpoint_machinery() -> anyhow::Result<(
         .await?;
     op.commit().await?;
 
-    let event_type = obix::out::EphemeralEventType::new("only");
-    ephemeral.publish(event_type, TestEvent::Ping(7)).await?;
+    ephemeral.publish(Status(7)).await?;
 
     wait_for_n_deliveries(&ephemeral_received, 1, std::time::Duration::from_secs(5)).await?;
 

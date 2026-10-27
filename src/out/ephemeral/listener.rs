@@ -1,52 +1,73 @@
 use futures::Stream;
-use serde::{Serialize, de::DeserializeOwned};
 use std::{pin::Pin, sync::Arc, task::Poll};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
-use super::cache::CacheHandle;
-use crate::out::event::{EphemeralEventType, EphemeralOutboxEvent};
+use super::{
+    cache::{CacheHandle, CachedEvent, CachedEvents},
+    event::{EphemeralEventType, EphemeralOutboxEvent, EphemeralSelection, RawPayload},
+};
+use crate::record_ephemeral_payload_undecodable;
 
-enum BackfillState<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    WaitingForHashMap(
-        oneshot::Receiver<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,
-    ),
-    IteratingHashMap(
-        im::hashmap::ConsumingIter<(EphemeralEventType, Arc<EphemeralOutboxEvent<P>>)>,
-    ),
+type Decode<P> = fn(&CachedEvent) -> Option<Arc<EphemeralOutboxEvent<P>>>;
 
+enum BackfillState {
+    WaitingForHashMap(oneshot::Receiver<CachedEvents>),
+    Iterating(std::vec::IntoIter<CachedEvent>),
     Done,
 }
 
-pub struct EphemeralOutboxListener<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    event_receiver: BroadcastStream<Arc<EphemeralOutboxEvent<P>>>,
-    backfill_state: BackfillState<P>,
+/// A stream of the ephemeral events a listener asked for: the current row of
+/// each of its keys first, then live rows in broadcast order.
+///
+/// A row whose payload does not decode as the listener's type is skipped and
+/// recorded, never yielded.
+pub struct EphemeralOutboxListener<P> {
+    event_receiver: BroadcastStream<CachedEvent>,
+    backfill_state: BackfillState,
+    keys: &'static [EphemeralEventType],
+    decode: Decode<P>,
 }
 
-impl<P> EphemeralOutboxListener<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    pub(crate) fn new(mut cache_handle: CacheHandle<P>) -> Self {
+impl<P> EphemeralOutboxListener<P> {
+    pub(super) fn new(
+        mut cache_handle: CacheHandle,
+        keys: &'static [EphemeralEventType],
+        decode: Decode<P>,
+    ) -> Self {
         let event_receiver = BroadcastStream::new(cache_handle.ephemeral_event_stream());
         let backfill_receiver = cache_handle.request_current_ephemeral_events();
         Self {
             event_receiver,
             backfill_state: BackfillState::WaitingForHashMap(backfill_receiver),
+            keys,
+            decode,
         }
     }
 }
 
-impl<P> Stream for EphemeralOutboxListener<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
+pub(super) fn decode_selection<S: EphemeralSelection>(
+    row: &CachedEvent,
+) -> Option<Arc<EphemeralOutboxEvent<S>>> {
+    match S::decode(&row.event_type, &row.payload)? {
+        Ok(payload) => Some(Arc::new(EphemeralOutboxEvent {
+            event_type: row.event_type.clone(),
+            payload,
+            tracing_context: row.tracing_context.clone(),
+            recorded_at: row.recorded_at,
+        })),
+        Err(error) => {
+            record_ephemeral_payload_undecodable(&error, row.event_type.as_str());
+            None
+        }
+    }
+}
+
+pub(super) fn decode_raw(row: &CachedEvent) -> Option<Arc<EphemeralOutboxEvent<RawPayload>>> {
+    Some(Arc::clone(row))
+}
+
+impl<P> Stream for EphemeralOutboxListener<P> {
     type Item = Arc<EphemeralOutboxEvent<P>>;
 
     fn poll_next(
@@ -55,14 +76,18 @@ where
     ) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
 
-        // Handle backfill state machine
         loop {
             match &mut this.backfill_state {
                 BackfillState::WaitingForHashMap(receiver) => {
                     match Pin::new(receiver).poll(cx) {
                         Poll::Ready(Ok(hashmap)) => {
-                            this.backfill_state =
-                                BackfillState::IteratingHashMap(hashmap.into_iter());
+                            let keys = this.keys;
+                            let rows: Vec<CachedEvent> = hashmap
+                                .into_iter()
+                                .filter(|(event_type, _)| keys.contains(event_type))
+                                .map(|(_, row)| row)
+                                .collect();
+                            this.backfill_state = BackfillState::Iterating(rows.into_iter());
                             continue;
                         }
                         Poll::Ready(Err(_)) => {
@@ -75,9 +100,12 @@ where
                         }
                     }
                 }
-                BackfillState::IteratingHashMap(iter) => {
-                    if let Some((_, event)) = iter.next() {
-                        return Poll::Ready(Some(event));
+                BackfillState::Iterating(iter) => {
+                    if let Some(row) = iter.next() {
+                        if let Some(event) = (this.decode)(&row) {
+                            return Poll::Ready(Some(event));
+                        }
+                        continue;
                     } else {
                         this.backfill_state = BackfillState::Done;
                         continue;
@@ -91,7 +119,15 @@ where
 
         loop {
             match Pin::new(&mut this.event_receiver).poll_next(cx) {
-                Poll::Ready(Some(Ok(event))) => return Poll::Ready(Some(event)),
+                Poll::Ready(Some(Ok(row))) => {
+                    if !this.keys.contains(&row.event_type) {
+                        continue;
+                    }
+                    if let Some(event) = (this.decode)(&row) {
+                        return Poll::Ready(Some(event));
+                    }
+                    continue;
+                }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
                     record_lagged(n);
                     continue;

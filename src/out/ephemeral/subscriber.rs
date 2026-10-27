@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use job::{
@@ -8,26 +8,31 @@ use job::{
     RetrySettings,
 };
 
-use super::EphemeralOutbox;
-use crate::out::event::EphemeralOutboxEvent;
+use super::{EphemeralOutbox, EphemeralOutboxEvent, EphemeralOutboxListener};
 use crate::tables::MailboxTables;
+
+type Listen<P, Tables> =
+    Arc<dyn Fn(&EphemeralOutbox<Tables>) -> EphemeralOutboxListener<P> + Send + Sync>;
 
 /// Handles the events of an [`EphemeralOutbox`].
 ///
-/// Registered with
-/// [`EphemeralOutbox::register_subscriber`], which runs it as a resident job.
+/// `P` is whatever the registration hands the handler: the selection `S` for
+/// [`EphemeralOutbox::register_subscriber`], or
+/// [`RawPayload`](super::RawPayload) for
+/// [`EphemeralOutbox::register_subscriber_raw`]. Either runs it as a
+/// resident job.
 /// There is no batch, checkpoint or execution state: the job never reads or
 /// writes its execution state, and ephemeral events are not replayed.
 ///
 /// Handed the shared [`Arc`] because an ephemeral event is broadcast to every
 /// listener; there is rarely anything to retain.
-pub trait EphemeralSubscriber<Q>: Send + Sync + 'static
+pub trait EphemeralSubscriber<P>: Send + Sync + 'static
 where
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    P: Send + Sync + 'static,
 {
     fn handle(
         &self,
-        event: &Arc<EphemeralOutboxEvent<Q>>,
+        event: &Arc<EphemeralOutboxEvent<P>>,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
 }
 
@@ -73,42 +78,45 @@ impl EphemeralSubscription {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct EphemeralSubscriberJobData {}
 
-pub(super) struct EphemeralSubscriberJobInitializer<H, Q, Tables>
+pub(super) struct EphemeralSubscriberJobInitializer<H, P, Tables>
 where
-    H: EphemeralSubscriber<Q>,
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: EphemeralSubscriber<P>,
+    P: Send + Sync + 'static,
     Tables: MailboxTables,
 {
-    outbox: EphemeralOutbox<Q, Tables>,
+    outbox: EphemeralOutbox<Tables>,
     handler: Arc<H>,
+    listen: Listen<P, Tables>,
     job_type: JobType,
     retry_settings: RetrySettings,
 }
 
-impl<H, Q, Tables> EphemeralSubscriberJobInitializer<H, Q, Tables>
+impl<H, P, Tables> EphemeralSubscriberJobInitializer<H, P, Tables>
 where
-    H: EphemeralSubscriber<Q>,
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: EphemeralSubscriber<P>,
+    P: Send + Sync + 'static,
     Tables: MailboxTables,
 {
     pub(super) fn new(
-        outbox: EphemeralOutbox<Q, Tables>,
+        outbox: EphemeralOutbox<Tables>,
         handler: H,
+        listen: Listen<P, Tables>,
         config: &EphemeralSubscriberConfig,
     ) -> Self {
         Self {
             outbox,
             handler: Arc::new(handler),
+            listen,
             job_type: config.job_type.clone(),
             retry_settings: config.retry_settings.clone(),
         }
     }
 }
 
-impl<H, Q, Tables> ResidentJobInitializer for EphemeralSubscriberJobInitializer<H, Q, Tables>
+impl<H, P, Tables> ResidentJobInitializer for EphemeralSubscriberJobInitializer<H, P, Tables>
 where
-    H: EphemeralSubscriber<Q>,
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: EphemeralSubscriber<P>,
+    P: Send + Sync + 'static,
     Tables: MailboxTables,
 {
     type Config = EphemeralSubscriberJobData;
@@ -125,35 +133,37 @@ where
         &self,
         _job: &Job,
     ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Box::new(EphemeralSubscriberJobRunner::<H, Q, Tables> {
+        Ok(Box::new(EphemeralSubscriberJobRunner::<H, P, Tables> {
             outbox: self.outbox.clone(),
             handler: self.handler.clone(),
+            listen: self.listen.clone(),
         }))
     }
 }
 
-struct EphemeralSubscriberJobRunner<H, Q, Tables>
+struct EphemeralSubscriberJobRunner<H, P, Tables>
 where
-    H: EphemeralSubscriber<Q>,
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: EphemeralSubscriber<P>,
+    P: Send + Sync + 'static,
     Tables: MailboxTables,
 {
-    outbox: EphemeralOutbox<Q, Tables>,
+    outbox: EphemeralOutbox<Tables>,
     handler: Arc<H>,
+    listen: Listen<P, Tables>,
 }
 
 #[async_trait]
-impl<H, Q, Tables> ResidentJobRunner for EphemeralSubscriberJobRunner<H, Q, Tables>
+impl<H, P, Tables> ResidentJobRunner for EphemeralSubscriberJobRunner<H, P, Tables>
 where
-    H: EphemeralSubscriber<Q>,
-    Q: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    H: EphemeralSubscriber<P>,
+    P: Send + Sync + 'static,
     Tables: MailboxTables,
 {
     async fn run(
         &self,
         mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let mut ephemeral = self.outbox.listen();
+        let mut ephemeral = (self.listen)(&self.outbox);
         loop {
             tokio::select! {
                 biased;
