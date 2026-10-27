@@ -1,3 +1,11 @@
+# [obix release v0.15.0](https://github.com/GaloyMoney/obix/releases/tag/0.15.0)
+
+
+
+### Features
+
+- [**breaking**] Ephemeral stream on its own EphemeralOutbox handle (#177)
+
 # [obix release v0.14.4](https://github.com/GaloyMoney/obix/releases/tag/0.14.4)
 
 
