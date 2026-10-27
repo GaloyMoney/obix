@@ -13,34 +13,15 @@ use job::{
 use crate::out::ctx::*;
 use crate::out::lane::{InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
-use crate::out::{EphemeralOutboxListener, Outbox, event::*};
+use crate::out::{Outbox, event::*};
 use crate::sequence::{CommitSequence, EventSequence};
 use crate::tables::MailboxTables;
-
-/// Which delivery streams an event-handler job subscribes to — see
-/// [`SingletonSubscriber::SUBSCRIPTION`].
-///
-/// - [`PersistentOnly`](Self::PersistentOnly): only the durable, checkpointed
-///   stream. The ephemeral stream is never subscribed, so batching is
-///   entirely immune to ephemeral traffic.
-/// - [`EphemeralOnly`](Self::EphemeralOnly): only the best-effort broadcast.
-///   No persistent deliveries, and none of the checkpoint/batch machinery —
-///   the job never reads or writes execution state.
-/// - [`All`](Self::All): both streams, raced fairly between batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamSelection {
-    All,
-    PersistentOnly,
-    EphemeralOnly,
-}
 
 /// Handles the events of one outbox listener job.
 ///
 /// Exactly one instance exists per type, created at registration and
 /// **always on**. That presence is a contract, not an implementation detail:
-/// it is what licenses the ephemeral subscription below, since ephemeral
-/// events cannot be replayed and only an always-present consumer may hear
-/// them. It is also why a singleton subscriber has no way to pause — no
+/// it is why a singleton subscriber has no way to pause — no
 /// `pause_until`, no staged chain. For a single-instance
 /// flow that does need to pause or stage, see
 /// [`KeyedSubscriber`](crate::out::KeyedSubscriber) with one static key.
@@ -67,12 +48,8 @@ pub enum StreamSelection {
 ///   lands before my work starts, and my op commits at return. Use for
 ///   causally significant or risky work.
 ///
-/// Ephemeral events are delivered on their own stream and are handled
-/// between batches: they never interrupt a pending batch, and nothing is
-/// pending while [`handle_ephemeral`](Self::handle_ephemeral) runs. Most
-/// handlers only consume one of the two streams — declare it via
-/// [`SUBSCRIPTION`](Self::SUBSCRIPTION) and the other stream is never even
-/// subscribed.
+/// This subscriber consumes the persistent stream only. For the ephemeral
+/// stream, see [`EphemeralSubscriber`](crate::out::EphemeralSubscriber).
 ///
 /// `L` is the delivery lane, which decides what a position is — for the event,
 /// the flush and the checkpoint. It defaults to
@@ -84,17 +61,6 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     L: Lane,
 {
-    /// Which delivery streams this handler's job subscribes to. Defaults to
-    /// [`All`](StreamSelection::All).
-    ///
-    /// Declaring a single-stream mode is a contract, not a filter: the other
-    /// stream is never subscribed, so its handler method is never called —
-    /// overriding [`handle_ephemeral`](Self::handle_ephemeral) on a
-    /// [`PersistentOnly`](StreamSelection::PersistentOnly) handler (or
-    /// [`handle_persistent`](Self::handle_persistent) on an
-    /// [`EphemeralOnly`](StreamSelection::EphemeralOnly) one) is dead code.
-    const SUBSCRIPTION: StreamSelection = StreamSelection::All;
-
     /// Accumulator for events resolved via
     /// [`collect_with`](EventCtx::collect_with) — `Vec<T>` for append-style
     /// batching, `HashMap<K, V>` for keyed coalescing folds, or any other
@@ -122,10 +88,10 @@ where
     /// position an ordinary event would have had, and derefs to the
     /// [`UndecodableEventError`] carrying the raw payload and serde error.
     ///
-    /// The runner lands the pending batch *before* invoking this — like
-    /// [`handle_ephemeral`](Self::handle_ephemeral), nothing is pending
-    /// while it runs and no batch transaction spans the await, and work
-    /// completed up to the event is durable regardless of the outcome.
+    /// The runner lands the pending batch *before* invoking this — nothing
+    /// is pending while it runs and no batch transaction spans the await,
+    /// and work completed up to the event is durable regardless of the
+    /// outcome.
     ///
     /// The default fails with the error as-is: a payload the consumer
     /// cannot decode is a runtime bug (schema drift, a producer ahead of
@@ -171,19 +137,6 @@ where
         let _ = (op, items);
         async { Ok(()) }
     }
-
-    /// Handed the shared [`Arc`] for the same reason as
-    /// [`handle_persistent`](Self::handle_persistent), though an ephemeral
-    /// event carries no sequence and belongs to no batch, so there is rarely
-    /// anything to retain.
-    fn handle_ephemeral(
-        &self,
-        event: &Arc<EphemeralOutboxEvent<P>>,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
-    {
-        let _ = event;
-        async { Ok(()) }
-    }
 }
 
 /// Object-safe bridge handing the handler's typed [`flush`] to the runner's
@@ -223,31 +176,6 @@ where
 /// The subscription's cursor on `L`, in the dynamic form the ctx plumbing uses.
 fn checkpoint_of<L: Lane>(state: &OutboxEventJobState) -> StreamPosition {
     L::checkpoint(state.sequence, state.commit_sequence).into()
-}
-
-/// What the fair two-stream race yielded while no batch was pending.
-enum NextDelivery<P, L>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-    L: Lane,
-{
-    Persistent(Option<Result<EventDelivery<P, L>, UndecodableDelivery<L>>>),
-    Ephemeral(Arc<EphemeralOutboxEvent<P>>),
-}
-
-/// Next ephemeral event — or pend forever when the handler's
-/// [`SUBSCRIPTION`](SingletonSubscriber::SUBSCRIPTION) never subscribed the
-/// ephemeral stream.
-async fn next_if_subscribed<P>(
-    listener: &mut Option<EphemeralOutboxListener<P>>,
-) -> Option<Arc<EphemeralOutboxEvent<P>>>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-{
-    match listener {
-        Some(listener) => listener.next().await,
-        None => std::future::pending().await,
-    }
 }
 
 /// What [`decide_lane`] decided, before any I/O happens.
@@ -460,12 +388,7 @@ where
         &self,
         current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        match H::SUBSCRIPTION {
-            StreamSelection::EphemeralOnly => self.run_ephemeral_only(current_job).await,
-            StreamSelection::All | StreamSelection::PersistentOnly => {
-                self.run_with_persistent(current_job).await
-            }
-        }
+        self.run_persistent(current_job).await
     }
 }
 
@@ -476,32 +399,6 @@ where
     Tables: MailboxTables,
     L: Lane,
 {
-    /// [`EphemeralOnly`](StreamSelection::EphemeralOnly): a bare dispatch
-    /// loop — no persistent subscription, no execution state, no batch or
-    /// checkpoint machinery.
-    async fn run_ephemeral_only(
-        &self,
-        mut current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let mut ephemeral = self.outbox.listen_ephemeral();
-        loop {
-            tokio::select! {
-                biased;
-                _ = current_job.shutdown_requested() => {
-                    return Ok(ResidentJobCompletion::RescheduleNow);
-                }
-                event = ephemeral.next() => match event {
-                    Some(event) => {
-                        self.handler
-                            .handle_ephemeral(&event)
-                            .await?;
-                    }
-                    None => return Ok(ResidentJobCompletion::RescheduleNow),
-                },
-            }
-        }
-    }
-
     /// Open `L`'s stream at the stored cursor, refusing a subscription
     /// established on the other lane.
     fn select_lane(
@@ -514,20 +411,13 @@ where
         Ok(self.outbox.listen::<L>(start_after).narrow_rejected()?)
     }
 
-    async fn run_with_persistent(
+    async fn run_persistent(
         &self,
         mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
 
-        // Two independent streams: the persistent backlog alone governs the
-        // batch lifecycle, so ephemeral traffic can never shrink a batch —
-        // and ephemerals are only handled while nothing is pending. A
-        // `PersistentOnly` handler never subscribes the ephemeral stream at
-        // all.
         let mut persistent = self.select_lane(&state)?;
-        let mut ephemeral =
-            (H::SUBSCRIPTION == StreamSelection::All).then(|| self.outbox.listen_ephemeral());
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
@@ -588,7 +478,7 @@ where
                     }
                 }
             } else {
-                let next = tokio::select! {
+                tokio::select! {
                     biased;
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
@@ -605,36 +495,14 @@ where
                         tracker.last_persist = tokio::time::Instant::now();
                         continue;
                     }
-                    // The two streams race in an UNBIASED inner select: the
-                    // poll order is randomized per wait, so when both are
-                    // continuously ready each gets a fair share of batch
-                    // boundaries — neither channel can starve the other
-                    // under any traffic pattern (N consecutive wins against
-                    // a ready peer has probability 2^-N). Shutdown and the
-                    // checkpoint timer keep deterministic priority above.
-                    next = async {
-                        tokio::select! {
-                            Some(event) = next_if_subscribed(&mut ephemeral) => {
-                                NextDelivery::Ephemeral(event)
+                    next = persistent.next() => match next {
+                        Some(item) => item,
+                        None => {
+                            if tracker.persisted < checkpoint_of::<L>(&state) {
+                                persist_checkpoint(&mut current_job, &state, None).await?;
                             }
-                            event = persistent.next() => NextDelivery::Persistent(event),
+                            return Ok(ResidentJobCompletion::RescheduleNow);
                         }
-                    } => next,
-                };
-                match next {
-                    // Nothing is pending here by construction, so no
-                    // transaction spans the foreign `handle_ephemeral` await
-                    // and a failure discards no batch work.
-                    NextDelivery::Ephemeral(event) => {
-                        self.handler.handle_ephemeral(&event).await?;
-                        continue;
-                    }
-                    NextDelivery::Persistent(Some(item)) => item,
-                    NextDelivery::Persistent(None) => {
-                        if tracker.persisted < checkpoint_of::<L>(&state) {
-                            persist_checkpoint(&mut current_job, &state, None).await?;
-                        }
-                        return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                 }
             };

@@ -1,7 +1,5 @@
-mod all_listener;
 mod ctx;
 mod ephemeral;
-mod ephemeral_events_hook;
 mod error;
 mod event;
 mod gap_fill;
@@ -29,9 +27,7 @@ pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef, Subscriptions, WakeKey, WakeKeys,
 };
-pub use self::subscription::singleton::{
-    Ordering, OutboxEventJobConfig, SingletonSubscriber, StreamSelection,
-};
+pub use self::subscription::singleton::{Ordering, OutboxEventJobConfig, SingletonSubscriber};
 pub use self::subscription::{
     StreamPosition, Subscription, SubscriptionRejection, SubscriptionSnapshot,
     SubscriptionStreamStatus,
@@ -44,9 +40,10 @@ use crate::{
     tables::*,
 };
 
-pub use all_listener::AllOutboxListener;
-use ephemeral::EphemeralOutboxEventCache;
-pub use ephemeral::EphemeralOutboxListener;
+pub use ephemeral::{
+    EphemeralConfig, EphemeralOutbox, EphemeralOutboxListener, EphemeralSubscriber,
+    EphemeralSubscriberConfig, EphemeralSubscription,
+};
 pub use event::*;
 use notifier::PersistentNotifier;
 pub use partition::{PartitionMaintainerConfig, Partitions};
@@ -69,7 +66,6 @@ where
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
-    ephemeral_cache: Arc<EphemeralOutboxEventCache<P, Tables>>,
     /// This process's commit-order sequencer, and the commit lane's fan-out.
     /// `None` when [`MailboxConfig::commit_lane`] leaves the lane
     /// [`Disabled`](CommitLane::Disabled): nothing folds, and the lane's
@@ -124,7 +120,6 @@ where
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
-            ephemeral_cache: self.ephemeral_cache.clone(),
             sequencer: self.sequencer.clone(),
             _pg_listener_handle: self._pg_listener_handle.clone(),
             notifier: self.notifier.clone(),
@@ -147,12 +142,10 @@ where
 
         let (persistent_notification_tx, persistent_notification_rx) =
             tokio::sync::mpsc::channel(config.event_buffer_size);
-        let (ephemeral_notification_tx, ephemeral_notification_rx) =
-            tokio::sync::mpsc::channel(config.event_buffer_size);
-        let pg_listener_handle = pg_notify::spawn_pg_listener::<Tables>(
+        let pg_listener_handle = pg_notify::spawn_pg_listener(
             &pool,
+            Tables::persistent_outbox_events_channel(),
             persistent_notification_tx,
-            ephemeral_notification_tx,
         )
         .await?;
 
@@ -170,8 +163,6 @@ where
             gap_fill_tx.clone(),
         )
         .await?;
-        let ephemeral_cache =
-            EphemeralOutboxEventCache::init(&pool, &config, ephemeral_notification_rx).await?;
 
         // Shared before the sequencer starts: a commit-lane backfill re-folds the
         // insert stream, so it opens listeners of its own.
@@ -208,7 +199,6 @@ where
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache,
-            ephemeral_cache: Arc::new(ephemeral_cache),
             sequencer,
             _pg_listener_handle: Arc::new(pg_listener_handle),
             notifier,
@@ -331,39 +321,6 @@ where
         Ok(())
     }
 
-    pub async fn publish_ephemeral(
-        &self,
-        event_type: EphemeralEventType,
-        event: impl Into<P>,
-    ) -> Result<(), ObixFault> {
-        let now = self.clock.manual_now();
-        let event =
-            Tables::persist_ephemeral_event(&self.pool, now, event_type, event.into()).await?;
-        let _ = self
-            .ephemeral_cache
-            .cache_fill_sender()
-            .send(Arc::new(event));
-        Ok(())
-    }
-
-    pub async fn publish_ephemeral_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        event_type: EphemeralEventType,
-        event: impl Into<P>,
-    ) -> Result<(), ObixFault> {
-        let hook = ephemeral_events_hook::PersistEphemeralEvents::<P, Tables>::new(
-            self.ephemeral_cache.cache_fill_sender().clone(),
-            event_type,
-            event,
-        );
-        if let Err(hook) = op.add_commit_hook(hook) {
-            use es_entity::hooks::CommitHook;
-            hook.force_execute_pre_commit(op).await?;
-        }
-        Ok(())
-    }
-
     /// Listen on lane `L` from `start_after`. Errors with
     /// [`CommitLaneDisabled`] only when `L` is [`CommitOrder`] and this outbox
     /// leaves the lane [`Disabled`](CommitLane::Disabled).
@@ -421,22 +378,6 @@ where
 
     pub(crate) fn persistent_cache_handle(&self) -> lane::LaneHandle<InsertOrder, P> {
         self.persistent_cache.handle()
-    }
-
-    pub fn listen_ephemeral(&self) -> EphemeralOutboxListener<P> {
-        EphemeralOutboxListener::new(self.ephemeral_cache.handle())
-    }
-
-    pub fn listen_all(
-        &self,
-        start_after: impl Into<Option<EventSequence>>,
-    ) -> AllOutboxListener<P> {
-        all_listener::AllOutboxListener::new(
-            self.persistent_cache.handle(),
-            self.ephemeral_cache.handle(),
-            start_after,
-            self.event_buffer_size,
-        )
     }
 
     /// Register `handler` as a resident job consuming this outbox — a

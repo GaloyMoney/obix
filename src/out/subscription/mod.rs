@@ -15,17 +15,15 @@
 //!
 //! | capability | singleton | keyed |
 //! |------------|-----------|-------|
-//! | ephemeral delivery | yes — by presence | no, statically |
+//! | ephemeral delivery | no — see [`EphemeralOutbox`](crate::EphemeralOutbox) | no |
 //! | `pause_until`, staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
 //!
 //! The two modes are not one mode with a flag, and the asymmetry is not
 //! scheduling mechanics — a resident job could perfectly well sleep. It is
-//! the **presence contract**: a singleton subscriber is always on, and that
-//! presence is exactly what licenses its ephemeral subscription, since
-//! ephemeral events cannot be replayed and only an always-present consumer
-//! may hear them. Pausing verbs contradict the property that defines the
-//! mode, so they are keyed-only.
+//! the **presence contract**: a singleton subscriber is always on. Pausing
+//! verbs contradict the property that defines the mode, so they are
+//! keyed-only.
 //!
 //! Consequently, a **single-instance flow that needs to pause or stage is
 //! persistent-only by definition** — host it as a keyed subscriber with one
