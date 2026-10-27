@@ -6,7 +6,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 
 use crate::{
-    config::*,
     handle::{OwnedTaskHandle, spawn_supervised},
     out::{event::*, pg_notify::NotifyMessage},
 };
@@ -72,16 +71,15 @@ where
 
     pub async fn init(
         pool: &sqlx::PgPool,
-        config: &MailboxConfig,
+        event_buffer_size: usize,
         ephemeral_notification_rx: mpsc::Receiver<NotifyMessage>,
     ) -> Result<Self, sqlx::Error> {
         let (backfill_send, backfill_recv) = mpsc::unbounded_channel();
-        let (cache_fill_send, cache_fill_recv) = broadcast::channel(config.event_buffer_size);
-        let (ephemeral_event_sender, _) = broadcast::channel(config.event_buffer_size);
+        let (cache_fill_send, cache_fill_recv) = broadcast::channel(event_buffer_size);
+        let (ephemeral_event_sender, _) = broadcast::channel(event_buffer_size);
 
         let cache_loop_handle = Self::spawn_cache_loop(
             pool,
-            config,
             ephemeral_event_sender.clone(),
             backfill_recv,
             cache_fill_recv,
@@ -141,7 +139,7 @@ where
     /// credentials. `recorded_at` bounds that fetch: when the in-process
     /// cache already holds an event at least as recent (the publisher's
     /// post-commit broadcast beat the NOTIFY), the hint is a no-op.
-    fn handle_ephemeral_notification(
+    fn handle_notification(
         payload: &str,
         cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
     ) -> Option<EphemeralEventType> {
@@ -174,7 +172,7 @@ where
         cache: &im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>,
     ) -> Option<EphemeralEventType> {
         if notification.channel() == Tables::ephemeral_outbox_events_channel() {
-            Self::handle_ephemeral_notification(notification.payload(), cache)
+            Self::handle_notification(notification.payload(), cache)
         } else {
             None
         }
@@ -182,7 +180,6 @@ where
 
     async fn spawn_cache_loop(
         pool: &sqlx::PgPool,
-        _config: &MailboxConfig,
         ephemeral_event_sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
         mut backfill_request: mpsc::UnboundedReceiver<
             oneshot::Sender<im::HashMap<EphemeralEventType, Arc<EphemeralOutboxEvent<P>>>>,

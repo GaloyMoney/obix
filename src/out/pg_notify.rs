@@ -1,17 +1,15 @@
 use crate::error::ObixFault;
 use es_entity::errlanes::Laned;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use std::time::Duration;
 
-use crate::{
-    handle::{OwnedTaskHandle, spawn_supervised},
-    tables::MailboxTables,
-};
+use crate::handle::{OwnedTaskHandle, spawn_supervised};
 
 /// A message from the pg LISTEN pump to a cache loop.
 pub(crate) enum NotifyMessage {
-    /// A notification arrived on one of the subscribed channels.
+    /// A notification arrived on the subscribed channel.
     Notification(sqlx::postgres::PgNotification),
     /// The LISTEN connection was lost and has been re-established.
     /// Notifications sent while it was down are gone — the cache must
@@ -22,23 +20,18 @@ pub(crate) enum NotifyMessage {
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
-pub async fn spawn_pg_listener<Tables>(
+pub async fn spawn_pg_listener(
     pool: &sqlx::PgPool,
-    persistent_notification_tx: mpsc::Sender<NotifyMessage>,
-    ephemeral_notification_tx: mpsc::Sender<NotifyMessage>,
-) -> Result<OwnedTaskHandle, sqlx::Error>
-where
-    Tables: MailboxTables,
-{
+    channel: &'static str,
+    notification_tx: mpsc::Sender<NotifyMessage>,
+) -> Result<OwnedTaskHandle, sqlx::Error> {
     let pool = pool.clone();
-    let persistent_channel = Tables::persistent_outbox_events_channel();
-    let ephemeral_channel = Tables::ephemeral_outbox_events_channel();
 
     // The initial connection stays fail-fast: a broken setup should surface
     // at init, not as an endlessly-retrying background task.
-    let mut listener = connect_and_listen(&pool, persistent_channel, ephemeral_channel).await?;
+    let mut listener = connect_and_listen(&pool, channel).await?;
 
-    let handle = spawn_supervised("obix::pg_listener", async move {
+    let pump = async move {
         loop {
             // `try_recv` (unlike `recv`) surfaces connection loss as
             // `Ok(None)` after sqlx has already reconnected and re-issued
@@ -47,35 +40,27 @@ where
             // resync, stalling every consumer until the next notification.
             match listener.try_recv().await {
                 Ok(Some(notification)) => {
-                    // Route notification to appropriate channel with backpressure
-                    let result = if notification.channel() == persistent_channel {
-                        persistent_notification_tx
-                            .send(NotifyMessage::Notification(notification))
-                            .await
-                    } else if notification.channel() == ephemeral_channel {
-                        ephemeral_notification_tx
-                            .send(NotifyMessage::Notification(notification))
-                            .await
-                    } else {
-                        // Unknown channel, skip
+                    // A LISTEN connection can still receive stray channels.
+                    if notification.channel() != channel {
                         continue;
-                    };
+                    }
 
                     // If send fails, receiver is dropped, so break
-                    if let Err(e) = result {
+                    if let Err(e) = notification_tx
+                        .send(NotifyMessage::Notification(notification))
+                        .await
+                    {
                         record_forward_failed(&e);
                         break;
                     }
                 }
                 Ok(None) => {
                     // Connection was lost; sqlx already reconnected and
-                    // re-issued LISTEN. Tell both caches to resync for
+                    // re-issued LISTEN. Tell the cache to resync for
                     // whatever was notified during the gap.
                     record_connection_lost();
-                    if send_resync(&persistent_notification_tx, &ephemeral_notification_tx)
-                        .await
-                        .is_err()
-                    {
+                    if let Err(e) = notification_tx.send(NotifyMessage::Resync).await {
+                        record_forward_failed(&e);
                         break;
                     }
                 }
@@ -83,7 +68,7 @@ where
                     // Reconnecting inside `try_recv` failed (e.g. the pool
                     // was saturated at that moment). This pump must outlive
                     // transient failures: exiting here drops the notification
-                    // senders, which kills the cache loops and leaves the
+                    // sender, which kills the cache loop and leaves the
                     // outbox permanently deaf while every consumer still
                     // looks healthy. Rebuild the listener with capped
                     // backoff, then resync.
@@ -91,8 +76,7 @@ where
                     let mut backoff = INITIAL_RECONNECT_BACKOFF;
                     listener = loop {
                         tokio::time::sleep(backoff).await;
-                        match connect_and_listen(&pool, persistent_channel, ephemeral_channel).await
-                        {
+                        match connect_and_listen(&pool, channel).await {
                             Ok(listener) => break listener,
                             Err(error) => {
                                 record_reconnect_failed(error);
@@ -105,43 +89,29 @@ where
                     // published before this point is covered by the resync
                     // (the head re-read happens after), anything after by
                     // regular notifications.
-                    if send_resync(&persistent_notification_tx, &ephemeral_notification_tx)
-                        .await
-                        .is_err()
-                    {
+                    if let Err(e) = notification_tx.send(NotifyMessage::Resync).await {
+                        record_forward_failed(&e);
                         break;
                     }
                 }
             }
         }
-    });
+    }
+    .instrument(tracing::info_span!("obix.pg_listener", channel));
 
-    Ok(OwnedTaskHandle::new(handle))
+    Ok(OwnedTaskHandle::new(spawn_supervised(
+        "obix::pg_listener",
+        pump,
+    )))
 }
 
 async fn connect_and_listen(
     pool: &sqlx::PgPool,
-    persistent_channel: &'static str,
-    ephemeral_channel: &'static str,
+    channel: &'static str,
 ) -> Result<sqlx::postgres::PgListener, sqlx::Error> {
     let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
-    listener
-        .listen_all([persistent_channel, ephemeral_channel])
-        .await?;
+    listener.listen(channel).await?;
     Ok(listener)
-}
-
-async fn send_resync(
-    persistent_notification_tx: &mpsc::Sender<NotifyMessage>,
-    ephemeral_notification_tx: &mpsc::Sender<NotifyMessage>,
-) -> Result<(), ()> {
-    for tx in [persistent_notification_tx, ephemeral_notification_tx] {
-        if let Err(e) = tx.send(NotifyMessage::Resync).await {
-            record_forward_failed(&e);
-            return Err(());
-        }
-    }
-    Ok(())
 }
 
 #[tracing::instrument(

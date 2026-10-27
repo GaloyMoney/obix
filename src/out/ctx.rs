@@ -20,13 +20,7 @@
 //! persistent backlog — the runner never awaits the stream while items are
 //! pending, so a pending stream is itself a flush trigger. Batching
 //! therefore rides bursts that already happened and adds no latency at low
-//! traffic. Ephemeral events travel on their own stream
-//! and are handled between batches — they never interrupt a batch, a
-//! transaction never spans the foreign `handle_ephemeral` await, and between
-//! batches the two streams race fairly so neither can starve the other.
-//! Handlers that only consume one stream should declare it via
-//! [`SUBSCRIPTION`](super::SingletonSubscriber::SUBSCRIPTION) — the other
-//! stream is then never subscribed at all.
+//! traffic.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
 //! items to the handler's [`flush`](super::SingletonSubscriber::flush) inside
@@ -43,17 +37,15 @@
 //!
 //! | capability | singleton | keyed |
 //! |------------|-----------|-------|
-//! | ephemeral delivery | yes — by presence | no, statically |
+//! | ephemeral delivery | no — see [`EphemeralOutbox`](crate::EphemeralOutbox) | no |
 //! | [`pause_until`](KeyedEventCtx::pause_until), staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
 //!
 //! The asymmetry is the **presence contract**, not scheduling mechanics. A
-//! singleton subscriber is always on, and that presence is precisely what
-//! licenses its ephemeral subscription: ephemeral events cannot be replayed,
-//! so only an always-present consumer may hear them. A verb that pauses
-//! consumption contradicts the property that defines the mode — which is why
-//! the pause and staged verbs are keyed-only, and why nothing is gained by
-//! adding a pause-less staged variant to the singleton.
+//! singleton subscriber is always on. A verb that pauses consumption
+//! contradicts the property that defines the mode — which is why the pause
+//! and staged verbs are keyed-only, and why nothing is gained by adding a
+//! pause-less staged variant to the singleton.
 //!
 //! A single-instance flow that genuinely needs to pause or stage is
 //! persistent-only by definition. Host it as a keyed subscriber with one
@@ -235,10 +227,8 @@ pub(crate) enum Outcome {
 ///
 /// # Presence contract
 ///
-/// A singleton subscriber is **always on**, and that presence is what
-/// licenses its ephemeral subscription: ephemeral events cannot be replayed,
-/// so only an always-present consumer may hear them. This ctx therefore has
-/// no pausing verb — no `pause_until`, no staged chain.
+/// A singleton subscriber is **always on**. This ctx therefore has no
+/// pausing verb — no `pause_until`, no staged chain.
 /// Their absence is semantic, not an omission: a verb that suspends
 /// consumption would contradict the property that defines the mode.
 ///
@@ -594,10 +584,8 @@ pub(crate) async fn persist_checkpoint(
 //     between them, and whose paused exit mints `Outcome::CommitAndPause`.
 //
 // Both live on a distinct type because the split is CONTRACTUAL, not just a
-// convenient type-gate. A singleton subscriber is always present, and that
-// presence is what licenses its ephemeral subscription (unreplayable events
-// need an always-present consumer); a verb that pauses consumption would
-// contradict it. So the type-gating is a consequence of the semantics
+// convenient type-gate. A singleton subscriber is always present; a verb
+// that pauses consumption would contradict it. So the type-gating is a consequence of the semantics
 // rather than the reason for it — the singleton runner never constructs a
 // ctx that can reach these, and its `Outcome::Pause`/`CommitAndPause` arm is
 // an `unreachable!` by construction.

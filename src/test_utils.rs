@@ -112,7 +112,7 @@ where
     Fut: std::future::Future<Output = Result<R, E>>,
     M: Fn(&R, &IE) -> Option<T>,
 {
-    let mut listener = outbox.listen_all(None);
+    let mut listener = outbox.listen_persisted(None);
 
     let result = trigger().await.map_err(ExpectEventError::TriggerFailed)?;
 

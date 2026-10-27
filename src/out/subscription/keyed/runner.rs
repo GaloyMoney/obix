@@ -1,8 +1,7 @@
 //! The per-key runner: one `job` execution per live subscription.
 //!
 //! Structurally the singleton runner's loop
-//! ([`singleton`](crate::out::subscription::singleton)), minus the ephemeral
-//! stream and plus the two things only a keyed member has: the pause verbs
+//! ([`singleton`](crate::out::subscription::singleton)), plus the two things only a keyed member has: the pause verbs
 //! (which park the cursor without advancing it) and linger-based dormancy
 //! (an idle, caught-up member completes its job rather than holding a slot).
 //!

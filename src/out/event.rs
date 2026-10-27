@@ -41,40 +41,6 @@ where
     }
 }
 
-pub enum OutboxEvent<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    Persistent(EventDelivery<P>),
-    Ephemeral(Arc<EphemeralOutboxEvent<P>>),
-}
-impl<P> Clone for OutboxEvent<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    fn clone(&self) -> Self {
-        match self {
-            Self::Persistent(event) => Self::Persistent(event.clone()),
-            Self::Ephemeral(event) => Self::Ephemeral(Arc::clone(event)),
-        }
-    }
-}
-
-impl<P> OutboxEvent<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    pub fn as_event<E>(&self) -> Option<&E>
-    where
-        P: OutboxEventMarker<E>,
-    {
-        match self {
-            Self::Persistent(e) => (**e).as_event::<E>(),
-            Self::Ephemeral(e) => (**e).as_event::<E>(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct EphemeralEventType(Cow<'static, str>);
@@ -125,15 +91,6 @@ where
     }
 }
 
-impl<P> From<EphemeralOutboxEvent<P>> for OutboxEvent<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    fn from(event: EphemeralOutboxEvent<P>) -> Self {
-        Self::Ephemeral(Arc::new(event))
-    }
-}
-
 /// A stored payload that could not be decoded into the consumer's event type
 /// (e.g. a variant the consumer's enum does not know yet, or a row written by
 /// a different event enum sharing the table).
@@ -154,8 +111,8 @@ pub struct DecodeFailure {
 /// consumer's event type. Everything undecodable-shaped is this one type,
 /// always in an `Err` arm: the
 /// [`MailboxTables`](crate::MailboxTables) load results, the
-/// [`PersistentOutboxListener`](crate::out::PersistentOutboxListener) /
-/// [`AllOutboxListener`](crate::out::AllOutboxListener) stream items, and
+/// [`PersistentOutboxListener`](crate::out::PersistentOutboxListener) stream
+/// items, and
 /// the error the default
 /// [`SingletonSubscriber::handle_undecodable`](crate::SingletonSubscriber::handle_undecodable)
 /// fails the handler job with.
@@ -475,15 +432,6 @@ where
     #[allow(clippy::result_large_err)]
     pub(crate) fn into_item(self) -> Result<EventDelivery<P, L>, UndecodableDelivery<L>> {
         self.map(PersistentDelivery::into_item).transpose()
-    }
-}
-
-impl<P> From<PersistentOutboxEvent<P>> for OutboxEvent<P>
-where
-    P: Serialize + DeserializeOwned + Send,
-{
-    fn from(event: PersistentOutboxEvent<P>) -> Self {
-        Self::Persistent(Delivery::new(event.sequence, true, Arc::new(event)))
     }
 }
 

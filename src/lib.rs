@@ -34,11 +34,13 @@ pub use inbox::{
 };
 pub use obix_macros::{MailboxTables, OutboxEvent};
 pub use out::{
-    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery, EventCtx,
-    EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
+    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery,
+    EphemeralConfig, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
+    EphemeralOutboxListener, EphemeralSubscriber, EphemeralSubscriberConfig, EphemeralSubscription,
+    EventCtx, EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
     KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox,
     OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
-    SingletonSubscriber, StagedOp, StreamPosition, StreamSelection, Subscription, SubscriptionDef,
+    SingletonSubscriber, StagedOp, StreamPosition, Subscription, SubscriptionDef,
     SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
     Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };

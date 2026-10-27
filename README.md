@@ -70,9 +70,15 @@ async fn main() -> anyhow::Result<()> {
     ).await?;
     op.commit().await?;
 
+    // The ephemeral stream has its own handle, payload type and LISTEN connection
+    let ephemeral = obix::EphemeralOutbox::<MyEvent>::init(
+        &pool,
+        obix::EphemeralConfig::builder().build(),
+    ).await?;
+
     // Publish an ephemeral event (only latest per type is kept)
-    let event_type = obix::out::EphemeralEventType::new("user_online_status");
-    outbox.publish_ephemeral(
+    let event_type = obix::EphemeralEventType::new("user_online_status");
+    ephemeral.publish(
         event_type,
         MyEvent::UserRegistered {
             user_id: "123".to_string(),
@@ -81,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     ).await?;
 
     // Listen to ephemeral events
-    let mut ephemeral_listener = outbox.listen_ephemeral();
+    let mut ephemeral_listener = ephemeral.listen();
     while let Some(event) = ephemeral_listener.next().await {
         println!("Ephemeral event: {:?}", event.payload);
     }
@@ -162,12 +168,11 @@ let mut listener = outbox.listen_persisted(EventSequence::from(42));
 // Listen to new persistent events only
 let mut listener = outbox.listen_persisted(None);
 
-// Listen to ephemeral events
-let mut listener = outbox.listen_ephemeral();
-
-// Listen to all events (persistent + ephemeral)
-let mut listener = outbox.listen_all(None);
+// Listen to ephemeral events, on the ephemeral handle
+let mut listener = ephemeral.listen();
 ```
+
+The two streams are never merged: hold one listener per stream.
 
 ## Errors and telemetry
 
@@ -181,7 +186,7 @@ re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`publish_ephemeral*`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::subscribe_in_op`/`cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
 | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription` |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |

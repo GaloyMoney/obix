@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use obix::{
-    Inbox, InboxEventStatus, MailboxConfig,
+    EphemeralConfig, EphemeralOutbox, Inbox, InboxEventStatus, MailboxConfig,
     inbox::{InboxConfig, InboxEventId},
     out::Outbox,
 };
@@ -49,10 +49,15 @@ pub async fn wipeout_outbox_tables(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE persistent_outbox_events RESTART IDENTITY")
         .execute(pool)
         .await?;
+    wipeout_ephemeral_table(pool).await?;
+    wipeout_commit_log(pool).await?;
+    Ok(())
+}
+
+pub async fn wipeout_ephemeral_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     sqlx::query!("TRUNCATE ephemeral_outbox_events")
         .execute(pool)
         .await?;
-    wipeout_commit_log(pool).await?;
     Ok(())
 }
 
@@ -152,6 +157,18 @@ where
 {
     wipeout_outbox_tables(pool).await?;
     let outbox = Outbox::<P, TestTables>::init(pool, config).await?;
+    Ok(outbox)
+}
+
+pub async fn init_ephemeral<Q>(
+    pool: &sqlx::PgPool,
+    config: EphemeralConfig,
+) -> anyhow::Result<EphemeralOutbox<Q, TestTables>>
+where
+    Q: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    wipeout_ephemeral_table(pool).await?;
+    let outbox = EphemeralOutbox::<Q, TestTables>::init(pool, config).await?;
     Ok(outbox)
 }
 

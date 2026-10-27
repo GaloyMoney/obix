@@ -175,7 +175,7 @@ impl std::fmt::Display for WakeKey {
 // === Traits ===
 
 /// Keyed subscribers — persistent-only by construction: there is no
-/// `handle_ephemeral` and no `SUBSCRIPTION` selector.
+/// ephemeral stream.
 ///
 /// That is the other side of the presence contract. A keyed subscriber is
 /// *not* always present — it passivates when idle, waits out pauses, and for

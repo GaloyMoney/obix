@@ -1,11 +1,11 @@
 mod helpers;
 
 use futures::stream::StreamExt;
-use obix::{EventSequence, MailboxConfig, OutboxEvent, out::OutboxEventMarker};
+use obix::{EphemeralConfig, EventSequence, MailboxConfig, OutboxEvent, out::OutboxEventMarker};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
-use helpers::{init_outbox, init_pool};
+use helpers::{init_ephemeral, init_outbox, init_pool};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
@@ -1262,13 +1262,13 @@ async fn backfill_fills_burned_tail_for_replaying_listener() -> anyhow::Result<(
 async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+    let outbox = init_ephemeral::<TestEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
-    let mut listener = outbox.listen_ephemeral();
+    let mut listener = outbox.listen();
 
     let event_type = obix::out::EphemeralEventType::new("test_type");
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(42))
+        .publish(event_type.clone(), TestEvent::Ping(42))
         .await?;
 
     let Some(event) =
@@ -1287,21 +1287,17 @@ async fn ephemeral_events_via_cache() -> anyhow::Result<()> {
 async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+    let outbox = init_ephemeral::<TestEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
     let type1 = obix::out::EphemeralEventType::new("type1");
     let type2 = obix::out::EphemeralEventType::new("type2");
 
-    outbox
-        .publish_ephemeral(type1.clone(), TestEvent::Ping(1))
-        .await?;
-    outbox
-        .publish_ephemeral(type2.clone(), TestEvent::Ping(2))
-        .await?;
+    outbox.publish(type1.clone(), TestEvent::Ping(1)).await?;
+    outbox.publish(type2.clone(), TestEvent::Ping(2)).await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let mut listener = outbox.listen_ephemeral();
+    let mut listener = outbox.listen();
 
     let mut received_events = Vec::new();
     for _ in 0..2 {
@@ -1325,25 +1321,25 @@ async fn ephemeral_events_multiple_types() -> anyhow::Result<()> {
 async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+    let outbox = init_ephemeral::<TestEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
     let event_type = obix::out::EphemeralEventType::new("replaceable");
 
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(1))
+        .publish(event_type.clone(), TestEvent::Ping(1))
         .await?;
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(2))
+        .publish(event_type.clone(), TestEvent::Ping(2))
         .await?;
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(3))
+        .publish(event_type.clone(), TestEvent::Ping(3))
         .await?;
 
     // Give the cache time to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Create listener - should only receive the latest event for this type
-    let mut listener = outbox.listen_ephemeral();
+    let mut listener = outbox.listen();
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(1), listener.next())
         .await?
@@ -1370,9 +1366,9 @@ async fn ephemeral_events_replace_same_type() -> anyhow::Result<()> {
 async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+    let outbox = init_ephemeral::<TestEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
-    let mut listener = outbox.listen_ephemeral();
+    let mut listener = outbox.listen();
 
     // A fully-formed forged event in the notification body.
     sqlx::query("SELECT pg_notify('ephemeral_outbox_events', $1)")
@@ -1398,7 +1394,7 @@ async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> 
     // The listener is still alive: a legitimately published event arrives.
     let event_type = obix::out::EphemeralEventType::new("legit_type");
     outbox
-        .publish_ephemeral(event_type.clone(), TestEvent::Ping(1))
+        .publish(event_type.clone(), TestEvent::Ping(1))
         .await?;
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
         .await?
@@ -1416,9 +1412,9 @@ async fn forged_ephemeral_notification_is_not_delivered() -> anyhow::Result<()> 
 async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Result<()> {
     let pool = init_pool().await?;
 
-    let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+    let outbox = init_ephemeral::<TestEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
-    let mut listener = outbox.listen_ephemeral();
+    let mut listener = outbox.listen();
 
     sqlx::query("INSERT INTO ephemeral_outbox_events (event_type, payload) VALUES ($1, $2)")
         .bind("external_type")

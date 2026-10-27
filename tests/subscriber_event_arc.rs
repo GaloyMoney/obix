@@ -6,9 +6,9 @@ mod helpers;
 use std::sync::Arc;
 
 use obix::{
-    EventCtx, EventDelivery, FlushOp, Handled, InsertOrder, KeyedEventCtx, KeyedSubscriber,
-    KeyedSubscriberConfig, MailboxConfig, OutboxEventJobConfig, SingletonSubscriber,
-    SubscriptionDef, WakeKey,
+    EphemeralConfig, EphemeralSubscriber, EphemeralSubscriberConfig, EventCtx, EventDelivery,
+    FlushOp, Handled, InsertOrder, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
+    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, SubscriptionDef, WakeKey,
     out::{Outbox, OutboxEventMarker, PersistentOutboxEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -16,8 +16,8 @@ use serial_test::file_serial;
 use tokio::sync::Mutex;
 
 use helpers::{
-    TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeout_outbox_job_tables,
-    wipeout_outbox_tables, wipeout_subscriptions,
+    TestTables, init_ephemeral, init_pool, wipeout_keyed_subscriber_job_tables,
+    wipeout_outbox_job_tables, wipeout_outbox_tables, wipeout_subscriptions,
 };
 
 const JOB_TYPE: &str = "test-subscriber-event-arc";
@@ -107,10 +107,8 @@ struct EphemeralReader {
     received: Arc<Mutex<Vec<u64>>>,
 }
 
-impl SingletonSubscriber<NonCloneEvent> for EphemeralReader {
-    type Batch = ();
-
-    async fn handle_ephemeral(
+impl EphemeralSubscriber<NonCloneEvent> for EphemeralReader {
+    async fn handle(
         &self,
         event: &Arc<obix::out::EphemeralOutboxEvent<NonCloneEvent>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -467,13 +465,15 @@ async fn a_singleton_classifies_through_the_arc_while_retaining() -> anyhow::Res
 async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
-    let outbox = init_outbox(&pool).await?;
+    wipeout_outbox_job_tables(&pool, JOB_TYPE).await?;
+    let ephemeral =
+        init_ephemeral::<NonCloneEvent>(&pool, EphemeralConfig::builder().build()).await?;
 
     let received = Arc::new(Mutex::new(Vec::new()));
-    outbox
-        .register_singleton_subscriber(
+    ephemeral
+        .register_subscriber(
             &mut jobs,
-            OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE)),
+            EphemeralSubscriberConfig::new(job::JobType::new(JOB_TYPE)),
             EphemeralReader {
                 received: received.clone(),
             },
@@ -483,8 +483,8 @@ async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {
     jobs.start_poll().await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    outbox
-        .publish_ephemeral(
+    ephemeral
+        .publish(
             obix::out::EphemeralEventType::new("arc_test"),
             NonCloneEvent::Ping { owner: 1, n: 42 },
         )
