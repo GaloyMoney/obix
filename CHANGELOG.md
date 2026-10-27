@@ -1,3 +1,11 @@
+# [obix release v0.15.1](https://github.com/GaloyMoney/obix/releases/tag/0.15.1)
+
+
+
+### Features
+
+- Ephemeral events typed by key; listener-side selections (#178)
+
 # [obix release v0.15.0](https://github.com/GaloyMoney/obix/releases/tag/0.15.0)
 
 
