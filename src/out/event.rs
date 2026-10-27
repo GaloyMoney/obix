@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use crate::out::lane::{CommitOrder, InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
@@ -17,8 +17,8 @@ pub trait OutboxEventMarker<E>:
 /// A type that can itself be an outbox payload. Opting in is what makes
 /// `T: OutboxEventMarker<T>` hold; it deliberately excludes wrappers such as
 /// `Arc<PersistentOutboxEvent<_>>`, which would otherwise satisfy the
-/// blanket impl below and shadow `PersistentOutboxEvent::as_event` /
-/// `EphemeralOutboxEvent::as_event` at the call site.
+/// blanket impl below and shadow `PersistentOutboxEvent::as_event` at the
+/// call site.
 ///
 /// `#[derive(OutboxEvent)]` implements this for you. A hand-rolled payload
 /// type used directly as `P` (no wrapping enum) needs one line:
@@ -38,56 +38,6 @@ where
 {
     fn as_event(&self) -> Option<&T> {
         Some(self)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(transparent)]
-pub struct EphemeralEventType(Cow<'static, str>);
-impl EphemeralEventType {
-    pub const fn new(name: &'static str) -> Self {
-        Self(Cow::Borrowed(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for EphemeralEventType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(bound(deserialize = "T: DeserializeOwned"))]
-pub struct EphemeralOutboxEvent<T>
-where
-    T: Serialize + DeserializeOwned + Send,
-{
-    pub event_type: EphemeralEventType,
-    pub payload: T,
-    pub tracing_context: Option<es_entity::context::TracingContext>,
-    pub recorded_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl<T> EphemeralOutboxEvent<T>
-where
-    T: Serialize + DeserializeOwned + Send,
-{
-    pub fn as_event<E>(&self) -> Option<&E>
-    where
-        T: OutboxEventMarker<E>,
-    {
-        self.payload.as_event()
-    }
-
-    #[cfg(feature = "tracing")]
-    pub fn inject_trace_parent(&self) {
-        if let Some(context) = &self.tracing_context {
-            context.inject_as_parent();
-        }
     }
 }
 

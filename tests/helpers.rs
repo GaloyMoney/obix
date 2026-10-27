@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use obix::{
-    EphemeralConfig, EphemeralOutbox, Inbox, InboxEventStatus, MailboxConfig,
+    EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox, EphemeralSelection,
+    Inbox, InboxEventStatus, MailboxConfig,
     inbox::{InboxConfig, InboxEventId},
     out::Outbox,
 };
@@ -160,16 +161,37 @@ where
     Ok(outbox)
 }
 
-pub async fn init_ephemeral<Q>(
+pub async fn init_ephemeral(
     pool: &sqlx::PgPool,
     config: EphemeralConfig,
-) -> anyhow::Result<EphemeralOutbox<Q, TestTables>>
-where
-    Q: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
-{
+) -> anyhow::Result<EphemeralOutbox<TestTables>> {
     wipeout_ephemeral_table(pool).await?;
-    let outbox = EphemeralOutbox::<Q, TestTables>::init(pool, config).await?;
+    let outbox = EphemeralOutbox::<TestTables>::init(pool, config).await?;
     Ok(outbox)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Status(pub u64);
+impl EphemeralEvent for Status {
+    const EVENT_TYPE: EphemeralEventType = EphemeralEventType::new("test.status");
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Tick(pub u64);
+impl EphemeralEvent for Tick {
+    const EVENT_TYPE: EphemeralEventType = EphemeralEventType::new("test.tick");
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Other(pub u64);
+impl EphemeralEvent for Other {
+    const EVENT_TYPE: EphemeralEventType = EphemeralEventType::new("test.other");
+}
+
+#[derive(EphemeralSelection, PartialEq, Debug)]
+pub enum StatusOrTick {
+    Status(Status),
+    Tick(Tick),
 }
 
 pub async fn wait_for_inbox_status(

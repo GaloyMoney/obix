@@ -41,8 +41,9 @@ use crate::{
 };
 
 pub use ephemeral::{
-    EphemeralConfig, EphemeralOutbox, EphemeralOutboxListener, EphemeralSubscriber,
-    EphemeralSubscriberConfig, EphemeralSubscription,
+    EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
+    EphemeralOutboxListener, EphemeralSelection, EphemeralSubscriber, EphemeralSubscriberConfig,
+    EphemeralSubscription, RawPayload,
 };
 pub use event::*;
 use notifier::PersistentNotifier;

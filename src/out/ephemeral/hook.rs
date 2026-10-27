@@ -1,63 +1,50 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use es_entity::hooks::{CommitHook, HookOperation, PreCommitRet};
-use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
-use crate::out::event::{EphemeralEventType, EphemeralOutboxEvent};
+use super::event::{EphemeralEventType, EphemeralOutboxEvent, RawPayload};
 use crate::tables::MailboxTables;
 
-pub struct EphemeralEvent<P> {
-    pub event_type: EphemeralEventType,
-    pub payload: P,
-}
-
-pub struct PersistEphemeralEvents<P, Tables>
+pub struct PersistEphemeralEvents<Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
-    pre_commit_events: Vec<EphemeralEvent<P>>,
-    post_commit_events: Vec<EphemeralOutboxEvent<P>>,
+    sender: broadcast::Sender<Arc<EphemeralOutboxEvent<RawPayload>>>,
+    pre_commit_events: Vec<(EphemeralEventType, RawPayload)>,
+    post_commit_events: Vec<EphemeralOutboxEvent<RawPayload>>,
     _phantom: PhantomData<Tables>,
 }
 
-impl<P, Tables> PersistEphemeralEvents<P, Tables>
+impl<Tables> PersistEphemeralEvents<Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
     pub fn new(
-        sender: broadcast::Sender<Arc<EphemeralOutboxEvent<P>>>,
+        sender: broadcast::Sender<Arc<EphemeralOutboxEvent<RawPayload>>>,
         event_type: EphemeralEventType,
-        event: impl Into<P>,
+        payload: RawPayload,
     ) -> Self {
         Self {
             sender,
-            pre_commit_events: vec![EphemeralEvent {
-                event_type,
-                payload: event.into(),
-            }],
+            pre_commit_events: vec![(event_type, payload)],
             post_commit_events: Vec::new(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<P, Tables> CommitHook for PersistEphemeralEvents<P, Tables>
+impl<Tables> CommitHook for PersistEphemeralEvents<Tables>
 where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
     async fn pre_commit(
         mut self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        for event in self.pre_commit_events.drain(..) {
+        for (event_type, payload) in self.pre_commit_events.drain(..) {
             let persisted =
-                Tables::persist_ephemeral_event_in_op(&mut op, event.event_type, event.payload)
-                    .await?;
+                Tables::persist_ephemeral_event_in_op(&mut op, event_type, payload).await?;
             self.post_commit_events.push(persisted);
         }
         PreCommitRet::ok(self, op)

@@ -53,7 +53,7 @@ members = [
 obix-macros = { path = "obix-macros", version = "0.15.1-dev" }
 
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 es-entity = "0.20.0"
 anyhow = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }

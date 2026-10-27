@@ -102,6 +102,10 @@ impl SingletonSubscriber<NonCloneEvent> for RetainingSubscriber {
     }
 }
 
+impl obix::EphemeralEvent for NonCloneEvent {
+    const EVENT_TYPE: obix::EphemeralEventType = obix::EphemeralEventType::new("test.arc");
+}
+
 /// Reads the event through the delivery without retaining it.
 struct EphemeralReader {
     received: Arc<Mutex<Vec<u64>>>,
@@ -466,12 +470,11 @@ async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let mut jobs = init_jobs(&pool).await?;
     wipeout_outbox_job_tables(&pool, JOB_TYPE).await?;
-    let ephemeral =
-        init_ephemeral::<NonCloneEvent>(&pool, EphemeralConfig::builder().build()).await?;
+    let ephemeral = init_ephemeral(&pool, EphemeralConfig::builder().build()).await?;
 
     let received = Arc::new(Mutex::new(Vec::new()));
     ephemeral
-        .register_subscriber(
+        .register_subscriber::<NonCloneEvent, _>(
             &mut jobs,
             EphemeralSubscriberConfig::new(job::JobType::new(JOB_TYPE)),
             EphemeralReader {
@@ -484,10 +487,7 @@ async fn an_ephemeral_handler_reads_through_the_arc() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     ephemeral
-        .publish(
-            obix::out::EphemeralEventType::new("arc_test"),
-            NonCloneEvent::Ping { owner: 1, n: 42 },
-        )
+        .publish(NonCloneEvent::Ping { owner: 1, n: 42 })
         .await?;
 
     eventually(std::time::Duration::from_secs(10), || async {

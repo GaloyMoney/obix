@@ -2,6 +2,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
 
+mod ephemeral_selection;
 mod outbox_event;
 mod tables;
 
@@ -12,6 +13,15 @@ use syn::parse_macro_input;
 pub fn mailbox_tables_derive(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as syn::DeriveInput);
     match tables::derive(ast) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.write_errors().into(),
+    }
+}
+
+#[proc_macro_derive(EphemeralSelection, attributes(obix))]
+pub fn ephemeral_selection_derive(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as syn::DeriveInput);
+    match ephemeral_selection::derive(ast) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.write_errors().into(),
     }

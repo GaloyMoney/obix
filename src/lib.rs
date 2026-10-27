@@ -32,15 +32,15 @@ pub use inbox::{
     Inbox, InboxConfig, InboxEvent, InboxEventId, InboxEventStatus, InboxHandler,
     InboxIdempotencyKey, InboxRejection, InboxResult,
 };
-pub use obix_macros::{MailboxTables, OutboxEvent};
+pub use obix_macros::{EphemeralSelection, MailboxTables, OutboxEvent};
 pub use out::{
     CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery,
-    EphemeralConfig, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
-    EphemeralOutboxListener, EphemeralSubscriber, EphemeralSubscriberConfig, EphemeralSubscription,
-    EventCtx, EventDelivery, FlushError, FlushOp, Handled, InsertOrder, IsolatedOp, KeyedEventCtx,
-    KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox,
-    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
-    SingletonSubscriber, StagedOp, StreamPosition, Subscription, SubscriptionDef,
+    EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
+    EphemeralOutboxListener, EphemeralSelection, EphemeralSubscriber, EphemeralSubscriberConfig,
+    EphemeralSubscription, EventCtx, EventDelivery, FlushError, FlushOp, Handled, InsertOrder,
+    IsolatedOp, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig, Lane, LaneMismatch,
+    Ordering, Outbox, OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook,
+    RawPayload, SingletonSubscriber, StagedOp, StreamPosition, Subscription, SubscriptionDef,
     SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
     Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };

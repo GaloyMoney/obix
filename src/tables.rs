@@ -91,7 +91,7 @@ fn record_persistent_payload_undecodable(error: &serde_json::Error, sequence: u6
     name = "obix.tables.ephemeral_payload_undecodable",
     level = "error",
     skip_all,
-    fields(otel.status_code = "ERROR", error = %error, event_type = %event_type)
+    fields(otel.status_code = "ERROR", error.category = ?error.classify(), event_type = %event_type)
 )]
 pub fn record_ephemeral_payload_undecodable(error: &serde_json::Error, event_type: &str) {}
 
