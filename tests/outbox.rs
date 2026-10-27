@@ -2,7 +2,7 @@ mod helpers;
 
 use futures::stream::StreamExt;
 use obix::{
-    EphemeralConfig, EphemeralEvent, EventSequence, MailboxConfig, OutboxEvent,
+    EphemeralConfig, EphemeralEvent, EphemeralEventType, EventSequence, MailboxConfig, OutboxEvent,
     out::OutboxEventMarker,
 };
 use serde::{Deserialize, Serialize};
@@ -1417,6 +1417,45 @@ async fn ephemeral_event_written_externally_is_fetched_from_db() -> anyhow::Resu
         .expect("externally written ephemeral event must be delivered via the hint + fetch path");
     assert_eq!(event.event_type, Status::EVENT_TYPE);
     assert_eq!(event.payload, Status(7));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn ephemeral_structured_payload_written_externally_is_fetched_from_db() -> anyhow::Result<()>
+{
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Reading {
+        celsius: u64,
+        tags: Vec<String>,
+    }
+    impl EphemeralEvent for Reading {
+        const EVENT_TYPE: EphemeralEventType = EphemeralEventType::new("test.reading");
+    }
+
+    let pool = init_pool().await?;
+
+    let outbox = init_ephemeral(&pool, EphemeralConfig::builder().build()).await?;
+
+    let mut listener = outbox.listen::<Reading>();
+
+    sqlx::query("INSERT INTO ephemeral_outbox_events (event_type, payload) VALUES ($1, $2)")
+        .bind(Reading::EVENT_TYPE.as_str())
+        .bind(serde_json::json!({"celsius": 21, "tags": ["a", "b"]}))
+        .execute(&pool)
+        .await?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+        .await?
+        .expect("a structured payload written externally must reach the cache");
+    assert_eq!(
+        event.payload,
+        Reading {
+            celsius: 21,
+            tags: vec!["a".into(), "b".into()],
+        }
+    );
 
     Ok(())
 }
