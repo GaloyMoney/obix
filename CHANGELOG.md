@@ -1,3 +1,11 @@
+# [obix release v0.16.0](https://github.com/GaloyMoney/obix/releases/tag/0.16.0)
+
+
+
+### Features
+
+- [**breaking**] Adopt job 0.19 lane-banded retry; InboxResult::Fail (#179)
+
 # [obix release v0.15.1](https://github.com/GaloyMoney/obix/releases/tag/0.15.1)
 
 
