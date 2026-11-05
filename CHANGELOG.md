@@ -1,3 +1,12 @@
+# [obix release v0.16.1](https://github.com/GaloyMoney/obix/releases/tag/0.16.1)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.20.4 and job to 0.19.3 (#181)
+- Bump the all-dependencies group across 1 directory with 2 updates (#175)
+
 # [obix release v0.16.0](https://github.com/GaloyMoney/obix/releases/tag/0.16.0)
 
 
