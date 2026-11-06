@@ -20,7 +20,8 @@ use std::any::TypeId;
 use std::sync::Arc;
 
 pub use self::ctx::{
-    EventCtx, FlushError, FlushOp, Handled, IsolatedOp, KeyedEventCtx, StagedOp, Suspended,
+    EventCtx, FinishedAtFence, FlushError, FlushOp, FlushOutcome, Handled, IsolatedOp,
+    KeyedEventCtx, StagedOp, Suspended,
 };
 pub use self::error::{CouldNotDecodeStored, LaneMismatch};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};

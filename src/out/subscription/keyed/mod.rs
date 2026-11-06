@@ -28,7 +28,7 @@ use std::{marker::PhantomData, time::Duration};
 use job::{JobType, RetrySettings};
 
 use crate::error::ObixFault;
-use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
+use crate::out::ctx::{FlushOp, FlushOutcome, Handled, KeyedEventCtx};
 use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
 use crate::out::{Subscription, SubscriptionRejection};
@@ -221,15 +221,18 @@ where
     }
 
     /// Same contract as
-    /// [`SingletonSubscriber::flush`](crate::out::SingletonSubscriber::flush).
+    /// [`SingletonSubscriber::flush`](crate::out::SingletonSubscriber::flush),
+    /// plus the verdict: return [`FlushOutcome::Finish`] to end this member in
+    /// the landing's own transaction.
     fn flush(
         &self,
         op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
-    {
+    ) -> impl std::future::Future<
+        Output = Result<FlushOutcome, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send {
         let _ = (op, items);
-        async { Ok(()) }
+        async { Ok(FlushOutcome::Continue) }
     }
 }
 
@@ -586,6 +589,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_outcome_defaults_to_continue() {
+        assert_eq!(FlushOutcome::default(), FlushOutcome::Continue);
+        assert_ne!(FlushOutcome::default(), FlushOutcome::Finish);
+    }
 
     #[test]
     fn config_retries_on_the_job_default() {

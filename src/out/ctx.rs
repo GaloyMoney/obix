@@ -152,6 +152,65 @@ pub(crate) trait CheckpointMirror: Send + Sync {
         op: &'a mut es_entity::DbOp<'static>,
         checkpoint: EventSequence,
     ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>>;
+
+    /// Delete the member's `subscriptions` row on `op`, in the transaction
+    /// that finishes it.
+    fn retire<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>>;
+}
+
+/// What a keyed flush decided for the member after this landing.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlushOutcome {
+    /// Keep consuming. The default, and the only value a `flush` that does
+    /// not override the trait method produces.
+    #[default]
+    Continue,
+    /// This member is done. The runner commits this landing's work and
+    /// checkpoint, deletes the subscription row and completes the job, in
+    /// the same transaction. Keyed-only by construction: a singleton's
+    /// `flush` returns `()`.
+    ///
+    /// A failed finish transaction replays the whole batch, so the handler
+    /// sees the same items again and must return `Finish` again; its writes
+    /// roll back with the op.
+    ///
+    /// Allowed from any keyed member: it cancels the member from inside and
+    /// completes it, atomically, and the key is then not reusable.
+    ///
+    /// A `Finish` landed by a later event's
+    /// [`consume`](KeyedEventCtx::consume) ends the member *before* that
+    /// event: the event is never handled and `consume()` returns
+    /// [`FinishedAtFence`].
+    Finish,
+}
+
+/// Returned by [`KeyedEventCtx::consume`] when the pending batch it landed
+/// ended the member with [`FlushOutcome::Finish`]. The event `consume` was
+/// called for is not handled. Propagate it unchanged so the runner can
+/// complete the member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinishedAtFence;
+
+impl std::fmt::Display for FinishedAtFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the member finished at the consume fence")
+    }
+}
+
+impl std::error::Error for FinishedAtFence {}
+
+/// How a [`flush_batch`] call ended.
+pub(crate) enum Landed {
+    /// Landed and committed (or nothing was pending).
+    Continue,
+    /// The flush asked to finish: the op carries the work, the checkpoint and
+    /// the row deletion, uncommitted. Completing the job with it commits all
+    /// of it at once.
+    Finished(es_entity::DbOp<'static>),
 }
 
 pub(crate) struct CtxParts<'inv> {
@@ -311,7 +370,10 @@ impl<'inv, B> EventCtx<'inv, B> {
             batch,
             flusher,
         } = self;
-        flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
+        let Landed::Continue = flush_batch(&mut parts, batch, flusher, "consume_entry").await?
+        else {
+            unreachable!("a singleton flush returns (), so its consume fence cannot land a Finish");
+        };
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await?,
@@ -393,7 +455,7 @@ pub(crate) trait ItemFlush<B>: Send + Sync {
         op: &'a mut es_entity::DbOp<'static>,
         items: B,
         state: &'a OutboxEventJobState,
-    ) -> BoxFuture<'a, Result<(), HandlerError>>;
+    ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>>;
 
     /// Where the subscription's cursor sits, on the handler's own lane.
     fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition;
@@ -491,10 +553,11 @@ pub(crate) async fn flush_batch<B: Default>(
     batch: &mut B,
     flusher: &dyn ItemFlush<B>,
     reason: &'static str,
-) -> Result<(), HandlerError> {
+) -> Result<Landed, HandlerError> {
     if parts.op_slot.is_none() && parts.tracker.collected == 0 {
-        return Ok(());
+        return Ok(Landed::Continue);
     }
+    let mut outcome = FlushOutcome::Continue;
     if parts.tracker.collected > 0 {
         if parts.op_slot.is_none() {
             *parts.op_slot = Some(
@@ -513,23 +576,43 @@ pub(crate) async fn flush_batch<B: Default>(
         let state = &*parts.state;
         let op = parts.op_slot.as_mut().expect("op was materialized above");
         let through = flusher.position_of(state);
-        if let Err(source) = flusher.flush_items(op, items, state).await {
-            return Err(Box::new(FlushError {
-                reason,
-                after: parts.tracker.persisted,
-                through,
-                source,
-            }));
+        match flusher.flush_items(op, items, state).await {
+            Ok(flushed) => outcome = flushed,
+            Err(source) => {
+                return Err(Box::new(FlushError {
+                    reason,
+                    after: parts.tracker.persisted,
+                    through,
+                    source,
+                }));
+            }
         }
     }
-    let op = parts
+    let mut op = parts
         .op_slot
         .take()
         .expect("a pending batch always has an op by now");
-    commit_checkpoint(parts.current_job, op, parts.state, parts.mirror).await?;
+    let landed = match outcome {
+        FlushOutcome::Continue => {
+            commit_checkpoint(parts.current_job, op, parts.state, parts.mirror).await?;
+            Landed::Continue
+        }
+        FlushOutcome::Finish => {
+            let mirror = parts
+                .mirror
+                .expect("only a keyed flush can return Finish, and keyed runners carry a mirror");
+            parts.state.paused = None;
+            parts
+                .current_job
+                .update_execution_state_in_op(&mut op, &*parts.state)
+                .await?;
+            mirror.retire(&mut op).await?;
+            Landed::Finished(op)
+        }
+    };
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
-    Ok(())
+    Ok(landed)
 }
 
 /// Write the checkpoint — and, for a keyed member, its mirrored copy — onto
@@ -654,7 +737,12 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
             flusher,
             event_seq,
         } = self;
-        flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
+        if let Landed::Finished(op) =
+            flush_batch(&mut parts, batch, flusher, "consume_entry").await?
+        {
+            *parts.op_slot = Some(op);
+            return Err(Box::new(FinishedAtFence));
+        }
         let op =
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await?;

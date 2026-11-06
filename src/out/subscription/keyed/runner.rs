@@ -41,7 +41,7 @@ where
         op: &'a mut es_entity::DbOp<'static>,
         items: S::Batch,
         state: &'a OutboxEventJobState,
-    ) -> BoxFuture<'a, Result<(), HandlerError>> {
+    ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>> {
         Box::pin(async move {
             let mut op = FlushOp::<InsertOrder>::new(op, state.sequence);
             self.subscriber.flush(&mut op, items).await
@@ -175,6 +175,15 @@ impl<Tables: MailboxTables> CheckpointMirror for KeyedCheckpointMirror<Tables> {
             .await
         })
     }
+
+    fn retire<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            Tables::delete_subscription_in_op(op, self.subscriber_type.as_str(), &self.key).await
+        })
+    }
 }
 
 struct KeyedSubscriberJobRunner<D, P, Tables>
@@ -284,7 +293,11 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
+                        if let Landed::Finished(op) =
+                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?
+                        {
+                            return Ok(job::JobCompletion::CompleteWithOp(op));
+                        }
                         return Ok(job::JobCompletion::RescheduleNow);
                     }
                     None => {
@@ -295,7 +308,11 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
+                        if let Landed::Finished(op) =
+                            flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?
+                        {
+                            return Ok(job::JobCompletion::CompleteWithOp(op));
+                        }
                         continue;
                     }
                 }
@@ -419,7 +436,11 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
+                    if let Landed::Finished(op) =
+                        flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?
+                    {
+                        return Ok(job::JobCompletion::CompleteWithOp(op));
+                    }
                     match subscriber.handle_undecodable(&undecodable).await {
                         Ok(()) => {
                             state.sequence = undecodable.sequence;
@@ -447,7 +468,18 @@ where
                 flusher: &flusher,
                 event_seq: event.sequence,
             };
-            let outcome = subscriber.handle(ctx, &event).await?.outcome;
+            let handled = subscriber
+                .handle(ctx, &event)
+                .await
+                .map(|handled| handled.outcome);
+            let outcome = match handled {
+                Ok(outcome) => outcome,
+                Err(error) if error.is::<FinishedAtFence>() && op_slot.is_some() => {
+                    let op = op_slot.take().expect("checked is_some above");
+                    return Ok(job::JobCompletion::CompleteWithOp(op));
+                }
+                Err(error) => return Err(error),
+            };
 
             match outcome {
                 Outcome::Pause(at) => {
@@ -463,7 +495,11 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "pause_entry").await?;
+                    if let Landed::Finished(op) =
+                        flush_batch(&mut parts, &mut batch, &flusher, "pause_entry").await?
+                    {
+                        return Ok(job::JobCompletion::CompleteWithOp(op));
+                    }
                     if !landed {
                         persist_checkpoint(&mut current_job, &state, Some(&mirror)).await?;
                     }
@@ -479,7 +515,11 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "staged_pause").await?;
+                    if let Landed::Finished(op) =
+                        flush_batch(&mut parts, &mut batch, &flusher, "staged_pause").await?
+                    {
+                        return Ok(job::JobCompletion::CompleteWithOp(op));
+                    }
                     return Ok(job::JobCompletion::RescheduleAt(at));
                 }
                 Outcome::Skip => {
@@ -499,7 +539,11 @@ where
                         tracker: &mut tracker,
                         mirror: Some(&mirror),
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
+                    if let Landed::Finished(op) =
+                        flush_batch(&mut parts, &mut batch, &flusher, "commit").await?
+                    {
+                        return Ok(job::JobCompletion::CompleteWithOp(op));
+                    }
                 }
                 Outcome::Collect => {
                     // Real work — this member is not idle. Restart linger.
@@ -513,7 +557,11 @@ where
                             tracker: &mut tracker,
                             mirror: Some(&mirror),
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
+                        if let Landed::Finished(op) =
+                            flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?
+                        {
+                            return Ok(job::JobCompletion::CompleteWithOp(op));
+                        }
                     }
                 }
             }

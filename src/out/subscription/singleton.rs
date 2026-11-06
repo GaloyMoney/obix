@@ -160,16 +160,33 @@ where
         op: &'a mut es_entity::DbOp<'static>,
         items: H::Batch,
         state: &'a OutboxEventJobState,
-    ) -> BoxFuture<'a, Result<(), HandlerError>> {
+    ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>> {
         Box::pin(async move {
             let mut op =
                 FlushOp::<L>::new(op, L::checkpoint(state.sequence, state.commit_sequence));
-            self.handler.flush(&mut op, items).await
+            self.handler.flush(&mut op, items).await?;
+            Ok(FlushOutcome::Continue)
         })
     }
 
     fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition {
         L::checkpoint(state.sequence, state.commit_sequence).into()
+    }
+}
+
+/// [`ctx::flush_batch`](crate::out::ctx::flush_batch) for a runner that has no
+/// subscription row to retire: a landing here can only continue.
+async fn flush_batch<B: Default>(
+    parts: &mut CtxParts<'_>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B>,
+    reason: &'static str,
+) -> Result<(), HandlerError> {
+    match crate::out::ctx::flush_batch(parts, batch, flusher, reason).await? {
+        Landed::Continue => Ok(()),
+        Landed::Finished(_) => {
+            unreachable!("a singleton flush returns (), so a singleton landing cannot finish")
+        }
     }
 }
 
