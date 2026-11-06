@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT commit_xid, sequence AS \"sequence!: i64\", id, payload,\n                   tracing_context, provenance, recorded_at\n            FROM persistent_outbox_events\n            WHERE commit_xid = ANY($1) AND sequence >= $2 AND payload IS NOT NULL\n            ORDER BY commit_xid, sequence",
+  "query": "\n            SELECT commit_xid, sequence AS \"sequence!: i64\", id, payload,\n                   tracing_context, event_context, recorded_at\n            FROM persistent_outbox_events\n            WHERE commit_xid = ANY($1) AND sequence >= $2 AND payload IS NOT NULL\n            ORDER BY commit_xid, sequence",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       },
       {
         "ordinal": 5,
-        "name": "provenance",
+        "name": "event_context",
         "type_info": "Jsonb"
       },
       {
@@ -55,5 +55,5 @@
       false
     ]
   },
-  "hash": "f6c4fed93ce20b6cad43372ef881ec1a5c924d9f2bd4398dae7bd0a6066da0b5"
+  "hash": "d6d1659e457b418cff81ba16ab10d6cbf2e11efb64dd3fc53de14c80604dd9d5"
 }

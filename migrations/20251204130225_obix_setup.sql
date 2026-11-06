@@ -3,7 +3,7 @@ CREATE TABLE persistent_outbox_events (
   sequence BIGSERIAL,
   payload JSONB,
   tracing_context JSONB,
-  provenance JSONB,
+  event_context JSONB,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   commit_xid BIGINT NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
   PRIMARY KEY (sequence)

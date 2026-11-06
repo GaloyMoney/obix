@@ -2145,13 +2145,13 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
     Ok(())
 }
 
-mod provenance {
+mod event_context {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::stream::StreamExt;
     use obix::{
-        CommitLane, CommitSequence, EventSequence, MailboxConfig, MailboxTables, ProvenanceSource,
+        CommitLane, CommitSequence, EventContextSource, EventSequence, MailboxConfig, MailboxTables,
     };
     use serde_json::{Value, json};
     use serial_test::file_serial;
@@ -2161,13 +2161,13 @@ mod provenance {
 
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    fn fixed(value: Option<Value>) -> ProvenanceSource {
+    fn fixed(value: Option<Value>) -> EventContextSource {
         Arc::new(move || value.clone())
     }
 
     async fn column(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Option<Value>>> {
         Ok(sqlx::query_scalar::<_, Option<Value>>(
-            "SELECT provenance FROM persistent_outbox_events ORDER BY sequence",
+            "SELECT event_context FROM persistent_outbox_events ORDER BY sequence",
         )
         .fetch_all(pool)
         .await?)
@@ -2175,13 +2175,13 @@ mod provenance {
 
     #[tokio::test]
     #[file_serial]
-    async fn provenance_round_trips_through_listener_and_range_load() -> anyhow::Result<()> {
+    async fn event_context_round_trips_through_listener_and_range_load() -> anyhow::Result<()> {
         let pool = init_pool().await?;
         let value = json!({"audit_entry_id": "a1"});
         let outbox = init_outbox::<TestEvent>(
             &pool,
             MailboxConfig::builder()
-                .provenance_source(fixed(Some(value.clone())))
+                .event_context_source(fixed(Some(value.clone())))
                 .build(),
         )
         .await?;
@@ -2196,7 +2196,7 @@ mod provenance {
         let event = tokio::time::timeout(WAIT, listener.next())
             .await?
             .expect("event")?;
-        assert_eq!(event.provenance, Some(value.clone()));
+        assert_eq!(event.event_context, Some(value.clone()));
 
         let loaded = TestTables::load_events_in_range::<TestEvent>(
             &pool,
@@ -2205,7 +2205,7 @@ mod provenance {
         )
         .await?;
         let loaded = loaded.into_iter().next().expect("one row")?;
-        assert_eq!(loaded.provenance, Some(value.clone()));
+        assert_eq!(loaded.event_context, Some(value.clone()));
         assert_eq!(column(&pool).await?, vec![Some(value)]);
         Ok(())
     }
@@ -2226,7 +2226,7 @@ mod provenance {
         let event = tokio::time::timeout(WAIT, listener.next())
             .await?
             .expect("event")?;
-        assert_eq!(event.provenance, None);
+        assert_eq!(event.event_context, None);
         assert_eq!(column(&pool).await?, vec![None]);
         Ok(())
     }
@@ -2238,7 +2238,7 @@ mod provenance {
         let outbox = init_outbox::<TestEvent>(
             &pool,
             MailboxConfig::builder()
-                .provenance_source(fixed(None))
+                .event_context_source(fixed(None))
                 .build(),
         )
         .await?;
@@ -2253,7 +2253,7 @@ mod provenance {
         let event = tokio::time::timeout(WAIT, listener.next())
             .await?
             .expect("event")?;
-        assert_eq!(event.provenance, None);
+        assert_eq!(event.event_context, None);
         assert_eq!(column(&pool).await?, vec![None]);
         Ok(())
     }
@@ -2264,11 +2264,13 @@ mod provenance {
         let pool = init_pool().await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let source: ProvenanceSource =
+        let source: EventContextSource =
             Arc::new(move || Some(json!({"call": counter.fetch_add(1, Ordering::SeqCst)})));
         let outbox = init_outbox::<TestEvent>(
             &pool,
-            MailboxConfig::builder().provenance_source(source).build(),
+            MailboxConfig::builder()
+                .event_context_source(source)
+                .build(),
         )
         .await?;
 
@@ -2305,10 +2307,12 @@ mod provenance {
     #[file_serial]
     async fn capture_happens_on_the_publishing_task_not_at_commit() -> anyhow::Result<()> {
         let pool = init_pool().await?;
-        let source: ProvenanceSource = Arc::new(|| SCOPED.try_with(Clone::clone).ok());
+        let source: EventContextSource = Arc::new(|| SCOPED.try_with(Clone::clone).ok());
         let outbox = init_outbox::<TestEvent>(
             &pool,
-            MailboxConfig::builder().provenance_source(source).build(),
+            MailboxConfig::builder()
+                .event_context_source(source)
+                .build(),
         )
         .await?;
 
@@ -2334,12 +2338,12 @@ mod provenance {
         let pool = init_pool().await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let source: ProvenanceSource =
+        let source: EventContextSource =
             Arc::new(move || Some(json!({"call": counter.fetch_add(1, Ordering::SeqCst)})));
         let outbox = init_outbox::<TestEvent>(
             &pool,
             MailboxConfig::builder()
-                .provenance_source(source)
+                .event_context_source(source)
                 .persist_events_batch_size(2)
                 .build(),
         )
@@ -2368,13 +2372,13 @@ mod provenance {
 
     #[tokio::test]
     #[file_serial]
-    async fn gap_placeholder_carries_no_provenance() -> anyhow::Result<()> {
+    async fn gap_placeholder_carries_no_event_context() -> anyhow::Result<()> {
         let pool = init_pool().await?;
         let value = json!({"audit_entry_id": "a1"});
         let outbox = init_outbox::<TestEvent>(
             &pool,
             MailboxConfig::builder()
-                .provenance_source(fixed(Some(value.clone())))
+                .event_context_source(fixed(Some(value.clone())))
                 .gap_fill_grace(std::time::Duration::from_millis(100))
                 .build(),
         )
@@ -2404,11 +2408,11 @@ mod provenance {
             .await?
             .expect("placeholder")?;
         assert!(placeholder.payload.is_none());
-        assert_eq!(placeholder.provenance, None);
+        assert_eq!(placeholder.event_context, None);
         let real = tokio::time::timeout(WAIT, listener.next())
             .await?
             .expect("real event")?;
-        assert_eq!(real.provenance, Some(value.clone()));
+        assert_eq!(real.event_context, Some(value.clone()));
         assert_eq!(
             column(&pool).await?,
             vec![Some(value.clone()), None, Some(value)]
@@ -2418,14 +2422,15 @@ mod provenance {
 
     #[tokio::test]
     #[file_serial]
-    async fn commit_lane_delivers_the_same_provenance_as_the_insert_lane() -> anyhow::Result<()> {
+    async fn commit_lane_delivers_the_same_event_context_as_the_insert_lane() -> anyhow::Result<()>
+    {
         let pool = init_pool().await?;
         let value = json!({"audit_entry_id": "a1"});
         let outbox = init_outbox::<TestEvent>(
             &pool,
             MailboxConfig::builder()
                 .commit_lane(CommitLane::Enabled)
-                .provenance_source(fixed(Some(value.clone())))
+                .event_context_source(fixed(Some(value.clone())))
                 .build(),
         )
         .await?;
@@ -2445,8 +2450,8 @@ mod provenance {
             let on_commit = tokio::time::timeout(WAIT, commit.next())
                 .await?
                 .expect("commit-lane event")?;
-            assert_eq!(on_insert.provenance, Some(value.clone()));
-            assert_eq!(on_commit.provenance, on_insert.provenance);
+            assert_eq!(on_insert.event_context, Some(value.clone()));
+            assert_eq!(on_commit.event_context, on_insert.event_context);
         }
         Ok(())
     }

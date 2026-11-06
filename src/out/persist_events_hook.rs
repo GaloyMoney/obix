@@ -28,9 +28,9 @@ where
     /// [`CommitHook::on_rollback`] below and the own-failure branches in
     /// `pre_commit`.
     abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
-    /// Events awaiting persistence, grouped by the provenance captured at
+    /// Events awaiting persistence, grouped by the event_context captured at
     /// the publish call that supplied them. Merged publishes append their
-    /// segments; adjacent segments with equal provenance coalesce.
+    /// segments; adjacent segments with equal event_context coalesce.
     pre_commit_events: Vec<(Option<serde_json::Value>, Vec<P>)>,
     /// Persisted events, stashed chunk-by-chunk *as* `pre_commit` runs (not
     /// at its end): if a later chunk, a later hook, or the COMMIT itself
@@ -95,11 +95,11 @@ where
         }
     }
 
-    /// Attach the provenance captured at this publish call to the events
+    /// Attach the event_context captured at this publish call to the events
     /// the hook was constructed with.
-    pub(crate) fn with_provenance(mut self, provenance: Option<serde_json::Value>) -> Self {
+    pub(crate) fn with_event_context(mut self, event_context: Option<serde_json::Value>) -> Self {
         for (segment, _) in &mut self.pre_commit_events {
-            segment.clone_from(&provenance);
+            segment.clone_from(&event_context);
         }
         self
     }
@@ -149,18 +149,18 @@ where
         let segments = std::mem::take(&mut self.pre_commit_events);
         self.post_commit_events
             .reserve(segments.iter().map(|(_, events)| events.len()).sum());
-        let chunks = segments.into_iter().flat_map(|(provenance, events)| {
+        let chunks = segments.into_iter().flat_map(|(event_context, events)| {
             let mut events = events.into_iter();
             std::iter::from_fn(move || {
                 let chunk: Vec<P> = events.by_ref().take(batch_size).collect();
-                (!chunk.is_empty()).then(|| (provenance.clone(), chunk))
+                (!chunk.is_empty()).then(|| (event_context.clone(), chunk))
             })
         });
-        for (provenance, chunk) in chunks {
+        for (event_context, chunk) in chunks {
             let persist = if self.notify_in_tx {
-                Tables::persist_events_notifying(&mut op, chunk.into_iter(), provenance).await
+                Tables::persist_events_notifying(&mut op, chunk.into_iter(), event_context).await
             } else {
-                Tables::persist_events(&mut op, chunk.into_iter(), provenance).await
+                Tables::persist_events(&mut op, chunk.into_iter(), event_context).await
             };
             let persisted_chunk = match persist {
                 Ok(chunk) => chunk,
@@ -237,10 +237,10 @@ where
     }
 
     fn merge(&mut self, other: &mut Self) -> bool {
-        for (provenance, mut events) in other.pre_commit_events.drain(..) {
+        for (event_context, mut events) in other.pre_commit_events.drain(..) {
             match self.pre_commit_events.last_mut() {
-                Some((last, segment)) if *last == provenance => segment.append(&mut events),
-                _ => self.pre_commit_events.push((provenance, events)),
+                Some((last, segment)) if *last == event_context => segment.append(&mut events),
+                _ => self.pre_commit_events.push((event_context, events)),
             }
         }
         true

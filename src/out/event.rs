@@ -182,8 +182,8 @@ where
     pub payload: Option<T>,
     pub tracing_context: Option<es_entity::context::TracingContext>,
     /// Application-supplied attribution stored with this row, surfaced
-    /// verbatim; see [`MailboxConfig::provenance_source`](crate::MailboxConfig).
-    pub provenance: Option<serde_json::Value>,
+    /// verbatim; see [`MailboxConfig::event_context_source`](crate::MailboxConfig).
+    pub event_context: Option<serde_json::Value>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
     /// The source transaction this event committed in. Events sharing one
     /// value committed together; reported on both lanes.
@@ -201,8 +201,8 @@ where
             .field("payload", &self.payload)
             .field("tracing_context", &self.tracing_context)
             .field(
-                "provenance",
-                &self.provenance.as_ref().map(|_| "<redacted>"),
+                "event_context",
+                &self.event_context.as_ref().map(|_| "<redacted>"),
             )
             .field("recorded_at", &self.recorded_at)
             .field("commit_group", &self.commit_group)
@@ -220,7 +220,7 @@ where
             sequence: self.sequence,
             payload: self.payload.clone(),
             tracing_context: self.tracing_context.clone(),
-            provenance: self.provenance.clone(),
+            event_context: self.event_context.clone(),
             recorded_at: self.recorded_at,
             commit_group: self.commit_group,
         }

@@ -125,7 +125,7 @@ pub enum CommitLane {
     Enabled,
 }
 
-pub type ProvenanceSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
+pub type EventContextSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
 
 #[derive(Clone, bon::Builder)]
 pub struct MailboxConfig {
@@ -188,8 +188,9 @@ pub struct MailboxConfig {
     pub clock: ClockHandle,
     /// Called once per publish call, on the publishing task; its value is
     /// stored verbatim on every row of that batch. `None` (the default)
-    /// never writes the column.
-    pub provenance_source: Option<ProvenanceSource>,
+    /// never writes the column. This is not the es-entity `EventContext`:
+    /// the application chooses what the closure returns.
+    pub event_context_source: Option<EventContextSource>,
 }
 
 #[cfg(test)]

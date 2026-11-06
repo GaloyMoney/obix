@@ -37,7 +37,7 @@ pub fn decode_persistent_event<P>(
     sequence: u64,
     recorded_at: chrono::DateTime<chrono::Utc>,
     tracing_context: Option<es_entity::context::TracingContext>,
-    provenance: Option<serde_json::Value>,
+    event_context: Option<serde_json::Value>,
     payload: Option<serde_json::Value>,
     commit_group: CommitGroupId,
 ) -> Result<PersistentOutboxEvent<P>, UndecodableEventError>
@@ -69,7 +69,7 @@ where
         sequence,
         payload,
         tracing_context,
-        provenance,
+        event_context,
         recorded_at,
         commit_group,
     })
@@ -134,7 +134,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     fn persist_events<'a, P>(
         op: &mut HookOperation<'a>,
         events: impl Iterator<Item = P>,
-        provenance: Option<serde_json::Value>,
+        event_context: Option<serde_json::Value>,
     ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;
@@ -147,7 +147,7 @@ pub trait MailboxTables: Send + Sync + 'static {
     fn persist_events_notifying<'a, P>(
         op: &mut HookOperation<'a>,
         events: impl Iterator<Item = P>,
-        provenance: Option<serde_json::Value>,
+        event_context: Option<serde_json::Value>,
     ) -> impl Future<Output = Result<Vec<PersistentOutboxEvent<P>>, sqlx::Error>> + Send
     where
         P: Serialize + DeserializeOwned + Send;

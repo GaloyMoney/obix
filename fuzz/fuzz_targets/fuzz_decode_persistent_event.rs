@@ -91,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(event.recorded_at, recorded_at);
             assert_eq!(event.commit_group, commit_group);
             assert!(event.tracing_context.is_none());
-            assert!(event.provenance.is_none());
+            assert!(event.event_context.is_none());
         }
         Err(UndecodableEventError {
             id: err_id,
