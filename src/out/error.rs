@@ -60,6 +60,15 @@ pub enum SubscriptionRejection {
         subscriber_type: String,
         key: String,
     },
+    /// `subscribe_from_in_op`: the requested birth position is above the
+    /// stream frontier sampled on the caller's operation. A member may not be
+    /// born owing nothing for events that already exist.
+    #[error("birth position {start_after} is ahead of the stream frontier {frontier}")]
+    #[rejection(code = "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER")]
+    BirthAheadOfFrontier {
+        start_after: crate::EventSequence,
+        frontier: crate::EventSequence,
+    },
     /// [`Subscription::await_position`](super::Subscription::await_position) —
     /// or [`await_caught_up`](super::Subscription::await_caught_up),
     /// which delegates to it — hit its deadline. Carries the observed lag so
@@ -151,6 +160,14 @@ mod tests {
             "OBIX_SUBSCRIPTION_NO_SUCH_SUBSCRIPTION"
         );
 
+        let birth_ahead: &'static str = SubscriptionRejection::BirthAheadOfFrontier {
+            start_after: crate::EventSequence::BEGIN,
+            frontier: crate::EventSequence::BEGIN,
+        }
+        .code()
+        .into();
+        assert_eq!(birth_ahead, "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER");
+
         let timeout: &'static str = SubscriptionRejection::CaughtUpTimeout {
             checkpoint: super::super::StreamPosition::Insert(crate::EventSequence::BEGIN),
             target: super::super::StreamPosition::Insert(crate::EventSequence::BEGIN),
@@ -159,6 +176,19 @@ mod tests {
         .code()
         .into();
         assert_eq!(timeout, "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT");
+    }
+
+    #[test]
+    fn birth_ahead_of_frontier_names_both_positions() {
+        let message = SubscriptionRejection::BirthAheadOfFrontier {
+            start_after: crate::EventSequence::from(6u64),
+            frontier: crate::EventSequence::from(5u64),
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "birth position 6 is ahead of the stream frontier 5"
+        );
     }
 
     /// `LaneMismatch` is configuration, not a caller outcome: it enters the

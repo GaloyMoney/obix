@@ -466,12 +466,55 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, ObixFault> {
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
+        self.subscribe_born_at(op, key, cfg, wake_keys.into(), None)
+            .await
+    }
+
+    /// [`subscribe_in_op`](Self::subscribe_in_op) with a caller-chosen birth
+    /// position instead of the sampled frontier.
+    ///
+    /// `start_after` is exclusive and must be at or below the frontier sampled
+    /// on `op`: a member may not be born owing nothing for events that already
+    /// exist, so a higher value is rejected with
+    /// [`SubscriptionRejection::BirthAheadOfFrontier`]. Everything else is
+    /// `subscribe_in_op`: Active from birth, idempotent while the row exists,
+    /// same wake keys.
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscribe_from_in_op", skip_all)]
+    pub async fn subscribe_from_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: D::Key,
+        cfg: D::InstanceConfig,
+        wake_keys: impl Into<WakeKeys>,
+        start_after: crate::EventSequence,
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
+        self.subscribe_born_at(op, key, cfg, wake_keys.into(), Some(start_after))
+            .await
+    }
+
+    async fn subscribe_born_at(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: D::Key,
+        cfg: D::InstanceConfig,
+        wake_keys: WakeKeys,
+        birth: Option<crate::EventSequence>,
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
         let key_str = key.to_string();
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
         // as the backstop against any other writer to the table.
-        let wake_keys = wake_keys.into().into_strings();
+        let wake_keys = wake_keys.into_strings();
         let instance_config = serde_json::to_value(&cfg)?;
         // Read on the caller's own operation, never on the pool: the caller
         // holds a transaction across this call, so a pool read here would
@@ -487,7 +530,7 @@ where
         // opaque future behind `&self` makes this method's `Send`-ness
         // higher-ranked and breaks `tokio::spawn` at the CALLER. Boxing
         // grounds the lifetime to the operation's borrow.
-        let start_after = {
+        let frontier = {
             let fut: std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<crate::EventSequence, sqlx::Error>>
@@ -496,6 +539,18 @@ where
                 >,
             > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
             fut.await?
+        };
+        let start_after = match birth {
+            None => frontier,
+            Some(start_after) if start_after <= frontier => start_after,
+            Some(start_after) => {
+                return Err(Fail::Rejected(
+                    SubscriptionRejection::BirthAheadOfFrontier {
+                        start_after,
+                        frontier,
+                    },
+                ));
+            }
         };
 
         Tables::insert_subscription_in_op(

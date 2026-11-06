@@ -579,3 +579,131 @@ async fn finish_wins_over_pause_entry() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+fn plain_config(owner: u64) -> InstanceConfig {
+    InstanceConfig {
+        owner,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+#[file_serial]
+async fn member_born_below_the_frontier_reads_history() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    publish_ping_burst(&outbox, 7, 1..6).await?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_from_in_op(
+        &mut op,
+        MemberId(1),
+        plain_config(7),
+        wake_key_for(7),
+        EventSequence::BEGIN,
+    )
+    .await?;
+    subs.subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1, 2, 3, 4, 5])
+    })
+    .await?;
+
+    // Control: the member born at the frontier saw none of that history, yet
+    // is delivering — it hears the next ping, as does the member born below.
+    publish_ping_burst(&outbox, 7, 6..7).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 2).await == vec![6]
+            && received_for(&shared, 1).await == vec![1, 2, 3, 4, 5, 6])
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
+    use es_entity::errlanes::Fail;
+
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    publish_ping_burst(&outbox, 7, 1..6).await?;
+
+    let mut op = outbox.begin_op().await?;
+    let rejected = subs
+        .subscribe_from_in_op(
+            &mut op,
+            MemberId(1),
+            plain_config(7),
+            wake_key_for(7),
+            EventSequence::from(6u64),
+        )
+        .await;
+    match rejected {
+        Err(Fail::Rejected(obix::SubscriptionRejection::BirthAheadOfFrontier {
+            start_after,
+            frontier,
+        })) => {
+            assert_eq!(start_after, EventSequence::from(6u64));
+            assert_eq!(frontier, EventSequence::from(5u64));
+        }
+        Ok(_) => panic!("a birth above the frontier must be rejected"),
+        Err(other) => panic!("expected BirthAheadOfFrontier, got {other:?}"),
+    }
+    drop(op);
+    assert!(!row_exists(&pool, 1).await?);
+
+    // Control: a birth exactly at the frontier is accepted and behaves as
+    // `subscribe_in_op`: no history, then the next ping.
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_from_in_op(
+        &mut op,
+        MemberId(1),
+        plain_config(7),
+        wake_key_for(7),
+        EventSequence::from(5u64),
+    )
+    .await?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping_burst(&outbox, 7, 6..7).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![6])
+    })
+    .await?;
+
+    Ok(())
+}
