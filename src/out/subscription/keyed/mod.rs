@@ -16,7 +16,35 @@
 //! plane, one per *outbox*, holding one erased route per registered type).
 //!
 //! Every wake is driven by the stream: wake-key matches for arrivals, and
-//! cache-pressure catch-up for members drifting toward a cold read.
+//! cache-pressure catch-up for dormant members drifting toward a cold read.
+//!
+//! # Birth position, presence, end
+//!
+//! Three independent dimensions describe a member:
+//!
+//! - **Birth position** — every subscriber consumes from its birth position.
+//!   `subscribe_in_op` uses the sampled stream frontier; `subscribe_from_in_op`
+//!   lets the caller name an earlier one (a birth above the frontier is
+//!   rejected). A birth at or below the frontier is strictly more
+//!   conservative than the frontier: the persistent stream is replayable, so
+//!   an event racing the subscribe is delivered or not owed, never
+//!   owed-and-missed.
+//! - **Presence** — whether an idle member passivates is the per-type
+//!   [`KeyedSubscriberConfig::linger`]; `Duration::MAX` is always-on. An
+//!   always-on type declares wake keys like any other; they are never
+//!   consulted, because its members never passivate.
+//! - **End** — [`KeyedSubscriber::flush`] returns a [`FlushOutcome`]. On
+//!   `Finish` the handler's writes, the checkpoint at [`FlushOp::position`],
+//!   the `DELETE` of the member's row and the job's completion land in one
+//!   transaction. A crash before commit replays the batch, so `flush` must
+//!   tolerate whole-batch replay and may return `Finish` again. A finished or
+//!   cancelled key is not reusable: the job crate retains the final execution
+//!   state under `(subscriber_type, key)`, so mint a fresh key.
+//!
+//! A member finishes only at a landing, and landings need collected items:
+//! decide before subscribing whether there can be nothing to fold. A handler
+//! that reads on the pool during `flush` holds two connections per landing,
+//! like any keyed flush that reads elsewhere.
 
 mod runner;
 mod waker;

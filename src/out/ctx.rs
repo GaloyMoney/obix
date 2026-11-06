@@ -40,6 +40,7 @@
 //! | ephemeral delivery | no — see [`EphemeralOutbox`](crate::EphemeralOutbox) | no |
 //! | [`pause_until`](KeyedEventCtx::pause_until), staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
+//! | finish (end from a flush) | no — by presence | yes |
 //!
 //! The asymmetry is the **presence contract**, not scheduling mechanics. A
 //! singleton subscriber is always on. A verb that pauses consumption

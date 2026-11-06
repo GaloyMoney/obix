@@ -177,6 +177,10 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 **Registration is optional and the outbox never breaks without it.** If you never register the maintainer, everything keeps working: once `sequence` passes the initial partition's upper bound, new rows land in the `DEFAULT` partition, which is still read, gap-filled, and replayed exactly like any other partition. You only forfeit the per-partition vacuum/freeze/cache-locality benefits (equivalent to the pre-partitioning single-table behaviour). A non-empty `DEFAULT` is a *layout* concern, not a correctness one — alert on it, and use [`Partitions::recover_default`](https://docs.rs/obix) to fold any stranded rows back into explicit partitions in a single transaction (never regressing `MAX(sequence)`).
 
+### Keyed subscribers: birth position, always-on, finishing
+
+`Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row deletion and job completion commit in one transaction. A finished or cancelled key is not reusable, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.
+
 ### Event Types
 
 **Persistent Events**: Stored in the database with sequential ordering, guaranteed delivery, and replay capability. Use for critical business events that must be processed reliably.
