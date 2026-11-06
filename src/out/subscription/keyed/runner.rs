@@ -186,6 +186,16 @@ impl<Tables: MailboxTables> CheckpointMirror for KeyedCheckpointMirror<Tables> {
     }
 }
 
+impl<Tables: MailboxTables> KeyedCheckpointMirror<Tables> {
+    /// Mark the row dormant, on the op that completes the passivating
+    /// generation. Inherent rather than on [`CheckpointMirror`], so the
+    /// singleton path (`mirror: None`) cannot reach it.
+    async fn passivate(&self, op: &mut es_entity::DbOp<'static>) -> Result<(), sqlx::Error> {
+        Tables::set_subscription_dormant_in_op(op, self.subscriber_type.as_str(), &self.key, true)
+            .await
+    }
+}
+
 struct KeyedSubscriberJobRunner<D, P, Tables>
 where
     D: SubscriptionDef<P>,
@@ -391,6 +401,7 @@ where
                                         .await?;
                                 }
                                 mirror.mirror(&mut op, state.sequence).await?;
+                                mirror.passivate(&mut op).await?;
                                 return Ok(job::JobCompletion::CompleteWithOp(op));
                             }
                         }

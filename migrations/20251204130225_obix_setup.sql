@@ -76,6 +76,7 @@ CREATE TABLE subscriptions (
   instance_config  JSONB NOT NULL,
   start_after      BIGINT NOT NULL,
   checkpoint       BIGINT NOT NULL,
+  dormant          BOOLEAN NOT NULL DEFAULT FALSE,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (subscriber_type, key)
 );

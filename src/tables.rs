@@ -431,9 +431,30 @@ pub trait MailboxTables: Send + Sync + 'static {
         checkpoint: EventSequence,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// `(subscriber_type, key)` of the subscriptions whose mirrored cursor is
-    /// below `below`, furthest behind first, capped at `limit` — the waker's
-    /// catch-up scan.
+    /// Mark one subscription dormant (passivated, not woken since) or not.
+    /// Written beside the checkpoint mirror when a member passivates.
+    fn set_subscription_dormant_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+        dormant: bool,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// [`set_subscription_dormant_in_op`](Self::set_subscription_dormant_in_op)
+    /// for several keys of one type in a single statement — the waker's flush,
+    /// for the keys it just spawned.
+    fn set_subscriptions_dormant_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        keys: &[String],
+        dormant: bool,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// `(subscriber_type, key)` of the **dormant** subscriptions whose mirrored
+    /// cursor is below `below`, furthest behind first, capped at `limit` — the
+    /// waker's catch-up scan. A member that is not dormant is live or paused,
+    /// already has a generation that owns its progress, and must not take a
+    /// slot from one that has none.
     ///
     /// Spans every *registered* subscriber type because the waker does: one
     /// scan per pass for the whole outbox, not one per type. Ordering is what

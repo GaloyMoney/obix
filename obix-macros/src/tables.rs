@@ -413,9 +413,19 @@ FROM {}persistent_outbox_events_sequence_seq",
             r#"
             SELECT subscriber_type, key
             FROM {tbl}subscriptions
-            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2
+            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2 AND dormant
             ORDER BY checkpoint ASC
             LIMIT $3"#,
+            tbl = table_prefix
+        );
+
+        let set_subscription_dormant_query = format!(
+            r#"UPDATE {tbl}subscriptions SET dormant = $3 WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        let set_subscriptions_dormant_query = format!(
+            r#"UPDATE {tbl}subscriptions SET dormant = $3 WHERE subscriber_type = $1 AND key = ANY($2::varchar[])"#,
             tbl = table_prefix
         );
 
@@ -1421,6 +1431,57 @@ FROM {}persistent_outbox_events_sequence_seq",
                             subscriber_type,
                             key,
                             checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn set_subscription_dormant_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    dormant: bool,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #set_subscription_dormant_query,
+                            subscriber_type,
+                            key,
+                            dormant,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn set_subscriptions_dormant_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    keys: &[String],
+                    dormant: bool,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let keys = keys.to_vec();
+
+                    async move {
+                        if keys.is_empty() {
+                            return Ok(());
+                        }
+                        sqlx::query!(
+                            #set_subscriptions_dormant_query,
+                            subscriber_type,
+                            &keys as _,
+                            dormant,
                         )
                         .execute(op.as_executor())
                         .await?;

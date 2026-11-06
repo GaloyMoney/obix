@@ -336,7 +336,10 @@ where
             let Some(route) = routes.get(idx) else {
                 continue;
             };
+            let woken: Vec<String> = keys.keys().cloned().collect();
             self.spawn_all(op, route, keys.into_iter().collect())
+                .await?;
+            Tables::set_subscriptions_dormant_in_op(op, route.subscriber_type(), &woken, false)
                 .await?;
         }
         Ok(())

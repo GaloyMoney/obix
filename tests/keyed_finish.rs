@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, Notify};
 use helpers::{TestTables, init_pool, wipeout_keyed_subscriber_job_tables, wipeout_subscriptions};
 
 const JOB_TYPE: &str = "test-keyed-finish";
+/// A second type on the same outbox whose members never passivate.
+const ALWAYS_ON_JOB_TYPE: &str = "test-keyed-finish-always-on";
 
 const TEST_LINGER: Duration = Duration::from_millis(150);
 const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
@@ -62,6 +64,9 @@ struct InstanceConfig {
     /// Park once, before collecting ping 3, until the test releases it.
     #[serde(default)]
     gate: bool,
+    /// Milliseconds of work per recorded ping.
+    #[serde(default)]
+    work_ms: u64,
 }
 
 #[derive(Clone, Default)]
@@ -162,6 +167,10 @@ impl KeyedSubscriber<TestEvent> for FinishingSubscriber {
             return Ok(op.commit());
         }
 
+        if self.cfg.work_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.cfg.work_ms)).await;
+        }
+
         self.shared
             .received
             .lock()
@@ -205,9 +214,18 @@ async fn init_jobs(pool: &sqlx::PgPool) -> anyhow::Result<job::Jobs> {
 }
 
 async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
+    init_outbox_with(pool, MailboxConfig::builder().build()).await
+}
+
+async fn init_outbox_with(
+    pool: &sqlx::PgPool,
+    config: MailboxConfig,
+) -> anyhow::Result<Outbox<TestEvent, TestTables>> {
     helpers::wipeout_outbox_tables(pool).await?;
     wipeout_keyed_subscriber_job_tables(pool, JOB_TYPE).await?;
+    wipeout_keyed_subscriber_job_tables(pool, ALWAYS_ON_JOB_TYPE).await?;
     wipeout_subscriptions(pool, JOB_TYPE).await?;
+    wipeout_subscriptions(pool, ALWAYS_ON_JOB_TYPE).await?;
     sqlx::query("DROP TABLE IF EXISTS test_finish_markers")
         .execute(pool)
         .await?;
@@ -218,7 +236,7 @@ async fn init_outbox(pool: &sqlx::PgPool) -> anyhow::Result<Outbox<TestEvent, Te
     .execute(pool)
     .await?;
 
-    Ok(Outbox::<TestEvent, TestTables>::init(pool, MailboxConfig::builder().build()).await?)
+    Ok(Outbox::<TestEvent, TestTables>::init(pool, config).await?)
 }
 
 /// Retry fast enough that a failed landing replays inside a test.
@@ -704,6 +722,254 @@ async fn birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
         Ok(received_for(&shared, 1).await == vec![6])
     })
     .await?;
+
+    Ok(())
+}
+
+fn always_on_config() -> KeyedSubscriberConfig {
+    KeyedSubscriberConfig::new(job::JobType::new(ALWAYS_ON_JOB_TYPE))
+        .with_linger(Duration::MAX)
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
+}
+
+async fn dormant_of(pool: &sqlx::PgPool, job_type: &str, key: u64) -> anyhow::Result<bool> {
+    let (dormant,): (bool,) =
+        sqlx::query_as("SELECT dormant FROM subscriptions WHERE subscriber_type = $1 AND key = $2")
+            .bind(job_type)
+            .bind(key.to_string())
+            .fetch_one(pool)
+            .await?;
+    Ok(dormant)
+}
+
+async fn generation_of(subs: &Subs, key: u64) -> anyhow::Result<job::JobId> {
+    Ok(subs
+        .subscription(&MemberId(key))
+        .await?
+        .load()
+        .await?
+        .job()
+        .job()
+        .id)
+}
+
+#[tokio::test]
+#[file_serial]
+async fn always_on_type_members_never_passivate() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let passivating: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+    let always_on: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            always_on_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    passivating
+        .subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+        .await?;
+    always_on
+        .subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+    jobs.start_poll().await?;
+
+    let generation = generation_of(&always_on, 2).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(generation_of(&always_on, 2).await?, generation);
+    assert!(!is_terminal(&always_on, 2).await?);
+    assert!(!dormant_of(&pool, ALWAYS_ON_JOB_TYPE, 2).await?);
+
+    publish_ping_burst(&outbox, 7, 1..2).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 2).await == vec![1])
+    })
+    .await?;
+    assert_eq!(generation_of(&always_on, 2).await?, generation);
+
+    // Control: a member of the type with a bounded linger passivates and its
+    // row says so.
+    eventually(Duration::from_secs(10), || async {
+        dormant_of(&pool, JOB_TYPE, 1).await
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn catch_up_scan_wakes_dormant_members_only() -> anyhow::Result<()> {
+    use obix::MailboxTables;
+
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox =
+        init_outbox_with(&pool, MailboxConfig::builder().event_cache_size(8).build()).await?;
+
+    let shared = Shared::default();
+    let passivating: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+    let always_on: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            always_on_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    // The dormant member: born before any traffic, passivated at checkpoint 0.
+    let mut op = outbox.begin_op().await?;
+    passivating
+        .subscribe_in_op(&mut op, MemberId(2), plain_config(8), wake_key_for(8))
+        .await?;
+    op.commit().await?;
+    jobs.start_poll().await?;
+    eventually(Duration::from_secs(10), || async {
+        dormant_of(&pool, JOB_TYPE, 2).await
+    })
+    .await?;
+    let dormant_generation = generation_of(&passivating, 2).await?;
+
+    // History for the live member, born below the frontier with a handler too
+    // slow to catch up: legitimately far behind, and not dormant.
+    for n in 0..12 {
+        publish_ping_burst(&outbox, 5, n..n + 1).await?;
+    }
+    let mut op = outbox.begin_op().await?;
+    always_on
+        .subscribe_from_in_op(
+            &mut op,
+            MemberId(1),
+            InstanceConfig {
+                owner: 5,
+                work_ms: 400,
+                ..Default::default()
+            },
+            wake_key_for(5),
+            EventSequence::BEGIN,
+        )
+        .await?;
+    op.commit().await?;
+    let live_generation = generation_of(&always_on, 1).await?;
+
+    // The dormant member is woken by the scan: a new generation.
+    eventually(Duration::from_secs(10), || async {
+        Ok(generation_of(&passivating, 2).await? != dormant_generation)
+    })
+    .await?;
+    assert_eq!(generation_of(&always_on, 1).await?, live_generation);
+
+    // The scan itself, against a bound above every checkpoint: the live
+    // member is far behind and is not selected.
+    let types = vec![JOB_TYPE.to_string(), ALWAYS_ON_JOB_TYPE.to_string()];
+    let scan = |pool: sqlx::PgPool, types: Vec<String>| async move {
+        let mut op = es_entity::DbOp::init(&pool).await?;
+        let rows =
+            TestTables::subscriptions_behind(&mut op, &types, EventSequence::from(1_000u64), 10)
+                .await?;
+        anyhow::Ok(rows.into_iter().map(|r| r.1).collect::<Vec<_>>())
+    };
+    assert!(
+        !scan(pool.clone(), types.clone())
+            .await?
+            .contains(&"1".to_string())
+    );
+
+    // Control: the same row, flagged dormant, is selected.
+    sqlx::query("UPDATE subscriptions SET dormant = TRUE WHERE subscriber_type = $1 AND key = '1'")
+        .bind(ALWAYS_ON_JOB_TYPE)
+        .execute(&pool)
+        .await?;
+    assert!(scan(pool.clone(), types).await?.contains(&"1".to_string()));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn wake_flips_dormant_off_in_the_waker_flush() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let passivating: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config().with_linger(Duration::from_millis(600)),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+    let always_on: Subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            always_on_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    passivating
+        .subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+        .await?;
+    always_on
+        .subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+    jobs.start_poll().await?;
+
+    eventually(Duration::from_secs(10), || async {
+        dormant_of(&pool, JOB_TYPE, 1).await
+    })
+    .await?;
+    assert!(!dormant_of(&pool, ALWAYS_ON_JOB_TYPE, 2).await?);
+    let live_generation = generation_of(&always_on, 2).await?;
+
+    publish_ping_burst(&outbox, 7, 1..2).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 1).await == vec![1] && received_for(&shared, 2).await == vec![1])
+    })
+    .await?;
+
+    assert!(
+        !dormant_of(&pool, JOB_TYPE, 1).await?,
+        "the wake cleared the flag"
+    );
+    // Control: a wake-key match for a live member leaves the flag and its
+    // generation alone.
+    assert!(!dormant_of(&pool, ALWAYS_ON_JOB_TYPE, 2).await?);
+    assert_eq!(generation_of(&always_on, 2).await?, live_generation);
 
     Ok(())
 }
