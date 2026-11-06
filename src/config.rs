@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +125,8 @@ pub enum CommitLane {
     Enabled,
 }
 
+pub type ProvenanceSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
+
 #[derive(Clone, bon::Builder)]
 pub struct MailboxConfig {
     #[builder(default = 100)]
@@ -182,6 +186,10 @@ pub struct MailboxConfig {
     pub commit_checkpoint_interval: std::time::Duration,
     #[builder(default = Clock::handle().clone())]
     pub clock: ClockHandle,
+    /// Called once per publish call, on the publishing task; its value is
+    /// stored verbatim on every row of that batch. `None` (the default)
+    /// never writes the column.
+    pub provenance_source: Option<ProvenanceSource>,
 }
 
 #[cfg(test)]

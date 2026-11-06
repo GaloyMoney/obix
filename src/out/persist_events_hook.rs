@@ -28,7 +28,10 @@ where
     /// [`CommitHook::on_rollback`] below and the own-failure branches in
     /// `pre_commit`.
     abandoned_tx: mpsc::UnboundedSender<GapFillRequest>,
-    pre_commit_events: Vec<P>,
+    /// Events awaiting persistence, grouped by the provenance captured at
+    /// the publish call that supplied them. Merged publishes append their
+    /// segments; adjacent segments with equal provenance coalesce.
+    pre_commit_events: Vec<(Option<serde_json::Value>, Vec<P>)>,
     /// Persisted events, stashed chunk-by-chunk *as* `pre_commit` runs (not
     /// at its end): if a later chunk, a later hook, or the COMMIT itself
     /// fails, this holds exactly the sequences the rolled-back transaction
@@ -82,7 +85,7 @@ where
             feeder,
             notifier_tx,
             abandoned_tx,
-            pre_commit_events: events.into_iter().map(Into::into).collect(),
+            pre_commit_events: vec![(None, events.into_iter().map(Into::into).collect())],
             post_commit_events: Vec::new(),
             batch_size,
             post_persist_hooks,
@@ -90,6 +93,15 @@ where
             runs_after,
             _phantom: PhantomData,
         }
+    }
+
+    /// Attach the provenance captured at this publish call to the events
+    /// the hook was constructed with.
+    pub(crate) fn with_provenance(mut self, provenance: Option<serde_json::Value>) -> Self {
+        for (segment, _) in &mut self.pre_commit_events {
+            segment.clone_from(&provenance);
+        }
+        self
     }
 
     /// Use the in-transaction NOTIFY persist variant — force-execute path
@@ -134,18 +146,21 @@ where
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
         let batch_size = self.batch_size.max(1);
-        let events = std::mem::take(&mut self.pre_commit_events);
-        self.post_commit_events.reserve(events.len());
-        let mut events = events.into_iter();
-        loop {
-            let chunk: Vec<P> = events.by_ref().take(batch_size).collect();
-            if chunk.is_empty() {
-                break;
-            }
+        let segments = std::mem::take(&mut self.pre_commit_events);
+        self.post_commit_events
+            .reserve(segments.iter().map(|(_, events)| events.len()).sum());
+        let chunks = segments.into_iter().flat_map(|(provenance, events)| {
+            let mut events = events.into_iter();
+            std::iter::from_fn(move || {
+                let chunk: Vec<P> = events.by_ref().take(batch_size).collect();
+                (!chunk.is_empty()).then(|| (provenance.clone(), chunk))
+            })
+        });
+        for (provenance, chunk) in chunks {
             let persist = if self.notify_in_tx {
-                Tables::persist_events_notifying(&mut op, chunk.into_iter()).await
+                Tables::persist_events_notifying(&mut op, chunk.into_iter(), provenance).await
             } else {
-                Tables::persist_events(&mut op, chunk.into_iter()).await
+                Tables::persist_events(&mut op, chunk.into_iter(), provenance).await
             };
             let persisted_chunk = match persist {
                 Ok(chunk) => chunk,
@@ -222,7 +237,12 @@ where
     }
 
     fn merge(&mut self, other: &mut Self) -> bool {
-        self.pre_commit_events.append(&mut other.pre_commit_events);
+        for (provenance, mut events) in other.pre_commit_events.drain(..) {
+            match self.pre_commit_events.last_mut() {
+                Some((last, segment)) if *last == provenance => segment.append(&mut events),
+                _ => self.pre_commit_events.push((provenance, events)),
+            }
+        }
         true
     }
 

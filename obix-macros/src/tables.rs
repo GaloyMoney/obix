@@ -128,8 +128,8 @@ FROM {}persistent_outbox_events_sequence_seq",
         // per-process debounced notifier (`src/out/notifier.rs`).
         let persist_events_query = format!(
             r#"WITH new_events AS (
-                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
-                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
+                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, provenance, recorded_at)
+                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, $4::jsonb AS provenance, COALESCE($3::timestamptz, NOW()) AS recorded_at
                    RETURNING id, sequence, recorded_at, commit_xid
                )
                SELECT ne.id AS "id!", ne.sequence AS "sequence!", ne.recorded_at AS "recorded_at!", ne.commit_xid AS "commit_xid!"
@@ -148,8 +148,8 @@ FROM {}persistent_outbox_events_sequence_seq",
         // HAVING COUNT(*) > 0 keeps an empty insert from notifying.
         let persist_events_notifying_query = format!(
             r#"WITH new_events AS (
-                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, recorded_at)
-                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, COALESCE($3::timestamptz, NOW()) AS recorded_at
+                   INSERT INTO {tbl}persistent_outbox_events (payload, tracing_context, provenance, recorded_at)
+                   SELECT unnest($1::jsonb[]) AS payload, $2::jsonb AS tracing_context, $4::jsonb AS provenance, COALESCE($3::timestamptz, NOW()) AS recorded_at
                    RETURNING id, sequence, recorded_at, commit_xid
                ),
                notified AS (
@@ -189,7 +189,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         // and batch-capped caller-side (`out::persistent::cache`).
         let load_next_page_query = format!(
             r#"
-            SELECT sequence AS "sequence!: i64", id AS "id!", payload, tracing_context, recorded_at AS "recorded_at!", commit_xid
+            SELECT sequence AS "sequence!: i64", id AS "id!", payload, tracing_context, provenance, recorded_at AS "recorded_at!", commit_xid
             FROM {}persistent_outbox_events
             WHERE sequence > $1
               AND sequence <= $1 + $2
@@ -219,7 +219,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                   AND sequence <= $1 + $2
             )
             SELECT e.sequence AS "sequence!: i64", e.id AS "id!", e.payload,
-                   e.tracing_context, e.recorded_at AS "recorded_at!", e.commit_xid
+                   e.tracing_context, e.provenance, e.recorded_at AS "recorded_at!", e.commit_xid
             FROM {tbl}persistent_outbox_events e
             WHERE e.sequence > $1
               AND e.sequence <= $1 + $2
@@ -260,7 +260,7 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let load_events_in_range_query = format!(
             r#"
-            SELECT id, sequence, payload, tracing_context, recorded_at, commit_xid
+            SELECT id, sequence, payload, tracing_context, provenance, recorded_at, commit_xid
             FROM {}persistent_outbox_events
             WHERE sequence > $1
               AND sequence <= $2
@@ -297,7 +297,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             INSERT INTO {}persistent_outbox_events (sequence)
             SELECT unnest($1::bigint[]) AS sequence
             ON CONFLICT (sequence) DO NOTHING
-            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, recorded_at, commit_xid AS "commit_xid!""#,
+            RETURNING id, sequence AS "sequence!: i64", payload, tracing_context, provenance, recorded_at, commit_xid AS "commit_xid!""#,
             table_prefix
         );
 
@@ -469,7 +469,7 @@ FROM {}persistent_outbox_events_sequence_seq",
         let load_group_members_query = format!(
             r#"
             SELECT commit_xid, sequence AS "sequence!: i64", id, payload,
-                   tracing_context, recorded_at
+                   tracing_context, provenance, recorded_at
             FROM {tbl}persistent_outbox_events
             WHERE commit_xid = ANY($1) AND sequence >= $2 AND payload IS NOT NULL
             ORDER BY commit_xid, sequence"#,
@@ -555,12 +555,14 @@ FROM {}persistent_outbox_events_sequence_seq",
                             let sequence = row.sequence;
                             let recorded_at = row.recorded_at;
                             let payload = row.payload;
+                            let provenance = row.provenance;
                             #deserialize_context
                             let event = #crate_name::decode_persistent_event(
                                 #crate_name::out::OutboxEventId::from(id),
                                 sequence as u64,
                                 recorded_at,
                                 tracing_context,
+                                provenance,
                                 payload,
                                 #crate_name::CommitGroupId::from(commit_xid),
                             );
@@ -668,6 +670,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn persist_events<'a, P>(
                     op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
                     events: impl Iterator<Item = P>,
+                    provenance: Option<#crate_name::prelude::serde_json::Value>,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
@@ -696,7 +699,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                             #persist_events_query,
                             &serialized_events as _,
                             tracing_json,
-                            now
+                            now,
+                            provenance
                         ).fetch_all(op.as_executor()).await?;
 
                         let events = rows
@@ -708,6 +712,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 recorded_at: row.recorded_at,
                                 payload: Some(payload),
                                 commit_group: #crate_name::CommitGroupId::from(row.commit_xid),
+                                provenance: provenance.clone(),
                                 #set_context
                             })
                             .collect::<Vec<_>>();
@@ -718,6 +723,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                 fn persist_events_notifying<'a, P>(
                     op: &mut #crate_name::prelude::es_entity::hooks::HookOperation<'a>,
                     events: impl Iterator<Item = P>,
+                    provenance: Option<#crate_name::prelude::serde_json::Value>,
                 ) -> impl std::future::Future<Output = Result<Vec<#crate_name::out::PersistentOutboxEvent<P>>, #crate_name::prelude::sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send,
@@ -746,7 +752,8 @@ FROM {}persistent_outbox_events_sequence_seq",
                             #persist_events_notifying_query,
                             &serialized_events as _,
                             tracing_json,
-                            now
+                            now,
+                            provenance
                         ).fetch_all(op.as_executor()).await?;
 
                         let events = rows
@@ -758,6 +765,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 recorded_at: row.recorded_at,
                                 payload: Some(payload),
                                 commit_group: #crate_name::CommitGroupId::from(row.commit_xid),
+                                provenance: provenance.clone(),
                                 #set_context
                             })
                             .collect::<Vec<_>>();
@@ -857,6 +865,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.sequence as u64,
                                     row.recorded_at,
                                     tracing_context,
+                                    row.provenance,
                                     row.payload,
                                     #crate_name::CommitGroupId::from(row.commit_xid),
                                 )
@@ -892,6 +901,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.sequence as u64,
                                     row.recorded_at,
                                     tracing_context,
+                                    row.provenance,
                                     row.payload,
                                     #crate_name::CommitGroupId::from(row.commit_xid),
                                 )
@@ -970,6 +980,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.sequence as u64,
                                     row.recorded_at,
                                     tracing_context,
+                                    row.provenance,
                                     row.payload,
                                     #crate_name::CommitGroupId::from(row.commit_xid),
                                 )
@@ -1021,6 +1032,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.sequence as u64,
                                     row.recorded_at,
                                     tracing_context,
+                                    row.provenance,
                                     row.payload,
                                     #crate_name::CommitGroupId::from(row.commit_xid),
                                 )
@@ -1086,6 +1098,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                                     row.sequence as u64,
                                     row.recorded_at,
                                     tracing_context,
+                                    row.provenance,
                                     row.payload,
                                     #crate_name::CommitGroupId::from(row.commit_xid),
                                 )

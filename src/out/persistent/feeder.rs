@@ -580,6 +580,7 @@ mod tests {
             sequence: EventSequence::from(seq),
             payload: None,
             tracing_context: None,
+            provenance: None,
             recorded_at: chrono::Utc::now(),
             commit_group: CommitGroupId::from(0i64),
         })))

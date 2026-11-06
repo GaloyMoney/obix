@@ -201,6 +201,10 @@ let mut listener = ephemeral.listen::<UserOnline>();
 
 The two streams are never merged: hold one listener per stream.
 
+### Provenance
+
+An application may hand the outbox a `provenance_source`; its value is stored opaquely on every row of a publish and surfaced as `PersistentOutboxEvent::provenance`. obix does not read it. It is attribution for exporters, not an input to handlers.
+
 ## Errors and telemetry
 
 obix's public methods return one of four `errlanes` carriers. Every `Fail`
