@@ -265,7 +265,10 @@ where
         persistent_event_sender: &broadcast::Sender<InsertTransport<P>>,
         mut last_broadcast_sequence: EventSequence,
         cache_size: usize,
-    ) -> (imbl::OrdMap<EventSequence, InsertTransport<P>>, EventSequence) {
+    ) -> (
+        imbl::OrdMap<EventSequence, InsertTransport<P>>,
+        EventSequence,
+    ) {
         use std::ops::Bound;
 
         let sequence = event.sequence();
