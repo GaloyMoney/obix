@@ -205,6 +205,10 @@ let mut listener = ephemeral.listen::<UserOnline>();
 
 The two streams are never merged: hold one listener per stream.
 
+### Reading a committed range on your own operation
+
+`Outbox::load_persisted_in_op(op, after, up_to)` returns the persistent events in `(after, up_to]`, in sequence order, with one plain `SELECT` on the executor you pass (a transaction, a flush op, or a pool). It writes nothing, consults no cache and opens no listener, so it is safe inside a transaction that holds a lock. A sequence missing from the result belongs to a transaction `op` cannot see, so choose `up_to` from a position you know is committed (another subscription's checkpoint), never from `highest_known_persistent_sequence`. An undecodable row is the `Err` item at its position. It is not a listener: the range is yours to bound, and streaming stays with `listen_persisted`.
+
 ### Event context
 
 An application may hand the outbox an `event_context_source`; its value is stored opaquely on every row of a publish and surfaced as `PersistentOutboxEvent::event_context`. obix does not read it; it is not the es-entity `EventContext` — the application chooses what crosses. It is attribution for exporters, not an input to handlers.
@@ -221,7 +225,7 @@ re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`load_persisted_in_op`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
 | `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op` |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
