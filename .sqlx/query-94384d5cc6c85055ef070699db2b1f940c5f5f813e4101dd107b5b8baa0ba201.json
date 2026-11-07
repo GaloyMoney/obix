@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT fence\n            FROM retired_subscriptions\n            WHERE subscriber_type = $1 AND key = $2",
+  "query": "\n            SELECT joined_at_sequence\n            FROM joinable_lanes\n            WHERE subscriber_type = $1 AND key = $2",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "fence",
+        "name": "joined_at_sequence",
         "type_info": "Int8"
       }
     ],
@@ -19,5 +19,5 @@
       true
     ]
   },
-  "hash": "6f05fd66e51cbeda74b57870e3a45b3460d6e22df79a52cbbcb95a6612c3c99e"
+  "hash": "94384d5cc6c85055ef070699db2b1f940c5f5f813e4101dd107b5b8baa0ba201"
 }

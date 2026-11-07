@@ -526,18 +526,25 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        // The lane's end of life: row deletion ends the lane (as for a keyed
-        // member) and the tombstone carries the join record. `fence` is NULL
-        // for a cancelled lane; `instance_config` is the unit.
+        // The lane's end of life, in one statement: row deletion ends the lane
+        // and leaves the ordinary keyed tombstone; the join record goes to
+        // `joinable_lanes` under the tip's type, with the unit carried over
+        // from the deleted row. `joined_at_sequence` is NULL for a cancelled
+        // lane.
         let retire_lane_query = format!(
             r#"
             WITH retired AS (
                 DELETE FROM {tbl}subscriptions
-                WHERE subscriber_type = $1 AND key = $2
-                RETURNING subscriber_type, key
+                WHERE subscriber_type = $2 AND key = $3
+                RETURNING key, instance_config
+            ),
+            tombstone AS (
+                INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at)
+                SELECT $2, key, COALESCE($4::timestamptz, NOW()) FROM retired
+                ON CONFLICT (subscriber_type, key) DO NOTHING
             )
-            INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at, fence, instance_config)
-            SELECT subscriber_type, key, COALESCE($3::timestamptz, NOW()), $4::bigint, $5::jsonb FROM retired
+            INSERT INTO {tbl}joinable_lanes (subscriber_type, key, instance_config, joined_at_sequence, ended_at)
+            SELECT $1, key, instance_config, $5::bigint, COALESCE($4::timestamptz, NOW()) FROM retired
             ON CONFLICT (subscriber_type, key) DO NOTHING"#,
             tbl = table_prefix
         );
@@ -553,17 +560,17 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         let joined_lanes_query = format!(
             r#"
-            SELECT key, instance_config AS "instance_config!", fence AS "fence!"
-            FROM {tbl}retired_subscriptions
-            WHERE subscriber_type = $1 AND fence >= $2 AND instance_config IS NOT NULL
-            ORDER BY fence, key"#,
+            SELECT key, instance_config, joined_at_sequence AS "joined_at_sequence!"
+            FROM {tbl}joinable_lanes
+            WHERE subscriber_type = $1 AND joined_at_sequence >= $2
+            ORDER BY joined_at_sequence, key"#,
             tbl = table_prefix
         );
 
         let lane_fence_query = format!(
             r#"
-            SELECT fence
-            FROM {tbl}retired_subscriptions
+            SELECT joined_at_sequence
+            FROM {tbl}joinable_lanes
             WHERE subscriber_type = $1 AND key = $2"#,
             tbl = table_prefix
         );
@@ -1733,14 +1740,15 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn retire_lane_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
-                    subscriber_type: &str,
+                    tip_type: &str,
+                    lane_type: &str,
                     key: &str,
                     fence: Option<#crate_name::EventSequence>,
-                    instance_config: Option<#crate_name::prelude::serde_json::Value>,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
-                    let subscriber_type = subscriber_type.to_string();
+                    let tip_type = tip_type.to_string();
+                    let lane_type = lane_type.to_string();
                     let key = key.to_string();
                     let now = op.maybe_now();
                     let fence = fence.map(|fence| u64::from(fence) as i64);
@@ -1748,11 +1756,11 @@ FROM {}persistent_outbox_events_sequence_seq",
                     async move {
                         sqlx::query!(
                             #retire_lane_query,
-                            subscriber_type,
+                            tip_type,
+                            lane_type,
                             key,
                             now,
-                            fence,
-                            instance_config
+                            fence
                         )
                         .execute(op.as_executor())
                         .await?;
@@ -1762,15 +1770,17 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn lanes_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
-                    subscriber_type: &str,
+                    tip_type: &str,
+                    lane_type: &str,
                     since: #crate_name::EventSequence,
                 ) -> impl std::future::Future<Output = Result<#crate_name::LaneRows, #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
-                    let subscriber_type = subscriber_type.to_string();
+                    let tip_type = tip_type.to_string();
+                    let lane_type = lane_type.to_string();
 
                     async move {
-                        let live = sqlx::query!(#live_lanes_query, subscriber_type)
+                        let live = sqlx::query!(#live_lanes_query, lane_type)
                             .fetch_all(op.as_executor())
                             .await?
                             .into_iter()
@@ -1778,7 +1788,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .collect();
                         let joined = sqlx::query!(
                             #joined_lanes_query,
-                            subscriber_type,
+                            tip_type,
                             since as #crate_name::EventSequence,
                         )
                         .fetch_all(op.as_executor())
@@ -1788,7 +1798,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             (
                                 row.key,
                                 row.instance_config,
-                                #crate_name::EventSequence::from(row.fence as u64),
+                                #crate_name::EventSequence::from(row.joined_at_sequence as u64),
                             )
                         })
                         .collect();
@@ -1798,20 +1808,20 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                 fn lane_fence(
                     pool: &#crate_name::prelude::sqlx::PgPool,
-                    subscriber_type: &str,
+                    tip_type: &str,
                     key: &str,
                 ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
                     let pool = pool.clone();
-                    let subscriber_type = subscriber_type.to_string();
+                    let tip_type = tip_type.to_string();
                     let key = key.to_string();
 
                     async move {
-                        let row = sqlx::query!(#lane_fence_query, subscriber_type, key)
+                        let row = sqlx::query!(#lane_fence_query, tip_type, key)
                             .fetch_optional(&pool)
                             .await?;
                         Ok(row
-                            .and_then(|row| row.fence)
-                            .map(|fence| #crate_name::EventSequence::from(fence as u64)))
+                            .and_then(|row| row.joined_at_sequence)
+                            .map(|sequence| #crate_name::EventSequence::from(sequence as u64)))
                     }
                 }
 

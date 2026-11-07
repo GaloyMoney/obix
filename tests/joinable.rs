@@ -342,6 +342,10 @@ impl Harness {
             .bind(TIP)
             .execute(&pool)
             .await?;
+        sqlx::query("DELETE FROM joinable_lanes WHERE subscriber_type = $1")
+            .bind(TIP)
+            .execute(&pool)
+            .await?;
         sqlx::query("DROP TABLE IF EXISTS test_joinable_applied")
             .execute(&pool)
             .await?;
@@ -472,13 +476,29 @@ impl Harness {
         )
     }
 
-    async fn tombstone_fence(&self, lane: &TestLane) -> anyhow::Result<Option<Option<i64>>> {
+    /// The lane's record in `joinable_tips`'s sibling, `joinable_lanes`:
+    /// `None` while the lane is live, `Some(None)` for a cancelled lane and
+    /// `Some(Some(F))` for one that joined at `F`.
+    async fn lane_record(&self, lane: &TestLane) -> anyhow::Result<Option<Option<i64>>> {
         Ok(sqlx::query_scalar(
-            "SELECT fence FROM retired_subscriptions WHERE subscriber_type = $1 AND key = $2",
+            "SELECT joined_at_sequence FROM joinable_lanes \
+             WHERE subscriber_type = $1 AND key = $2",
+        )
+        .bind(TIP)
+        .bind(lane.id().to_string())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Whether the lane left the ordinary keyed tombstone behind.
+    async fn has_tombstone(&self, lane: &TestLane) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM retired_subscriptions \
+             WHERE subscriber_type = $1 AND key = $2)",
         )
         .bind(LANE)
         .bind(lane.id().to_string())
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?)
     }
 
@@ -675,7 +695,7 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
         "no event at or below the fence is applied by the tip"
     );
     assert!(h.tip_row_checkpoint().await?.unwrap() <= u64::from(fence) as i64);
-    assert_eq!(h.tombstone_fence(&lane).await?, Some(Some(4)));
+    assert_eq!(h.lane_record(&lane).await?, Some(Some(4)));
     let flushes = h.lane_flushes().await?;
     assert_eq!(flushes.len(), 1);
     assert_eq!(
@@ -745,7 +765,7 @@ async fn fence_entered_first() -> anyhow::Result<()> {
         h.applied_by("tip", "u").await?.is_empty(),
         "the tip's next landing is parked at entry behind the fence"
     );
-    assert_eq!(h.tombstone_fence(&lane).await?, None);
+    assert_eq!(h.lane_record(&lane).await?, None);
 
     h.shared.handle_gate.release();
     let fence = lane.await_fenced(WAIT).await?;
@@ -909,7 +929,7 @@ async fn fenced_drain_failure_replays() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(
-        h.tombstone_fence(&lane).await?,
+        h.lane_record(&lane).await?,
         None,
         "a failed fenced landing leaves no join record"
     );
@@ -946,7 +966,7 @@ async fn empty_batch_fenced_landing() -> anyhow::Result<()> {
         vec![(Some(3), 0, true)],
         "flush ran once, over an empty batch, carrying the fence"
     );
-    assert_eq!(h.tombstone_fence(&lane).await?, Some(Some(3)));
+    assert_eq!(h.lane_record(&lane).await?, Some(Some(3)));
     assert_eq!(h.applied_count().await?, 0);
     Ok(())
 }
@@ -1126,7 +1146,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        h.tombstone_fence(&lane).await?,
+        h.lane_record(&lane).await?,
         None,
         "the default handle_undecodable fails the fenced landing"
     );
@@ -1167,8 +1187,8 @@ async fn shutdown_between_landings_only() -> anyhow::Result<()> {
     h.shared.handle_gate.release();
     tokio::time::timeout(WAIT, shutdown).await???;
 
-    let tombstone = h.tombstone_fence(&lane).await?;
-    match tombstone {
+    let record = h.lane_record(&lane).await?;
+    match record {
         Some(fence) => {
             assert_eq!(fence, Some(6), "the landing completed whole, at the fence");
             assert_eq!(h.applied_by("catch_up", "u").await?, vec![2, 3, 4, 5, 6]);
@@ -1220,9 +1240,13 @@ async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
     lane.cancel_in_op(&mut op).await?;
     op.commit().await?;
     assert_eq!(
-        h.tombstone_fence(&lane).await?,
+        h.lane_record(&lane).await?,
         Some(None),
-        "a cancelled lane is retired with no fence"
+        "a cancelled lane is recorded with no join sequence"
+    );
+    assert!(
+        h.has_tombstone(&lane).await?,
+        "the ordinary keyed tombstone is left behind"
     );
 
     h.shared.tip_gate.release();

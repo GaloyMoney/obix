@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT key, instance_config AS \"instance_config!\", fence AS \"fence!\"\n            FROM retired_subscriptions\n            WHERE subscriber_type = $1 AND fence >= $2 AND instance_config IS NOT NULL\n            ORDER BY fence, key",
+  "query": "\n            SELECT key, instance_config, joined_at_sequence AS \"joined_at_sequence!\"\n            FROM joinable_lanes\n            WHERE subscriber_type = $1 AND joined_at_sequence >= $2\n            ORDER BY joined_at_sequence, key",
   "describe": {
     "columns": [
       {
@@ -10,12 +10,12 @@
       },
       {
         "ordinal": 1,
-        "name": "instance_config!",
+        "name": "instance_config",
         "type_info": "Jsonb"
       },
       {
         "ordinal": 2,
-        "name": "fence!",
+        "name": "joined_at_sequence!",
         "type_info": "Int8"
       }
     ],
@@ -27,9 +27,9 @@
     },
     "nullable": [
       false,
-      true,
+      false,
       true
     ]
   },
-  "hash": "f3d3dd144d272bb01e0a9fc093ea7f7325ed254d9c277abc4e165398f1d641e0"
+  "hash": "eccf25f8f862bc94fda19382bf6fc3eb44337df671219f680db04b514c0af7ca"
 }

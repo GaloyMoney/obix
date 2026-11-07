@@ -40,7 +40,7 @@ where
 {
     subscriber: Arc<S>,
     unit: S::Unit,
-    stored_unit: serde_json::Value,
+    tip_type: JobType,
     lane_type: JobType,
     key: String,
     fence: Mutex<Option<EventSequence>>,
@@ -128,10 +128,10 @@ where
         Box::pin(async move {
             Tables::retire_lane_in_op(
                 op,
+                self.tip_type.as_str(),
                 self.lane_type.as_str(),
                 &self.key,
                 self.fence(),
-                Some(self.stored_unit.clone()),
             )
             .await
         })
@@ -387,7 +387,7 @@ where
         else {
             return Ok(job::JobCompletion::Complete);
         };
-        let unit: S::Unit = serde_json::from_value(row.instance_config.clone())
+        let unit: S::Unit = serde_json::from_value(row.instance_config)
             .map_err(Undecodable::InstanceConfig)
             .into_fault()?;
         let state = decode_execution_state(&current_job)?.unwrap_or(OutboxEventJobState {
@@ -399,7 +399,7 @@ where
         let run = LaneRun::<S, P, Tables> {
             subscriber: self.subscriber.clone(),
             unit,
-            stored_unit: row.instance_config,
+            tip_type: self.tip_type.clone(),
             lane_type: self.lane_type.clone(),
             key: self.key.clone(),
             fence: Mutex::new(None),

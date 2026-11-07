@@ -368,6 +368,7 @@ where
                 >,
             > = Box::pin(Tables::lanes_in_op(
                 &mut *op,
+                self.shared.job_type.as_str(),
                 registered.lane_job_type.as_str(),
                 since,
             ));
@@ -563,7 +564,7 @@ where
         &self,
         timeout: Duration,
     ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
-        let registered = self.registered()?;
+        self.registered()?;
         let key = self.id.to_string();
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
@@ -571,7 +572,7 @@ where
         loop {
             if let Some(fence) = Tables::lane_fence(
                 self.shared.outbox.pool(),
-                registered.lane_job_type.as_str(),
+                self.shared.job_type.as_str(),
                 &key,
             )
             .await?
@@ -592,8 +593,8 @@ where
 
     /// Cancel the lane on the caller's own operation — atomic with, e.g.,
     /// deletion of the unit it covers. Row absence ends the lane: the
-    /// runner's next run-start check completes it. The id is retired with no
-    /// fence, so it never appears among a tip's joined lanes.
+    /// runner's next run-start check completes it. The lane's record has no
+    /// join sequence, so it never appears among a tip's joined lanes.
     #[es_entity::errlanes::instrument(name = "obix.joinable.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
@@ -605,9 +606,9 @@ where
             Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + '_>,
         > = Box::pin(Tables::retire_lane_in_op(
             &mut *op,
+            self.shared.job_type.as_str(),
             registered.lane_job_type.as_str(),
             &key,
-            None,
             None,
         ));
         fut.await?;

@@ -216,7 +216,7 @@ obix does **not** decide which events belong to a unit. The handler contract (`J
 
 `lanes_in_op` lists the lanes still catching up and the joins whose fence is at or above `since`; a tip passes its previous checkpoint, which bounds the list by construction. `JoinableConfig::max_fence_gap` (default: `lane_max_batch_size`) bounds how far past its position a fenced landing drains while it holds the tip's lock: past it, or when this process has not yet seen the tip's checkpoint, the landing is an ordinary one and the lane keeps catching up. Correctness never depends on it.
 
-Adopting this changes the schema: `joinable_tips`, and the `fence` and `instance_config` columns of `retired_subscriptions`.
+Adopting this changes the schema: two tables, `joinable_tips` (the tip's lock row and mirrored checkpoint) and `joinable_lanes` (each ended lane's unit and the sequence it joined at, or none if cancelled), both keyed by the tip's job type. Lanes are otherwise ordinary keyed rows in `subscriptions`, and leave the ordinary tombstone in `retired_subscriptions` when they end.
 
 ### Event Types
 
