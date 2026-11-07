@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT subscriber_type, key\n            FROM subscriptions\n            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2\n            ORDER BY checkpoint ASC\n            LIMIT $3",
+  "query": "\n            SELECT subscriber_type, key\n            FROM subscriptions\n            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2 AND dormant\n            ORDER BY checkpoint ASC\n            LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -26,5 +26,5 @@
       false
     ]
   },
-  "hash": "7375d6dc1e0d03aa9c9ddba89e75d462661a49abca1f7b1be02371a6e6315434"
+  "hash": "e9fa52c69a2a4a8bc9c54e633931893d8f1fc4913687359273460e235508b5d5"
 }

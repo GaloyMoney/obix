@@ -392,7 +392,9 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// `(subscriber_type, key)` — an already-live subscription — resolves to
     /// success without overwriting the existing row's `start_after` or
     /// `wake_keys`. Re-subscribing an already-subscribed key must never
-    /// silently rewind or fast-forward its birth frontier.
+    /// silently rewind or fast-forward its birth frontier. The conflict does
+    /// clear `dormant`: the caller spawns the key in the same operation, so
+    /// a passivated member comes back live.
     fn insert_subscription_in_op(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,
@@ -402,14 +404,31 @@ pub trait MailboxTables: Send + Sync + 'static {
         start_after: EventSequence,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// Delete a subscription row. Row absence is the tombstone: no job-kill
-    /// API exists or is needed — the runner's next run-start row check (or a
-    /// stray wake) observes the missing row and completes.
-    fn delete_subscription_in_op(
+    /// Delete a subscription row and record its key in
+    /// `retired_subscriptions`, in one statement. Row absence ends the
+    /// member: no job-kill API exists or is needed — the runner's next
+    /// run-start row check (or a stray wake) observes the missing row and
+    /// completes. The retired row is the tombstone that keeps the key from
+    /// being subscribed again. A key with no live row is left untouched.
+    fn retire_subscription_in_op(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,
         key: &str,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Whether `(subscriber_type, key)` has a tombstone in
+    /// `retired_subscriptions` — its subscription finished or was cancelled.
+    ///
+    /// Locks the live `subscriptions` row first (`FOR UPDATE`), then reads
+    /// the tombstone in a separate statement. A concurrent retirement of the
+    /// key is therefore either serialized after the caller's operation or
+    /// committed and visible to the tombstone read, so a subscribe that
+    /// passes this check cannot re-insert a key retired in the meantime.
+    fn subscription_retired_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
 
     /// Point-read one subscription's identity and terms by primary key.
     /// `None` means cancelled (or never subscribed) — the caller's row-is-truth
@@ -431,9 +450,30 @@ pub trait MailboxTables: Send + Sync + 'static {
         checkpoint: EventSequence,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// `(subscriber_type, key)` of the subscriptions whose mirrored cursor is
-    /// below `below`, furthest behind first, capped at `limit` — the waker's
-    /// catch-up scan.
+    /// Mark one subscription dormant (passivated, not woken since) or not.
+    /// Written beside the checkpoint mirror when a member passivates.
+    fn set_subscription_dormant_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+        dormant: bool,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// [`set_subscription_dormant_in_op`](Self::set_subscription_dormant_in_op)
+    /// for several keys of one type in a single statement — the waker's flush,
+    /// for the keys it just spawned.
+    fn set_subscriptions_dormant_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        keys: &[String],
+        dormant: bool,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// `(subscriber_type, key)` of the **dormant** subscriptions whose mirrored
+    /// cursor is below `below`, furthest behind first, capped at `limit` — the
+    /// waker's catch-up scan. A member that is not dormant is live or paused,
+    /// already has a generation that owns its progress, and must not take a
+    /// slot from one that has none.
     ///
     /// Spans every *registered* subscriber type because the waker does: one
     /// scan per pass for the whole outbox, not one per type. Ordering is what

@@ -28,7 +28,11 @@
 //! arrival for a specific subscription; delaying or shedding it would break
 //! the latency contract the whole mechanism exists to provide.
 //!
-//! **Catch-up** — capped and cascading. A Dormant member whose cursor is
+//! **Catch-up** — capped and cascading, and for **dormant** members only
+//! (`subscriptions.dormant`: passivated and not woken since). A live or
+//! paused member already has a generation that owns its progress, and being
+//! legitimately far behind must not let it take a slot from one that has
+//! none. A Dormant member whose cursor is
 //! drifting toward the bottom of the in-memory cache will, if left alone,
 //! eventually resume with a paged cold read from disk: one `SELECT` per
 //! `backfill_page_size` events it fell behind. Waking it while its backlog
@@ -336,7 +340,10 @@ where
             let Some(route) = routes.get(idx) else {
                 continue;
             };
+            let woken: Vec<String> = keys.keys().cloned().collect();
             self.spawn_all(op, route, keys.into_iter().collect())
+                .await?;
+            Tables::set_subscriptions_dormant_in_op(op, route.subscriber_type(), &woken, false)
                 .await?;
         }
         Ok(())

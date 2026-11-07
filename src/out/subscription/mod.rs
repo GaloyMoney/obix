@@ -18,6 +18,7 @@
 //! | ephemeral delivery | no — see [`EphemeralOutbox`](crate::EphemeralOutbox) | no |
 //! | `pause_until`, staged chains | no — by presence | yes |
 //! | dormancy / wake | no | yes |
+//! | finish (end from a flush) | no — by presence | yes |
 //!
 //! The two modes are not one mode with a flag, and the asymmetry is not
 //! scheduling mechanics — a resident job could perfectly well sleep. It is

@@ -112,6 +112,10 @@ pub async fn wipeout_subscriptions(
         .bind(subscriber_type)
         .execute(pool)
         .await?;
+    sqlx::query("DELETE FROM retired_subscriptions WHERE subscriber_type = $1")
+        .bind(subscriber_type)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

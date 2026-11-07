@@ -242,9 +242,9 @@ impl KeyedSubscriber<NonCloneEvent> for RetainingKeyedSubscriber {
         &self,
         _op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<obix::FlushOutcome, Box<dyn std::error::Error + Send + Sync>> {
         self.observed.record_flush(items).await;
-        Ok(())
+        Ok(obix::FlushOutcome::Continue)
     }
 }
 

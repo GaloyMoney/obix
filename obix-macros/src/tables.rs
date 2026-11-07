@@ -373,16 +373,17 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         // === Keyed-subscriber subscription queries ===
 
-        // DO NOTHING, not DO UPDATE: re-subscribing an already-live key must
-        // resolve to the ORIGINAL row (identity + birth frontier), never
-        // rewrite it with a freshly-sampled `start_after` — the whole
-        // from-birth-delivery guarantee rests on `start_after` being sampled
-        // exactly once, at the subscription's true birth.
+        // The conflict arm touches `dormant` only: re-subscribing an
+        // already-live key must resolve to the ORIGINAL row (identity + birth
+        // frontier), never rewrite it with a freshly-sampled `start_after` —
+        // the whole from-birth-delivery guarantee rests on `start_after` being
+        // sampled exactly once, at the subscription's true birth. `dormant` is
+        // cleared because the subscribe spawns the key in the same operation.
         let insert_subscription_query = format!(
             r#"
             INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint, created_at)
             VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6::timestamptz, NOW()))
-            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            ON CONFLICT (subscriber_type, key) DO UPDATE SET dormant = FALSE"#,
             tbl = table_prefix
         );
 
@@ -413,15 +414,53 @@ FROM {}persistent_outbox_events_sequence_seq",
             r#"
             SELECT subscriber_type, key
             FROM {tbl}subscriptions
-            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2
+            WHERE subscriber_type = ANY($1::varchar[]) AND checkpoint < $2 AND dormant
             ORDER BY checkpoint ASC
             LIMIT $3"#,
             tbl = table_prefix
         );
 
-        // Row absence IS the tombstone: no job-kill API exists or is needed.
-        let delete_subscription_query = format!(
-            r#"DELETE FROM {tbl}subscriptions WHERE subscriber_type = $1 AND key = $2"#,
+        let set_subscription_dormant_query = format!(
+            r#"UPDATE {tbl}subscriptions SET dormant = $3 WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        let set_subscriptions_dormant_query = format!(
+            r#"UPDATE {tbl}subscriptions SET dormant = $3 WHERE subscriber_type = $1 AND key = ANY($2::varchar[])"#,
+            tbl = table_prefix
+        );
+
+        // Row absence in `subscriptions` ends the member: no job-kill API
+        // exists or is needed. The `retired_subscriptions` row is the
+        // tombstone that keeps the key from being reused.
+        let retire_subscription_query = format!(
+            r#"
+            WITH retired AS (
+                DELETE FROM {tbl}subscriptions
+                WHERE subscriber_type = $1 AND key = $2
+                RETURNING subscriber_type, key
+            )
+            INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at)
+            SELECT subscriber_type, key, COALESCE($3::timestamptz, NOW()) FROM retired
+            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let lock_subscription_query = format!(
+            r#"
+            SELECT 1 AS "locked!"
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = $1 AND key = $2
+            FOR UPDATE"#,
+            tbl = table_prefix
+        );
+
+        let subscription_retired_query = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM {tbl}retired_subscriptions
+                WHERE subscriber_type = $1 AND key = $2
+            ) AS "retired!""#,
             tbl = table_prefix
         );
 
@@ -1363,7 +1402,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn delete_subscription_in_op(
+                fn retire_subscription_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,
                     key: &str,
@@ -1372,12 +1411,34 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                     let subscriber_type = subscriber_type.to_string();
                     let key = key.to_string();
+                    let now = op.maybe_now();
 
                     async move {
-                        sqlx::query!(#delete_subscription_query, subscriber_type, key)
+                        sqlx::query!(#retire_subscription_query, subscriber_type, key, now)
                             .execute(op.as_executor())
                             .await?;
                         Ok(())
+                    }
+                }
+
+                fn subscription_retired_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query_scalar!(#lock_subscription_query, subscriber_type, key)
+                            .fetch_optional(op.as_executor())
+                            .await?;
+                        let retired = sqlx::query_scalar!(#subscription_retired_query, subscriber_type, key)
+                            .fetch_one(op.as_executor())
+                            .await?;
+                        Ok(retired)
                     }
                 }
 
@@ -1421,6 +1482,57 @@ FROM {}persistent_outbox_events_sequence_seq",
                             subscriber_type,
                             key,
                             checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn set_subscription_dormant_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    dormant: bool,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #set_subscription_dormant_query,
+                            subscriber_type,
+                            key,
+                            dormant,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn set_subscriptions_dormant_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    keys: &[String],
+                    dormant: bool,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let keys = keys.to_vec();
+
+                    async move {
+                        if keys.is_empty() {
+                            return Ok(());
+                        }
+                        sqlx::query!(
+                            #set_subscriptions_dormant_query,
+                            subscriber_type,
+                            &keys as _,
+                            dormant,
                         )
                         .execute(op.as_executor())
                         .await?;

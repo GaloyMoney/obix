@@ -1308,11 +1308,11 @@ impl KeyedSubscriber<TestEvent> for StagedSubscriber {
         &self,
         op: &mut obix::FlushOp<'_, obix::InsertOrder>,
         items: Self::Batch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<obix::FlushOutcome, Box<dyn std::error::Error + Send + Sync>> {
         for label in items {
             insert_label(op, &label).await?;
         }
-        Ok(())
+        Ok(obix::FlushOutcome::Continue)
     }
 }
 

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE subscriptions SET dormant = $3 WHERE subscriber_type = $1 AND key = ANY($2::varchar[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "VarcharArray",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3543a50f2d299366c9507359a46f4a2d0c66c3d0f96787a100a5b8c15f692d16"
+}

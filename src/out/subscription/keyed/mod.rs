@@ -16,7 +16,37 @@
 //! plane, one per *outbox*, holding one erased route per registered type).
 //!
 //! Every wake is driven by the stream: wake-key matches for arrivals, and
-//! cache-pressure catch-up for members drifting toward a cold read.
+//! cache-pressure catch-up for dormant members drifting toward a cold read.
+//!
+//! # Birth position, presence, end
+//!
+//! Three independent dimensions describe a member:
+//!
+//! - **Birth position** — every subscriber consumes from its birth position.
+//!   `subscribe_in_op` uses the sampled stream frontier; `subscribe_from_in_op`
+//!   lets the caller name an earlier one (a birth above the frontier is
+//!   rejected). A birth at or below the frontier is strictly more
+//!   conservative than the frontier: the persistent stream is replayable, so
+//!   an event racing the subscribe is delivered or not owed, never
+//!   owed-and-missed.
+//! - **Presence** — whether an idle member passivates is the per-type
+//!   [`KeyedSubscriberConfig::linger`]; `Duration::MAX` is always-on. An
+//!   always-on type declares wake keys like any other; they are never
+//!   consulted, because its members never passivate.
+//! - **End** — [`KeyedSubscriber::flush`] returns a [`FlushOutcome`]. On
+//!   `Finish` the handler's writes, the checkpoint at [`FlushOp::position`],
+//!   the retirement of the member's row and the job's completion land in one
+//!   transaction. A crash before commit replays the batch, so `flush` must
+//!   tolerate whole-batch replay and may return `Finish` again. A finished or
+//!   cancelled key is not reusable: the job crate retains the final execution
+//!   state under `(subscriber_type, key)`, so a retired key's tombstone in
+//!   `retired_subscriptions` makes both subscribe calls reject it with
+//!   [`SubscriptionRejection::KeyRetired`]. Mint a fresh key.
+//!
+//! A member finishes only at a landing, and landings need collected items:
+//! decide before subscribing whether there can be nothing to fold. A handler
+//! that reads on the pool during `flush` holds two connections per landing,
+//! like any keyed flush that reads elsewhere.
 
 mod runner;
 mod waker;
@@ -28,7 +58,7 @@ use std::{marker::PhantomData, time::Duration};
 use job::{JobType, RetrySettings};
 
 use crate::error::ObixFault;
-use crate::out::ctx::{FlushOp, Handled, KeyedEventCtx};
+use crate::out::ctx::{FlushOp, FlushOutcome, Handled, KeyedEventCtx};
 use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
 use crate::out::{Subscription, SubscriptionRejection};
@@ -221,15 +251,18 @@ where
     }
 
     /// Same contract as
-    /// [`SingletonSubscriber::flush`](crate::out::SingletonSubscriber::flush).
+    /// [`SingletonSubscriber::flush`](crate::out::SingletonSubscriber::flush),
+    /// plus the verdict: return [`FlushOutcome::Finish`] to end this member in
+    /// the landing's own transaction.
     fn flush(
         &self,
         op: &mut FlushOp<'_, InsertOrder>,
         items: Self::Batch,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send
-    {
+    ) -> impl std::future::Future<
+        Output = Result<FlushOutcome, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send {
         let _ = (op, items);
-        async { Ok(()) }
+        async { Ok(FlushOutcome::Continue) }
     }
 }
 
@@ -448,9 +481,11 @@ where
     /// spawned in the same operation, so a fresh subscription drains from
     /// birth without needing any wake until its first dormancy.
     ///
-    /// Idempotent: re-subscribing an already-subscribed key resolves to the
-    /// existing row (its original `start_after` and `wake_keys` are never
-    /// overwritten) and the existing live job.
+    /// Idempotent while subscribed: re-subscribing an already-subscribed key
+    /// resolves to the existing row (its original `start_after` and
+    /// `wake_keys` are never overwritten) and the existing live job. A key
+    /// whose previous subscription ended (finished or cancelled) is rejected
+    /// with [`SubscriptionRejection::KeyRetired`] — mint a new key.
     ///
     /// `wake_keys` takes anything convertible into [`WakeKeys`], which is
     /// non-empty by construction — a single [`WakeKey`] converts directly.
@@ -463,12 +498,72 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<Subscription<P, InsertOrder, Tables>, ObixFault> {
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
+        self.subscribe_born_at(op, key, cfg, wake_keys.into(), None)
+            .await
+    }
+
+    /// [`subscribe_in_op`](Self::subscribe_in_op) with a caller-chosen birth
+    /// position instead of the sampled frontier.
+    ///
+    /// `start_after` is exclusive and must be at or below the frontier sampled
+    /// on `op`: a member may not be born owing nothing for events that already
+    /// exist, so a higher value is rejected with
+    /// [`SubscriptionRejection::BirthAheadOfFrontier`]. Everything else is
+    /// `subscribe_in_op`: Active from birth, idempotent while subscribed, a
+    /// retired key rejected with [`SubscriptionRejection::KeyRetired`], same
+    /// wake keys.
+    #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscribe_from_in_op", skip_all)]
+    pub async fn subscribe_from_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: D::Key,
+        cfg: D::InstanceConfig,
+        wake_keys: impl Into<WakeKeys>,
+        start_after: crate::EventSequence,
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
+        self.subscribe_born_at(op, key, cfg, wake_keys.into(), Some(start_after))
+            .await
+    }
+
+    async fn subscribe_born_at(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: D::Key,
+        cfg: D::InstanceConfig,
+        wake_keys: WakeKeys,
+        birth: Option<crate::EventSequence>,
+    ) -> Result<
+        Subscription<P, InsertOrder, Tables>,
+        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+    > {
         let key_str = key.to_string();
+        let retired = {
+            let fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>,
+            > = Box::pin(Tables::subscription_retired_in_op(
+                &mut *op,
+                self.job_type.as_str(),
+                &key_str,
+            ));
+            fut.await?
+        };
+        if retired {
+            return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
+                subscriber_type: self.job_type.to_string(),
+                key: key_str,
+            }));
+        }
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
         // as the backstop against any other writer to the table.
-        let wake_keys = wake_keys.into().into_strings();
+        let wake_keys = wake_keys.into_strings();
         let instance_config = serde_json::to_value(&cfg)?;
         // Read on the caller's own operation, never on the pool: the caller
         // holds a transaction across this call, so a pool read here would
@@ -484,7 +579,7 @@ where
         // opaque future behind `&self` makes this method's `Send`-ness
         // higher-ranked and breaks `tokio::spawn` at the CALLER. Boxing
         // grounds the lifetime to the operation's borrow.
-        let start_after = {
+        let frontier = {
             let fut: std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<crate::EventSequence, sqlx::Error>>
@@ -493,6 +588,18 @@ where
                 >,
             > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
             fut.await?
+        };
+        let start_after = match birth {
+            None => frontier,
+            Some(start_after) if start_after <= frontier => start_after,
+            Some(start_after) => {
+                return Err(Fail::Rejected(
+                    SubscriptionRejection::BirthAheadOfFrontier {
+                        start_after,
+                        frontier,
+                    },
+                ));
+            }
         };
 
         Tables::insert_subscription_in_op(
@@ -527,15 +634,17 @@ where
     }
 
     /// Cancel a subscription on the caller's own operation — atomic with,
-    /// e.g., deletion of the domain entity it belongs to. Row absence is the
-    /// tombstone: no job-kill API exists or is needed.
+    /// e.g., deletion of the domain entity it belongs to. Row absence ends the
+    /// member: no job-kill API exists or is needed. The key is retired: a
+    /// later subscribe of it is rejected with
+    /// [`SubscriptionRejection::KeyRetired`].
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: &D::Key,
     ) -> Result<(), ObixFault> {
-        Tables::delete_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
+        Tables::retire_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
         Ok(())
     }
 
@@ -586,6 +695,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_outcome_defaults_to_continue() {
+        assert_eq!(FlushOutcome::default(), FlushOutcome::Continue);
+        assert_ne!(FlushOutcome::default(), FlushOutcome::Finish);
+    }
 
     #[test]
     fn config_retries_on_the_job_default() {
