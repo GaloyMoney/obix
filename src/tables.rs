@@ -508,6 +508,38 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_types: &[String],
         wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+
+    // === Joinable-subscription methods ===
+
+    /// Create the tip's `joinable_tips` row if it is absent, with no
+    /// checkpoint. Idempotent across processes.
+    fn ensure_tip_row(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Lock the tip's row (`FOR UPDATE`) on `op` and return its checkpoint:
+    /// `None` until the tip has reported one. One statement, so the lock and
+    /// the value it protects are read together, on the caller's own op. An
+    /// absent row is `RowNotFound`.
+    fn lock_tip_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+
+    /// Advance the tip's mirrored checkpoint, in the caller's op so it shares
+    /// the fate of the job checkpoint it copies. Monotonic.
+    fn mirror_tip_checkpoint_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        checkpoint: EventSequence,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// The tip's mirrored checkpoint, read on the pool without locking.
+    fn tip_checkpoint(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
 }
 
 /// A sparse checkpoint of the commit-lane fold: after folding through

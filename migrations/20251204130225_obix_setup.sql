@@ -87,5 +87,13 @@ CREATE TABLE retired_subscriptions (
   subscriber_type  VARCHAR NOT NULL,
   key              VARCHAR NOT NULL,
   retired_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  fence            BIGINT,
+  instance_config  JSONB,
   PRIMARY KEY (subscriber_type, key)
+);
+
+CREATE TABLE joinable_tips (
+  subscriber_type  VARCHAR PRIMARY KEY,
+  checkpoint       BIGINT,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

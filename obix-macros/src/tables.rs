@@ -499,6 +499,41 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        // === Joinable-subscription queries ===
+
+        let ensure_tip_row_query = format!(
+            r#"
+            INSERT INTO {tbl}joinable_tips (subscriber_type)
+            VALUES ($1)
+            ON CONFLICT (subscriber_type) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let lock_tip_query = format!(
+            r#"
+            SELECT checkpoint
+            FROM {tbl}joinable_tips
+            WHERE subscriber_type = $1
+            FOR UPDATE"#,
+            tbl = table_prefix
+        );
+
+        let mirror_tip_checkpoint_query = format!(
+            r#"
+            UPDATE {tbl}joinable_tips
+            SET checkpoint = GREATEST(COALESCE(checkpoint, $2), $2), updated_at = NOW()
+            WHERE subscriber_type = $1"#,
+            tbl = table_prefix
+        );
+
+        let tip_checkpoint_query = format!(
+            r#"
+            SELECT checkpoint
+            FROM {tbl}joinable_tips
+            WHERE subscriber_type = $1"#,
+            tbl = table_prefix
+        );
+
         // === Commit-ordered lane queries ===
 
         // INVARIANT: the `sequence >= $2` bound is what keeps this a
@@ -1595,6 +1630,79 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| (row.subscriber_type, row.key))
                             .collect())
+                    }
+                }
+
+                // === Joinable-subscription methods ===
+
+                fn ensure_tip_row(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        sqlx::query!(#ensure_tip_row_query, subscriber_type)
+                            .execute(&pool)
+                            .await?;
+                        Ok(())
+                    }
+                }
+
+                fn lock_tip_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#lock_tip_query, subscriber_type)
+                            .fetch_one(op.as_executor())
+                            .await?;
+                        Ok(row
+                            .checkpoint
+                            .map(|checkpoint| #crate_name::EventSequence::from(checkpoint as u64)))
+                    }
+                }
+
+                fn mirror_tip_checkpoint_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    checkpoint: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #mirror_tip_checkpoint_query,
+                            subscriber_type,
+                            checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn tip_checkpoint(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#tip_checkpoint_query, subscriber_type)
+                            .fetch_one(&pool)
+                            .await?;
+                        Ok(row
+                            .checkpoint
+                            .map(|checkpoint| #crate_name::EventSequence::from(checkpoint as u64)))
                     }
                 }
             }

@@ -226,6 +226,16 @@ pub(crate) trait Landing: Copy + Send + Sync {
     /// Nothing was pending, so nothing landed.
     fn idle() -> Self::Landed;
 
+    /// Called once, immediately after the landing op is materialised and
+    /// before any handler statement runs on it. Default: nothing.
+    fn enter(
+        self,
+        op: &mut es_entity::DbOp<'static>,
+    ) -> impl std::future::Future<Output = Result<(), ObixFault>> + Send {
+        let _ = op;
+        std::future::ready(Ok(()))
+    }
+
     /// Persist the checkpoint on `op` and land it as `verdict` says.
     fn land(
         self,
@@ -452,10 +462,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             flusher,
         } = self;
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
-        *parts.op_slot = Some(
-            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?,
-        );
+        *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         let op = parts.op_slot.as_mut().expect("just materialized above");
         Ok(IsolatedOp { op })
     }
@@ -614,6 +621,18 @@ impl std::error::Error for FlushError {
     }
 }
 
+/// Open an op for a landing and give the landing its entry hook, before any
+/// other statement runs on it. Every op a landing's handler work runs on is
+/// materialised here.
+async fn open_landing_op<L: Landing>(
+    current_job: &CurrentJob,
+    landing: L,
+) -> Result<es_entity::DbOp<'static>, ObixFault> {
+    let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+    landing.enter(&mut op).await?;
+    Ok(op)
+}
+
 /// Land the pending batch, if any: hand collected items to the handler's
 /// flush (inside a transaction opened for the landing) → checkpoint at the
 /// last fully handled sequence → commit. Also lands a runner-committed op
@@ -640,13 +659,7 @@ pub(crate) async fn flush_batch<B: Default, L: Landing>(
     let mut verdict = L::Verdict::default();
     if parts.tracker.collected > 0 {
         if parts.op_slot.is_none() {
-            *parts.op_slot = Some(
-                es_entity::DbOp::init_with_clock(
-                    parts.current_job.pool(),
-                    parts.current_job.clock(),
-                )
-                .await?,
-            );
+            *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         }
         // Drain before the call: on error the items are dropped with the op,
         // and the replayed events re-collect them — the accumulator never
@@ -809,9 +822,7 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
             *parts.op_slot = Some(op);
             return Err(Box::new(FinishedAtFence));
         }
-        let op =
-            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?;
+        let op = open_landing_op(parts.current_job, parts.landing).await?;
         Ok(StagedOp {
             op,
             parts,
