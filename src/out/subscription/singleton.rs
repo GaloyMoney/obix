@@ -413,12 +413,109 @@ where
 
     async fn run_persistent(
         &self,
-        mut current_job: CurrentJob,
+        current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
+        let state = decode_execution_state(&current_job)?.unwrap_or_default();
+        let persistent = self.select_lane(&state)?;
+        let flusher = SubscriberFlusher::<H, P, L> {
+            handler: self.handler.clone(),
+            _payload: std::marker::PhantomData,
+        };
+        run_persistent_loop(
+            self,
+            current_job,
+            state,
+            persistent,
+            &flusher,
+            Singleton,
+            None,
+            self.max_batch_size,
+            self.checkpoint_interval,
+        )
+        .await
+    }
+}
 
-        let mut persistent = self.select_lane(&state)?;
+impl<H, P, Tables, L> PersistentDispatch<P, L> for OutboxEventJobRunner<H, P, Tables, L>
+where
+    H: SingletonSubscriber<P, L>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+    L: Lane,
+{
+    type Batch = H::Batch;
+    type Landing = Singleton;
 
+    async fn dispatch<'inv>(
+        &self,
+        parts: CtxParts<'inv, Singleton>,
+        batch: &'inv mut H::Batch,
+        flusher: &'inv dyn ItemFlush<H::Batch, ()>,
+        event: &EventDelivery<P, L>,
+    ) -> Result<Outcome, HandlerError> {
+        let ctx = EventCtx {
+            parts,
+            batch,
+            flusher,
+        };
+        // The Handled token is branded with the invocation lifetime (it
+        // cannot leave this call) and every path that mints one consumes
+        // the ctx — so the outcome is authentic by construction.
+        Ok(self.handler.handle_persistent(ctx, event).await?.outcome)
+    }
+
+    async fn undecodable(&self, error: &UndecodableDelivery<L>) -> Result<(), HandlerError> {
+        self.handler.handle_undecodable(error).await
+    }
+}
+
+/// What the shared persistent loop calls into: the one place a runner decides
+/// how an event reaches its handler, and with which ctx.
+pub(crate) trait PersistentDispatch<P, L>: Send + Sync
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    L: Lane,
+{
+    type Batch: Default + Send + 'static;
+    type Landing: Landing<Verdict = (), Landed = ()>;
+
+    /// Hand one event to the handler and return how it resolved.
+    fn dispatch<'inv>(
+        &self,
+        parts: CtxParts<'inv, Self::Landing>,
+        batch: &'inv mut Self::Batch,
+        flusher: &'inv dyn ItemFlush<Self::Batch, ()>,
+        event: &EventDelivery<P, L>,
+    ) -> impl std::future::Future<Output = Result<Outcome, HandlerError>> + Send;
+
+    /// Decide the fate of an undecodable event; `Ok` acknowledges it.
+    fn undecodable(
+        &self,
+        error: &UndecodableDelivery<L>,
+    ) -> impl std::future::Future<Output = Result<(), HandlerError>> + Send;
+}
+
+/// The loop behind every always-on persistent runner: batching, landing
+/// triggers, checkpoint cadence and shutdown, parameterised by the landing and
+/// by how an event reaches its handler.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_persistent_loop<D, P, L>(
+    dispatch: &D,
+    mut current_job: CurrentJob,
+    mut state: OutboxEventJobState,
+    mut persistent: crate::out::LaneListener<L, P>,
+    flusher: &dyn ItemFlush<D::Batch, ()>,
+    landing: D::Landing,
+    mirror: Option<&dyn CheckpointMirror>,
+    max_batch_size: usize,
+    checkpoint_interval: std::time::Duration,
+) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>>
+where
+    D: PersistentDispatch<P, L>,
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    L: Lane,
+{
+    {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
             collected: 0,
@@ -426,11 +523,7 @@ where
             last_persist: tokio::time::Instant::now(),
         };
         let mut in_group = false;
-        let mut batch = H::Batch::default();
-        let flusher = SubscriberFlusher::<H, P, L> {
-            handler: self.handler.clone(),
-            _payload: std::marker::PhantomData,
-        };
+        let mut batch = D::Batch::default();
 
         loop {
             let item = if tracker.collected > 0 {
@@ -446,9 +539,9 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            landing: Singleton,
+                            landing,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
+                        flush_batch(&mut parts, &mut batch, flusher, "stream_closed").await?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
                     None if in_group => match persistent.next().await {
@@ -459,9 +552,9 @@ where
                                 current_job: &mut current_job,
                                 state: &mut state,
                                 tracker: &mut tracker,
-                                landing: Singleton,
+                                landing,
                             };
-                            flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
+                            flush_batch(&mut parts, &mut batch, flusher, "stream_closed").await?;
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
                     },
@@ -471,9 +564,9 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            landing: Singleton,
+                            landing,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
+                        flush_batch(&mut parts, &mut batch, flusher, "backlog_drained").await?;
                         continue;
                     }
                 }
@@ -482,14 +575,14 @@ where
                     biased;
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
-                            persist_checkpoint(&mut current_job, &state, None)
+                            persist_checkpoint(&mut current_job, &state, mirror)
                                 .await?;
                         }
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
-                    _ = tokio::time::sleep_until(tracker.last_persist + self.checkpoint_interval),
+                    _ = tokio::time::sleep_until(tracker.last_persist + checkpoint_interval),
                         if tracker.persisted < checkpoint_of::<L>(&state) => {
-                        persist_checkpoint(&mut current_job, &state, None)
+                        persist_checkpoint(&mut current_job, &state, mirror)
                             .await?;
                         tracker.persisted = checkpoint_of::<L>(&state);
                         tracker.last_persist = tokio::time::Instant::now();
@@ -499,7 +592,7 @@ where
                         Some(item) => item,
                         None => {
                             if tracker.persisted < checkpoint_of::<L>(&state) {
-                                persist_checkpoint(&mut current_job, &state, None).await?;
+                                persist_checkpoint(&mut current_job, &state, mirror).await?;
                             }
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
@@ -525,10 +618,10 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        landing: Singleton,
+                        landing,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
-                    match self.handler.handle_undecodable(&undecodable).await {
+                    flush_batch(&mut parts, &mut batch, flusher, "undecodable_event").await?;
+                    match dispatch.undecodable(&undecodable).await {
                         Ok(()) => {
                             // INVARIANT: both cursors advance. Leaving
                             // `commit_sequence` behind redelivers the event
@@ -539,7 +632,7 @@ where
                         }
                         Err(error) => {
                             if tracker.persisted < checkpoint_of::<L>(&state) {
-                                persist_checkpoint(&mut current_job, &state, None).await?;
+                                persist_checkpoint(&mut current_job, &state, mirror).await?;
                             }
                             return Err(error);
                         }
@@ -547,23 +640,16 @@ where
                 }
             };
 
-            let ctx = EventCtx {
-                parts: CtxParts {
-                    op_slot: &mut op_slot,
-                    current_job: &mut current_job,
-                    state: &mut state,
-                    tracker: &mut tracker,
-                    landing: Singleton,
-                },
-                batch: &mut batch,
-                flusher: &flusher,
+            let parts = CtxParts {
+                op_slot: &mut op_slot,
+                current_job: &mut current_job,
+                state: &mut state,
+                tracker: &mut tracker,
+                landing,
             };
-            // The Handled token is branded with the invocation lifetime (it
-            // cannot leave this call) and every path that mints one consumes
-            // the ctx — so the outcome is authentic by construction. Extract
-            // it in the same statement so the token (and with it the ctx
-            // borrows) ends before the state advance below.
-            let outcome = self.handler.handle_persistent(ctx, &event).await?.outcome;
+            let outcome = dispatch
+                .dispatch(parts, &mut batch, flusher, &event)
+                .await?;
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
             in_group = !event.is_boundary();
@@ -575,20 +661,20 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        landing: Singleton,
+                        landing,
                     };
-                    flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
+                    flush_batch(&mut parts, &mut batch, flusher, "commit").await?;
                 }
                 Outcome::Collect => {
-                    if tracker.collected >= self.max_batch_size && !in_group {
+                    if tracker.collected >= max_batch_size && !in_group {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            landing: Singleton,
+                            landing,
                         };
-                        flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
+                        flush_batch(&mut parts, &mut batch, flusher, "batch_full").await?;
                     }
                 }
                 Outcome::Pause(_) | Outcome::CommitAndPause(_) => {
