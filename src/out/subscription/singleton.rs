@@ -436,7 +436,7 @@ where
     }
 }
 
-impl<H, P, Tables, L> PersistentDispatch<P, L> for OutboxEventJobRunner<H, P, Tables, L>
+impl<H, P, Tables, L> PersistentDispatch<P, L, Singleton> for OutboxEventJobRunner<H, P, Tables, L>
 where
     H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -444,7 +444,6 @@ where
     L: Lane,
 {
     type Batch = H::Batch;
-    type Landing = Singleton;
 
     async fn dispatch<'inv>(
         &self,
@@ -471,18 +470,18 @@ where
 
 /// What the shared persistent loop calls into: the one place a runner decides
 /// how an event reaches its handler, and with which ctx.
-pub(crate) trait PersistentDispatch<P, L>: Send + Sync
+pub(crate) trait PersistentDispatch<P, L, Ld>: Send + Sync
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     L: Lane,
+    Ld: Landing<Verdict = (), Landed = ()>,
 {
     type Batch: Default + Send + 'static;
-    type Landing: Landing<Verdict = (), Landed = ()>;
 
     /// Hand one event to the handler and return how it resolved.
     fn dispatch<'inv>(
         &self,
-        parts: CtxParts<'inv, Self::Landing>,
+        parts: CtxParts<'inv, Ld>,
         batch: &'inv mut Self::Batch,
         flusher: &'inv dyn ItemFlush<Self::Batch, ()>,
         event: &EventDelivery<P, L>,
@@ -499,21 +498,22 @@ where
 /// triggers, checkpoint cadence and shutdown, parameterised by the landing and
 /// by how an event reaches its handler.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_persistent_loop<D, P, L>(
+pub(crate) async fn run_persistent_loop<D, P, L, Ld>(
     dispatch: &D,
     mut current_job: CurrentJob,
     mut state: OutboxEventJobState,
     mut persistent: crate::out::LaneListener<L, P>,
     flusher: &dyn ItemFlush<D::Batch, ()>,
-    landing: D::Landing,
+    landing: Ld,
     mirror: Option<&dyn CheckpointMirror>,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
 ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>>
 where
-    D: PersistentDispatch<P, L>,
+    D: PersistentDispatch<P, L, Ld>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     L: Lane,
+    Ld: Landing<Verdict = (), Landed = ()>,
 {
     {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;

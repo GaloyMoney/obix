@@ -39,6 +39,7 @@
 //! caught-up barrier built on it. It is a capability, not a value — it
 //! caches nothing, and every read goes to committed state.
 
+pub(crate) mod joinable;
 pub(crate) mod keyed;
 pub(crate) mod singleton;
 

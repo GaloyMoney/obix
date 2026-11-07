@@ -304,6 +304,49 @@ impl Landing for Keyed<'_> {
     }
 }
 
+/// The tip row's lock: the first statement of every tip landing, and of every
+/// landing that fences against the tip.
+///
+/// `sqlx::Error` for the reason [`CheckpointMirror`] documents.
+pub(crate) trait TipLock: Send + Sync {
+    /// Lock the row on `op` and read the checkpoint it protects: `None` while
+    /// the tip has not reported one.
+    fn lock<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> futures::future::BoxFuture<'a, Result<Option<EventSequence>, sqlx::Error>>;
+}
+
+/// A joinable tip's landing: takes the tip row's lock as the first statement
+/// of every landing transaction and mirrors the checkpoint into that row.
+#[derive(Clone, Copy)]
+pub(crate) struct Tip<'m> {
+    pub(crate) mirror: &'m dyn CheckpointMirror,
+    pub(crate) lock: &'m dyn TipLock,
+}
+
+impl Landing for Tip<'_> {
+    type Verdict = ();
+    type Landed = ();
+
+    fn idle() {}
+
+    async fn enter(self, op: &mut es_entity::DbOp<'static>) -> Result<(), ObixFault> {
+        self.lock.lock(op).await?;
+        Ok(())
+    }
+
+    async fn land(
+        self,
+        (): (),
+        current_job: &mut CurrentJob,
+        state: &mut OutboxEventJobState,
+        op: es_entity::DbOp<'static>,
+    ) -> Result<(), ObixFault> {
+        commit_checkpoint(current_job, op, state, Some(self.mirror)).await
+    }
+}
+
 pub(crate) struct CtxParts<'inv, L> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
@@ -731,6 +774,92 @@ pub(crate) async fn persist_checkpoint(
 ) -> Result<(), ObixFault> {
     let op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
     commit_checkpoint(current_job, op, state, mirror).await
+}
+
+/// Per-event decision point handed to
+/// [`JoinableSubscriber::handle`](super::JoinableSubscriber::handle): the
+/// same on the tip and on every catch-up lane, with the two verbs that are
+/// safe on both.
+///
+/// There is no `consume` and no `pause_until`. A fenced landing drains the
+/// lane with its landing op already open, so a verb that opens a second op
+/// is unrepresentable rather than rejected at runtime; a lane never
+/// passivates, so a verb that parks it contradicts the mode.
+///
+/// ```compile_fail
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// async fn consume_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     // error[E0599]: no method named `consume` found for struct `JoinableEventCtx`
+///     let _op = ctx.consume().await.unwrap();
+///     unreachable!()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// fn pause_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     // error[E0599]: no method named `pause_until` found for struct `JoinableEventCtx`
+///     ctx.pause_until(chrono::Utc::now())
+/// }
+/// ```
+///
+/// The control for the two tests above — same signature, with a verb the ctx
+/// does have. If this stops compiling, those `compile_fail` tests have
+/// started passing for the wrong reason:
+///
+/// ```
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// fn resolve_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     ctx.skip()
+/// }
+/// ```
+#[must_use = "resolve the JoinableEventCtx via skip / collect_with"]
+pub struct JoinableEventCtx<'inv, B = ()> {
+    pub(crate) batch: &'inv mut B,
+    pub(crate) tracker: &'inv mut BatchTracker,
+}
+
+impl<'inv, B> JoinableEventCtx<'inv, B> {
+    /// Identical to [`EventCtx::skip`].
+    pub fn skip(self) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Skip,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Identical to [`EventCtx::collect_with`].
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        self.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl<'inv, T> JoinableEventCtx<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> JoinableEventCtx<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap` accumulators.
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
+    }
 }
 
 // === Keyed subscribers ===

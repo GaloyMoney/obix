@@ -135,6 +135,15 @@ pub enum CouldNotDecodeStored {
     Key { job_type: ::job::JobType },
 }
 
+/// A joinable subscription used in a way only a code change corrects. Carries
+/// ids and job types only — never a unit, a payload or an event context.
+#[derive(Debug, errlanes::Classify)]
+pub enum JoinableFault {
+    #[classify(fatal(Invariant))]
+    #[error("joinable subscription {job_type} was used before spawn")]
+    NotSpawned { job_type: ::job::JobType },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

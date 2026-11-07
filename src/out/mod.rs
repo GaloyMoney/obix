@@ -21,10 +21,11 @@ use std::sync::Arc;
 
 pub use self::ctx::{
     EventCtx, FinishedAtFence, FlushError, FlushOp, FlushOutcome, Handled, IsolatedOp,
-    KeyedEventCtx, StagedOp, Suspended,
+    JoinableEventCtx, KeyedEventCtx, StagedOp, Suspended,
 };
 pub use self::error::{CouldNotDecodeStored, LaneMismatch};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
+pub use self::subscription::joinable::{JoinableConfig, JoinableHandle, JoinableSubscriber, Scope};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef, Subscriptions, WakeKey, WakeKeys,
 };
