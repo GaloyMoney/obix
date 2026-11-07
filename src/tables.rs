@@ -392,7 +392,9 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// `(subscriber_type, key)` — an already-live subscription — resolves to
     /// success without overwriting the existing row's `start_after` or
     /// `wake_keys`. Re-subscribing an already-subscribed key must never
-    /// silently rewind or fast-forward its birth frontier.
+    /// silently rewind or fast-forward its birth frontier. The conflict does
+    /// clear `dormant`: the caller spawns the key in the same operation, so
+    /// a passivated member comes back live.
     fn insert_subscription_in_op(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,

@@ -876,6 +876,62 @@ async fn retired_key_is_rejected_by_both_subscribe_calls() -> anyhow::Result<()>
 
 #[tokio::test]
 #[file_serial]
+async fn re_subscribing_a_dormant_member_respawns_it_and_clears_dormant() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+    jobs.start_poll().await?;
+
+    eventually(Duration::from_secs(10), || async {
+        dormant_of(&pool, JOB_TYPE, 1).await
+    })
+    .await?;
+    let passivated = generation_of(&subs, 1).await?;
+    assert!(is_terminal(&subs, 1).await?);
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+
+    assert_ne!(
+        generation_of(&subs, 1).await?,
+        passivated,
+        "re-subscribing a passivated key starts a new generation"
+    );
+    assert!(
+        !dormant_of(&pool, JOB_TYPE, 1).await?,
+        "the respawned member is live, so its row must not read dormant"
+    );
+
+    // Control: the respawned member passivates again in its own time and the
+    // flag follows it.
+    eventually(Duration::from_secs(10), || async {
+        dormant_of(&pool, JOB_TYPE, 1).await
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
 async fn a_subscribe_racing_a_cancel_cannot_resurrect_the_key() -> anyhow::Result<()> {
     use es_entity::errlanes::Fail;
 

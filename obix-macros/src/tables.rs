@@ -373,16 +373,17 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         // === Keyed-subscriber subscription queries ===
 
-        // DO NOTHING, not DO UPDATE: re-subscribing an already-live key must
-        // resolve to the ORIGINAL row (identity + birth frontier), never
-        // rewrite it with a freshly-sampled `start_after` — the whole
-        // from-birth-delivery guarantee rests on `start_after` being sampled
-        // exactly once, at the subscription's true birth.
+        // The conflict arm touches `dormant` only: re-subscribing an
+        // already-live key must resolve to the ORIGINAL row (identity + birth
+        // frontier), never rewrite it with a freshly-sampled `start_after` —
+        // the whole from-birth-delivery guarantee rests on `start_after` being
+        // sampled exactly once, at the subscription's true birth. `dormant` is
+        // cleared because the subscribe spawns the key in the same operation.
         let insert_subscription_query = format!(
             r#"
             INSERT INTO {tbl}subscriptions (subscriber_type, key, wake_keys, instance_config, start_after, checkpoint, created_at)
             VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6::timestamptz, NOW()))
-            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            ON CONFLICT (subscriber_type, key) DO UPDATE SET dormant = FALSE"#,
             tbl = table_prefix
         );
 
