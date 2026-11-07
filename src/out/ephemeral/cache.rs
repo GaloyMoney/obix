@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub(super) type CachedEvent = Arc<EphemeralOutboxEvent<RawPayload>>;
-pub(super) type CachedEvents = im::HashMap<EphemeralEventType, CachedEvent>;
+pub(super) type CachedEvents = imbl::HashMap<EphemeralEventType, CachedEvent>;
 
 pub struct CacheHandle {
     ephemeral_event_receiver: Option<broadcast::Receiver<CachedEvent>>,
@@ -175,7 +175,7 @@ where
         let pool = pool.clone();
 
         let handle = spawn_supervised("obix::ephemeral_cache_loop", async move {
-            let mut ephemeral_cache: CachedEvents = im::HashMap::new();
+            let mut ephemeral_cache: CachedEvents = imbl::HashMap::new();
 
             loop {
                 tokio::select! {

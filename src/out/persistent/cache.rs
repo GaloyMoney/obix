@@ -259,13 +259,16 @@ where
     }
 
     fn insert_into_cache_and_maybe_broadcast(
-        cache: im::OrdMap<EventSequence, InsertTransport<P>>,
+        cache: imbl::OrdMap<EventSequence, InsertTransport<P>>,
         event: InsertTransport<P>,
         highest_known_sequence: &AtomicU64,
         persistent_event_sender: &broadcast::Sender<InsertTransport<P>>,
         mut last_broadcast_sequence: EventSequence,
         cache_size: usize,
-    ) -> (im::OrdMap<EventSequence, InsertTransport<P>>, EventSequence) {
+    ) -> (
+        imbl::OrdMap<EventSequence, InsertTransport<P>>,
+        EventSequence,
+    ) {
         use std::ops::Bound;
 
         let sequence = event.sequence();
@@ -387,7 +390,7 @@ where
         pool: sqlx::PgPool,
         start_after: EventSequence,
         sender: mpsc::Sender<InsertTransport<P>>,
-        cache_snapshot: im::OrdMap<EventSequence, InsertTransport<P>>,
+        cache_snapshot: imbl::OrdMap<EventSequence, InsertTransport<P>>,
         cache_fill_sender: broadcast::Sender<InsertTransport<P>>,
         highest: EventSequence,
         page_size: usize,
@@ -555,7 +558,7 @@ where
     /// Returns `None` for unparsable payloads.
     fn handle_notification(
         payload: &str,
-        cache: &im::OrdMap<EventSequence, InsertTransport<P>>,
+        cache: &imbl::OrdMap<EventSequence, InsertTransport<P>>,
     ) -> Option<NotifiedRange> {
         #[derive(serde::Deserialize)]
         struct NotificationHeader {
@@ -612,8 +615,8 @@ where
         let initial_sequence = EventSequence::from(highest_known_sequence.load(Ordering::Relaxed));
 
         let handle = spawn_supervised("obix::persistent_cache_loop", async move {
-            let mut persistent_cache: im::OrdMap<EventSequence, InsertTransport<P>> =
-                im::OrdMap::new();
+            let mut persistent_cache: imbl::OrdMap<EventSequence, InsertTransport<P>> =
+                imbl::OrdMap::new();
             let mut last_broadcast_sequence = initial_sequence;
             let mut stall = StallTracker::default();
             // Bound for backfill's historical classification: every
