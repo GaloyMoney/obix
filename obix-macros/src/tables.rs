@@ -429,9 +429,37 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        // Row absence IS the tombstone: no job-kill API exists or is needed.
-        let delete_subscription_query = format!(
-            r#"DELETE FROM {tbl}subscriptions WHERE subscriber_type = $1 AND key = $2"#,
+        // Row absence in `subscriptions` ends the member: no job-kill API
+        // exists or is needed. The `retired_subscriptions` row is the
+        // tombstone that keeps the key from being reused.
+        let retire_subscription_query = format!(
+            r#"
+            WITH retired AS (
+                DELETE FROM {tbl}subscriptions
+                WHERE subscriber_type = $1 AND key = $2
+                RETURNING subscriber_type, key
+            )
+            INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at)
+            SELECT subscriber_type, key, COALESCE($3::timestamptz, NOW()) FROM retired
+            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let lock_subscription_query = format!(
+            r#"
+            SELECT 1 AS "locked!"
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = $1 AND key = $2
+            FOR UPDATE"#,
+            tbl = table_prefix
+        );
+
+        let subscription_retired_query = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM {tbl}retired_subscriptions
+                WHERE subscriber_type = $1 AND key = $2
+            ) AS "retired!""#,
             tbl = table_prefix
         );
 
@@ -1373,7 +1401,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn delete_subscription_in_op(
+                fn retire_subscription_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,
                     key: &str,
@@ -1382,12 +1410,34 @@ FROM {}persistent_outbox_events_sequence_seq",
 
                     let subscriber_type = subscriber_type.to_string();
                     let key = key.to_string();
+                    let now = op.maybe_now();
 
                     async move {
-                        sqlx::query!(#delete_subscription_query, subscriber_type, key)
+                        sqlx::query!(#retire_subscription_query, subscriber_type, key, now)
                             .execute(op.as_executor())
                             .await?;
                         Ok(())
+                    }
+                }
+
+                fn subscription_retired_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        sqlx::query_scalar!(#lock_subscription_query, subscriber_type, key)
+                            .fetch_optional(op.as_executor())
+                            .await?;
+                        let retired = sqlx::query_scalar!(#subscription_retired_query, subscriber_type, key)
+                            .fetch_one(op.as_executor())
+                            .await?;
+                        Ok(retired)
                     }
                 }
 

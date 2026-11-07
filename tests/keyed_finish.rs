@@ -726,6 +726,232 @@ async fn birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn tombstone_exists(pool: &sqlx::PgPool, key: u64) -> anyhow::Result<bool> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM retired_subscriptions WHERE subscriber_type = $1 AND key = $2",
+    )
+    .bind(JOB_TYPE)
+    .bind(key.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+async fn assert_key_retired(
+    subs: &Subs,
+    outbox: &Outbox<TestEvent, TestTables>,
+    key: u64,
+) -> anyhow::Result<()> {
+    use es_entity::errlanes::Fail;
+
+    let mut op = outbox.begin_op().await?;
+    let via_frontier = subs
+        .subscribe_in_op(&mut op, MemberId(key), plain_config(7), wake_key_for(7))
+        .await;
+    match via_frontier {
+        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired {
+            subscriber_type,
+            key: rejected_key,
+        })) => {
+            assert_eq!(subscriber_type, JOB_TYPE);
+            assert_eq!(rejected_key, key.to_string());
+        }
+        Ok(_) => panic!("subscribe_in_op must reject retired key {key}"),
+        Err(other) => panic!("expected KeyRetired from subscribe_in_op, got {other:?}"),
+    }
+    let via_birth = subs
+        .subscribe_from_in_op(
+            &mut op,
+            MemberId(key),
+            plain_config(7),
+            wake_key_for(7),
+            EventSequence::BEGIN,
+        )
+        .await;
+    match via_birth {
+        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired {
+            subscriber_type,
+            key: rejected_key,
+        })) => {
+            assert_eq!(subscriber_type, JOB_TYPE);
+            assert_eq!(rejected_key, key.to_string());
+        }
+        Ok(_) => panic!("subscribe_from_in_op must reject retired key {key}"),
+        Err(other) => panic!("expected KeyRetired from subscribe_from_in_op, got {other:?}"),
+    }
+    op.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn retired_key_is_rejected_by_both_subscribe_calls() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let shared = Shared::default();
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: shared.clone(),
+            },
+        )
+        .await?;
+
+    let finishing = InstanceConfig {
+        owner: 7,
+        finish_at: Some(1),
+        ..Default::default()
+    };
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(&mut op, MemberId(1), finishing, wake_key_for(7))
+        .await?;
+    subs.subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+        .await?;
+    subs.subscribe_in_op(&mut op, MemberId(3), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+
+    jobs.start_poll().await?;
+    publish_ping_burst(&outbox, 7, 1..2).await?;
+    eventually(Duration::from_secs(10), || async {
+        is_terminal(&subs, 1).await
+    })
+    .await?;
+    subs.cancel(&MemberId(2)).await?;
+
+    assert!(
+        tombstone_exists(&pool, 1).await?,
+        "finish leaves a tombstone"
+    );
+    assert!(
+        tombstone_exists(&pool, 2).await?,
+        "cancel leaves a tombstone"
+    );
+
+    assert_key_retired(&subs, &outbox, 1).await?;
+    assert_key_retired(&subs, &outbox, 2).await?;
+    assert!(
+        !row_exists(&pool, 1).await?,
+        "a rejected subscribe inserts no row"
+    );
+    assert!(
+        !row_exists(&pool, 2).await?,
+        "a rejected subscribe inserts no row"
+    );
+
+    // Control: a live key is still idempotent through both calls, and a fresh
+    // key subscribes and receives.
+    assert!(!tombstone_exists(&pool, 3).await?);
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(&mut op, MemberId(3), plain_config(7), wake_key_for(7))
+        .await?;
+    subs.subscribe_from_in_op(
+        &mut op,
+        MemberId(3),
+        plain_config(7),
+        wake_key_for(7),
+        EventSequence::BEGIN,
+    )
+    .await?;
+    subs.subscribe_in_op(&mut op, MemberId(4), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+    assert!(row_exists(&pool, 3).await?);
+
+    publish_ping_burst(&outbox, 7, 2..3).await?;
+    eventually(Duration::from_secs(10), || async {
+        Ok(received_for(&shared, 3).await == vec![1, 2]
+            && received_for(&shared, 4).await == vec![2])
+    })
+    .await?;
+    assert_eq!(received_for(&shared, 1).await, vec![1]);
+    assert!(!row_exists(&pool, 1).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn a_subscribe_racing_a_cancel_cannot_resurrect_the_key() -> anyhow::Result<()> {
+    use es_entity::errlanes::Fail;
+
+    let pool = init_pool().await?;
+    let mut jobs = init_jobs(&pool).await?;
+    let outbox = init_outbox(&pool).await?;
+
+    let subs = outbox
+        .register_keyed_subscriber(
+            &mut jobs,
+            test_config(),
+            TestDef {
+                shared: Shared::default(),
+            },
+        )
+        .await?;
+
+    let mut op = outbox.begin_op().await?;
+    subs.subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+        .await?;
+    subs.subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+        .await?;
+    op.commit().await?;
+
+    let mut cancelling = outbox.begin_op().await?;
+    subs.cancel_in_op(&mut cancelling, &MemberId(1)).await?;
+
+    let racing_outbox = outbox.clone();
+    let racing_subs = subs.clone();
+    let racing = tokio::spawn(async move {
+        let mut op = racing_outbox.begin_op().await?;
+        let result = racing_subs
+            .subscribe_in_op(&mut op, MemberId(1), plain_config(7), wake_key_for(7))
+            .await;
+        op.commit().await?;
+        Ok::<_, anyhow::Error>(result.map(|_| ()))
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !racing.is_finished(),
+        "the subscribe must wait on the row the uncommitted cancel holds"
+    );
+    cancelling.commit().await?;
+
+    match racing.await?? {
+        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired { key, .. })) => {
+            assert_eq!(key, MemberId(1).to_string());
+        }
+        Ok(()) => panic!("a subscribe racing a cancel must not resurrect the key"),
+        Err(other) => panic!("expected KeyRetired, got {other:?}"),
+    }
+    assert!(
+        !row_exists(&pool, 1).await?,
+        "no live row beside the tombstone"
+    );
+    assert!(tombstone_exists(&pool, 1).await?);
+
+    // Control: with no cancel in flight, the same concurrent shape resolves
+    // idempotently against the live row.
+    let racing_outbox = outbox.clone();
+    let racing_subs = subs.clone();
+    tokio::spawn(async move {
+        let mut op = racing_outbox.begin_op().await?;
+        racing_subs
+            .subscribe_in_op(&mut op, MemberId(2), plain_config(7), wake_key_for(7))
+            .await?;
+        op.commit().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert!(row_exists(&pool, 2).await?);
+
+    Ok(())
+}
+
 fn always_on_config() -> KeyedSubscriberConfig {
     KeyedSubscriberConfig::new(job::JobType::new(ALWAYS_ON_JOB_TYPE))
         .with_linger(Duration::MAX)

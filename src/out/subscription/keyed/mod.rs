@@ -35,11 +35,13 @@
 //!   consulted, because its members never passivate.
 //! - **End** — [`KeyedSubscriber::flush`] returns a [`FlushOutcome`]. On
 //!   `Finish` the handler's writes, the checkpoint at [`FlushOp::position`],
-//!   the `DELETE` of the member's row and the job's completion land in one
+//!   the retirement of the member's row and the job's completion land in one
 //!   transaction. A crash before commit replays the batch, so `flush` must
 //!   tolerate whole-batch replay and may return `Finish` again. A finished or
 //!   cancelled key is not reusable: the job crate retains the final execution
-//!   state under `(subscriber_type, key)`, so mint a fresh key.
+//!   state under `(subscriber_type, key)`, so a retired key's tombstone in
+//!   `retired_subscriptions` makes both subscribe calls reject it with
+//!   [`SubscriptionRejection::KeyRetired`]. Mint a fresh key.
 //!
 //! A member finishes only at a landing, and landings need collected items:
 //! decide before subscribing whether there can be nothing to fold. A handler
@@ -479,9 +481,11 @@ where
     /// spawned in the same operation, so a fresh subscription drains from
     /// birth without needing any wake until its first dormancy.
     ///
-    /// Idempotent: re-subscribing an already-subscribed key resolves to the
-    /// existing row (its original `start_after` and `wake_keys` are never
-    /// overwritten) and the existing live job.
+    /// Idempotent while subscribed: re-subscribing an already-subscribed key
+    /// resolves to the existing row (its original `start_after` and
+    /// `wake_keys` are never overwritten) and the existing live job. A key
+    /// whose previous subscription ended (finished or cancelled) is rejected
+    /// with [`SubscriptionRejection::KeyRetired`] — mint a new key.
     ///
     /// `wake_keys` takes anything convertible into [`WakeKeys`], which is
     /// non-empty by construction — a single [`WakeKey`] converts directly.
@@ -509,8 +513,9 @@ where
     /// on `op`: a member may not be born owing nothing for events that already
     /// exist, so a higher value is rejected with
     /// [`SubscriptionRejection::BirthAheadOfFrontier`]. Everything else is
-    /// `subscribe_in_op`: Active from birth, idempotent while the row exists,
-    /// same wake keys.
+    /// `subscribe_in_op`: Active from birth, idempotent while subscribed, a
+    /// retired key rejected with [`SubscriptionRejection::KeyRetired`], same
+    /// wake keys.
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscribe_from_in_op", skip_all)]
     pub async fn subscribe_from_in_op(
         &self,
@@ -539,6 +544,22 @@ where
         Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
     > {
         let key_str = key.to_string();
+        let retired = {
+            let fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>,
+            > = Box::pin(Tables::subscription_retired_in_op(
+                &mut *op,
+                self.job_type.as_str(),
+                &key_str,
+            ));
+            fut.await?
+        };
+        if retired {
+            return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
+                subscriber_type: self.job_type.to_string(),
+                key: key_str,
+            }));
+        }
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
         // as the backstop against any other writer to the table.
@@ -613,15 +634,17 @@ where
     }
 
     /// Cancel a subscription on the caller's own operation — atomic with,
-    /// e.g., deletion of the domain entity it belongs to. Row absence is the
-    /// tombstone: no job-kill API exists or is needed.
+    /// e.g., deletion of the domain entity it belongs to. Row absence ends the
+    /// member: no job-kill API exists or is needed. The key is retired: a
+    /// later subscribe of it is rejected with
+    /// [`SubscriptionRejection::KeyRetired`].
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         key: &D::Key,
     ) -> Result<(), ObixFault> {
-        Tables::delete_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
+        Tables::retire_subscription_in_op(op, self.job_type.as_str(), &key.to_string()).await?;
         Ok(())
     }
 

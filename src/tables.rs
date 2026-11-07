@@ -402,14 +402,31 @@ pub trait MailboxTables: Send + Sync + 'static {
         start_after: EventSequence,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// Delete a subscription row. Row absence is the tombstone: no job-kill
-    /// API exists or is needed — the runner's next run-start row check (or a
-    /// stray wake) observes the missing row and completes.
-    fn delete_subscription_in_op(
+    /// Delete a subscription row and record its key in
+    /// `retired_subscriptions`, in one statement. Row absence ends the
+    /// member: no job-kill API exists or is needed — the runner's next
+    /// run-start row check (or a stray wake) observes the missing row and
+    /// completes. The retired row is the tombstone that keeps the key from
+    /// being subscribed again. A key with no live row is left untouched.
+    fn retire_subscription_in_op(
         op: &mut impl es_entity::AtomicOperation,
         subscriber_type: &str,
         key: &str,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Whether `(subscriber_type, key)` has a tombstone in
+    /// `retired_subscriptions` — its subscription finished or was cancelled.
+    ///
+    /// Locks the live `subscriptions` row first (`FOR UPDATE`), then reads
+    /// the tombstone in a separate statement. A concurrent retirement of the
+    /// key is therefore either serialized after the caller's operation or
+    /// committed and visible to the tombstone read, so a subscribe that
+    /// passes this check cannot re-insert a key retired in the meantime.
+    fn subscription_retired_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
 
     /// Point-read one subscription's identity and terms by primary key.
     /// `None` means cancelled (or never subscribed) — the caller's row-is-truth

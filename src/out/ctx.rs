@@ -171,7 +171,7 @@ pub enum FlushOutcome {
     #[default]
     Continue,
     /// This member is done. The runner commits this landing's work and
-    /// checkpoint, deletes the subscription row and completes the job, in
+    /// checkpoint, retires the subscription row and completes the job, in
     /// the same transaction. Keyed-only by construction: a singleton's
     /// `flush` returns `()`.
     ///
@@ -180,7 +180,8 @@ pub enum FlushOutcome {
     /// roll back with the op.
     ///
     /// Allowed from any keyed member: it cancels the member from inside and
-    /// completes it, atomically, and the key is then not reusable.
+    /// completes it, atomically, and the key is then retired: subscribing it
+    /// again is rejected with `SubscriptionRejection::KeyRetired`.
     ///
     /// A `Finish` landed by a later event's
     /// [`consume`](KeyedEventCtx::consume) ends the member *before* that
@@ -209,7 +210,7 @@ pub(crate) enum Landed {
     /// Landed and committed (or nothing was pending).
     Continue,
     /// The flush asked to finish: the op carries the work, the checkpoint and
-    /// the row deletion, uncommitted. Completing the job with it commits all
+    /// the row retirement, uncommitted. Completing the job with it commits all
     /// of it at once.
     Finished(es_entity::DbOp<'static>),
 }

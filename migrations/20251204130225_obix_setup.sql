@@ -82,3 +82,10 @@ CREATE TABLE subscriptions (
 );
 CREATE INDEX idx_subscriptions_checkpoint ON subscriptions (checkpoint);
 CREATE INDEX idx_subscriptions_wake_keys ON subscriptions USING GIN (wake_keys);
+
+CREATE TABLE retired_subscriptions (
+  subscriber_type  VARCHAR NOT NULL,
+  key              VARCHAR NOT NULL,
+  retired_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (subscriber_type, key)
+);

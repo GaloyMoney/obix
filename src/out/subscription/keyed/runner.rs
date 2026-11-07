@@ -181,7 +181,7 @@ impl<Tables: MailboxTables> CheckpointMirror for KeyedCheckpointMirror<Tables> {
         op: &'a mut es_entity::DbOp<'static>,
     ) -> futures::future::BoxFuture<'a, Result<(), sqlx::Error>> {
         Box::pin(async move {
-            Tables::delete_subscription_in_op(op, self.subscriber_type.as_str(), &self.key).await
+            Tables::retire_subscription_in_op(op, self.subscriber_type.as_str(), &self.key).await
         })
     }
 }
