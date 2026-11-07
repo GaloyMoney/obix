@@ -17,7 +17,7 @@ use crate::out::event::{EventDelivery, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
 use crate::out::subscription::StreamPosition;
 use crate::out::subscription::singleton::PersistentDispatch;
-use crate::out::subscription::singleton::{OutboxEventJobData, run_persistent_loop};
+use crate::out::subscription::singleton::{LoopCadence, OutboxEventJobData, run_persistent_loop};
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
 
@@ -205,9 +205,10 @@ where
                 mirror: &row,
                 lock: &row,
             },
-            Some(&row),
-            self.max_batch_size,
-            self.checkpoint_interval,
+            LoopCadence {
+                max_batch_size: self.max_batch_size,
+                checkpoint_interval: self.checkpoint_interval,
+            },
         )
         .await
     }

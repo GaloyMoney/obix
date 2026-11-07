@@ -428,9 +428,10 @@ where
             persistent,
             &flusher,
             Singleton,
-            None,
-            self.max_batch_size,
-            self.checkpoint_interval,
+            LoopCadence {
+                max_batch_size: self.max_batch_size,
+                checkpoint_interval: self.checkpoint_interval,
+            },
         )
         .await
     }
@@ -494,10 +495,17 @@ where
     ) -> impl std::future::Future<Output = Result<(), HandlerError>> + Send;
 }
 
+/// When the shared loop lands on its own initiative: a full batch, and a
+/// skip-only stretch that has gone unpersisted for the interval.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LoopCadence {
+    pub(crate) max_batch_size: usize,
+    pub(crate) checkpoint_interval: std::time::Duration,
+}
+
 /// The loop behind every always-on persistent runner: batching, landing
 /// triggers, checkpoint cadence and shutdown, parameterised by the landing and
 /// by how an event reaches its handler.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_persistent_loop<D, P, L, Ld>(
     dispatch: &D,
     mut current_job: CurrentJob,
@@ -505,9 +513,7 @@ pub(crate) async fn run_persistent_loop<D, P, L, Ld>(
     mut persistent: crate::out::LaneListener<L, P>,
     flusher: &dyn ItemFlush<D::Batch, ()>,
     landing: Ld,
-    mirror: Option<&dyn CheckpointMirror>,
-    max_batch_size: usize,
-    checkpoint_interval: std::time::Duration,
+    cadence: LoopCadence,
 ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>>
 where
     D: PersistentDispatch<P, L, Ld>,
@@ -515,6 +521,11 @@ where
     L: Lane,
     Ld: Landing<Verdict = (), Landed = ()>,
 {
+    let LoopCadence {
+        max_batch_size,
+        checkpoint_interval,
+    } = cadence;
+    let mirror = landing.mirror();
     {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {

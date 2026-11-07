@@ -226,6 +226,12 @@ pub(crate) trait Landing: Copy + Send + Sync {
     /// Nothing was pending, so nothing landed.
     fn idle() -> Self::Landed;
 
+    /// Where this landing copies the checkpoint, if anywhere: the same copy
+    /// on a batch landing and on a skip-only persist. Default: nowhere.
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        None
+    }
+
     /// Called once, immediately after the landing op is materialised and
     /// before any handler statement runs on it. Default: nothing.
     fn enter(
@@ -263,7 +269,7 @@ impl Landing for Singleton {
         state: &mut OutboxEventJobState,
         op: es_entity::DbOp<'static>,
     ) -> Result<(), ObixFault> {
-        commit_checkpoint(current_job, op, state, None).await
+        commit_checkpoint(current_job, op, state, self.mirror()).await
     }
 }
 
@@ -280,6 +286,10 @@ impl Landing for Keyed<'_> {
         Landed::Continue
     }
 
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        Some(self.0)
+    }
+
     async fn land(
         self,
         verdict: FlushOutcome,
@@ -289,7 +299,7 @@ impl Landing for Keyed<'_> {
     ) -> Result<Landed, ObixFault> {
         match verdict {
             FlushOutcome::Continue => {
-                commit_checkpoint(current_job, op, state, Some(self.0)).await?;
+                commit_checkpoint(current_job, op, state, self.mirror()).await?;
                 Ok(Landed::Continue)
             }
             FlushOutcome::Finish => {
@@ -331,6 +341,10 @@ impl Landing for Tip<'_> {
 
     fn idle() {}
 
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        Some(self.mirror)
+    }
+
     async fn enter(self, op: &mut es_entity::DbOp<'static>) -> Result<(), ObixFault> {
         self.lock.lock(op).await?;
         Ok(())
@@ -343,7 +357,7 @@ impl Landing for Tip<'_> {
         state: &mut OutboxEventJobState,
         op: es_entity::DbOp<'static>,
     ) -> Result<(), ObixFault> {
-        commit_checkpoint(current_job, op, state, Some(self.mirror)).await
+        commit_checkpoint(current_job, op, state, Landing::mirror(&self)).await
     }
 }
 
