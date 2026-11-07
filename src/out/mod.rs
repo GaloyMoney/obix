@@ -25,7 +25,9 @@ pub use self::ctx::{
 };
 pub use self::error::{CouldNotDecodeStored, LaneMismatch};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
-pub use self::subscription::joinable::{JoinableConfig, JoinableHandle, JoinableSubscriber, Scope};
+pub use self::subscription::joinable::{
+    CatchUpLane, JoinableConfig, JoinableHandle, JoinableSubscriber, LaneId, Lanes, Scope,
+};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef, Subscriptions, WakeKey, WakeKeys,
 };

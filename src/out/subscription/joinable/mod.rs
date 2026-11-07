@@ -17,24 +17,32 @@
 //! commit after it. The placement at landing **entry** is the whole point, and
 //! it is obix's to enforce, not the handler's.
 
+mod lane;
 mod runner;
 
-use es_entity::errlanes::{Fail, lanes};
+use es_entity::errlanes::{Fail, ResultExt, lanes};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use job::{JobType, Jobs, RetrySettings};
 
+use self::lane::{LaneJobInitializer, LaneMsg};
 use crate::error::ObixFault;
 use crate::out::Outbox;
 use crate::out::ctx::{FlushOp, Handled, JoinableEventCtx};
-use crate::out::error::JoinableFault;
+use crate::out::error::{CouldNotDecodeStored as Undecodable, JoinableFault};
 use crate::out::event::{EventDelivery, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
 use crate::out::subscription::singleton::{OutboxEventJobConfig, OutboxEventJobData};
-use crate::out::subscription::{Subscription, SubscriptionRejection, SubscriptionSnapshot};
+use crate::out::subscription::{
+    INITIAL_POLL_INTERVAL, MAX_POLL_INTERVAL, Subscription, SubscriptionRejection,
+    SubscriptionSnapshot,
+};
 use crate::sequence::EventSequence;
 use crate::tables::{DefaultMailboxTables, MailboxTables};
+
+es_entity::entity_id! { LaneId }
 
 const DEFAULT_LANE_MAX_BATCH_SIZE: usize = 100;
 
@@ -179,6 +187,20 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     tip: Subscription<P, InsertOrder, Tables>,
+    jobs: Jobs,
+    lane_job_type: JobType,
+    lane_spawner: job::KeyedJobSpawner<LaneMsg>,
+}
+
+/// The lanes of one joinable as of a landing op, from
+/// [`JoinableHandle::lanes_in_op`].
+#[derive(Debug, Clone)]
+pub struct Lanes<U> {
+    /// Lanes that have not joined yet: the tip must not apply their units.
+    pub catching_up: Vec<(LaneId, U)>,
+    /// Lanes that joined at a fence at or above the `since` asked for: the
+    /// tip applies their units from the event after the fence.
+    pub joined: Vec<(LaneId, U, EventSequence)>,
 }
 
 struct Shared<P, Tables>
@@ -243,13 +265,15 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    /// Register the tip for `handler`. Must run before
-    /// [`Jobs::start_poll`](job::Jobs::start_poll), like the other
-    /// registrations.
+    /// Register the tip (a resident job under the handle's job type) and the
+    /// lane job type (a keyed job under `"<job type>.lane"`) for `handler`.
+    /// Must run before [`Jobs::start_poll`](job::Jobs::start_poll), like the
+    /// other registrations.
     ///
     /// Idempotent per job type, as
     /// [`register_singleton_subscriber`](Outbox::register_singleton_subscriber)
-    /// is.
+    /// is. The lane job type's name is leaked once per call: the job crate
+    /// only accepts `&'static str`.
     #[es_entity::errlanes::instrument(name = "obix.joinable.spawn", skip_all)]
     pub async fn spawn<S>(
         &self,
@@ -263,17 +287,35 @@ where
         let shared = &self.shared;
         Tables::ensure_tip_row(shared.outbox.pool(), shared.job_type.as_str()).await?;
 
-        let initializer = runner::TipJobInitializer::<S, P, Tables>::new(
+        let handler = Arc::new(handler);
+        let tip_initializer = runner::TipJobInitializer::<S, P, Tables>::new(
             shared.outbox.clone(),
-            handler,
+            handler.clone(),
             shared.job_type.clone(),
             &config,
         );
-        let spawner = jobs.add_resident_initializer(initializer);
-        let job = spawner.spawn(OutboxEventJobData::default()).await?;
+        let tip_spawner = jobs.add_resident_initializer(tip_initializer);
 
+        let lane_job_type = JobType::new(Box::leak(
+            format!("{}.lane", shared.job_type).into_boxed_str(),
+        ));
+        let lane_initializer = LaneJobInitializer::<S, P, Tables>::new(
+            shared.outbox.clone(),
+            handler,
+            shared.job_type.clone(),
+            lane_job_type.clone(),
+            &config,
+        );
+        let lane_spawner = jobs.add_keyed_initializer(lane_initializer);
+
+        let job = tip_spawner.spawn(OutboxEventJobData::default()).await?;
         let tip = Subscription::new(job, shared.outbox.pool().clone(), None);
-        let _ = shared.registered.set(Registered { tip });
+        let _ = shared.registered.set(Registered {
+            tip,
+            jobs: jobs.clone(),
+            lane_job_type,
+            lane_spawner,
+        });
         Ok(())
     }
 
@@ -292,5 +334,283 @@ where
         &self,
     ) -> Result<SubscriptionSnapshot, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         self.registered()?.tip.load().await
+    }
+
+    /// Re-derive a lane handle from a stored id.
+    pub fn lane(&self, id: LaneId) -> CatchUpLane<P, Tables> {
+        CatchUpLane {
+            shared: self.shared.clone(),
+            id,
+        }
+    }
+
+    /// Lane state as of `op`. Inside a tip `flush` this is read under the
+    /// entry lock and is the contract for consumers that keep no seam state of
+    /// their own: skip units in `catching_up`, apply `> fence` for units in
+    /// `joined`. `joined` holds joins with `fence >= since`; a tip passes its
+    /// previous checkpoint, which bounds the list by construction.
+    #[es_entity::errlanes::instrument(name = "obix.joinable.lanes_in_op", skip_all)]
+    pub async fn lanes_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        since: EventSequence,
+    ) -> Result<Lanes<U>, ObixFault>
+    where
+        U: DeserializeOwned,
+    {
+        let registered = self.registered()?;
+        let rows = {
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<crate::tables::LaneRows, sqlx::Error>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(Tables::lanes_in_op(
+                &mut *op,
+                registered.lane_job_type.as_str(),
+                since,
+            ));
+            fut.await?
+        };
+        let lane_job_type = &registered.lane_job_type;
+        let decode = |key: String, stored: serde_json::Value| -> Result<(LaneId, U), ObixFault> {
+            let id: LaneId = key
+                .parse()
+                .ok()
+                .ok_or(Undecodable::Key {
+                    job_type: lane_job_type.clone(),
+                })
+                .into_fault()?;
+            let unit: U = serde_json::from_value(stored)
+                .map_err(Undecodable::InstanceConfig)
+                .into_fault()?;
+            Ok((id, unit))
+        };
+        let mut lanes = Lanes {
+            catching_up: Vec::with_capacity(rows.live.len()),
+            joined: Vec::with_capacity(rows.joined.len()),
+        };
+        for (key, stored) in rows.live {
+            lanes.catching_up.push(decode(key, stored)?);
+        }
+        for (key, stored, fence) in rows.joined {
+            let (id, unit) = decode(key, stored)?;
+            lanes.joined.push((id, unit, fence));
+        }
+        Ok(lanes)
+    }
+
+    /// Start a catch-up for `unit` from `start_after` (exclusive), in the
+    /// caller's op — the one that creates the unit. Takes the tip's lock
+    /// exclusively as the first statement on `op`, so a tip landing sees the
+    /// unit and its lane together or not at all, and holds it until `op`
+    /// commits. A birth above the stream frontier is rejected with
+    /// [`SubscriptionRejection::BirthAheadOfFrontier`].
+    #[es_entity::errlanes::instrument(name = "obix.joinable.join_in_op", skip_all)]
+    pub async fn join_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        unit: U,
+        start_after: EventSequence,
+    ) -> Result<CatchUpLane<P, Tables>, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
+    where
+        U: Serialize,
+    {
+        let registered = self.registered()?;
+        let tip_type = self.shared.job_type.as_str();
+
+        {
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<Option<EventSequence>, sqlx::Error>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(Tables::lock_tip_in_op(&mut *op, tip_type));
+            fut.await?;
+        }
+
+        let id = LaneId::new();
+        let key = id.to_string();
+        let lane_type = registered.lane_job_type.as_str();
+        let retired = {
+            let fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>,
+            > = Box::pin(Tables::subscription_retired_in_op(
+                &mut *op, lane_type, &key,
+            ));
+            fut.await?
+        };
+        if retired {
+            return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
+                subscriber_type: lane_type.to_string(),
+                key,
+            }));
+        }
+        let instance_config = serde_json::to_value(&unit)?;
+        let frontier = {
+            let fut: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<EventSequence, sqlx::Error>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
+            fut.await?
+        };
+        if start_after > frontier {
+            return Err(Fail::Rejected(
+                SubscriptionRejection::BirthAheadOfFrontier {
+                    start_after,
+                    frontier,
+                },
+            ));
+        }
+
+        Tables::insert_subscription_in_op(
+            op,
+            lane_type,
+            &key,
+            &[LANE_WAKE_KEY.to_string()],
+            instance_config,
+            start_after,
+        )
+        .await?;
+        registered
+            .lane_spawner
+            .spawn_in_op(op, key.clone(), LaneMsg { lane: key })
+            .await?;
+
+        Ok(CatchUpLane {
+            shared: self.shared.clone(),
+            id,
+        })
+    }
+}
+
+/// The wake key every lane row carries: the table requires one, and a lane
+/// never passivates, so nothing ever consults it.
+const LANE_WAKE_KEY: &str = "lane";
+
+/// One catch-up lane: an address derived from its id, cheap to clone and to
+/// re-derive with [`JoinableHandle::lane`].
+pub struct CatchUpLane<P, Tables = DefaultMailboxTables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    shared: Arc<Shared<P, Tables>>,
+    id: LaneId,
+}
+
+impl<P, Tables> Clone for CatchUpLane<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            id: self.id,
+        }
+    }
+}
+
+impl<P, Tables> CatchUpLane<P, Tables>
+where
+    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
+    Tables: MailboxTables,
+{
+    pub fn id(&self) -> LaneId {
+        self.id
+    }
+
+    fn registered(&self) -> Result<&Registered<P, Tables>, JoinableFault> {
+        self.shared
+            .registered
+            .get()
+            .ok_or_else(|| JoinableFault::NotSpawned {
+                job_type: self.shared.job_type.clone(),
+            })
+    }
+
+    /// The lane's checkpoint, frontier and job status. A joined lane's final
+    /// execution state stays readable.
+    #[es_entity::errlanes::instrument(name = "obix.joinable.lane_load", skip_all)]
+    pub async fn load(
+        &self,
+    ) -> Result<SubscriptionSnapshot, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
+        let registered = self.registered()?;
+        Subscription::<P, InsertOrder, Tables>::new_keyed(
+            registered.jobs.clone(),
+            registered.lane_job_type.clone(),
+            self.id.to_string(),
+            self.shared.outbox.pool().clone(),
+        )
+        .load()
+        .await
+    }
+
+    /// Block until the lane has joined; returns the fence. Polls the join
+    /// record as [`Subscription::await_position`] polls a checkpoint, and
+    /// reports its deadline as [`SubscriptionRejection::LaneFenceTimeout`].
+    /// A cancelled lane never joins, so it ends in the same timeout.
+    #[es_entity::errlanes::instrument(
+        name = "obix.joinable.await_fenced",
+        skip_all,
+        fields(timeout_ms = timeout.as_millis())
+    )]
+    pub async fn await_fenced(
+        &self,
+        timeout: Duration,
+    ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
+        let registered = self.registered()?;
+        let key = self.id.to_string();
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
+        let mut interval = INITIAL_POLL_INTERVAL;
+        loop {
+            if let Some(fence) = Tables::lane_fence(
+                self.shared.outbox.pool(),
+                registered.lane_job_type.as_str(),
+                &key,
+            )
+            .await?
+            {
+                return Ok(fence);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(Fail::Rejected(SubscriptionRejection::LaneFenceTimeout {
+                    lane: self.id,
+                    waited: now.duration_since(start),
+                }));
+            }
+            tokio::time::sleep(interval.min(deadline - now)).await;
+            interval = (interval * 2).min(MAX_POLL_INTERVAL);
+        }
+    }
+
+    /// Cancel the lane on the caller's own operation — atomic with, e.g.,
+    /// deletion of the unit it covers. Row absence ends the lane: the
+    /// runner's next run-start check completes it. The id is retired with no
+    /// fence, so it never appears among a tip's joined lanes.
+    #[es_entity::errlanes::instrument(name = "obix.joinable.cancel_in_op", skip_all)]
+    pub async fn cancel_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+    ) -> Result<(), ObixFault> {
+        let registered = self.registered()?;
+        let key = self.id.to_string();
+        let fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + '_>,
+        > = Box::pin(Tables::retire_lane_in_op(
+            &mut *op,
+            registered.lane_job_type.as_str(),
+            &key,
+            None,
+            None,
+        ));
+        fut.await?;
+        Ok(())
     }
 }

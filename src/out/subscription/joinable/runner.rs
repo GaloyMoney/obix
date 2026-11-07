@@ -107,13 +107,13 @@ where
 {
     pub(in crate::out) fn new(
         outbox: Outbox<P, Tables>,
-        subscriber: S,
+        subscriber: Arc<S>,
         job_type: JobType,
         config: &JoinableConfig,
     ) -> Self {
         Self {
             outbox,
-            subscriber: Arc::new(subscriber),
+            subscriber,
             job_type,
             retry_settings: config.tip.retry_settings.clone(),
             max_batch_size: config.tip.max_batch_size,

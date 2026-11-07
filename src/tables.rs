@@ -540,6 +540,43 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         subscriber_type: &str,
     ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+
+    /// End a catch-up lane: delete its `subscriptions` row and record the join
+    /// in `retired_subscriptions`, in one statement. `fence` is `None` for a
+    /// lane cancelled rather than joined; `instance_config` is the lane's unit.
+    /// A lane with no live row is left untouched.
+    fn retire_lane_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+        fence: Option<EventSequence>,
+        instance_config: Option<serde_json::Value>,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// The lanes of one lane type as of `op`: the live ones, and the joined
+    /// ones whose fence is at or above `since`.
+    fn lanes_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        since: EventSequence,
+    ) -> impl Future<Output = Result<LaneRows, sqlx::Error>> + Send;
+
+    /// The fence a lane joined at, read on the pool; `None` while the lane is
+    /// live and for a lane that was cancelled.
+    fn lane_fence(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+}
+
+/// The stored lanes of one lane type, as [`MailboxTables::lanes_in_op`] reads
+/// them: `(key, instance_config)` for each live lane and
+/// `(key, instance_config, fence)` for each join.
+#[derive(Debug, Clone)]
+pub struct LaneRows {
+    pub live: Vec<(String, serde_json::Value)>,
+    pub joined: Vec<(String, serde_json::Value, EventSequence)>,
 }
 
 /// A sparse checkpoint of the commit-lane fold: after folding through

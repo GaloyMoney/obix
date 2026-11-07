@@ -667,7 +667,7 @@ impl std::error::Error for FlushError {
 /// Open an op for a landing and give the landing its entry hook, before any
 /// other statement runs on it. Every op a landing's handler work runs on is
 /// materialised here.
-async fn open_landing_op<L: Landing>(
+pub(crate) async fn open_landing_op<L: Landing>(
     current_job: &CurrentJob,
     landing: L,
 ) -> Result<es_entity::DbOp<'static>, ObixFault> {
@@ -690,17 +690,18 @@ async fn open_landing_op<L: Landing>(
     ),
     err
 )]
-pub(crate) async fn flush_batch<B: Default, L: Landing>(
+async fn land_batch<B: Default, L: Landing>(
     parts: &mut CtxParts<'_, L>,
     batch: &mut B,
     flusher: &dyn ItemFlush<B, L::Verdict>,
     reason: &'static str,
+    force: bool,
 ) -> Result<L::Landed, HandlerError> {
     if parts.op_slot.is_none() && parts.tracker.collected == 0 {
         return Ok(L::idle());
     }
     let mut verdict = L::Verdict::default();
-    if parts.tracker.collected > 0 {
+    if parts.tracker.collected > 0 || force {
         if parts.op_slot.is_none() {
             *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         }
@@ -735,6 +736,26 @@ pub(crate) async fn flush_batch<B: Default, L: Landing>(
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(landed)
+}
+
+pub(crate) async fn flush_batch<B: Default, L: Landing>(
+    parts: &mut CtxParts<'_, L>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B, L::Verdict>,
+    reason: &'static str,
+) -> Result<L::Landed, HandlerError> {
+    land_batch(parts, batch, flusher, reason, false).await
+}
+
+/// [`flush_batch`] for a landing whose handler must run even over an empty
+/// batch: a lane's fenced landing, whose `flush` carries the fence.
+pub(crate) async fn flush_fenced<B: Default, L: Landing>(
+    parts: &mut CtxParts<'_, L>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B, L::Verdict>,
+    reason: &'static str,
+) -> Result<L::Landed, HandlerError> {
+    land_batch(parts, batch, flusher, reason, true).await
 }
 
 /// Write the checkpoint — and, for a keyed member, its mirrored copy — onto

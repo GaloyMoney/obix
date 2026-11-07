@@ -526,6 +526,48 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        // The lane's end of life: row deletion ends the lane (as for a keyed
+        // member) and the tombstone carries the join record. `fence` is NULL
+        // for a cancelled lane; `instance_config` is the unit.
+        let retire_lane_query = format!(
+            r#"
+            WITH retired AS (
+                DELETE FROM {tbl}subscriptions
+                WHERE subscriber_type = $1 AND key = $2
+                RETURNING subscriber_type, key
+            )
+            INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at, fence, instance_config)
+            SELECT subscriber_type, key, COALESCE($3::timestamptz, NOW()), $4::bigint, $5::jsonb FROM retired
+            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let live_lanes_query = format!(
+            r#"
+            SELECT key, instance_config
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = $1
+            ORDER BY created_at, key"#,
+            tbl = table_prefix
+        );
+
+        let joined_lanes_query = format!(
+            r#"
+            SELECT key, instance_config AS "instance_config!", fence AS "fence!"
+            FROM {tbl}retired_subscriptions
+            WHERE subscriber_type = $1 AND fence >= $2 AND instance_config IS NOT NULL
+            ORDER BY fence, key"#,
+            tbl = table_prefix
+        );
+
+        let lane_fence_query = format!(
+            r#"
+            SELECT fence
+            FROM {tbl}retired_subscriptions
+            WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
         let tip_checkpoint_query = format!(
             r#"
             SELECT checkpoint
@@ -1686,6 +1728,90 @@ FROM {}persistent_outbox_events_sequence_seq",
                         .execute(op.as_executor())
                         .await?;
                         Ok(())
+                    }
+                }
+
+                fn retire_lane_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                    fence: Option<#crate_name::EventSequence>,
+                    instance_config: Option<#crate_name::prelude::serde_json::Value>,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+                    let now = op.maybe_now();
+                    let fence = fence.map(|fence| u64::from(fence) as i64);
+
+                    async move {
+                        sqlx::query!(
+                            #retire_lane_query,
+                            subscriber_type,
+                            key,
+                            now,
+                            fence,
+                            instance_config
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn lanes_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    since: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<#crate_name::LaneRows, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        let live = sqlx::query!(#live_lanes_query, subscriber_type)
+                            .fetch_all(op.as_executor())
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.key, row.instance_config))
+                            .collect();
+                        let joined = sqlx::query!(
+                            #joined_lanes_query,
+                            subscriber_type,
+                            since as #crate_name::EventSequence,
+                        )
+                        .fetch_all(op.as_executor())
+                        .await?
+                        .into_iter()
+                        .map(|row| {
+                            (
+                                row.key,
+                                row.instance_config,
+                                #crate_name::EventSequence::from(row.fence as u64),
+                            )
+                        })
+                        .collect();
+                        Ok(#crate_name::LaneRows { live, joined })
+                    }
+                }
+
+                fn lane_fence(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#lane_fence_query, subscriber_type, key)
+                            .fetch_optional(&pool)
+                            .await?;
+                        Ok(row
+                            .and_then(|row| row.fence)
+                            .map(|fence| #crate_name::EventSequence::from(fence as u64)))
                     }
                 }
 

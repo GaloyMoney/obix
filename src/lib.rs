@@ -34,23 +34,23 @@ pub use inbox::{
 };
 pub use obix_macros::{EphemeralSelection, MailboxTables, OutboxEvent};
 pub use out::{
-    CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery,
+    CatchUpLane, CommitLaneDisabled, CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery,
     EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
     EphemeralOutboxListener, EphemeralSelection, EphemeralSubscriber, EphemeralSubscriberConfig,
     EphemeralSubscription, EventCtx, EventDelivery, FinishedAtFence, FlushError, FlushOp,
     FlushOutcome, Handled, InsertOrder, IsolatedOp, JoinableConfig, JoinableEventCtx,
     JoinableHandle, JoinableSubscriber, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
-    Lane, LaneMismatch, Ordering, Outbox, OutboxEventJobConfig, PartitionMaintainerConfig,
-    Partitions, PostPersistHook, RawPayload, Scope, SingletonSubscriber, StagedOp, StreamPosition,
-    Subscription, SubscriptionDef, SubscriptionRejection, SubscriptionSnapshot,
-    SubscriptionStreamStatus, Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError,
-    WakeKey, WakeKeys,
+    Lane, LaneId, LaneMismatch, Lanes, Ordering, Outbox, OutboxEventJobConfig,
+    PartitionMaintainerConfig, Partitions, PostPersistHook, RawPayload, Scope, SingletonSubscriber,
+    StagedOp, StreamPosition, Subscription, SubscriptionDef, SubscriptionRejection,
+    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended, UndecodableDelivery,
+    UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
 pub use tables::CommitCheckpoint;
 pub use tables::MailboxTables;
-pub use tables::{PersistentEventRows, SubscriptionRow};
+pub use tables::{LaneRows, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
 pub use tables::{
     decode_persistent_event, record_ephemeral_event_type_undecodable,
