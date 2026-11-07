@@ -108,15 +108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitmaps"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
-dependencies = [
- "typenum",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -449,9 +440,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.20.4"
+version = "0.20.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ae66a9f5fed89cbd89631469fdff2410013dfdc0fe22ea6197080c2ddd99b5"
+checksum = "91646a8a88a4208b5a3c81f63920d95034f2cde99e8127a6bfd8b9994c719e93"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -461,9 +452,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.20.4"
+version = "0.20.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31d98c72ae472a49b605915a8c8172e435cda4be5aa9ae5a5b7f3bdaf0b3302d"
+checksum = "83702a019fa9b10b7d63a8a03386d8cfaf873a9fdb8a65b3145e38db5a3f7052"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -475,9 +466,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.20.4"
+version = "0.20.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d20561c4d03cbe79ca95938e4b5860b35fca30eef5d3c43d356a8ae443902bce"
+checksum = "e88e315692589f43def67e3149584346d3b41b06f8bfce52de4fe9949240e153"
 dependencies = [
  "async-stream",
  "chrono",
@@ -485,7 +476,7 @@ dependencies = [
  "es-entity-macros",
  "futures-core",
  "futures-util",
- "im",
+ "imbl",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -501,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.20.4"
+version = "0.20.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d6a2538c8f33779cc3cc82e1ea25fe5cb479326b180ad288faef7485d02c825"
+checksum = "3d71ba62c2b1e1527ac1136a5fb840d853a9f8cbc59e3396f978343130e857d8"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -935,21 +926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "im"
-version = "15.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
-dependencies = [
- "bitmaps",
- "rand_core 0.6.4",
- "rand_xoshiro 0.6.0",
- "serde",
- "sized-chunks",
- "typenum",
- "version_check",
-]
-
-[[package]]
 name = "imbl"
 version = "7.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -959,7 +935,7 @@ dependencies = [
  "equivalent",
  "imbl-sized-chunks",
  "rand_core 0.9.5",
- "rand_xoshiro 0.7.0",
+ "rand_xoshiro",
  "serde_core",
  "version_check",
  "wide",
@@ -1517,15 +1493,6 @@ checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 
 [[package]]
 name = "rand_xoshiro"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand_xoshiro"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
@@ -1883,16 +1850,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "sized-chunks"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
-dependencies = [
- "bitmaps",
- "typenum",
 ]
 
 [[package]]

@@ -54,7 +54,7 @@ obix-macros = { path = "obix-macros", version = "0.16.2-dev" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
-es-entity = "0.20.4"
+es-entity = "0.20.5"
 anyhow = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
