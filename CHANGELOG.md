@@ -1,3 +1,22 @@
+# [obix release v0.17.0](https://github.com/GaloyMoney/obix/releases/tag/0.17.0)
+
+
+
+### Bug Fixes
+
+- Bump rustls to 0.23.46 (#174)
+
+### Features
+
+- Finite keyed subscriptions — FlushOutcome, birth position, dormant scan, KeyRetired (#185)
+- [**breaking**] Application-supplied event context on persistent outbox events (#184)
+
+### Miscellaneous Tasks
+
+- Replace im with imbl (#182)
+- Update flake inputs (#183)
+- Bump the all-dependencies group across 1 directory with 2 updates (#180)
+
 # [obix release v0.16.1](https://github.com/GaloyMoney/obix/releases/tag/0.16.1)
 
 
