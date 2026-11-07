@@ -181,6 +181,43 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 `Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row retirement and job completion commit in one transaction. A finished or cancelled key is retired: both subscribe calls reject it with `SubscriptionRejection::KeyRetired`, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.
 
+### Joinable subscriptions — catch-up lanes
+
+A consumer that folds many units in one pass (a rollup, a projection keyed by many entities) cannot add a unit with history without a second cursor: the live writer is at `C`, the new unit needs the stream from an earlier position. A *joinable* subscriber is one handler run by two runners: a **tip**, the live writer (a resident job, like a singleton), and any number of **catch-up lanes**, one per unit, each born at an earlier position.
+
+```rust
+let tip = outbox.joinable::<Unit>(JobType::new("rollup"));
+tip.spawn(&mut jobs, JoinableConfig::new(OutboxEventJobConfig::new(JobType::new("rollup"))), Rollup::new(&tip))
+    .await?;
+
+// In the op that creates the unit:
+let lane = tip.join_in_op(&mut op, unit, EventSequence::BEGIN).await?;
+// Later:
+let fence = lane.await_fenced(Duration::from_secs(30)).await?;
+```
+
+The guarantee, precisely. Let `C` be the tip's committed checkpoint and `P` a lane's position at a landing. A **fenced landing** is a lane landing performed under the tip lock in which obix reads `C`, drains the lane through its own `handle` to `C` if `P < C`, sets `F = max(C, P)`, calls `flush` with `Scope::CatchUp { fence: Some(F) }`, retires the lane recording `F`, and commits.
+
+> **No tip landing straddles a fence.** Every tip landing transaction either (a) begins after the fenced landing committed — and any read it makes on its op sees the join — or (b) commits before `C` is read by the fenced landing — and is therefore inside `F`.
+
+It holds because the tip's landing takes the tip row's lock as the first statement of its transaction, before `flush` runs, and lane birth and the fenced landing take it exclusively. A lock taken at commit would not do: a tip landing could decide coverage on a snapshot from before the fence and commit after it, dropping `(F, X]` for the unit. The two interleavings:
+
+| who enters first | what happens |
+|---|---|
+| the tip's landing | the fenced landing waits for the lock, then reads a `C` that includes that landing; the drain covers what the tip skipped for the unit |
+| the fenced landing | the tip's landing waits at entry, then sees the join on its own op |
+
+obix does **not** decide which events belong to a unit. The handler contract (`JoinableSubscriber`):
+
+1. `flush` tolerates whole-batch replay, as everywhere.
+2. `flush` may be called with an **empty batch** on a lane's fenced landing: the lane caught up on skips alone, and the runner lands anyway.
+3. Seam state is read **on `op`** — the handler's own columns written by a lane's fenced `flush`, or `JoinableHandle::lanes_in_op(op, since)` — never from the pool or from a cache across landings.
+4. Apply an event to a unit only if `sequence > fence` once joined, and never while the unit's lane is live. (With a lane ahead of the tip, the fence is the lane's own position, and the tip's next landings contain events at or below it that belong to the lane.)
+
+`lanes_in_op` lists the lanes still catching up and the joins whose fence is at or above `since`; a tip passes its previous checkpoint, which bounds the list by construction. `JoinableConfig::max_fence_gap` (default: `lane_max_batch_size`) bounds how far past its position a fenced landing drains while it holds the tip's lock: past it, or when this process has not yet seen the tip's checkpoint, the landing is an ordinary one and the lane keeps catching up. Correctness never depends on it.
+
+Adopting this changes the schema: `joinable_tips`, and the `fence` and `instance_config` columns of `retired_subscriptions`.
+
 ### Event Types
 
 **Persistent Events**: Stored in the database with sequential ordering, guaranteed delivery, and replay capability. Use for critical business events that must be processed reliably.
@@ -221,9 +258,9 @@ re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `JoinableHandle::spawn`/`lanes_in_op`, `CatchUpLane::cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op` |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op`, `JoinableHandle::load`/`join_in_op` (`BirthAheadOfFrontier`), `CatchUpLane::load`/`await_fenced` (`LaneFenceTimeout`: the `await_position` deadline shape, with the lane and the wait) |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
 
 `ObixFault` is `obix::ObixFault`; `Fail` and `lanes!` come from `errlanes`,
