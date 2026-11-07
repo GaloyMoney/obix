@@ -149,7 +149,7 @@ struct SubscriberFlusher<H, P, L> {
     _payload: std::marker::PhantomData<fn() -> (P, L)>,
 }
 
-impl<H, P, L> ItemFlush<H::Batch> for SubscriberFlusher<H, P, L>
+impl<H, P, L> ItemFlush<H::Batch, ()> for SubscriberFlusher<H, P, L>
 where
     H: SingletonSubscriber<P, L>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -160,33 +160,16 @@ where
         op: &'a mut es_entity::DbOp<'static>,
         items: H::Batch,
         state: &'a OutboxEventJobState,
-    ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>> {
+    ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
             let mut op =
                 FlushOp::<L>::new(op, L::checkpoint(state.sequence, state.commit_sequence));
-            self.handler.flush(&mut op, items).await?;
-            Ok(FlushOutcome::Continue)
+            self.handler.flush(&mut op, items).await
         })
     }
 
     fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition {
         L::checkpoint(state.sequence, state.commit_sequence).into()
-    }
-}
-
-/// [`ctx::flush_batch`](crate::out::ctx::flush_batch) for a runner that has no
-/// subscription row to retire: a landing here can only continue.
-async fn flush_batch<B: Default>(
-    parts: &mut CtxParts<'_>,
-    batch: &mut B,
-    flusher: &dyn ItemFlush<B>,
-    reason: &'static str,
-) -> Result<(), HandlerError> {
-    match crate::out::ctx::flush_batch(parts, batch, flusher, reason).await? {
-        Landed::Continue => Ok(()),
-        Landed::Finished(_) => {
-            unreachable!("a singleton flush returns (), so a singleton landing cannot finish")
-        }
     }
 }
 
@@ -463,7 +446,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: None,
+                            landing: Singleton,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
@@ -476,7 +459,7 @@ where
                                 current_job: &mut current_job,
                                 state: &mut state,
                                 tracker: &mut tracker,
-                                mirror: None,
+                                landing: Singleton,
                             };
                             flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?;
                             return Ok(ResidentJobCompletion::RescheduleNow);
@@ -488,7 +471,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: None,
+                            landing: Singleton,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?;
                         continue;
@@ -542,7 +525,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: None,
+                        landing: Singleton,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?;
                     match self.handler.handle_undecodable(&undecodable).await {
@@ -570,7 +553,7 @@ where
                     current_job: &mut current_job,
                     state: &mut state,
                     tracker: &mut tracker,
-                    mirror: None,
+                    landing: Singleton,
                 },
                 batch: &mut batch,
                 flusher: &flusher,
@@ -592,7 +575,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: None,
+                        landing: Singleton,
                     };
                     flush_batch(&mut parts, &mut batch, &flusher, "commit").await?;
                 }
@@ -603,7 +586,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: None,
+                            landing: Singleton,
                         };
                         flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?;
                     }

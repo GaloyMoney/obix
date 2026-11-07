@@ -205,7 +205,7 @@ impl std::fmt::Display for FinishedAtFence {
 
 impl std::error::Error for FinishedAtFence {}
 
-/// How a [`flush_batch`] call ended.
+/// How a keyed [`flush_batch`] call ended.
 pub(crate) enum Landed {
     /// Landed and committed (or nothing was pending).
     Continue,
@@ -215,7 +215,86 @@ pub(crate) enum Landed {
     Finished(es_entity::DbOp<'static>),
 }
 
-pub(crate) struct CtxParts<'inv> {
+/// What a runner does with a batch op once the handler's flush has decided:
+/// the verdict the flush can return, and what the landing hands back.
+pub(crate) trait Landing: Copy + Send + Sync {
+    /// What the handler's flush returns.
+    type Verdict: Default + Send;
+    /// How a landing ended.
+    type Landed;
+
+    /// Nothing was pending, so nothing landed.
+    fn idle() -> Self::Landed;
+
+    /// Persist the checkpoint on `op` and land it as `verdict` says.
+    fn land(
+        self,
+        verdict: Self::Verdict,
+        current_job: &mut CurrentJob,
+        state: &mut OutboxEventJobState,
+        op: es_entity::DbOp<'static>,
+    ) -> impl std::future::Future<Output = Result<Self::Landed, ObixFault>> + Send;
+}
+
+/// A singleton runner's landing: no subscription row, so it can only commit.
+#[derive(Clone, Copy)]
+pub(crate) struct Singleton;
+
+impl Landing for Singleton {
+    type Verdict = ();
+    type Landed = ();
+
+    fn idle() {}
+
+    async fn land(
+        self,
+        (): (),
+        current_job: &mut CurrentJob,
+        state: &mut OutboxEventJobState,
+        op: es_entity::DbOp<'static>,
+    ) -> Result<(), ObixFault> {
+        commit_checkpoint(current_job, op, state, None).await
+    }
+}
+
+/// A keyed member's landing: mirrors the checkpoint into its `subscriptions`
+/// row, or retires the row when the flush returns [`FlushOutcome::Finish`].
+#[derive(Clone, Copy)]
+pub(crate) struct Keyed<'m>(pub(crate) &'m dyn CheckpointMirror);
+
+impl Landing for Keyed<'_> {
+    type Verdict = FlushOutcome;
+    type Landed = Landed;
+
+    fn idle() -> Landed {
+        Landed::Continue
+    }
+
+    async fn land(
+        self,
+        verdict: FlushOutcome,
+        current_job: &mut CurrentJob,
+        state: &mut OutboxEventJobState,
+        mut op: es_entity::DbOp<'static>,
+    ) -> Result<Landed, ObixFault> {
+        match verdict {
+            FlushOutcome::Continue => {
+                commit_checkpoint(current_job, op, state, Some(self.0)).await?;
+                Ok(Landed::Continue)
+            }
+            FlushOutcome::Finish => {
+                state.paused = None;
+                current_job
+                    .update_execution_state_in_op(&mut op, &*state)
+                    .await?;
+                self.0.retire(&mut op).await?;
+                Ok(Landed::Finished(op))
+            }
+        }
+    }
+}
+
+pub(crate) struct CtxParts<'inv, L> {
     pub(crate) op_slot: &'inv mut Option<es_entity::DbOp<'static>>,
     pub(crate) current_job: &'inv mut CurrentJob,
     /// Mutable so the pause verbs can record where the member paused in the
@@ -223,9 +302,9 @@ pub(crate) struct CtxParts<'inv> {
     /// alone.
     pub(crate) state: &'inv mut OutboxEventJobState,
     pub(crate) tracker: &'inv mut BatchTracker,
-    /// `Some` for keyed members, `None` for singletons — see
-    /// [`CheckpointMirror`].
-    pub(crate) mirror: Option<&'inv dyn CheckpointMirror>,
+    /// [`Singleton`] or [`Keyed`]: decides what a flush may return and how
+    /// its batch lands.
+    pub(crate) landing: L,
 }
 
 /// Proof that a persistent event was resolved in one of the legal ways.
@@ -318,9 +397,9 @@ pub(crate) enum Outcome {
 /// ```
 #[must_use = "resolve the EventCtx via skip / collect / consume"]
 pub struct EventCtx<'inv, B = ()> {
-    pub(crate) parts: CtxParts<'inv>,
+    pub(crate) parts: CtxParts<'inv, Singleton>,
     pub(crate) batch: &'inv mut B,
-    pub(crate) flusher: &'inv dyn ItemFlush<B>,
+    pub(crate) flusher: &'inv dyn ItemFlush<B, ()>,
 }
 
 impl<'inv, B> EventCtx<'inv, B> {
@@ -372,10 +451,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             batch,
             flusher,
         } = self;
-        let Landed::Continue = flush_batch(&mut parts, batch, flusher, "consume_entry").await?
-        else {
-            unreachable!("a singleton flush returns (), so its consume fence cannot land a Finish");
-        };
+        flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         *parts.op_slot = Some(
             es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
                 .await?,
@@ -451,13 +527,15 @@ pub(crate) type BoxFuture<'a, T> =
 /// [`flush`](super::SingletonSubscriber::flush) — erases the handler type so
 /// [`EventCtx`] only needs to know the accumulator `B`. The whole
 /// [`OutboxEventJobState`] is passed because only the implementor knows its `L`.
-pub(crate) trait ItemFlush<B>: Send + Sync {
+/// `V` is the flush's verdict: `()` for a singleton, [`FlushOutcome`] for a
+/// keyed member — see [`Landing::Verdict`].
+pub(crate) trait ItemFlush<B, V>: Send + Sync {
     fn flush_items<'a>(
         &'a self,
         op: &'a mut es_entity::DbOp<'static>,
         items: B,
         state: &'a OutboxEventJobState,
-    ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>>;
+    ) -> BoxFuture<'a, Result<V, HandlerError>>;
 
     /// Where the subscription's cursor sits, on the handler's own lane.
     fn position_of(&self, state: &OutboxEventJobState) -> StreamPosition;
@@ -550,16 +628,16 @@ impl std::error::Error for FlushError {
     ),
     err
 )]
-pub(crate) async fn flush_batch<B: Default>(
-    parts: &mut CtxParts<'_>,
+pub(crate) async fn flush_batch<B: Default, L: Landing>(
+    parts: &mut CtxParts<'_, L>,
     batch: &mut B,
-    flusher: &dyn ItemFlush<B>,
+    flusher: &dyn ItemFlush<B, L::Verdict>,
     reason: &'static str,
-) -> Result<Landed, HandlerError> {
+) -> Result<L::Landed, HandlerError> {
     if parts.op_slot.is_none() && parts.tracker.collected == 0 {
-        return Ok(Landed::Continue);
+        return Ok(L::idle());
     }
-    let mut outcome = FlushOutcome::Continue;
+    let mut verdict = L::Verdict::default();
     if parts.tracker.collected > 0 {
         if parts.op_slot.is_none() {
             *parts.op_slot = Some(
@@ -579,7 +657,7 @@ pub(crate) async fn flush_batch<B: Default>(
         let op = parts.op_slot.as_mut().expect("op was materialized above");
         let through = flusher.position_of(state);
         match flusher.flush_items(op, items, state).await {
-            Ok(flushed) => outcome = flushed,
+            Ok(flushed) => verdict = flushed,
             Err(source) => {
                 return Err(Box::new(FlushError {
                     reason,
@@ -590,28 +668,14 @@ pub(crate) async fn flush_batch<B: Default>(
             }
         }
     }
-    let mut op = parts
+    let op = parts
         .op_slot
         .take()
         .expect("a pending batch always has an op by now");
-    let landed = match outcome {
-        FlushOutcome::Continue => {
-            commit_checkpoint(parts.current_job, op, parts.state, parts.mirror).await?;
-            Landed::Continue
-        }
-        FlushOutcome::Finish => {
-            let mirror = parts
-                .mirror
-                .expect("only a keyed flush can return Finish, and keyed runners carry a mirror");
-            parts.state.paused = None;
-            parts
-                .current_job
-                .update_execution_state_in_op(&mut op, &*parts.state)
-                .await?;
-            mirror.retire(&mut op).await?;
-            Landed::Finished(op)
-        }
-    };
+    let landed = parts
+        .landing
+        .land(verdict, parts.current_job, parts.state, op)
+        .await?;
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(landed)
@@ -682,9 +746,9 @@ pub(crate) async fn persist_checkpoint(
 /// chain are the keyed-only additions.
 #[must_use = "resolve the KeyedEventCtx via skip / collect / consume / pause_until"]
 pub struct KeyedEventCtx<'inv, B = ()> {
-    pub(crate) parts: CtxParts<'inv>,
+    pub(crate) parts: CtxParts<'inv, Keyed<'inv>>,
     pub(crate) batch: &'inv mut B,
-    pub(crate) flusher: &'inv dyn ItemFlush<B>,
+    pub(crate) flusher: &'inv dyn ItemFlush<B, FlushOutcome>,
     /// Sequence of the event being processed. Distinct from
     /// `parts.state.sequence`, which is the last *fully handled* sequence —
     /// i.e. strictly before this one.
@@ -852,7 +916,7 @@ where
 #[must_use = "exit with .commit() / .suspend() / .pause_until()"]
 pub struct StagedOp<'inv> {
     op: es_entity::DbOp<'static>,
-    parts: CtxParts<'inv>,
+    parts: CtxParts<'inv, Keyed<'inv>>,
     event_seq: EventSequence,
 }
 
@@ -946,7 +1010,7 @@ es_entity::delegate_atomic_operation!(StagedOp<'_>, { s => s.op });
 /// ```
 #[must_use = "continue with .resume() or pause with .pause_until()"]
 pub struct Suspended<'inv> {
-    parts: CtxParts<'inv>,
+    parts: CtxParts<'inv, Keyed<'inv>>,
     event_seq: EventSequence,
 }
 

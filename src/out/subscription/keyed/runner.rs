@@ -31,7 +31,7 @@ struct KeyedSubscriberFlusher<S, P> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<S, P> ItemFlush<S::Batch> for KeyedSubscriberFlusher<S, P>
+impl<S, P> ItemFlush<S::Batch, FlushOutcome> for KeyedSubscriberFlusher<S, P>
 where
     S: KeyedSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -189,7 +189,7 @@ impl<Tables: MailboxTables> CheckpointMirror for KeyedCheckpointMirror<Tables> {
 impl<Tables: MailboxTables> KeyedCheckpointMirror<Tables> {
     /// Mark the row dormant, on the op that completes the passivating
     /// generation. Inherent rather than on [`CheckpointMirror`], so the
-    /// singleton path (`mirror: None`) cannot reach it.
+    /// singleton path ([`Singleton`] landing) cannot reach it.
     async fn passivate(&self, op: &mut es_entity::DbOp<'static>) -> Result<(), sqlx::Error> {
         Tables::set_subscription_dormant_in_op(op, self.subscriber_type.as_str(), &self.key, true)
             .await
@@ -301,7 +301,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: Some(&mirror),
+                            landing: Keyed(&mirror),
                         };
                         if let Landed::Finished(op) =
                             flush_batch(&mut parts, &mut batch, &flusher, "stream_closed").await?
@@ -316,7 +316,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: Some(&mirror),
+                            landing: Keyed(&mirror),
                         };
                         if let Landed::Finished(op) =
                             flush_batch(&mut parts, &mut batch, &flusher, "backlog_drained").await?
@@ -445,7 +445,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: Some(&mirror),
+                        landing: Keyed(&mirror),
                     };
                     if let Landed::Finished(op) =
                         flush_batch(&mut parts, &mut batch, &flusher, "undecodable_event").await?
@@ -473,7 +473,7 @@ where
                     current_job: &mut current_job,
                     state: &mut state,
                     tracker: &mut tracker,
-                    mirror: Some(&mirror),
+                    landing: Keyed(&mirror),
                 },
                 batch: &mut batch,
                 flusher: &flusher,
@@ -504,7 +504,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: Some(&mirror),
+                        landing: Keyed(&mirror),
                     };
                     if let Landed::Finished(op) =
                         flush_batch(&mut parts, &mut batch, &flusher, "pause_entry").await?
@@ -524,7 +524,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: Some(&mirror),
+                        landing: Keyed(&mirror),
                     };
                     if let Landed::Finished(op) =
                         flush_batch(&mut parts, &mut batch, &flusher, "staged_pause").await?
@@ -548,7 +548,7 @@ where
                         current_job: &mut current_job,
                         state: &mut state,
                         tracker: &mut tracker,
-                        mirror: Some(&mirror),
+                        landing: Keyed(&mirror),
                     };
                     if let Landed::Finished(op) =
                         flush_batch(&mut parts, &mut batch, &flusher, "commit").await?
@@ -566,7 +566,7 @@ where
                             current_job: &mut current_job,
                             state: &mut state,
                             tracker: &mut tracker,
-                            mirror: Some(&mirror),
+                            landing: Keyed(&mirror),
                         };
                         if let Landed::Finished(op) =
                             flush_batch(&mut parts, &mut batch, &flusher, "batch_full").await?
