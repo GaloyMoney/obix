@@ -2144,3 +2144,315 @@ async fn slow_consumer_does_not_inflate_the_rows_read() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+mod event_context {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::stream::StreamExt;
+    use obix::{
+        CommitLane, CommitSequence, EventContextSource, EventSequence, MailboxConfig, MailboxTables,
+    };
+    use serde_json::{Value, json};
+    use serial_test::file_serial;
+
+    use super::{TestEvent, helpers};
+    use helpers::{TestTables, init_outbox, init_pool};
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn fixed(value: Option<Value>) -> EventContextSource {
+        Arc::new(move || value.clone())
+    }
+
+    async fn column(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Option<Value>>> {
+        Ok(sqlx::query_scalar::<_, Option<Value>>(
+            "SELECT event_context FROM persistent_outbox_events ORDER BY sequence",
+        )
+        .fetch_all(pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn event_context_round_trips_through_listener_and_range_load() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let value = json!({"audit_entry_id": "a1"});
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(fixed(Some(value.clone())))
+                .build(),
+        )
+        .await?;
+        let mut listener = outbox.listen_persisted(None);
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+            .await?;
+        op.commit().await?;
+
+        let event = tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("event")?;
+        assert_eq!(event.event_context, Some(value.clone()));
+
+        let loaded = TestTables::load_events_in_range::<TestEvent>(
+            &pool,
+            EventSequence::BEGIN,
+            event.sequence,
+        )
+        .await?;
+        let loaded = loaded.into_iter().next().expect("one row")?;
+        assert_eq!(loaded.event_context, Some(value.clone()));
+        assert_eq!(column(&pool).await?, vec![Some(value)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn no_source_stores_null() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let outbox = init_outbox::<TestEvent>(&pool, MailboxConfig::builder().build()).await?;
+        let mut listener = outbox.listen_persisted(None);
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+            .await?;
+        op.commit().await?;
+
+        let event = tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("event")?;
+        assert_eq!(event.event_context, None);
+        assert_eq!(column(&pool).await?, vec![None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn source_returning_none_stores_null() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(fixed(None))
+                .build(),
+        )
+        .await?;
+        let mut listener = outbox.listen_persisted(None);
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+            .await?;
+        op.commit().await?;
+
+        let event = tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("event")?;
+        assert_eq!(event.event_context, None);
+        assert_eq!(column(&pool).await?, vec![None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn batch_shares_one_capture_and_each_call_captures_afresh() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let source: EventContextSource =
+            Arc::new(move || Some(json!({"call": counter.fetch_add(1, Ordering::SeqCst)})));
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(source)
+                .build(),
+        )
+        .await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_all_persisted(
+                &mut op,
+                [TestEvent::Ping(1), TestEvent::Ping(2), TestEvent::Ping(3)],
+            )
+            .await?;
+        op.commit().await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(4))
+            .await?;
+        op.commit().await?;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let first = Some(json!({"call": 0}));
+        let second = Some(json!({"call": 1}));
+        assert_eq!(
+            column(&pool).await?,
+            vec![first.clone(), first.clone(), first, second]
+        );
+        Ok(())
+    }
+
+    tokio::task_local! {
+        static SCOPED: Value;
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn capture_happens_on_the_publishing_task_not_at_commit() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let source: EventContextSource = Arc::new(|| SCOPED.try_with(Clone::clone).ok());
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(source)
+                .build(),
+        )
+        .await?;
+
+        let mut op = outbox.begin_op().await?;
+        let value = json!({"request": "r1"});
+        SCOPED
+            .scope(value.clone(), async {
+                outbox
+                    .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+                    .await
+            })
+            .await?;
+        assert!(SCOPED.try_with(|_| ()).is_err(), "scope has ended");
+        op.commit().await?;
+
+        assert_eq!(column(&pool).await?, vec![Some(value)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn merged_publishes_in_one_op_keep_their_own_capture() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let source: EventContextSource =
+            Arc::new(move || Some(json!({"call": counter.fetch_add(1, Ordering::SeqCst)})));
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(source)
+                .persist_events_batch_size(2)
+                .build(),
+        )
+        .await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_all_persisted(
+                &mut op,
+                [TestEvent::Ping(1), TestEvent::Ping(2), TestEvent::Ping(3)],
+            )
+            .await?;
+        outbox
+            .publish_all_persisted(&mut op, [TestEvent::Ping(4), TestEvent::Ping(5)])
+            .await?;
+        op.commit().await?;
+
+        let first = Some(json!({"call": 0}));
+        let second = Some(json!({"call": 1}));
+        assert_eq!(
+            column(&pool).await?,
+            vec![first.clone(), first.clone(), first, second.clone(), second]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn gap_placeholder_carries_no_event_context() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let value = json!({"audit_entry_id": "a1"});
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .event_context_source(fixed(Some(value.clone())))
+                .gap_fill_grace(std::time::Duration::from_millis(100))
+                .build(),
+        )
+        .await?;
+        let mut listener = outbox.listen_persisted(None);
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(0))
+            .await?;
+        op.commit().await?;
+        tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("first event")?;
+
+        sqlx::query!("SELECT nextval('persistent_outbox_events_sequence_seq')")
+            .fetch_one(&pool)
+            .await?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, TestEvent::Ping(1))
+            .await?;
+        op.commit().await?;
+
+        let placeholder = tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("placeholder")?;
+        assert!(placeholder.payload.is_none());
+        assert_eq!(placeholder.event_context, None);
+        let real = tokio::time::timeout(WAIT, listener.next())
+            .await?
+            .expect("real event")?;
+        assert_eq!(real.event_context, Some(value.clone()));
+        assert_eq!(
+            column(&pool).await?,
+            vec![Some(value.clone()), None, Some(value)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[file_serial]
+    async fn commit_lane_delivers_the_same_event_context_as_the_insert_lane() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let value = json!({"audit_entry_id": "a1"});
+        let outbox = init_outbox::<TestEvent>(
+            &pool,
+            MailboxConfig::builder()
+                .commit_lane(CommitLane::Enabled)
+                .event_context_source(fixed(Some(value.clone())))
+                .build(),
+        )
+        .await?;
+        let mut insert = outbox.listen_persisted(None);
+        let mut commit = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
+
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_all_persisted(&mut op, [TestEvent::Ping(1), TestEvent::Ping(2)])
+            .await?;
+        op.commit().await?;
+
+        for _ in 0..2 {
+            let on_insert = tokio::time::timeout(WAIT, insert.next())
+                .await?
+                .expect("insert-lane event")?;
+            let on_commit = tokio::time::timeout(WAIT, commit.next())
+                .await?
+                .expect("commit-lane event")?;
+            assert_eq!(on_insert.event_context, Some(value.clone()));
+            assert_eq!(on_commit.event_context, on_insert.event_context);
+        }
+        Ok(())
+    }
+}

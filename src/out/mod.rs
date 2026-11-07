@@ -64,6 +64,7 @@ where
     /// saves it a cold read.
     event_cache_size: usize,
     persist_events_batch_size: usize,
+    event_context_source: Option<EventContextSource>,
     partition_premake: u64,
     partition_maintainer_interval: std::time::Duration,
     persistent_cache: Arc<PersistentOutboxEventCache<P, Tables>>,
@@ -118,6 +119,7 @@ where
             event_buffer_size: self.event_buffer_size,
             event_cache_size: self.event_cache_size,
             persist_events_batch_size: self.persist_events_batch_size,
+            event_context_source: self.event_context_source.clone(),
             partition_premake: self.partition_premake,
             partition_maintainer_interval: self.partition_maintainer_interval,
             persistent_cache: self.persistent_cache.clone(),
@@ -197,6 +199,7 @@ where
             event_buffer_size: config.event_buffer_size,
             event_cache_size: config.event_cache_size,
             persist_events_batch_size: config.persist_events_batch_size,
+            event_context_source: config.event_context_source.clone(),
             partition_premake: config.partition_premake,
             partition_maintainer_interval: config.partition_maintainer_interval,
             persistent_cache,
@@ -304,6 +307,10 @@ where
             .read()
             .expect("persist_after lock poisoned")
             .clone();
+        let event_context = self
+            .event_context_source
+            .as_ref()
+            .and_then(|source| source());
         let hook = persist_events_hook::PersistEvents::<P, Tables>::new(
             self.persistent_cache.feeder(),
             self.notifier.report_sender(),
@@ -312,7 +319,8 @@ where
             self.persist_events_batch_size,
             post_persist_hooks,
             persist_after,
-        );
+        )
+        .with_event_context(event_context);
         if let Err(hook) = op.add_commit_hook(hook) {
             use es_entity::hooks::CommitHook;
             hook.with_in_tx_notify()

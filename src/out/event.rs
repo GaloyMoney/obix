@@ -166,7 +166,7 @@ where
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct PersistentOutboxEvent<T>
 where
     T: Serialize + DeserializeOwned + Send,
@@ -181,10 +181,33 @@ where
     #[serde(bound = "T: DeserializeOwned")]
     pub payload: Option<T>,
     pub tracing_context: Option<es_entity::context::TracingContext>,
+    /// Application-supplied attribution stored with this row, surfaced
+    /// verbatim; see [`MailboxConfig::event_context_source`](crate::MailboxConfig).
+    pub event_context: Option<serde_json::Value>,
     pub recorded_at: chrono::DateTime<chrono::Utc>,
     /// The source transaction this event committed in. Events sharing one
     /// value committed together; reported on both lanes.
     pub commit_group: CommitGroupId,
+}
+
+impl<T> std::fmt::Debug for PersistentOutboxEvent<T>
+where
+    T: std::fmt::Debug + Serialize + DeserializeOwned + Send,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentOutboxEvent")
+            .field("id", &self.id)
+            .field("sequence", &self.sequence)
+            .field("payload", &self.payload)
+            .field("tracing_context", &self.tracing_context)
+            .field(
+                "event_context",
+                &self.event_context.as_ref().map(|_| "<redacted>"),
+            )
+            .field("recorded_at", &self.recorded_at)
+            .field("commit_group", &self.commit_group)
+            .finish()
+    }
 }
 
 impl<T> Clone for PersistentOutboxEvent<T>
@@ -197,6 +220,7 @@ where
             sequence: self.sequence,
             payload: self.payload.clone(),
             tracing_context: self.tracing_context.clone(),
+            event_context: self.event_context.clone(),
             recorded_at: self.recorded_at,
             commit_group: self.commit_group,
         }

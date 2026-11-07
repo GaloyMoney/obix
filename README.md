@@ -201,6 +201,10 @@ let mut listener = ephemeral.listen::<UserOnline>();
 
 The two streams are never merged: hold one listener per stream.
 
+### Event context
+
+An application may hand the outbox an `event_context_source`; its value is stored opaquely on every row of a publish and surfaced as `PersistentOutboxEvent::event_context`. obix does not read it; it is not the es-entity `EventContext` — the application chooses what crosses. It is attribution for exporters, not an input to handlers.
+
 ## Errors and telemetry
 
 obix's public methods return one of four `errlanes` carriers. Every `Fail`
