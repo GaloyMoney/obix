@@ -525,6 +525,48 @@ where
         Ok(subscription::read_frontier::<Tables>(&self.pool).await?)
     }
 
+    /// The committed persistent events in `(after, up_to]`, in sequence
+    /// order, read on `op`: a plain SELECT against the caller's snapshot.
+    /// Nothing is written and the cache is not consulted. A sequence absent
+    /// from the result was assigned to a transaction the snapshot cannot
+    /// see (in flight, or rolled back), so the caller chooses `up_to` from
+    /// a position it knows to be committed — another subscription's
+    /// checkpoint, for instance — never from
+    /// [`highest_known_persistent_sequence`](Self::highest_known_persistent_sequence),
+    /// which counts uncommitted assignments. An undecodable row is the
+    /// `Err` item at its position; the rows around it are still returned.
+    /// `after >= up_to` reads nothing.
+    ///
+    /// The range is bounded by the caller: there is no paging and no
+    /// internal limit. Intended ranges are small and known to be committed;
+    /// a range wider than `backfill_page_size` is a smell, not an error.
+    /// Streaming and paging stay with the `listen*` methods.
+    #[es_entity::errlanes::instrument(
+        name = "obix.outbox.load_persisted_in_op",
+        skip_all,
+        fields(after = %after, up_to = %up_to, count)
+    )]
+    pub async fn load_persisted_in_op<'a>(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
+        after: EventSequence,
+        up_to: EventSequence,
+    ) -> Result<PersistentEventRows<P>, ObixFault> {
+        if after >= up_to {
+            return Ok(Vec::new());
+        }
+        let fut: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<PersistentEventRows<P>, sqlx::Error>>
+                    + Send
+                    + 'a,
+            >,
+        > = Box::pin(Tables::load_events_in_range::<P>(op, after, up_to));
+        let rows = fut.await?;
+        tracing::Span::current().record("count", rows.len());
+        Ok(rows)
+    }
+
     /// Register the partition maintainer for `persistent_outbox_events`: a
     /// timer-scheduled job that pre-creates RANGE partitions ahead of the
     /// sequence head so inserts always route into an explicit partition rather

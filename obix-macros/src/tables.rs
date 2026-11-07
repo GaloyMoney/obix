@@ -1111,22 +1111,22 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn load_events_in_range<P>(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
+                fn load_events_in_range<'a, P>(
+                    op: impl #crate_name::prelude::es_entity::IntoOneTimeExecutor<'a>,
                     after_sequence: #crate_name::EventSequence,
                     up_to_sequence: #crate_name::EventSequence,
                 ) -> impl std::future::Future<Output = Result<Vec<Result<#crate_name::out::PersistentOutboxEvent<P>, #crate_name::out::UndecodableEventError>>, sqlx::Error>> + Send
                 where
                     P: #crate_name::prelude::serde::Serialize + #crate_name::prelude::serde::de::DeserializeOwned + Send
                 {
-                    let pool = pool.clone();
+                    let executor = op.into_executor();
 
                     async move {
-                        let rows = sqlx::query!(
+                        let rows = executor.fetch_all(sqlx::query!(
                             #load_events_in_range_query,
                             after_sequence as #crate_name::EventSequence,
                             up_to_sequence as #crate_name::EventSequence,
-                        ).fetch_all(&pool).await?;
+                        )).await?;
 
                         let events = rows
                             .into_iter()

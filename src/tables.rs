@@ -267,8 +267,8 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// from the result belong to in-flight transactions and are left to the
     /// grace-period gap fill. Undecodable payloads are the `Err` items, as
     /// in [`load_next_page`](Self::load_next_page).
-    fn load_events_in_range<P>(
-        pool: &sqlx::PgPool,
+    fn load_events_in_range<'a, P>(
+        op: impl es_entity::IntoOneTimeExecutor<'a>,
         after_sequence: EventSequence,
         up_to_sequence: EventSequence,
     ) -> impl Future<Output = Result<PersistentEventRows<P>, sqlx::Error>> + Send
