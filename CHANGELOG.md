@@ -1,3 +1,11 @@
+# [obix release v0.18.0](https://github.com/GaloyMoney/obix/releases/tag/0.18.0)
+
+
+
+### Features
+
+- [**breaking**] Joinable subscriptions — a tip with catch-up lanes (#187)
+
 # [obix release v0.17.0](https://github.com/GaloyMoney/obix/releases/tag/0.17.0)
 
 
