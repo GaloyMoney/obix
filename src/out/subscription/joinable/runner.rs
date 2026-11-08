@@ -233,7 +233,11 @@ where
             batch,
             tracker: parts.tracker,
         };
-        Ok(self.subscriber.handle(ctx, event).await?.outcome)
+        Ok(self
+            .subscriber
+            .handle(ctx, Scope::Tip, event)
+            .await?
+            .outcome)
     }
 
     async fn undecodable(&self, error: &UndecodableDelivery) -> Result<(), HandlerError> {

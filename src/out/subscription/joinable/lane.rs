@@ -59,6 +59,19 @@ where
     fn set_join(&self, join: Option<EventSequence>) {
         *self.join.lock().expect("lane join lock poisoned") = join;
     }
+
+    /// The scope of the landing in progress: [`Scope::Join`] from the moment
+    /// the join landing has fixed its sequence until it has landed, and
+    /// [`Scope::CatchUp`] otherwise.
+    fn scope(&self) -> Scope<'_, S::Unit> {
+        match self.join() {
+            Some(join) => Scope::Join {
+                unit: &self.unit,
+                join,
+            },
+            None => Scope::CatchUp { unit: &self.unit },
+        }
+    }
 }
 
 impl<S, P, Tables> ItemFlush<S::Batch, FlushOutcome> for LaneRun<S, P, Tables>
@@ -74,22 +87,12 @@ where
         state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>> {
         Box::pin(async move {
-            let join = self.join();
+            let scope = self.scope();
             let mut op = FlushOp::<InsertOrder>::new(op, state.sequence);
-            self.subscriber
-                .flush(
-                    &mut op,
-                    Scope::CatchUp {
-                        unit: &self.unit,
-                        join,
-                    },
-                    items,
-                )
-                .await?;
-            Ok(if join.is_some() {
-                FlushOutcome::Finish
-            } else {
-                FlushOutcome::Continue
+            self.subscriber.flush(&mut op, scope, items).await?;
+            Ok(match scope {
+                Scope::Join { .. } => FlushOutcome::Finish,
+                Scope::CatchUp { .. } | Scope::Tip => FlushOutcome::Continue,
             })
         })
     }
@@ -296,7 +299,12 @@ where
             batch: &mut self.batch,
             tracker: &mut self.tracker,
         };
-        let outcome = self.run.subscriber.handle(ctx, event).await?.outcome;
+        let outcome = self
+            .run
+            .subscriber
+            .handle(ctx, self.run.scope(), event)
+            .await?
+            .outcome;
         self.state.sequence = event.sequence;
         Ok(outcome)
     }
@@ -343,6 +351,18 @@ where
             return self.land_ordinary(reason).await;
         }
 
+        // The join is fixed before the drain, so the events the drain handles
+        // are handled under `Scope::Join` — the scope their flush carries.
+        self.run.set_join(Some(position.max(tip)));
+        let landed = self.land_joining(tip).await;
+        self.run.set_join(None);
+        landed
+    }
+
+    /// The join landing proper, with the tip's lock held and the join fixed:
+    /// drain the lane's own stream to `tip`, then land everything with the
+    /// join. Every outcome resets the join in [`try_land`](Self::try_land).
+    async fn land_joining(&mut self, tip: EventSequence) -> Result<Landed, HandlerError> {
         while self.state.sequence < tip {
             let Some(item) = self.persistent.next().await else {
                 Err::<(), _>(JoinableFault::DrainEnded {
@@ -368,7 +388,6 @@ where
             }
         }
 
-        self.run.set_join(Some(position.max(tip)));
         let mut parts = CtxParts {
             op_slot: &mut self.op_slot,
             current_job: &mut self.current_job,
@@ -376,9 +395,7 @@ where
             tracker: &mut self.tracker,
             landing: Keyed(self.run),
         };
-        let landed = flush_joining(&mut parts, &mut self.batch, self.run, "join").await;
-        self.run.set_join(None);
-        landed
+        flush_joining(&mut parts, &mut self.batch, self.run, "join").await
     }
 }
 

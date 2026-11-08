@@ -196,7 +196,7 @@ let lane = tip.open_lane_in_op(&mut op, unit, EventSequence::BEGIN).await?;
 let joined_at = lane.await_join(Duration::from_secs(30)).await?;
 ```
 
-The guarantee, precisely. Let `C` be the tip's committed checkpoint and `P` a lane's position at a landing. A **join landing** is a lane landing performed under the tip lock in which obix reads `C`, drains the lane through its own `handle` to `C` if `P < C`, sets `F = max(C, P)`, calls `flush` with `Scope::CatchUp { join: Some(F) }`, retires the lane recording `F`, and commits.
+The guarantee, precisely. Let `C` be the tip's committed checkpoint and `P` a lane's position at a landing. A **join landing** is a lane landing performed under the tip lock in which obix reads `C`, sets `F = max(C, P)`, drains the lane through its own `handle` to `C` if `P < C`, calls `flush` with `Scope::Join { unit, join: F }`, retires the lane recording `F`, and commits.
 
 > **No tip landing straddles a join.** `F` is a fence on the tip's landings: every tip landing transaction either (a) begins after the join landing committed — and any read it makes on its op sees the join — or (b) commits before `C` is read by the join landing — and is therefore inside `F`.
 
@@ -207,7 +207,7 @@ It holds because the tip's landing takes the tip row's lock as the first stateme
 | the tip's landing | the join landing waits for the lock, then reads a `C` that includes that landing; the drain covers what the tip skipped for the unit |
 | the join landing | the tip's landing waits at entry, then sees the join on its own op |
 
-obix does **not** decide which events belong to a unit. The handler contract (`JoinableSubscriber`):
+obix does **not** decide which events belong to a unit. Both `handle` and `flush` receive a `Scope` — `Tip`, `CatchUp { unit }` or `Join { unit, join }` — so a lane's `handle` skips what is not its unit's and `flush` folds for the tip or for one unit. The handler contract (`JoinableSubscriber`):
 
 1. `flush` tolerates whole-batch replay, as everywhere.
 2. `flush` may be called with an **empty batch** on a lane's join landing: the lane caught up on skips alone, and the runner lands anyway.

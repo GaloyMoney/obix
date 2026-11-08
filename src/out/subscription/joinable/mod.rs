@@ -64,9 +64,11 @@ const DEFAULT_LANE_MAX_BATCH_SIZE: usize = 100;
 ///    ahead of the tip, it joins at its own position and the tip's next
 ///    landings contain events at or below it that belong to the lane.
 ///
-/// One handler instance serves both runners; the unit arrives with the
-/// landing. [`handle`](Self::handle) is the same on both sides, and its ctx
-/// offers [`skip`](JoinableEventCtx::skip) and
+/// One handler instance serves both runners, and both of its methods are told
+/// whose work they are doing through a [`Scope`]: a lane's
+/// [`handle`](Self::handle) can skip events that are not its unit's, and
+/// [`flush`](Self::flush) folds for the tip or for one unit. The ctx offers
+/// [`skip`](JoinableEventCtx::skip) and
 /// [`collect_with`](JoinableEventCtx::collect_with) only.
 pub trait JoinableSubscriber<P>: Send + Sync + 'static
 where
@@ -80,10 +82,13 @@ where
     /// [`collect_with`](JoinableEventCtx::collect_with).
     type Batch: Default + Send + 'static;
 
-    /// Identical on the tip and on every lane.
+    /// One event, on the tip or on a lane. `scope` says which: a lane's
+    /// handler may skip what is not its unit's. The same scope reaches the
+    /// `flush` the event's batch lands in.
     fn handle<'inv>(
         &self,
         ctx: JoinableEventCtx<'inv, Self::Batch>,
+        scope: Scope<'_, Self::Unit>,
         event: &EventDelivery<P>,
     ) -> impl std::future::Future<
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
@@ -111,20 +116,33 @@ where
     }
 }
 
-/// Whose landing a [`JoinableSubscriber::flush`] is.
+/// Whose work a [`JoinableSubscriber`] call is: the tip's, or one catch-up
+/// lane's, and for a lane whether this is the landing in which it joins.
+///
+/// `handle` and `flush` receive the same scope for one landing: events a lane
+/// handles under [`Join`](Self::Join) are the ones its join landing's drain
+/// pulled, and they land in the `flush` that carries the same `join`.
 #[derive(Debug)]
 pub enum Scope<'a, U> {
     /// The live writer.
     Tip,
-    /// One catch-up lane. `join` is `Some(F)` on that lane's final landing
-    /// only, the one in which it joins the tip: every event at or below `F`
-    /// has been handled by this lane, and the tip has not committed any
-    /// landing past `F`.
-    CatchUp {
-        unit: &'a U,
-        join: Option<EventSequence>,
-    },
+    /// One catch-up lane, still catching up: an ordinary landing of its own.
+    CatchUp { unit: &'a U },
+    /// One catch-up lane's final landing, in which it joins the tip at
+    /// `join`: every event at or below `join` has been handled by this lane,
+    /// and the tip has not committed any landing past `join`.
+    Join { unit: &'a U, join: EventSequence },
 }
+
+// Manual `Clone`/`Copy`: a scope borrows its unit, so it is `Copy` whatever
+// `U` is — deriving would wrongly bound `U`.
+impl<U> Clone for Scope<'_, U> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<U> Copy for Scope<'_, U> {}
 
 /// Tuning for one joinable registration.
 #[derive(Clone)]

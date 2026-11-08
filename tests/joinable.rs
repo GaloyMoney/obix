@@ -4,9 +4,9 @@
 //!
 //! The fixture is the handler contract: a tip applies an event to a unit only
 //! when the unit has joined at a sequence below the event's (read on
-//! the landing op through `lanes_in_op`), and a lane applies only its own
-//! unit's events. Every application is a row, so "applied by whom, in what
-//! order" is a query.
+//! the landing op through `lanes_in_op`), and a lane collects only its own
+//! unit's events, skipping the rest in `handle`. Every application is a row,
+//! so "applied by whom, in what order" is a query.
 
 mod helpers;
 
@@ -102,6 +102,8 @@ struct Shared {
     tip_flush_failures: Arc<AtomicU64>,
     undecodable_ok: Arc<AtomicBool>,
     undecodable_calls: Arc<AtomicU64>,
+    /// `(sequence, join)` of every event a lane handled under `Scope::Join`.
+    drain_joins: Arc<Mutex<Vec<(u64, u64)>>>,
     tip_lock_held: Arc<Mutex<Vec<bool>>>,
     tip_units: Arc<Mutex<HashMap<String, EventSequence>>>,
     tip_prev: Arc<AtomicU64>,
@@ -121,12 +123,20 @@ impl JoinableSubscriber<TestEvent> for Applier {
     async fn handle<'inv>(
         &self,
         ctx: JoinableEventCtx<'inv, Self::Batch>,
+        scope: Scope<'_, Self::Unit>,
         event: &obix::EventDelivery<TestEvent>,
     ) -> Result<Handled<'inv>, BoxError> {
         let Some(TestEvent::Ping { key, .. }) = &event.payload else {
             return Ok(ctx.skip());
         };
         let sequence = u64::from(event.sequence);
+        if let Scope::Join { join, .. } = scope {
+            self.shared
+                .drain_joins
+                .lock()
+                .await
+                .push((sequence, u64::from(join)));
+        }
         if self.shared.handle_gate_seq.load(Ordering::SeqCst) == sequence {
             self.shared.handle_gate.pass().await;
         }
@@ -135,6 +145,12 @@ impl JoinableSubscriber<TestEvent> for Applier {
         {
             self.shared.handle_failures.fetch_add(1, Ordering::SeqCst);
             return Err("injected failure in handle".into());
+        }
+        // A lane collects its own unit's events only; the tip collects all.
+        match scope {
+            Scope::Tip => {}
+            Scope::CatchUp { unit } | Scope::Join { unit, .. } if unit == key => {}
+            Scope::CatchUp { .. } | Scope::Join { .. } => return Ok(ctx.skip()),
         }
         Ok(ctx.collect((key.clone(), event.sequence)))
     }
@@ -204,20 +220,19 @@ impl JoinableSubscriber<TestEvent> for Applier {
                 insert_flush(op, "tip", None, items, lock_held).await?;
                 self.shared.tip_prev.store(position, Ordering::SeqCst);
             }
-            Scope::CatchUp { unit, join } => {
+            Scope::CatchUp { unit } | Scope::Join { unit, .. } => {
+                let join = match scope {
+                    Scope::Join { join, .. } => Some(u64::from(join) as i64),
+                    Scope::CatchUp { .. } | Scope::Tip => None,
+                };
                 for (key, sequence) in batch {
-                    if &key == unit {
-                        insert_applied(op, "catch_up", &key, sequence).await?;
-                    }
+                    assert_eq!(
+                        &key, unit,
+                        "a lane's batch holds its own unit's events only"
+                    );
+                    insert_applied(op, "catch_up", &key, sequence).await?;
                 }
-                insert_flush(
-                    op,
-                    "catch_up",
-                    join.map(|f| u64::from(f) as i64),
-                    items,
-                    lock_held,
-                )
-                .await?;
+                insert_flush(op, "catch_up", join, items, lock_held).await?;
             }
         }
         Ok(())
@@ -518,8 +533,9 @@ impl Harness {
 
     /// Stage the interleaving most tests share: the tip is parked inside a
     /// landing of events 2..=6 of unit `u` (entry lock held, committed
-    /// checkpoint 1), and unit `u`'s lane has handled event 1 and is released
-    /// into its first batch, which it can only land as its join.
+    /// checkpoint 1), and unit `u`'s lane has handled event 1 (another
+    /// unit's, skipped) and is released into its first batch, which it can
+    /// only land as its join.
     ///
     /// Returns once the lane is waiting on the tip row's lock.
     async fn stage_tip_entered_first(&self) -> anyhow::Result<TestLane> {
@@ -700,8 +716,8 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
     assert_eq!(flushes.len(), 1);
     assert_eq!(
         flushes[0],
-        (Some(u64::from(join) as i64), 4, true),
-        "one join landing, over the whole collected batch, lock held"
+        (Some(u64::from(join) as i64), 2, true),
+        "one join landing, over the unit's own events only, lock held"
     );
 
     // Control: past the join the tip applies to the unit, and the lane does not.
@@ -737,8 +753,13 @@ async fn tip_entered_first() -> anyhow::Result<()> {
     let flushes = h.lane_flushes().await?;
     assert_eq!(
         flushes,
-        vec![(Some(6), 6, true)],
+        vec![(Some(6), 5, true)],
         "one landing, carrying the join, over the lane's whole batch"
+    );
+    assert_eq!(
+        h.shared.drain_joins.lock().await.as_slice(),
+        &[(4, 6), (5, 6), (6, 6)],
+        "the drain handled what the tip had landed under the join's scope"
     );
     Ok(())
 }
@@ -757,6 +778,11 @@ async fn join_entered_first() -> anyhow::Result<()> {
     assert!(
         !h.waits_on_the_tip_row().await?,
         "control: the lane got the row, so nobody waits yet"
+    );
+    assert_eq!(
+        h.shared.drain_joins.lock().await.as_slice(),
+        &[(4, 6)],
+        "inside the drain, handle already runs under the join it will land"
     );
 
     h.publish(vec![ping("u", 7)]).await?;
@@ -990,7 +1016,7 @@ async fn max_join_gap_declines() -> anyhow::Result<()> {
     );
     assert_eq!(
         flushes.last(),
-        Some(&(Some(6), 2, true)),
+        Some(&(Some(6), 1, true)),
         "and the lane kept catching up until it joined: {flushes:?}"
     );
     assert!(
@@ -1112,7 +1138,9 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     .with_max_join_gap(100);
     let h = Harness::start(config).await?;
 
-    h.publish(vec![ping("x", 0)]).await?;
+    // The unit's own event at 1, so the lane's first batch is full at 1 and
+    // its first landing attempt is the join that meets the poison row.
+    h.publish(vec![ping("u", 0)]).await?;
     eventually(WAIT, || async {
         Ok(h.tip_row_checkpoint().await? == Some(1))
     })
@@ -1161,7 +1189,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     assert_eq!(u64::from(join), 4);
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
-        vec![3, 4],
+        vec![1, 3, 4],
         "an overriding Ok lets the join complete past the poison row, once"
     );
     Ok(())
