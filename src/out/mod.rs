@@ -21,10 +21,14 @@ use std::sync::Arc;
 
 pub use self::ctx::{
     EventCtx, FinishedAtFence, FlushError, FlushOp, FlushOutcome, Handled, IsolatedOp,
-    KeyedEventCtx, StagedOp, Suspended,
+    JoinableEventCtx, KeyedEventCtx, StagedOp, Suspended,
 };
 pub use self::error::{CouldNotDecodeStored, LaneMismatch};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
+pub use self::subscription::joinable::{
+    CatchUp, CatchUpId, CatchUps, JoinableHandle, JoinableSubscriber, JoinableSubscriberConfig,
+    Scope,
+};
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef, Subscriptions, WakeKey, WakeKeys,
 };
@@ -95,6 +99,10 @@ where
     /// shared with the single waker job. Registration pushes here; the first
     /// push is what registers the waker (see `register_keyed_subscriber`).
     keyed_routes: subscription::keyed::WakeRoutes<P>,
+    /// The joinables registered on this outbox, by the tip's job type: what a
+    /// [`JoinableHandle`] resolves at each call (see
+    /// `register_joinable_subscriber`).
+    joinable_registrations: subscription::joinable::Registrations<P, Tables>,
 }
 
 impl<P, Tables> std::fmt::Debug for Outbox<P, Tables>
@@ -132,6 +140,7 @@ where
             post_persist_hooks: self.post_persist_hooks.clone(),
             persist_after: self.persist_after.clone(),
             keyed_routes: self.keyed_routes.clone(),
+            joinable_registrations: self.joinable_registrations.clone(),
         }
     }
 }
@@ -212,6 +221,7 @@ where
             post_persist_hooks: Arc::new(std::sync::RwLock::new(Vec::new().into())),
             persist_after: Arc::new(std::sync::RwLock::new(Vec::new().into())),
             keyed_routes: Arc::new(std::sync::RwLock::new(Vec::new())),
+            joinable_registrations: Arc::new(std::sync::RwLock::new(Default::default())),
         })
     }
 
@@ -511,6 +521,32 @@ where
             jobs.clone(),
             spawner,
         ))
+    }
+
+    /// Register a joinable subscriber: one handler run by a **tip** (a
+    /// resident job under `config.job_type`, the live writer) and by any
+    /// number of **catch-ups** (keyed jobs under `"<job_type>.catch_up"`),
+    /// each started for one unit with
+    /// [`JoinableHandle::start_catch_up_in_op`] and joining the tip at a
+    /// sequence no tip landing straddles. Returns the handle; the same
+    /// handle is available before this call as an address from
+    /// [`joinable`](Self::joinable), for a service that starts catch-ups
+    /// without depending on the handler.
+    ///
+    /// Idempotent per job type, as
+    /// [`register_singleton_subscriber`](Self::register_singleton_subscriber)
+    /// is. Must be called **before** [`::job::Jobs::start_poll`].
+    #[es_entity::errlanes::instrument(name = "obix.register_joinable_subscriber", skip_all)]
+    pub async fn register_joinable_subscriber<S>(
+        &self,
+        jobs: &mut ::job::Jobs,
+        config: JoinableSubscriberConfig,
+        handler: S,
+    ) -> Result<JoinableHandle<P, S::Unit, Tables>, ObixFault>
+    where
+        S: JoinableSubscriber<P>,
+    {
+        self.register_joinable(jobs, config, handler).await
     }
 
     /// The highest sequence the persistent outbox has handed out — the

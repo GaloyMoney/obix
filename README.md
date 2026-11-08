@@ -181,6 +181,46 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 `Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row retirement and job completion commit in one transaction. A finished or cancelled key is retired: both subscribe calls reject it with `SubscriptionRejection::KeyRetired`, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.
 
+### Joinable subscriptions — catch-ups
+
+A consumer that folds many units in one pass (a rollup, a projection keyed by many entities) cannot add a unit with history without a second cursor: the live writer is at `C`, the new unit needs the stream from an earlier position. A *joinable* subscriber is one handler run by two runners: a **tip**, the live writer (a resident job, like a singleton), and any number of **catch-ups**, one per unit, each born at an earlier position.
+
+```rust
+// An address, usable before registration — so a service that starts
+// catch-ups can hold it without depending on the handler.
+let tip: JoinableHandle<_, Unit, _> = outbox.joinable(JobType::new("rollup"));
+outbox
+    .register_joinable_subscriber(&mut jobs, JoinableSubscriberConfig::new(JobType::new("rollup")), Rollup::new(&tip))
+    .await?;
+
+// In the op that creates the unit:
+let catch_up = tip.start_catch_up_in_op(&mut op, unit, EventSequence::BEGIN).await?;
+// Later:
+let joined_at = catch_up.await_join(Duration::from_secs(30)).await?;
+```
+
+The guarantee, precisely. Let `C` be the tip's committed checkpoint and `P` a catch-up's position at a landing. A **join landing** is a catch-up landing performed under the tip lock in which obix reads `C`, sets `F = max(C, P)`, drains the catch-up through its own `handle` to `C` if `P < C`, calls `flush` with `Scope::Join { unit, join: F }`, retires the catch-up recording `F`, and commits.
+
+> **No tip landing straddles a join.** `F` is a fence on the tip's landings: every tip landing transaction either (a) begins after the join landing committed — and any read it makes on its op sees the join — or (b) commits before `C` is read by the join landing — and is therefore inside `F`.
+
+It holds because the tip's landing takes the tip row's lock as the first statement of its transaction, before `flush` runs, and a catch-up's birth and the join landing take it exclusively. A lock taken at commit would not do: a tip landing could decide coverage on a snapshot from before the join and commit after it, dropping `(F, X]` for the unit. The two interleavings:
+
+| who enters first | what happens |
+|---|---|
+| the tip's landing | the join landing waits for the lock, then reads a `C` that includes that landing; the drain covers what the tip skipped for the unit |
+| the join landing | the tip's landing waits at entry, then sees the join on its own op |
+
+obix does **not** decide which events belong to a unit. Both `handle` and `flush` receive a `Scope` — `Tip`, `CatchUp { unit }` or `Join { unit, join }` — so a catch-up's `handle` skips what is not its unit's and `flush` folds for the tip or for one unit. The handler contract (`JoinableSubscriber`):
+
+1. `flush` tolerates whole-batch replay, as everywhere.
+2. `flush` may be called with an **empty batch** on a catch-up's join landing: it caught up on skips alone, and the runner lands anyway.
+3. Seam state is read **on `op`** — the handler's own columns written by a catch-up's joining `flush`, or `JoinableHandle::catch_ups_in_op(op, since)` — never from the pool or from a cache across landings.
+4. Apply an event to a unit only if its sequence is past the one the unit joined at, and never while the unit's catch-up is live. (With a catch-up ahead of the tip, it joins at its own position, and the tip's next landings contain events at or below it that belong to the catch-up.)
+
+`catch_ups_in_op` lists the catch-ups still catching up and the joins at or above `since`; a tip passes its previous checkpoint, which bounds the list by construction. `JoinableSubscriberConfig::max_join_gap` (default: `catch_up_max_batch_size`) bounds how far past its position a join landing drains while it holds the tip's lock: past it, or when this process has not yet seen the tip's checkpoint, the landing is an ordinary one and the catch-up keeps catching up. Correctness never depends on it.
+
+Adopting this changes the schema: two tables, `joinable_tips` (the tip's lock row and mirrored checkpoint) and `joinable_catch_ups` (each ended catch-up's unit and the sequence it joined at, or none if cancelled), both keyed by the tip's job type. Catch-ups are otherwise ordinary keyed rows in `subscriptions` under `"<job_type>.catch_up"`, and leave the ordinary tombstone in `retired_subscriptions` when they end.
+
 ### Event Types
 
 **Persistent Events**: Stored in the database with sequential ordering, guaranteed delivery, and replay capability. Use for critical business events that must be processed reliably.
@@ -221,9 +261,9 @@ re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `register_joinable_subscriber`, `JoinableHandle::tip`/`catch_ups_in_op`, `CatchUp::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op` |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op`, `JoinableHandle::load`/`start_catch_up_in_op` (`BirthAheadOfFrontier`), `CatchUp::load`/`await_join` (`CatchUpJoinTimeout`: the `await_position` deadline shape, with the catch-up and the wait) |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
 
 `ObixFault` is `obix::ObixFault`; `Fail` and `lanes!` come from `errlanes`,
@@ -262,7 +302,7 @@ chain — which is how a handler reaches job's dispositions: a `Transient`
 congestion kind reschedules without spending an attempt, and the lane of any
 other error picks the retry band (`Transient` retries on the short band,
 `Fatal` on the long one) of the `RetrySettings` you pass through
-`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`. Retrying
+`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `JoinableSubscriberConfig` / `InboxConfig`. Retrying
 never stops on its own: the only terminal verdict is
 `InboxResult::Fail(error)`, which ends one inbox event and its job, and
 subscribers (singleton and keyed) have no equivalent. A boxed `Fail::Rejected` has **no surviving marker** and simply

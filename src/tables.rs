@@ -430,6 +430,16 @@ pub trait MailboxTables: Send + Sync + 'static {
         key: &str,
     ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
 
+    /// Lock the live `subscriptions` row (`FOR UPDATE`) on `op`: `true` if
+    /// there is one. A retirement of the row then waits for `op` to end, and
+    /// `false` means the row is already gone — the caller's row-is-truth check
+    /// under its own op, for a landing that must not commit after a cancel.
+    fn lock_subscription_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
+
     /// Point-read one subscription's identity and terms by primary key.
     /// `None` means cancelled (or never subscribed) — the caller's row-is-truth
     /// check.
@@ -508,6 +518,80 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_types: &[String],
         wake_keys: &[String],
     ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+
+    // === Joinable-subscription methods ===
+
+    /// Create the tip's `joinable_tips` row if it is absent, with no
+    /// checkpoint. Idempotent across processes.
+    fn ensure_tip_row(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// Lock the tip's row (`FOR UPDATE`) on `op` and return its checkpoint:
+    /// `None` until the tip has reported one. One statement, so the lock and
+    /// the value it protects are read together, on the caller's own op. An
+    /// absent row is `RowNotFound`.
+    fn lock_tip_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+
+    /// Advance the tip's mirrored checkpoint, in the caller's op so it shares
+    /// the fate of the job checkpoint it copies. Monotonic.
+    fn mirror_tip_checkpoint_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        checkpoint: EventSequence,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// The tip's mirrored checkpoint, read on the pool without locking.
+    fn tip_checkpoint(
+        pool: &sqlx::PgPool,
+        subscriber_type: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+
+    /// End a catch-up, in one statement: delete its `subscriptions` row
+    /// (under `catch_up_type`), leave the ordinary tombstone in
+    /// `retired_subscriptions`, and record its end in `joinable_catch_ups`
+    /// under the tip's `tip_type`, carrying the unit from the deleted row.
+    /// `join` is the sequence it joined at, or `None` for a catch-up
+    /// cancelled rather than joined. A catch-up with no live row is left
+    /// untouched.
+    fn retire_catch_up_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        tip_type: &str,
+        catch_up_type: &str,
+        key: &str,
+        join: Option<EventSequence>,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+
+    /// The catch-ups of one tip as of `op`: the live ones (rows under
+    /// `catch_up_type` in `subscriptions`), and the ones in
+    /// `joinable_catch_ups` under `tip_type` that joined at or above `since`.
+    fn catch_ups_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        tip_type: &str,
+        catch_up_type: &str,
+        since: EventSequence,
+    ) -> impl Future<Output = Result<CatchUpRows, sqlx::Error>> + Send;
+
+    /// The sequence a catch-up joined its tip at, read on the pool; `None`
+    /// while it is live and for one that was cancelled.
+    fn catch_up_join_sequence(
+        pool: &sqlx::PgPool,
+        tip_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
+}
+
+/// The stored catch-ups of one tip, as [`MailboxTables::catch_ups_in_op`]
+/// reads them: `(key, instance_config)` for each live one and
+/// `(key, instance_config, joined_at_sequence)` for each join.
+#[derive(Debug, Clone)]
+pub struct CatchUpRows {
+    pub live: Vec<(String, serde_json::Value)>,
+    pub joined: Vec<(String, serde_json::Value, EventSequence)>,
 }
 
 /// A sparse checkpoint of the commit-lane fold: after folding through

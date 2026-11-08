@@ -499,6 +499,90 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
+        // === Joinable-subscription queries ===
+
+        let ensure_tip_row_query = format!(
+            r#"
+            INSERT INTO {tbl}joinable_tips (subscriber_type)
+            VALUES ($1)
+            ON CONFLICT (subscriber_type) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let lock_tip_query = format!(
+            r#"
+            SELECT checkpoint
+            FROM {tbl}joinable_tips
+            WHERE subscriber_type = $1
+            FOR UPDATE"#,
+            tbl = table_prefix
+        );
+
+        let mirror_tip_checkpoint_query = format!(
+            r#"
+            UPDATE {tbl}joinable_tips
+            SET checkpoint = GREATEST(COALESCE(checkpoint, $2), $2), updated_at = NOW()
+            WHERE subscriber_type = $1"#,
+            tbl = table_prefix
+        );
+
+        // A catch-up's end of life, in one statement: row deletion ends it
+        // and leaves the ordinary keyed tombstone; the join record goes to
+        // `joinable_catch_ups` under the tip's type, with the unit carried
+        // over from the deleted row. `joined_at_sequence` is NULL for a
+        // cancelled catch-up.
+        let retire_catch_up_query = format!(
+            r#"
+            WITH retired AS (
+                DELETE FROM {tbl}subscriptions
+                WHERE subscriber_type = $2 AND key = $3
+                RETURNING key, instance_config
+            ),
+            tombstone AS (
+                INSERT INTO {tbl}retired_subscriptions (subscriber_type, key, retired_at)
+                SELECT $2, key, COALESCE($4::timestamptz, NOW()) FROM retired
+                ON CONFLICT (subscriber_type, key) DO NOTHING
+            )
+            INSERT INTO {tbl}joinable_catch_ups (subscriber_type, key, instance_config, joined_at_sequence, ended_at)
+            SELECT $1, key, instance_config, $5::bigint, COALESCE($4::timestamptz, NOW()) FROM retired
+            ON CONFLICT (subscriber_type, key) DO NOTHING"#,
+            tbl = table_prefix
+        );
+
+        let live_catch_ups_query = format!(
+            r#"
+            SELECT key, instance_config
+            FROM {tbl}subscriptions
+            WHERE subscriber_type = $1
+            ORDER BY created_at, key"#,
+            tbl = table_prefix
+        );
+
+        let joined_catch_ups_query = format!(
+            r#"
+            SELECT key, instance_config, joined_at_sequence AS "joined_at_sequence!"
+            FROM {tbl}joinable_catch_ups
+            WHERE subscriber_type = $1 AND joined_at_sequence >= $2
+            ORDER BY joined_at_sequence, key"#,
+            tbl = table_prefix
+        );
+
+        let catch_up_join_sequence_query = format!(
+            r#"
+            SELECT joined_at_sequence
+            FROM {tbl}joinable_catch_ups
+            WHERE subscriber_type = $1 AND key = $2"#,
+            tbl = table_prefix
+        );
+
+        let tip_checkpoint_query = format!(
+            r#"
+            SELECT checkpoint
+            FROM {tbl}joinable_tips
+            WHERE subscriber_type = $1"#,
+            tbl = table_prefix
+        );
+
         // === Commit-ordered lane queries ===
 
         // INVARIANT: the `sequence >= $2` bound is what keeps this a
@@ -1421,6 +1505,24 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
+                fn lock_subscription_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        let locked = sqlx::query_scalar!(#lock_subscription_query, subscriber_type, key)
+                            .fetch_optional(op.as_executor())
+                            .await?;
+                        Ok(locked.is_some())
+                    }
+                }
+
                 fn subscription_retired_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,
@@ -1595,6 +1697,166 @@ FROM {}persistent_outbox_events_sequence_seq",
                             .into_iter()
                             .map(|row| (row.subscriber_type, row.key))
                             .collect())
+                    }
+                }
+
+                // === Joinable-subscription methods ===
+
+                fn ensure_tip_row(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        sqlx::query!(#ensure_tip_row_query, subscriber_type)
+                            .execute(&pool)
+                            .await?;
+                        Ok(())
+                    }
+                }
+
+                fn lock_tip_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#lock_tip_query, subscriber_type)
+                            .fetch_one(op.as_executor())
+                            .await?;
+                        Ok(row
+                            .checkpoint
+                            .map(|checkpoint| #crate_name::EventSequence::from(checkpoint as u64)))
+                    }
+                }
+
+                fn mirror_tip_checkpoint_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    checkpoint: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        sqlx::query!(
+                            #mirror_tip_checkpoint_query,
+                            subscriber_type,
+                            checkpoint as #crate_name::EventSequence,
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn retire_catch_up_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    tip_type: &str,
+                    catch_up_type: &str,
+                    key: &str,
+                    join: Option<#crate_name::EventSequence>,
+                ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let tip_type = tip_type.to_string();
+                    let catch_up_type = catch_up_type.to_string();
+                    let key = key.to_string();
+                    let now = op.maybe_now();
+                    let join = join.map(|join| u64::from(join) as i64);
+
+                    async move {
+                        sqlx::query!(
+                            #retire_catch_up_query,
+                            tip_type,
+                            catch_up_type,
+                            key,
+                            now,
+                            join
+                        )
+                        .execute(op.as_executor())
+                        .await?;
+                        Ok(())
+                    }
+                }
+
+                fn catch_ups_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    tip_type: &str,
+                    catch_up_type: &str,
+                    since: #crate_name::EventSequence,
+                ) -> impl std::future::Future<Output = Result<#crate_name::CatchUpRows, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let tip_type = tip_type.to_string();
+                    let catch_up_type = catch_up_type.to_string();
+
+                    async move {
+                        let live = sqlx::query!(#live_catch_ups_query, catch_up_type)
+                            .fetch_all(op.as_executor())
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.key, row.instance_config))
+                            .collect();
+                        let joined = sqlx::query!(
+                            #joined_catch_ups_query,
+                            tip_type,
+                            since as #crate_name::EventSequence,
+                        )
+                        .fetch_all(op.as_executor())
+                        .await?
+                        .into_iter()
+                        .map(|row| {
+                            (
+                                row.key,
+                                row.instance_config,
+                                #crate_name::EventSequence::from(row.joined_at_sequence as u64),
+                            )
+                        })
+                        .collect();
+                        Ok(#crate_name::CatchUpRows { live, joined })
+                    }
+                }
+
+                fn catch_up_join_sequence(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    tip_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let tip_type = tip_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#catch_up_join_sequence_query, tip_type, key)
+                            .fetch_optional(&pool)
+                            .await?;
+                        Ok(row
+                            .and_then(|row| row.joined_at_sequence)
+                            .map(|sequence| #crate_name::EventSequence::from(sequence as u64)))
+                    }
+                }
+
+                fn tip_checkpoint(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    subscriber_type: &str,
+                ) -> impl std::future::Future<Output = Result<Option<#crate_name::EventSequence>, #crate_name::prelude::sqlx::Error>> + Send {
+                    let pool = pool.clone();
+                    let subscriber_type = subscriber_type.to_string();
+
+                    async move {
+                        let row = sqlx::query!(#tip_checkpoint_query, subscriber_type)
+                            .fetch_one(&pool)
+                            .await?;
+                        Ok(row
+                            .checkpoint
+                            .map(|checkpoint| #crate_name::EventSequence::from(checkpoint as u64)))
                     }
                 }
             }

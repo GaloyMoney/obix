@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO joinable_tips (subscriber_type)\n            VALUES ($1)\n            ON CONFLICT (subscriber_type) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4137dd812847f1684843a1f0613202518b4d3e3cde3d42f5bc2c72c677b671ad"
+}

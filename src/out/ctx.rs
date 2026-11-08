@@ -226,6 +226,22 @@ pub(crate) trait Landing: Copy + Send + Sync {
     /// Nothing was pending, so nothing landed.
     fn idle() -> Self::Landed;
 
+    /// Where this landing copies the checkpoint, if anywhere: the same copy
+    /// on a batch landing and on a skip-only persist. Default: nowhere.
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        None
+    }
+
+    /// Called once, immediately after the landing op is materialised and
+    /// before any handler statement runs on it. Default: nothing.
+    fn enter(
+        self,
+        op: &mut es_entity::DbOp<'static>,
+    ) -> impl std::future::Future<Output = Result<(), ObixFault>> + Send {
+        let _ = op;
+        std::future::ready(Ok(()))
+    }
+
     /// Persist the checkpoint on `op` and land it as `verdict` says.
     fn land(
         self,
@@ -253,7 +269,7 @@ impl Landing for Singleton {
         state: &mut OutboxEventJobState,
         op: es_entity::DbOp<'static>,
     ) -> Result<(), ObixFault> {
-        commit_checkpoint(current_job, op, state, None).await
+        commit_checkpoint(current_job, op, state, self.mirror()).await
     }
 }
 
@@ -270,6 +286,10 @@ impl Landing for Keyed<'_> {
         Landed::Continue
     }
 
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        Some(self.0)
+    }
+
     async fn land(
         self,
         verdict: FlushOutcome,
@@ -279,7 +299,7 @@ impl Landing for Keyed<'_> {
     ) -> Result<Landed, ObixFault> {
         match verdict {
             FlushOutcome::Continue => {
-                commit_checkpoint(current_job, op, state, Some(self.0)).await?;
+                commit_checkpoint(current_job, op, state, self.mirror()).await?;
                 Ok(Landed::Continue)
             }
             FlushOutcome::Finish => {
@@ -291,6 +311,53 @@ impl Landing for Keyed<'_> {
                 Ok(Landed::Finished(op))
             }
         }
+    }
+}
+
+/// The tip row's lock: the first statement of every tip landing, of opening a
+/// catch-up, and of a catch-up's join landing.
+///
+/// `sqlx::Error` for the reason [`CheckpointMirror`] documents.
+pub(crate) trait TipLock: Send + Sync {
+    /// Lock the row on `op` and read the checkpoint it protects: `None` while
+    /// the tip has not reported one.
+    fn lock<'a>(
+        &'a self,
+        op: &'a mut es_entity::DbOp<'static>,
+    ) -> futures::future::BoxFuture<'a, Result<Option<EventSequence>, sqlx::Error>>;
+}
+
+/// A joinable tip's landing: takes the tip row's lock as the first statement
+/// of every landing transaction and mirrors the checkpoint into that row.
+#[derive(Clone, Copy)]
+pub(crate) struct Tip<'m> {
+    pub(crate) mirror: &'m dyn CheckpointMirror,
+    pub(crate) lock: &'m dyn TipLock,
+}
+
+impl Landing for Tip<'_> {
+    type Verdict = ();
+    type Landed = ();
+
+    fn idle() {}
+
+    fn mirror(&self) -> Option<&dyn CheckpointMirror> {
+        Some(self.mirror)
+    }
+
+    async fn enter(self, op: &mut es_entity::DbOp<'static>) -> Result<(), ObixFault> {
+        self.lock.lock(op).await?;
+        Ok(())
+    }
+
+    async fn land(
+        self,
+        (): (),
+        current_job: &mut CurrentJob,
+        state: &mut OutboxEventJobState,
+        op: es_entity::DbOp<'static>,
+    ) -> Result<(), ObixFault> {
+        commit_checkpoint(current_job, op, state, Landing::mirror(&self)).await
     }
 }
 
@@ -452,10 +519,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             flusher,
         } = self;
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
-        *parts.op_slot = Some(
-            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?,
-        );
+        *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         let op = parts.op_slot.as_mut().expect("just materialized above");
         Ok(IsolatedOp { op })
     }
@@ -614,6 +678,18 @@ impl std::error::Error for FlushError {
     }
 }
 
+/// Open an op for a landing and give the landing its entry hook, before any
+/// other statement runs on it. Every op a landing's handler work runs on is
+/// materialised here.
+pub(crate) async fn open_landing_op<L: Landing>(
+    current_job: &CurrentJob,
+    landing: L,
+) -> Result<es_entity::DbOp<'static>, ObixFault> {
+    let mut op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
+    landing.enter(&mut op).await?;
+    Ok(op)
+}
+
 /// Land the pending batch, if any: hand collected items to the handler's
 /// flush (inside a transaction opened for the landing) → checkpoint at the
 /// last fully handled sequence → commit. Also lands a runner-committed op
@@ -628,25 +704,20 @@ impl std::error::Error for FlushError {
     ),
     err
 )]
-pub(crate) async fn flush_batch<B: Default, L: Landing>(
+async fn land_batch<B: Default, L: Landing>(
     parts: &mut CtxParts<'_, L>,
     batch: &mut B,
     flusher: &dyn ItemFlush<B, L::Verdict>,
     reason: &'static str,
+    force: bool,
 ) -> Result<L::Landed, HandlerError> {
     if parts.op_slot.is_none() && parts.tracker.collected == 0 {
         return Ok(L::idle());
     }
     let mut verdict = L::Verdict::default();
-    if parts.tracker.collected > 0 {
+    if parts.tracker.collected > 0 || force {
         if parts.op_slot.is_none() {
-            *parts.op_slot = Some(
-                es_entity::DbOp::init_with_clock(
-                    parts.current_job.pool(),
-                    parts.current_job.clock(),
-                )
-                .await?,
-            );
+            *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         }
         // Drain before the call: on error the items are dropped with the op,
         // and the replayed events re-collect them — the accumulator never
@@ -679,6 +750,26 @@ pub(crate) async fn flush_batch<B: Default, L: Landing>(
     parts.tracker.persisted = flusher.position_of(parts.state);
     parts.tracker.last_persist = tokio::time::Instant::now();
     Ok(landed)
+}
+
+pub(crate) async fn flush_batch<B: Default, L: Landing>(
+    parts: &mut CtxParts<'_, L>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B, L::Verdict>,
+    reason: &'static str,
+) -> Result<L::Landed, HandlerError> {
+    land_batch(parts, batch, flusher, reason, false).await
+}
+
+/// [`flush_batch`] for a landing whose handler must run even over an empty
+/// batch: a catch-up's join landing, whose `flush` carries the join sequence.
+pub(crate) async fn flush_joining<B: Default, L: Landing>(
+    parts: &mut CtxParts<'_, L>,
+    batch: &mut B,
+    flusher: &dyn ItemFlush<B, L::Verdict>,
+    reason: &'static str,
+) -> Result<L::Landed, HandlerError> {
+    land_batch(parts, batch, flusher, reason, true).await
 }
 
 /// Write the checkpoint — and, for a keyed member, its mirrored copy — onto
@@ -718,6 +809,92 @@ pub(crate) async fn persist_checkpoint(
 ) -> Result<(), ObixFault> {
     let op = es_entity::DbOp::init_with_clock(current_job.pool(), current_job.clock()).await?;
     commit_checkpoint(current_job, op, state, mirror).await
+}
+
+/// Per-event decision point handed to
+/// [`JoinableSubscriber::handle`](super::JoinableSubscriber::handle): the
+/// same on the tip and on every catch-up, with the two verbs that are safe
+/// on both.
+///
+/// There is no `consume` and no `pause_until`. A join landing drains the
+/// catch-up with its landing op already open, so a verb that opens a second
+/// op is unrepresentable rather than rejected at runtime; a catch-up never
+/// passivates, so a verb that parks it contradicts the mode.
+///
+/// ```compile_fail
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// async fn consume_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     // error[E0599]: no method named `consume` found for struct `JoinableEventCtx`
+///     let _op = ctx.consume().await.unwrap();
+///     unreachable!()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// fn pause_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     // error[E0599]: no method named `pause_until` found for struct `JoinableEventCtx`
+///     ctx.pause_until(chrono::Utc::now())
+/// }
+/// ```
+///
+/// The control for the two tests above — same signature, with a verb the ctx
+/// does have. If this stops compiling, those `compile_fail` tests have
+/// started passing for the wrong reason:
+///
+/// ```
+/// use obix::{Handled, JoinableEventCtx};
+///
+/// fn resolve_it<'inv>(ctx: JoinableEventCtx<'inv, ()>) -> Handled<'inv> {
+///     ctx.skip()
+/// }
+/// ```
+#[must_use = "resolve the JoinableEventCtx via skip / collect_with"]
+pub struct JoinableEventCtx<'inv, B = ()> {
+    pub(crate) batch: &'inv mut B,
+    pub(crate) tracker: &'inv mut BatchTracker,
+}
+
+impl<'inv, B> JoinableEventCtx<'inv, B> {
+    /// Identical to [`EventCtx::skip`].
+    pub fn skip(self) -> Handled<'inv> {
+        Handled {
+            outcome: Outcome::Skip,
+            _invocation: PhantomData,
+        }
+    }
+
+    /// Identical to [`EventCtx::collect_with`].
+    pub fn collect_with(self, f: impl FnOnce(&mut B)) -> Handled<'inv> {
+        f(self.batch);
+        self.tracker.collected += 1;
+        Handled {
+            outcome: Outcome::Collect,
+            _invocation: PhantomData,
+        }
+    }
+}
+
+impl<'inv, T> JoinableEventCtx<'inv, Vec<T>> {
+    /// [`collect_with`](Self::collect_with) sugar for `Vec` accumulators.
+    pub fn collect(self, item: T) -> Handled<'inv> {
+        self.collect_with(|batch| batch.push(item))
+    }
+}
+
+impl<'inv, K, V, S> JoinableEventCtx<'inv, std::collections::HashMap<K, V, S>>
+where
+    K: std::hash::Hash + Eq,
+    S: std::hash::BuildHasher,
+{
+    /// [`collect_with`](Self::collect_with) sugar for `HashMap` accumulators.
+    pub fn collect(self, key: K, value: V) -> Handled<'inv> {
+        self.collect_with(|batch| {
+            batch.insert(key, value);
+        })
+    }
 }
 
 // === Keyed subscribers ===
@@ -809,9 +986,7 @@ impl<'inv, B> KeyedEventCtx<'inv, B> {
             *parts.op_slot = Some(op);
             return Err(Box::new(FinishedAtFence));
         }
-        let op =
-            es_entity::DbOp::init_with_clock(parts.current_job.pool(), parts.current_job.clock())
-                .await?;
+        let op = open_landing_op(parts.current_job, parts.landing).await?;
         Ok(StagedOp {
             op,
             parts,
