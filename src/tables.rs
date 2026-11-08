@@ -430,6 +430,16 @@ pub trait MailboxTables: Send + Sync + 'static {
         key: &str,
     ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
 
+    /// Lock the live `subscriptions` row (`FOR UPDATE`) on `op`: `true` if
+    /// there is one. A retirement of the row then waits for `op` to end, and
+    /// `false` means the row is already gone — the caller's row-is-truth check
+    /// under its own op, for a landing that must not commit after a cancel.
+    fn lock_subscription_in_op(
+        op: &mut impl es_entity::AtomicOperation,
+        subscriber_type: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send;
+
     /// Point-read one subscription's identity and terms by primary key.
     /// `None` means cancelled (or never subscribed) — the caller's row-is-truth
     /// check.

@@ -593,8 +593,11 @@ where
 
     /// Cancel the lane on the caller's own operation — atomic with, e.g.,
     /// deletion of the unit it covers. Row absence ends the lane: the
-    /// runner's next run-start check completes it. The lane's record has no
-    /// join sequence, so it never appears among a tip's joined lanes.
+    /// runner's next run-start check completes it, and a fenced landing
+    /// already waiting for the tip's lock finds the row gone and ends the
+    /// lane without flushing. The lane's record has no join sequence, so it
+    /// never appears among a tip's joined lanes. Cancelling a lane that has
+    /// already joined is a no-op: its row is gone and its join record stands.
     #[es_entity::errlanes::instrument(name = "obix.joinable.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,

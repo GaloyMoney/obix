@@ -1505,6 +1505,24 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
+                fn lock_subscription_in_op(
+                    op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
+                    subscriber_type: &str,
+                    key: &str,
+                ) -> impl std::future::Future<Output = Result<bool, #crate_name::prelude::sqlx::Error>> + Send {
+                    use #crate_name::prelude::es_entity::AtomicOperation;
+
+                    let subscriber_type = subscriber_type.to_string();
+                    let key = key.to_string();
+
+                    async move {
+                        let locked = sqlx::query_scalar!(#lock_subscription_query, subscriber_type, key)
+                            .fetch_optional(op.as_executor())
+                            .await?;
+                        Ok(locked.is_some())
+                    }
+                }
+
                 fn subscription_retired_in_op(
                     op: &mut impl #crate_name::prelude::es_entity::AtomicOperation,
                     subscriber_type: &str,

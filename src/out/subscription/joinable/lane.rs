@@ -307,6 +307,12 @@ where
     /// The tip row's lock is the first statement on the landing op, taken
     /// before anything else is read or written on it; there is no pool read
     /// once it is open, and nothing in here is a cancellation point.
+    ///
+    /// The lane's own row is locked second. A cancel that committed while this
+    /// landing waited for the tip's lock is seen here, and the landing ends
+    /// the lane without flushing: nothing of a cancelled lane lands, and no
+    /// join is claimed. A cancel that arrives later waits for this op to
+    /// commit and then finds the row already retired by the join.
     async fn try_land(
         &mut self,
         outbox: &Outbox<P, Tables>,
@@ -322,6 +328,12 @@ where
 
         let mut op = open_landing_op(&self.current_job, Keyed(self.run)).await?;
         let tip = Tables::lock_tip_in_op(&mut op, tip_type.as_str()).await?;
+        let live =
+            Tables::lock_subscription_in_op(&mut op, self.run.lane_type.as_str(), &self.run.key)
+                .await?;
+        if !live {
+            return Ok(Landed::Finished(op));
+        }
         self.op_slot = Some(op);
         let Some(tip) = tip else {
             return self.land_ordinary(reason).await;

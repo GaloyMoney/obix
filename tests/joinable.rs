@@ -1249,7 +1249,13 @@ async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
         "the ordinary keyed tombstone is left behind"
     );
 
+    // The lane is parked on the tip's lock inside its fenced landing. Once the
+    // tip commits, that landing must see the cancel, not claim a join.
     h.shared.tip_gate.release();
+    eventually(WAIT, || async {
+        Ok(h.tip_row_checkpoint().await? == Some(6))
+    })
+    .await?;
     let timeout = lane.await_fenced(Duration::from_millis(600)).await;
     assert!(
         matches!(
@@ -1259,6 +1265,23 @@ async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
             ))
         ),
         "a cancelled lane never joins"
+    );
+    assert_eq!(
+        h.lane_record(&lane).await?,
+        Some(None),
+        "the cancel record is not overwritten by a join"
+    );
+    assert!(
+        h.lane_flushes().await?.is_empty(),
+        "nothing of a cancelled lane lands: no fenced flush ran"
+    );
+    assert!(
+        h.applied_by("catch_up", "u").await?.is_empty(),
+        "no catch-up write for the cancelled unit committed"
+    );
+    assert!(
+        !h.waits_on_the_tip_row().await?,
+        "the landing released the tip's lock"
     );
     let mut op = h.outbox.begin_op().await?;
     let lanes = h.tip.lanes_in_op(&mut op, EventSequence::BEGIN).await?;
