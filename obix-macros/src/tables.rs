@@ -567,7 +567,7 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix
         );
 
-        let lane_fence_query = format!(
+        let lane_join_sequence_query = format!(
             r#"
             SELECT joined_at_sequence
             FROM {tbl}joinable_lanes
@@ -1761,7 +1761,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     tip_type: &str,
                     lane_type: &str,
                     key: &str,
-                    fence: Option<#crate_name::EventSequence>,
+                    join: Option<#crate_name::EventSequence>,
                 ) -> impl std::future::Future<Output = Result<(), #crate_name::prelude::sqlx::Error>> + Send {
                     use #crate_name::prelude::es_entity::AtomicOperation;
 
@@ -1769,7 +1769,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let lane_type = lane_type.to_string();
                     let key = key.to_string();
                     let now = op.maybe_now();
-                    let fence = fence.map(|fence| u64::from(fence) as i64);
+                    let join = join.map(|join| u64::from(join) as i64);
 
                     async move {
                         sqlx::query!(
@@ -1778,7 +1778,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                             lane_type,
                             key,
                             now,
-                            fence
+                            join
                         )
                         .execute(op.as_executor())
                         .await?;
@@ -1824,7 +1824,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     }
                 }
 
-                fn lane_fence(
+                fn lane_join_sequence(
                     pool: &#crate_name::prelude::sqlx::PgPool,
                     tip_type: &str,
                     key: &str,
@@ -1834,7 +1834,7 @@ FROM {}persistent_outbox_events_sequence_seq",
                     let key = key.to_string();
 
                     async move {
-                        let row = sqlx::query!(#lane_fence_query, tip_type, key)
+                        let row = sqlx::query!(#lane_join_sequence_query, tip_type, key)
                             .fetch_optional(&pool)
                             .await?;
                         Ok(row

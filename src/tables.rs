@@ -555,14 +555,14 @@ pub trait MailboxTables: Send + Sync + 'static {
     /// (under `lane_type`), leave the ordinary tombstone in
     /// `retired_subscriptions`, and record the lane's end in `joinable_lanes`
     /// under the tip's `tip_type`, carrying the unit from the deleted row.
-    /// `fence` is the sequence it joined at, or `None` for a lane cancelled
+    /// `join` is the sequence it joined at, or `None` for a lane cancelled
     /// rather than joined. A lane with no live row is left untouched.
     fn retire_lane_in_op(
         op: &mut impl es_entity::AtomicOperation,
         tip_type: &str,
         lane_type: &str,
         key: &str,
-        fence: Option<EventSequence>,
+        join: Option<EventSequence>,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
     /// The lanes of one tip as of `op`: the live ones (rows under `lane_type`
@@ -577,7 +577,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
     /// The sequence a lane joined its tip at, read on the pool; `None` while
     /// the lane is live and for a lane that was cancelled.
-    fn lane_fence(
+    fn lane_join_sequence(
         pool: &sqlx::PgPool,
         tip_type: &str,
         key: &str,
@@ -586,7 +586,7 @@ pub trait MailboxTables: Send + Sync + 'static {
 
 /// The stored lanes of one tip, as [`MailboxTables::lanes_in_op`] reads
 /// them: `(key, instance_config)` for each live lane and
-/// `(key, instance_config, fence)` for each join.
+/// `(key, instance_config, joined_at_sequence)` for each join.
 #[derive(Debug, Clone)]
 pub struct LaneRows {
     pub live: Vec<(String, serde_json::Value)>,

@@ -314,8 +314,8 @@ impl Landing for Keyed<'_> {
     }
 }
 
-/// The tip row's lock: the first statement of every tip landing, and of every
-/// landing that fences against the tip.
+/// The tip row's lock: the first statement of every tip landing, of opening a
+/// lane, and of a lane's join landing.
 ///
 /// `sqlx::Error` for the reason [`CheckpointMirror`] documents.
 pub(crate) trait TipLock: Send + Sync {
@@ -762,8 +762,8 @@ pub(crate) async fn flush_batch<B: Default, L: Landing>(
 }
 
 /// [`flush_batch`] for a landing whose handler must run even over an empty
-/// batch: a lane's fenced landing, whose `flush` carries the fence.
-pub(crate) async fn flush_fenced<B: Default, L: Landing>(
+/// batch: a lane's join landing, whose `flush` carries the join sequence.
+pub(crate) async fn flush_joining<B: Default, L: Landing>(
     parts: &mut CtxParts<'_, L>,
     batch: &mut B,
     flusher: &dyn ItemFlush<B, L::Verdict>,
@@ -816,7 +816,7 @@ pub(crate) async fn persist_checkpoint(
 /// same on the tip and on every catch-up lane, with the two verbs that are
 /// safe on both.
 ///
-/// There is no `consume` and no `pause_until`. A fenced landing drains the
+/// There is no `consume` and no `pause_until`. A join landing drains the
 /// lane with its landing op already open, so a verb that opens a second op
 /// is unrepresentable rather than rejected at runtime; a lane never
 /// passivates, so a verb that parks it contradicts the mode.

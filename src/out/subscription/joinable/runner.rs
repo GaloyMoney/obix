@@ -21,9 +21,9 @@ use crate::out::subscription::singleton::{LoopCadence, OutboxEventJobData, run_p
 use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
 
-/// The tip's `joinable_tips` row: locked at the start of every tip landing and
-/// by everything that fences against the tip, and written with the tip's
-/// checkpoint.
+/// The tip's `joinable_tips` row: locked at the start of every tip landing,
+/// when a lane is opened and in a lane's join landing, and written with the
+/// tip's checkpoint.
 pub(super) struct TipRow<Tables> {
     pub(super) subscriber_type: JobType,
     pub(super) _tables: PhantomData<fn() -> Tables>,

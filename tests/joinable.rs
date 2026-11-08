@@ -1,9 +1,9 @@
 //! Contracts for joinable subscriptions: a tip whose every landing takes the
-//! tip row's lock at entry, and catch-up lanes that join it at a fence no tip
+//! tip row's lock at entry, and catch-up lanes that join it at a sequence no tip
 //! landing straddles.
 //!
 //! The fixture is the handler contract: a tip applies an event to a unit only
-//! when the unit is joined with a fence below the event's sequence (read on
+//! when the unit has joined at a sequence below the event's (read on
 //! the landing op through `lanes_in_op`), and a lane applies only its own
 //! unit's events. Every application is a row, so "applied by whom, in what
 //! order" is a query.
@@ -192,11 +192,11 @@ impl JoinableSubscriber<TestEvent> for Applier {
                         .collect(),
                 });
                 let mut units = self.shared.tip_units.lock().await;
-                for (_, unit, fence) in lanes.joined {
-                    units.insert(unit, fence);
+                for (_, unit, join) in lanes.joined {
+                    units.insert(unit, join);
                 }
                 for (key, sequence) in batch {
-                    if units.get(&key).is_some_and(|fence| sequence > *fence) {
+                    if units.get(&key).is_some_and(|join| sequence > *join) {
                         insert_applied(op, "tip", &key, sequence).await?;
                     }
                 }
@@ -204,7 +204,7 @@ impl JoinableSubscriber<TestEvent> for Applier {
                 insert_flush(op, "tip", None, items, lock_held).await?;
                 self.shared.tip_prev.store(position, Ordering::SeqCst);
             }
-            Scope::CatchUp { unit, fence } => {
+            Scope::CatchUp { unit, join } => {
                 for (key, sequence) in batch {
                     if &key == unit {
                         insert_applied(op, "catch_up", &key, sequence).await?;
@@ -213,7 +213,7 @@ impl JoinableSubscriber<TestEvent> for Applier {
                 insert_flush(
                     op,
                     "catch_up",
-                    fence.map(|f| u64::from(f) as i64),
+                    join.map(|f| u64::from(f) as i64),
                     items,
                     lock_held,
                 )
@@ -243,17 +243,17 @@ async fn insert_applied(
 async fn insert_flush(
     op: &mut FlushOp<'_, InsertOrder>,
     scope: &str,
-    fence: Option<i64>,
+    join: Option<i64>,
     items: i64,
     lock_held: bool,
 ) -> Result<(), sqlx::Error> {
     use es_entity::AtomicOperation;
     sqlx::query(
-        "INSERT INTO test_joinable_flushes (scope, fence, items, lock_held) \
+        "INSERT INTO test_joinable_flushes (scope, join_sequence, items, lock_held) \
          VALUES ($1, $2, $3, $4)",
     )
     .bind(scope)
-    .bind(fence)
+    .bind(join)
     .bind(items)
     .bind(lock_held)
     .execute(op.as_executor())
@@ -360,7 +360,7 @@ impl Harness {
             .await?;
         sqlx::query(
             "CREATE TABLE test_joinable_flushes (id BIGSERIAL PRIMARY KEY, \
-             scope TEXT NOT NULL, fence BIGINT, items BIGINT NOT NULL, lock_held BOOLEAN NOT NULL)",
+             scope TEXT NOT NULL, join_sequence BIGINT, items BIGINT NOT NULL, lock_held BOOLEAN NOT NULL)",
         )
         .execute(&pool)
         .await?;
@@ -420,11 +420,11 @@ impl Harness {
         Ok(())
     }
 
-    async fn join(&self, unit: &str, start_after: u64) -> anyhow::Result<TestLane> {
+    async fn open_lane(&self, unit: &str, start_after: u64) -> anyhow::Result<TestLane> {
         let mut op = self.outbox.begin_op().await?;
         let lane = self
             .tip
-            .join_in_op(&mut op, unit.to_string(), EventSequence::from(start_after))
+            .open_lane_in_op(&mut op, unit.to_string(), EventSequence::from(start_after))
             .await?;
         op.commit().await?;
         Ok(lane)
@@ -458,10 +458,10 @@ impl Harness {
         )
     }
 
-    /// `(fence, items, lock_held)` of every lane flush, in landing order.
+    /// `(join_sequence, items, lock_held)` of every lane flush, in landing order.
     async fn lane_flushes(&self) -> anyhow::Result<Vec<(Option<i64>, i64, bool)>> {
         Ok(sqlx::query_as(
-            "SELECT fence, items, lock_held FROM test_joinable_flushes \
+            "SELECT join_sequence, items, lock_held FROM test_joinable_flushes \
              WHERE scope = 'catch_up' ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -519,7 +519,7 @@ impl Harness {
     /// Stage the interleaving most tests share: the tip is parked inside a
     /// landing of events 2..=6 of unit `u` (entry lock held, committed
     /// checkpoint 1), and unit `u`'s lane has handled event 1 and is released
-    /// into its first batch, which it can only land under the fence.
+    /// into its first batch, which it can only land as its join.
     ///
     /// Returns once the lane is waiting on the tip row's lock.
     async fn stage_tip_entered_first(&self) -> anyhow::Result<TestLane> {
@@ -531,7 +531,7 @@ impl Harness {
 
         self.shared.handle_gate_seq.store(1, Ordering::SeqCst);
         self.shared.handle_gate.arm();
-        let lane = self.join("u", 0).await?;
+        let lane = self.open_lane("u", 0).await?;
         eventually(WAIT, || async { Ok(self.shared.handle_gate.is_parked()) }).await?;
 
         self.shared.tip_gate.arm();
@@ -564,7 +564,7 @@ fn ping(key: &str, n: u64) -> TestEvent {
 fn staged_config() -> JoinableConfig {
     test_config()
         .with_lane_max_batch_size(2)
-        .with_max_fence_gap(100)
+        .with_max_join_gap(100)
 }
 
 async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<()>
@@ -685,26 +685,26 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.join("u", 0).await?;
-    let fence = lane.await_fenced(WAIT).await?;
+    let lane = h.open_lane("u", 0).await?;
+    let join = lane.await_join(WAIT).await?;
 
-    assert!(u64::from(fence) >= 4);
+    assert!(u64::from(join) >= 4);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![1, 3]);
     assert!(
         h.applied_by("tip", "u").await?.is_empty(),
-        "no event at or below the fence is applied by the tip"
+        "no event at or below the join is applied by the tip"
     );
-    assert!(h.tip_row_checkpoint().await?.unwrap() <= u64::from(fence) as i64);
+    assert!(h.tip_row_checkpoint().await?.unwrap() <= u64::from(join) as i64);
     assert_eq!(h.lane_record(&lane).await?, Some(Some(4)));
     let flushes = h.lane_flushes().await?;
     assert_eq!(flushes.len(), 1);
     assert_eq!(
         flushes[0],
-        (Some(u64::from(fence) as i64), 4, true),
-        "one fenced landing, over the whole collected batch, lock held"
+        (Some(u64::from(join) as i64), 4, true),
+        "one join landing, over the whole collected batch, lock held"
     );
 
-    // Control: past the fence the tip applies to the unit, and the lane does not.
+    // Control: past the join the tip applies to the unit, and the lane does not.
     h.publish(vec![ping("u", 5)]).await?;
     eventually(WAIT, || async {
         Ok(h.applied_by("tip", "u").await? == vec![5])
@@ -721,12 +721,12 @@ async fn tip_entered_first() -> anyhow::Result<()> {
     let lane = h.stage_tip_entered_first().await?;
 
     h.shared.tip_gate.release();
-    let fence = lane.await_fenced(WAIT).await?;
+    let join = lane.await_join(WAIT).await?;
 
     assert_eq!(
-        u64::from(fence),
+        u64::from(join),
         6,
-        "the fence is the end of the landing the tip held"
+        "the join is at the end of the landing the tip held"
     );
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
@@ -738,14 +738,14 @@ async fn tip_entered_first() -> anyhow::Result<()> {
     assert_eq!(
         flushes,
         vec![(Some(6), 6, true)],
-        "one landing, carrying the fence, over the lane's whole batch"
+        "one landing, carrying the join, over the lane's whole batch"
     );
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn fence_entered_first() -> anyhow::Result<()> {
+async fn join_entered_first() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
     let lane = h.stage_tip_entered_first().await?;
 
@@ -763,13 +763,13 @@ async fn fence_entered_first() -> anyhow::Result<()> {
     eventually(WAIT, || async { h.waits_on_the_tip_row().await }).await?;
     assert!(
         h.applied_by("tip", "u").await?.is_empty(),
-        "the tip's next landing is parked at entry behind the fence"
+        "the tip's next landing is parked at entry behind the join"
     );
     assert_eq!(h.lane_record(&lane).await?, None);
 
     h.shared.handle_gate.release();
-    let fence = lane.await_fenced(WAIT).await?;
-    assert_eq!(u64::from(fence), 6);
+    let join = lane.await_join(WAIT).await?;
+    assert_eq!(u64::from(join), 6);
     eventually(WAIT, || async {
         Ok(h.applied_by("tip", "u").await? == vec![7])
     })
@@ -777,14 +777,14 @@ async fn fence_entered_first() -> anyhow::Result<()> {
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
         vec![2, 3, 4, 5, 6],
-        "the lane applied up to the fence and the tip only past it"
+        "the lane applied up to the join and the tip only past it"
     );
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn lane_ahead_fences_at_own_position() -> anyhow::Result<()> {
+async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
     let slow_tip = JoinableConfig::new(
         OutboxEventJobConfig::new(job::JobType::new(TIP))
             .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
@@ -805,7 +805,7 @@ async fn lane_ahead_fences_at_own_position() -> anyhow::Result<()> {
     // The lane is held at an event the tip has already passed.
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.join("u", 0).await?;
+    let lane = h.open_lane("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip is stalled: every landing fails, and the retry backoff keeps it
@@ -818,17 +818,17 @@ async fn lane_ahead_fences_at_own_position() -> anyhow::Result<()> {
     .await?;
 
     h.shared.handle_gate.release();
-    let fence = lane.await_fenced(WAIT).await?;
+    let join = lane.await_join(WAIT).await?;
 
-    assert_eq!(u64::from(fence), 4, "the lane fenced at its own position");
+    assert_eq!(u64::from(join), 4, "the lane joined at its own position");
     assert_eq!(
         h.tip_row_checkpoint().await?,
         Some(1),
-        "the tip is behind the fence"
+        "the tip is behind the join"
     );
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![2, 3, 4]);
 
-    // The tip recovers and replays from its own checkpoint, past the fence.
+    // The tip recovers and replays from its own checkpoint, past the join.
     h.shared.fail_tip_flush.store(false, Ordering::SeqCst);
     h.publish(vec![ping("u", 5)]).await?;
     eventually(WAIT, || async {
@@ -838,7 +838,7 @@ async fn lane_ahead_fences_at_own_position() -> anyhow::Result<()> {
     assert_eq!(
         h.applied_by("tip", "u").await?,
         vec![5],
-        "the tip applies nothing at or below the fence, though it replays it"
+        "the tip applies nothing at or below the join, though it replays it"
     );
     Ok(())
 }
@@ -862,7 +862,7 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut op = outbox.begin_op().await?;
             let lane = tip
-                .join_in_op(&mut op, "u".to_string(), EventSequence::BEGIN)
+                .open_lane_in_op(&mut op, "u".to_string(), EventSequence::BEGIN)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             op.commit().await?;
@@ -901,8 +901,8 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
     );
 
     h.shared.handle_gate.release();
-    let fence = lane.await_fenced(WAIT).await?;
-    assert_eq!(u64::from(fence), 2);
+    let join = lane.await_join(WAIT).await?;
+    assert_eq!(u64::from(join), 2);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![1, 2]);
     assert!(h.applied_by("tip", "u").await?.is_empty());
     Ok(())
@@ -910,7 +910,7 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn fenced_drain_failure_replays() -> anyhow::Result<()> {
+async fn join_drain_failure_replays() -> anyhow::Result<()> {
     let slow_lane_retry = staged_config().with_lane_retry_settings(retry_settings(
         Duration::from_secs(1),
         Duration::from_secs(2),
@@ -919,7 +919,7 @@ async fn fenced_drain_failure_replays() -> anyhow::Result<()> {
     let lane = h.stage_tip_entered_first().await?;
     let checkpoint_before = h.lane_row_checkpoint(&lane).await?;
 
-    // The first handle of event 4 happens inside the fenced drain.
+    // The first handle of event 4 happens inside the join landing's drain.
     h.shared.fail_handle_seq.store(4, Ordering::SeqCst);
     h.shared.fail_handle_armed.store(true, Ordering::SeqCst);
     h.shared.tip_gate.release();
@@ -931,24 +931,24 @@ async fn fenced_drain_failure_replays() -> anyhow::Result<()> {
     assert_eq!(
         h.lane_record(&lane).await?,
         None,
-        "a failed fenced landing leaves no join record"
+        "a failed join landing leaves no join record"
     );
     assert_eq!(h.lane_row_checkpoint(&lane).await?, checkpoint_before);
     assert_eq!(h.applied_count().await?, 0, "nothing of it committed");
 
-    let fence = lane.await_fenced(WAIT).await?;
-    assert!(u64::from(fence) >= 6);
+    let join = lane.await_join(WAIT).await?;
+    assert!(u64::from(join) >= 6);
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
         vec![2, 3, 4, 5, 6],
-        "the retry applied everything up to the fence exactly once"
+        "the retry applied everything up to the join exactly once"
     );
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn empty_batch_fenced_landing() -> anyhow::Result<()> {
+async fn empty_batch_join_landing() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
     h.publish(vec![TestEvent::Noise, TestEvent::Noise, TestEvent::Noise])
         .await?;
@@ -957,14 +957,14 @@ async fn empty_batch_fenced_landing() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.join("u", 0).await?;
-    let fence = lane.await_fenced(WAIT).await?;
+    let lane = h.open_lane("u", 0).await?;
+    let join = lane.await_join(WAIT).await?;
 
-    assert_eq!(u64::from(fence), 3);
+    assert_eq!(u64::from(join), 3);
     assert_eq!(
         h.lane_flushes().await?,
         vec![(Some(3), 0, true)],
-        "flush ran once, over an empty batch, carrying the fence"
+        "flush ran once, over an empty batch, carrying the join"
     );
     assert_eq!(h.lane_record(&lane).await?, Some(Some(3)));
     assert_eq!(h.applied_count().await?, 0);
@@ -973,31 +973,31 @@ async fn empty_batch_fenced_landing() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn max_fence_gap_declines() -> anyhow::Result<()> {
-    let h = Harness::start(staged_config().with_max_fence_gap(1)).await?;
+async fn max_join_gap_declines() -> anyhow::Result<()> {
+    let h = Harness::start(staged_config().with_max_join_gap(1)).await?;
     let lane = h.stage_tip_entered_first().await?;
 
     h.shared.tip_gate.release();
-    let fence = lane.await_fenced(WAIT).await?;
+    let join = lane.await_join(WAIT).await?;
 
-    assert_eq!(u64::from(fence), 6);
+    assert_eq!(u64::from(join), 6);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![2, 3, 4, 5, 6]);
     let flushes = h.lane_flushes().await?;
     assert_eq!(
         flushes.first(),
         Some(&(None, 2, true)),
-        "the first landing declined the fence and was ordinary, under the lock: {flushes:?}"
+        "the first landing declined the join and was ordinary, under the lock: {flushes:?}"
     );
     assert_eq!(
         flushes.last(),
         Some(&(Some(6), 2, true)),
-        "and the lane kept catching up until it fenced: {flushes:?}"
+        "and the lane kept catching up until it joined: {flushes:?}"
     );
     assert!(
         flushes[..flushes.len() - 1]
             .iter()
             .all(|(f, ..)| f.is_none()),
-        "only the last landing carries a fence: {flushes:?}"
+        "only the last landing carries a join: {flushes:?}"
     );
     assert!(
         flushes.iter().any(|(f, _, held)| f.is_none() && !held),
@@ -1008,16 +1008,16 @@ async fn max_fence_gap_declines() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn tip_replay_after_fence() -> anyhow::Result<()> {
+async fn tip_replay_after_join() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
     h.publish_pings("u", 1..3).await?;
     eventually(WAIT, || async {
         Ok(h.tip_row_checkpoint().await? == Some(2))
     })
     .await?;
-    let lane = h.join("u", 0).await?;
-    let fence = lane.await_fenced(WAIT).await?;
-    assert_eq!(u64::from(fence), 2);
+    let lane = h.open_lane("u", 0).await?;
+    let join = lane.await_join(WAIT).await?;
+    assert_eq!(u64::from(join), 2);
 
     h.shared.fail_tip_flush_once.store(true, Ordering::SeqCst);
     h.publish_pings("u", 3..4).await?;
@@ -1030,7 +1030,7 @@ async fn tip_replay_after_fence() -> anyhow::Result<()> {
     assert_eq!(
         h.applied_by("tip", "u").await?,
         vec![3],
-        "the retry applied past the fence only, once"
+        "the retry applied past the join only, once"
     );
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![1, 2]);
     Ok(())
@@ -1045,8 +1045,8 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
         Ok(h.tip_row_checkpoint().await? == Some(3))
     })
     .await?;
-    let lane = h.join("u", 0).await?;
-    assert_eq!(u64::from(lane.await_fenced(WAIT).await?), 3);
+    let lane = h.open_lane("u", 0).await?;
+    assert_eq!(u64::from(lane.await_join(WAIT).await?), 3);
 
     h.publish_pings("u", 4..5).await?;
     eventually(WAIT, || async {
@@ -1069,12 +1069,12 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
     assert_eq!(
         listed(3),
         Some(1),
-        "a landing whose previous checkpoint is the fence still lists the join: {views:?}"
+        "a landing whose previous checkpoint is the join sequence still lists the join: {views:?}"
     );
     assert_eq!(
         listed(4),
         Some(0),
-        "once the tip's checkpoint is past the fence the join is no longer listed: {views:?}"
+        "once the tip's checkpoint is past the join sequence the join is no longer listed: {views:?}"
     );
     assert_eq!(
         h.applied_by("tip", "u").await?,
@@ -1083,19 +1083,19 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
     );
 
     let mut op = h.outbox.begin_op().await?;
-    let at_fence = h
+    let at_join = h
         .tip
         .lanes_in_op(&mut op, EventSequence::from(3u64))
         .await?;
-    assert_eq!(at_fence.joined.len(), 1);
-    assert_eq!(at_fence.joined[0].0, lane.id());
-    assert_eq!(at_fence.joined[0].2, EventSequence::from(3u64));
-    let past_fence = h
+    assert_eq!(at_join.joined.len(), 1);
+    assert_eq!(at_join.joined[0].0, lane.id());
+    assert_eq!(at_join.joined[0].2, EventSequence::from(3u64));
+    let past_join = h
         .tip
         .lanes_in_op(&mut op, EventSequence::from(4u64))
         .await?;
-    assert!(past_fence.joined.is_empty());
-    assert!(past_fence.catching_up.is_empty());
+    assert!(past_join.joined.is_empty());
+    assert!(past_join.catching_up.is_empty());
     Ok(())
 }
 
@@ -1109,7 +1109,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     )
     .with_lane_retry_settings(fast_retry_settings())
     .with_lane_max_batch_size(1)
-    .with_max_fence_gap(100);
+    .with_max_join_gap(100);
     let h = Harness::start(config).await?;
 
     h.publish(vec![ping("x", 0)]).await?;
@@ -1120,7 +1120,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
 
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.join("u", 0).await?;
+    let lane = h.open_lane("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip passes the poison row (event 2) in memory only: its committed
@@ -1148,7 +1148,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     assert_eq!(
         h.lane_record(&lane).await?,
         None,
-        "the default handle_undecodable fails the fenced landing"
+        "the default handle_undecodable fails the join landing"
     );
     assert!(
         h.lane_row_checkpoint(&lane).await?.unwrap() < 2,
@@ -1157,12 +1157,12 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     assert_eq!(h.applied_count().await?, 0);
 
     h.shared.undecodable_ok.store(true, Ordering::SeqCst);
-    let fence = lane.await_fenced(WAIT).await?;
-    assert_eq!(u64::from(fence), 4);
+    let join = lane.await_join(WAIT).await?;
+    assert_eq!(u64::from(join), 4);
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
         vec![3, 4],
-        "an overriding Ok lets the fence complete past the poison row, once"
+        "an overriding Ok lets the join complete past the poison row, once"
     );
     Ok(())
 }
@@ -1189,15 +1189,15 @@ async fn shutdown_between_landings_only() -> anyhow::Result<()> {
 
     let record = h.lane_record(&lane).await?;
     match record {
-        Some(fence) => {
-            assert_eq!(fence, Some(6), "the landing completed whole, at the fence");
+        Some(join) => {
+            assert_eq!(join, Some(6), "the landing completed whole, at the join");
             assert_eq!(h.applied_by("catch_up", "u").await?, vec![2, 3, 4, 5, 6]);
         }
         None => {
             assert_eq!(
                 h.lane_row_checkpoint(&lane).await?,
                 checkpoint_before,
-                "or it rolled back whole: no checkpoint strictly between P and the fence"
+                "or it rolled back whole: no checkpoint strictly between P and the join"
             );
             assert!(h.applied_by("catch_up", "u").await?.is_empty());
         }
@@ -1216,7 +1216,7 @@ async fn a_birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
     let mut op = h.outbox.begin_op().await?;
     let rejected = h
         .tip
-        .join_in_op(&mut op, "u".to_string(), EventSequence::from(99u64))
+        .open_lane_in_op(&mut op, "u".to_string(), EventSequence::from(99u64))
         .await;
     assert!(
         matches!(
@@ -1232,7 +1232,7 @@ async fn a_birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
+async fn cancel_in_op_ends_a_lane_without_a_join() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
     let lane = h.stage_tip_entered_first().await?;
 
@@ -1249,19 +1249,19 @@ async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
         "the ordinary keyed tombstone is left behind"
     );
 
-    // The lane is parked on the tip's lock inside its fenced landing. Once the
+    // The lane is parked on the tip's lock inside its join landing. Once the
     // tip commits, that landing must see the cancel, not claim a join.
     h.shared.tip_gate.release();
     eventually(WAIT, || async {
         Ok(h.tip_row_checkpoint().await? == Some(6))
     })
     .await?;
-    let timeout = lane.await_fenced(Duration::from_millis(600)).await;
+    let timeout = lane.await_join(Duration::from_millis(600)).await;
     assert!(
         matches!(
             timeout,
             Err(es_entity::errlanes::Fail::Rejected(
-                obix::SubscriptionRejection::LaneFenceTimeout { .. }
+                obix::SubscriptionRejection::LaneJoinTimeout { .. }
             ))
         ),
         "a cancelled lane never joins"
@@ -1273,7 +1273,7 @@ async fn cancel_in_op_ends_a_lane_without_a_fence() -> anyhow::Result<()> {
     );
     assert!(
         h.lane_flushes().await?.is_empty(),
-        "nothing of a cancelled lane lands: no fenced flush ran"
+        "nothing of a cancelled lane lands: no join flush ran"
     );
     assert!(
         h.applied_by("catch_up", "u").await?.is_empty(),

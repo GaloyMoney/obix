@@ -90,12 +90,12 @@ pub enum SubscriptionRejection {
         target: super::StreamPosition,
         waited: std::time::Duration,
     },
-    /// [`CatchUpLane::await_fenced`](super::subscription::joinable::CatchUpLane::await_fenced)
+    /// [`CatchUpLane::await_join`](super::subscription::joinable::CatchUpLane::await_join)
     /// hit its deadline before the lane joined its tip. A lane that was
     /// cancelled never joins, so it ends here too.
     #[error("lane {lane} has not joined its tip after {waited:?}")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_LANE_FENCE_TIMEOUT")]
-    LaneFenceTimeout {
+    #[rejection(code = "OBIX_SUBSCRIPTION_LANE_JOIN_TIMEOUT")]
+    LaneJoinTimeout {
         lane: super::subscription::joinable::LaneId,
         waited: std::time::Duration,
     },
@@ -151,7 +151,7 @@ pub enum JoinableFault {
     #[classify(fatal(Invariant))]
     #[error("joinable subscription {job_type} was used before spawn")]
     NotSpawned { job_type: ::job::JobType },
-    /// A fenced landing's drain pulled the lane's own stream and it ended
+    /// A join landing's drain pulled the lane's own stream and it ended
     /// before `through`. The events up to the tip's committed checkpoint are
     /// committed, so a stream that ends there is a closed listener, not a
     /// short stream. The landing rolls back and the lane retries.

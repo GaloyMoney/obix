@@ -1,9 +1,9 @@
 //! The catch-up lane's runner: one `job` execution per live lane.
 //!
 //! A lane consumes the stream from its birth position through the same handler
-//! as the tip, and ends in one fenced landing under the tip's lock. Unlike a
-//! keyed member it never passivates and never pauses, and it attempts the
-//! fence whenever it has caught up with what is ready, including on skips
+//! as the tip, and ends in one join landing under the tip's lock. Unlike a
+//! keyed member it never passivates and never pauses, and it attempts to
+//! join whenever it has caught up with what is ready, including on skips
 //! alone.
 
 use es_entity::errlanes::ResultExt;
@@ -31,8 +31,8 @@ pub(in crate::out) struct LaneMsg {
 }
 
 /// One lane's flush bridge and checkpoint mirror in a single struct, so the
-/// fence the loop sets before the fenced landing is the one both the flush
-/// (as [`Scope`]) and the retirement (as the join record) read.
+/// join sequence the loop sets before the join landing is the one both the
+/// flush (as [`Scope`]) and the retirement (as the join record) read.
 struct LaneRun<S, P, Tables>
 where
     S: JoinableSubscriber<P>,
@@ -43,7 +43,7 @@ where
     tip_type: JobType,
     lane_type: JobType,
     key: String,
-    fence: Mutex<Option<EventSequence>>,
+    join: Mutex<Option<EventSequence>>,
     _marker: PhantomData<fn() -> (P, Tables)>,
 }
 
@@ -52,12 +52,12 @@ where
     S: JoinableSubscriber<P>,
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    fn fence(&self) -> Option<EventSequence> {
-        *self.fence.lock().expect("lane fence lock poisoned")
+    fn join(&self) -> Option<EventSequence> {
+        *self.join.lock().expect("lane join lock poisoned")
     }
 
-    fn set_fence(&self, fence: Option<EventSequence>) {
-        *self.fence.lock().expect("lane fence lock poisoned") = fence;
+    fn set_join(&self, join: Option<EventSequence>) {
+        *self.join.lock().expect("lane join lock poisoned") = join;
     }
 }
 
@@ -74,19 +74,19 @@ where
         state: &'a OutboxEventJobState,
     ) -> BoxFuture<'a, Result<FlushOutcome, HandlerError>> {
         Box::pin(async move {
-            let fence = self.fence();
+            let join = self.join();
             let mut op = FlushOp::<InsertOrder>::new(op, state.sequence);
             self.subscriber
                 .flush(
                     &mut op,
                     Scope::CatchUp {
                         unit: &self.unit,
-                        fence,
+                        join,
                     },
                     items,
                 )
                 .await?;
-            Ok(if fence.is_some() {
+            Ok(if join.is_some() {
                 FlushOutcome::Finish
             } else {
                 FlushOutcome::Continue
@@ -131,7 +131,7 @@ where
                 self.tip_type.as_str(),
                 self.lane_type.as_str(),
                 &self.key,
-                self.fence(),
+                self.join(),
             )
             .await
         })
@@ -150,7 +150,7 @@ where
     lane_type: JobType,
     retry_settings: RetrySettings,
     max_batch_size: usize,
-    max_fence_gap: u64,
+    max_join_gap: u64,
     checkpoint_interval: std::time::Duration,
     max_concurrent_per_process: Option<usize>,
 }
@@ -175,7 +175,7 @@ where
             lane_type,
             retry_settings: config.lane_retry_settings.clone(),
             max_batch_size: config.lane_max_batch_size,
-            max_fence_gap: config.max_fence_gap,
+            max_join_gap: config.max_join_gap,
             checkpoint_interval: config.tip.checkpoint_interval,
             max_concurrent_per_process: config.max_concurrent_lanes_per_process,
         }
@@ -221,7 +221,7 @@ where
             lane_type: self.lane_type.clone(),
             key: lane,
             max_batch_size: self.max_batch_size,
-            max_fence_gap: self.max_fence_gap,
+            max_join_gap: self.max_join_gap,
             checkpoint_interval: self.checkpoint_interval,
         }))
     }
@@ -239,11 +239,11 @@ where
     lane_type: JobType,
     key: String,
     max_batch_size: usize,
-    max_fence_gap: u64,
+    max_join_gap: u64,
     checkpoint_interval: std::time::Duration,
 }
 
-/// The lane loop's mutable state, together, so the fenced landing can take it
+/// The lane loop's mutable state, together, so the join landing can take it
 /// as one `&mut self`.
 struct LaneLoop<'r, S, P, Tables>
 where
@@ -274,7 +274,7 @@ where
     }
 
     /// An ordinary landing: the pending batch and the checkpoint, with no
-    /// fence.
+    /// join.
     async fn land_ordinary(&mut self, reason: &'static str) -> Result<Landed, HandlerError> {
         let mut parts = CtxParts {
             op_slot: &mut self.op_slot,
@@ -301,7 +301,7 @@ where
         Ok(outcome)
     }
 
-    /// Land the pending batch, as the fenced landing when the lane has reached
+    /// Land the pending batch, as the join landing when the lane has reached
     /// the tip and as an ordinary one otherwise.
     ///
     /// The tip row's lock is the first statement on the landing op, taken
@@ -317,7 +317,7 @@ where
         &mut self,
         outbox: &Outbox<P, Tables>,
         tip_type: &JobType,
-        max_fence_gap: u64,
+        max_join_gap: u64,
         reason: &'static str,
     ) -> Result<Landed, HandlerError> {
         let position = self.state.sequence;
@@ -339,7 +339,7 @@ where
             return self.land_ordinary(reason).await;
         };
         let gap = u64::from(tip).saturating_sub(u64::from(position));
-        if gap > max_fence_gap || tip > outbox.persistent_cache_handle().head() {
+        if gap > max_join_gap || tip > outbox.persistent_cache_handle().head() {
             return self.land_ordinary(reason).await;
         }
 
@@ -368,7 +368,7 @@ where
             }
         }
 
-        self.run.set_fence(Some(position.max(tip)));
+        self.run.set_join(Some(position.max(tip)));
         let mut parts = CtxParts {
             op_slot: &mut self.op_slot,
             current_job: &mut self.current_job,
@@ -376,8 +376,8 @@ where
             tracker: &mut self.tracker,
             landing: Keyed(self.run),
         };
-        let landed = flush_fenced(&mut parts, &mut self.batch, self.run, "fenced").await;
-        self.run.set_fence(None);
+        let landed = flush_joining(&mut parts, &mut self.batch, self.run, "join").await;
+        self.run.set_join(None);
         landed
     }
 }
@@ -414,7 +414,7 @@ where
             tip_type: self.tip_type.clone(),
             lane_type: self.lane_type.clone(),
             key: self.key.clone(),
-            fence: Mutex::new(None),
+            join: Mutex::new(None),
             _marker: PhantomData,
         };
         let persistent = self.outbox.listen_persisted(Some(state.sequence));
@@ -478,7 +478,7 @@ where
                             "caught_up"
                         };
                         let landed = lane
-                            .try_land(&self.outbox, &self.tip_type, self.max_fence_gap, reason)
+                            .try_land(&self.outbox, &self.tip_type, self.max_join_gap, reason)
                             .await?;
                         if let Landed::Finished(op) = landed {
                             return Ok(job::JobCompletion::CompleteWithOp(op));
@@ -547,7 +547,7 @@ where
                             .try_land(
                                 &self.outbox,
                                 &self.tip_type,
-                                self.max_fence_gap,
+                                self.max_join_gap,
                                 "batch_full",
                             )
                             .await?;
