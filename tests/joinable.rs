@@ -16,9 +16,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use obix::{
-    CatchUpLane, EventSequence, FlushOp, Handled, InsertOrder, JoinableConfig, JoinableEventCtx,
-    JoinableHandle, JoinableSubscriber, MailboxConfig, OutboxEventJobConfig, Scope,
-    UndecodableDelivery, out::Outbox,
+    CatchUpLane, EventSequence, FlushOp, Handled, InsertOrder, JoinableEventCtx, JoinableHandle,
+    JoinableSubscriber, JoinableSubscriberConfig, MailboxConfig, Scope, UndecodableDelivery,
+    out::Outbox,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -196,7 +196,7 @@ impl JoinableSubscriber<TestEvent> for Applier {
                     .shared
                     .handle
                     .get()
-                    .expect("handle is set before spawn");
+                    .expect("handle is set before registration");
                 let lanes = handle.lanes_in_op(&mut *op, since).await?;
                 self.shared.tip_views.lock().await.push(TipView {
                     since: u64::from(since),
@@ -323,13 +323,11 @@ fn retry_settings(initial: Duration, max: Duration) -> job::RetrySettings {
     }
 }
 
-fn test_config() -> JoinableConfig {
-    JoinableConfig::new(
-        OutboxEventJobConfig::new(job::JobType::new(TIP))
-            .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
-            .with_retry_settings(fast_retry_settings()),
-    )
-    .with_lane_retry_settings(fast_retry_settings())
+fn test_config() -> JoinableSubscriberConfig {
+    JoinableSubscriberConfig::new(job::JobType::new(TIP))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
+        .with_retry_settings(fast_retry_settings())
+        .with_lane_retry_settings(fast_retry_settings())
 }
 
 struct Harness {
@@ -341,7 +339,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(config: JoinableConfig) -> anyhow::Result<Self> {
+    async fn start(config: JoinableSubscriberConfig) -> anyhow::Result<Self> {
         let pool = init_pool().await?;
         let job_config = job::JobSvcConfig::builder()
             .pool(pool.clone())
@@ -381,6 +379,8 @@ impl Harness {
         .await?;
 
         let outbox = TestOutbox::init(&pool, MailboxConfig::builder().build()).await?;
+        // The address is minted before registration and handed to the handler,
+        // which reads lanes through it: the cycle the address exists to break.
         let tip: TestHandle = outbox.joinable(job::JobType::new(TIP));
         let shared = Shared::default();
         shared.undecodable_ok.store(true, Ordering::SeqCst);
@@ -388,14 +388,19 @@ impl Harness {
             .handle
             .set(tip.clone())
             .unwrap_or_else(|_| unreachable!("fresh shared"));
-        tip.spawn(
-            &mut jobs,
-            config,
-            Applier {
-                shared: shared.clone(),
-            },
-        )
-        .await?;
+        let registered = outbox
+            .register_joinable_subscriber(
+                &mut jobs,
+                config,
+                Applier {
+                    shared: shared.clone(),
+                },
+            )
+            .await?;
+        assert!(
+            registered.load().await.is_ok() && tip.load().await.is_ok(),
+            "the returned handle and the address minted beforehand both resolve"
+        );
         jobs.start_poll().await?;
 
         let harness = Self {
@@ -435,11 +440,11 @@ impl Harness {
         Ok(())
     }
 
-    async fn open_lane(&self, unit: &str, start_after: u64) -> anyhow::Result<TestLane> {
+    async fn start_catch_up(&self, unit: &str, start_after: u64) -> anyhow::Result<TestLane> {
         let mut op = self.outbox.begin_op().await?;
         let lane = self
             .tip
-            .open_lane_in_op(&mut op, unit.to_string(), EventSequence::from(start_after))
+            .start_catch_up_in_op(&mut op, unit.to_string(), EventSequence::from(start_after))
             .await?;
         op.commit().await?;
         Ok(lane)
@@ -547,7 +552,7 @@ impl Harness {
 
         self.shared.handle_gate_seq.store(1, Ordering::SeqCst);
         self.shared.handle_gate.arm();
-        let lane = self.open_lane("u", 0).await?;
+        let lane = self.start_catch_up("u", 0).await?;
         eventually(WAIT, || async { Ok(self.shared.handle_gate.is_parked()) }).await?;
 
         self.shared.tip_gate.arm();
@@ -577,7 +582,7 @@ fn ping(key: &str, n: u64) -> TestEvent {
     }
 }
 
-fn staged_config() -> JoinableConfig {
+fn staged_config() -> JoinableSubscriberConfig {
     test_config()
         .with_lane_max_batch_size(2)
         .with_max_join_gap(100)
@@ -606,12 +611,17 @@ where
 #[file_serial]
 async fn the_tip_lands_under_scope_tip_and_mirrors_its_checkpoint() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
-    let unspawned: TestHandle = h
+    let unregistered: TestHandle = h
         .outbox
-        .joinable(job::JobType::new("test-joinable-unspawned"));
+        .joinable(job::JobType::new("test-joinable-unregistered"));
     assert!(
-        unspawned.load().await.is_err(),
-        "an address used before spawn has no registration to read"
+        unregistered.load().await.is_err() && unregistered.tip().is_err(),
+        "an address with no registration behind it has nothing to read"
+    );
+    assert_eq!(
+        h.tip.tip()?.load().await?.checkpoint(),
+        h.tip.load().await?.checkpoint(),
+        "the tip's Subscription reads the same checkpoint as the handle"
     );
 
     h.publish_pings("a", 1..4).await?;
@@ -701,7 +711,7 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     let join = lane.await_join(WAIT).await?;
 
     assert!(u64::from(join) >= 4);
@@ -811,15 +821,13 @@ async fn join_entered_first() -> anyhow::Result<()> {
 #[tokio::test]
 #[file_serial]
 async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
-    let slow_tip = JoinableConfig::new(
-        OutboxEventJobConfig::new(job::JobType::new(TIP))
-            .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
-            .with_retry_settings(retry_settings(
-                Duration::from_millis(1000),
-                Duration::from_millis(1500),
-            )),
-    )
-    .with_lane_retry_settings(fast_retry_settings());
+    let slow_tip = JoinableSubscriberConfig::new(job::JobType::new(TIP))
+        .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
+        .with_retry_settings(retry_settings(
+            Duration::from_millis(1000),
+            Duration::from_millis(1500),
+        ))
+        .with_lane_retry_settings(fast_retry_settings());
     let h = Harness::start(slow_tip).await?;
 
     h.publish(vec![ping("x", 0)]).await?;
@@ -831,7 +839,7 @@ async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
     // The lane is held at an event the tip has already passed.
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip is stalled: every landing fails, and the retry backoff keeps it
@@ -888,7 +896,7 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut op = outbox.begin_op().await?;
             let lane = tip
-                .open_lane_in_op(&mut op, "u".to_string(), EventSequence::BEGIN)
+                .start_catch_up_in_op(&mut op, "u".to_string(), EventSequence::BEGIN)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             op.commit().await?;
@@ -983,7 +991,7 @@ async fn empty_batch_join_landing() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     let join = lane.await_join(WAIT).await?;
 
     assert_eq!(u64::from(join), 3);
@@ -1041,7 +1049,7 @@ async fn tip_replay_after_join() -> anyhow::Result<()> {
         Ok(h.tip_row_checkpoint().await? == Some(2))
     })
     .await?;
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     let join = lane.await_join(WAIT).await?;
     assert_eq!(u64::from(join), 2);
 
@@ -1071,7 +1079,7 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
         Ok(h.tip_row_checkpoint().await? == Some(3))
     })
     .await?;
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     assert_eq!(u64::from(lane.await_join(WAIT).await?), 3);
 
     h.publish_pings("u", 4..5).await?;
@@ -1128,14 +1136,12 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
 #[tokio::test]
 #[file_serial]
 async fn undecodable_inside_drain() -> anyhow::Result<()> {
-    let config = JoinableConfig::new(
-        OutboxEventJobConfig::new(job::JobType::new(TIP))
-            .with_checkpoint_interval(Duration::from_secs(3600))
-            .with_retry_settings(fast_retry_settings()),
-    )
-    .with_lane_retry_settings(fast_retry_settings())
-    .with_lane_max_batch_size(1)
-    .with_max_join_gap(100);
+    let config = JoinableSubscriberConfig::new(job::JobType::new(TIP))
+        .with_checkpoint_interval(Duration::from_secs(3600))
+        .with_retry_settings(fast_retry_settings())
+        .with_lane_retry_settings(fast_retry_settings())
+        .with_lane_max_batch_size(1)
+        .with_max_join_gap(100);
     let h = Harness::start(config).await?;
 
     // The unit's own event at 1, so the lane's first batch is full at 1 and
@@ -1148,7 +1154,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
 
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.open_lane("u", 0).await?;
+    let lane = h.start_catch_up("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip passes the poison row (event 2) in memory only: its committed
@@ -1244,7 +1250,7 @@ async fn a_birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
     let mut op = h.outbox.begin_op().await?;
     let rejected = h
         .tip
-        .open_lane_in_op(&mut op, "u".to_string(), EventSequence::from(99u64))
+        .start_catch_up_in_op(&mut op, "u".to_string(), EventSequence::from(99u64))
         .await;
     assert!(
         matches!(
@@ -1314,5 +1320,43 @@ async fn cancel_in_op_ends_a_lane_without_a_join() -> anyhow::Result<()> {
     let mut op = h.outbox.begin_op().await?;
     let lanes = h.tip.lanes_in_op(&mut op, EventSequence::BEGIN).await?;
     assert!(lanes.catching_up.is_empty() && lanes.joined.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn cancel_standalone_ends_a_lane_and_is_a_no_op_once_joined() -> anyhow::Result<()> {
+    let h = Harness::start(test_config()).await?;
+    h.publish(vec![ping("x", 0)]).await?;
+    eventually(WAIT, || async {
+        Ok(h.tip_row_checkpoint().await? == Some(1))
+    })
+    .await?;
+
+    // Held in its first handle, so it is live when cancelled.
+    h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
+    h.shared.handle_gate.arm();
+    let lane = h.start_catch_up("u", 0).await?;
+    eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
+
+    lane.cancel().await?;
+    assert_eq!(h.lane_record(&lane).await?, Some(None));
+    assert!(h.has_tombstone(&lane).await?);
+    h.shared.handle_gate.release();
+    eventually(WAIT, || async {
+        Ok(h.lane_row_checkpoint(&lane).await?.is_none())
+    })
+    .await?;
+
+    // A lane that joined keeps its join record through a later cancel.
+    let joined = h.start_catch_up("v", 0).await?;
+    let join = joined.await_join(WAIT).await?;
+    let re_derived = h.tip.lane(joined.id());
+    re_derived.cancel().await?;
+    assert_eq!(
+        h.lane_record(&joined).await?,
+        Some(Some(u64::from(join) as i64)),
+        "cancelling a joined lane changes nothing"
+    );
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::{marker::PhantomData, sync::Arc, sync::Mutex};
 
 use job::{CurrentJob, Job, JobType, RetrySettings};
 
-use super::{JoinableConfig, JoinableSubscriber, Scope};
+use super::{JoinableSubscriber, JoinableSubscriberConfig, Scope};
 use crate::out::Outbox;
 use crate::out::ctx::*;
 use crate::out::error::{CouldNotDecodeStored as Undecodable, JoinableFault};
@@ -167,19 +167,18 @@ where
     pub(in crate::out) fn new(
         outbox: Outbox<P, Tables>,
         subscriber: Arc<S>,
-        tip_type: JobType,
         lane_type: JobType,
-        config: &JoinableConfig,
+        config: &JoinableSubscriberConfig,
     ) -> Self {
         Self {
             outbox,
             subscriber,
-            tip_type,
+            tip_type: config.job_type.clone(),
             lane_type,
             retry_settings: config.lane_retry_settings.clone(),
             max_batch_size: config.lane_max_batch_size,
             max_join_gap: config.max_join_gap,
-            checkpoint_interval: config.tip.checkpoint_interval,
+            checkpoint_interval: config.checkpoint_interval,
             max_concurrent_per_process: config.max_concurrent_lanes_per_process,
         }
     }

@@ -10,7 +10,7 @@ use job::{
     RetrySettings,
 };
 
-use super::{JoinableConfig, JoinableSubscriber, Scope};
+use super::{JoinableSubscriber, JoinableSubscriberConfig, Scope};
 use crate::out::Outbox;
 use crate::out::ctx::*;
 use crate::out::event::{EventDelivery, UndecodableDelivery};
@@ -108,16 +108,15 @@ where
     pub(in crate::out) fn new(
         outbox: Outbox<P, Tables>,
         subscriber: Arc<S>,
-        job_type: JobType,
-        config: &JoinableConfig,
+        config: &JoinableSubscriberConfig,
     ) -> Self {
         Self {
             outbox,
             subscriber,
-            job_type,
-            retry_settings: config.tip.retry_settings.clone(),
-            max_batch_size: config.tip.max_batch_size,
-            checkpoint_interval: config.tip.checkpoint_interval,
+            job_type: config.job_type.clone(),
+            retry_settings: config.retry_settings.clone(),
+            max_batch_size: config.max_batch_size,
+            checkpoint_interval: config.checkpoint_interval,
         }
     }
 }

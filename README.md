@@ -186,12 +186,15 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 A consumer that folds many units in one pass (a rollup, a projection keyed by many entities) cannot add a unit with history without a second cursor: the live writer is at `C`, the new unit needs the stream from an earlier position. A *joinable* subscriber is one handler run by two runners: a **tip**, the live writer (a resident job, like a singleton), and any number of **catch-up lanes**, one per unit, each born at an earlier position.
 
 ```rust
-let tip = outbox.joinable::<Unit>(JobType::new("rollup"));
-tip.spawn(&mut jobs, JoinableConfig::new(OutboxEventJobConfig::new(JobType::new("rollup"))), Rollup::new(&tip))
+// An address, usable before registration — so a service that starts
+// catch-ups can hold it without depending on the handler.
+let tip: JoinableHandle<_, Unit, _> = outbox.joinable(JobType::new("rollup"));
+outbox
+    .register_joinable_subscriber(&mut jobs, JoinableSubscriberConfig::new(JobType::new("rollup")), Rollup::new(&tip))
     .await?;
 
 // In the op that creates the unit:
-let lane = tip.open_lane_in_op(&mut op, unit, EventSequence::BEGIN).await?;
+let lane = tip.start_catch_up_in_op(&mut op, unit, EventSequence::BEGIN).await?;
 // Later:
 let joined_at = lane.await_join(Duration::from_secs(30)).await?;
 ```
@@ -214,7 +217,7 @@ obix does **not** decide which events belong to a unit. Both `handle` and `flush
 3. Seam state is read **on `op`** — the handler's own columns written by a lane's joining `flush`, or `JoinableHandle::lanes_in_op(op, since)` — never from the pool or from a cache across landings.
 4. Apply an event to a unit only if its sequence is past the one the unit joined at, and never while the unit's lane is live. (With a lane ahead of the tip, it joins at its own position, and the tip's next landings contain events at or below it that belong to the lane.)
 
-`lanes_in_op` lists the lanes still catching up and the joins at or above `since`; a tip passes its previous checkpoint, which bounds the list by construction. `JoinableConfig::max_join_gap` (default: `lane_max_batch_size`) bounds how far past its position a join landing drains while it holds the tip's lock: past it, or when this process has not yet seen the tip's checkpoint, the landing is an ordinary one and the lane keeps catching up. Correctness never depends on it.
+`lanes_in_op` lists the lanes still catching up and the joins at or above `since`; a tip passes its previous checkpoint, which bounds the list by construction. `JoinableSubscriberConfig::max_join_gap` (default: `lane_max_batch_size`) bounds how far past its position a join landing drains while it holds the tip's lock: past it, or when this process has not yet seen the tip's checkpoint, the landing is an ordinary one and the lane keeps catching up. Correctness never depends on it.
 
 Adopting this changes the schema: two tables, `joinable_tips` (the tip's lock row and mirrored checkpoint) and `joinable_lanes` (each ended lane's unit and the sequence it joined at, or none if cancelled), both keyed by the tip's job type. Lanes are otherwise ordinary keyed rows in `subscriptions`, and leave the ordinary tombstone in `retired_subscriptions` when they end.
 
@@ -258,9 +261,9 @@ re-exported from `obix::`, `obix::out::` and
 
 | carrier | returned by |
 |---|---|
-| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `JoinableHandle::spawn`/`lanes_in_op`, `CatchUpLane::cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
+| `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `register_joinable_subscriber`, `JoinableHandle::tip`/`lanes_in_op`, `CatchUpLane::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op`, `JoinableHandle::load`/`open_lane_in_op` (`BirthAheadOfFrontier`), `CatchUpLane::load`/`await_join` (`LaneJoinTimeout`: the `await_position` deadline shape, with the lane and the wait) |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op`, `JoinableHandle::load`/`start_catch_up_in_op` (`BirthAheadOfFrontier`), `CatchUpLane::load`/`await_join` (`LaneJoinTimeout`: the `await_position` deadline shape, with the lane and the wait) |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
 
 `ObixFault` is `obix::ObixFault`; `Fail` and `lanes!` come from `errlanes`,
@@ -299,7 +302,7 @@ chain — which is how a handler reaches job's dispositions: a `Transient`
 congestion kind reschedules without spending an attempt, and the lane of any
 other error picks the retry band (`Transient` retries on the short band,
 `Fatal` on the long one) of the `RetrySettings` you pass through
-`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `InboxConfig`. Retrying
+`OutboxEventJobConfig` / `KeyedSubscriberConfig` / `JoinableSubscriberConfig` / `InboxConfig`. Retrying
 never stops on its own: the only terminal verdict is
 `InboxResult::Fail(error)`, which ends one inbox event and its job, and
 subscribers (singleton and keyed) have no equivalent. A boxed `Fail::Rejected` has **no surviving marker** and simply

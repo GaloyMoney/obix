@@ -23,7 +23,8 @@ mod runner;
 
 use es_entity::errlanes::{Fail, ResultExt, lanes};
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use job::{JobType, Jobs, RetrySettings};
@@ -35,7 +36,7 @@ use crate::out::ctx::{FlushOp, Handled, JoinableEventCtx};
 use crate::out::error::{CouldNotDecodeStored as Undecodable, JoinableFault};
 use crate::out::event::{EventDelivery, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
-use crate::out::subscription::singleton::{OutboxEventJobConfig, OutboxEventJobData};
+use crate::out::subscription::singleton::OutboxEventJobData;
 use crate::out::subscription::{
     INITIAL_POLL_INTERVAL, MAX_POLL_INTERVAL, Subscription, SubscriptionRejection,
     SubscriptionSnapshot,
@@ -45,7 +46,8 @@ use crate::tables::{DefaultMailboxTables, MailboxTables};
 
 es_entity::entity_id! { LaneId }
 
-const DEFAULT_LANE_MAX_BATCH_SIZE: usize = 100;
+const DEFAULT_MAX_BATCH_SIZE: usize = 100;
+const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A handler run by a tip and by catch-up lanes.
 ///
@@ -144,13 +146,24 @@ impl<U> Clone for Scope<'_, U> {
 
 impl<U> Copy for Scope<'_, U> {}
 
-/// Tuning for one joinable registration.
+/// Tuning for one joinable registration: the tip's dials, as for a
+/// singleton's [`OutboxEventJobConfig`](crate::out::OutboxEventJobConfig),
+/// and the lanes'.
 #[derive(Clone)]
-pub struct JoinableConfig {
-    /// Batch size, checkpoint interval and retry of the tip, as for a
-    /// singleton. Its `job_type` is ignored: a joinable's identity is the job
-    /// type its [`JoinableHandle`] was addressed with.
-    pub tip: OutboxEventJobConfig,
+pub struct JoinableSubscriberConfig {
+    /// The tip's job type, and the joinable's identity: the job type an
+    /// address from [`Outbox::joinable`] names. Lanes run under
+    /// `"<job_type>.lane"`.
+    pub job_type: JobType,
+    /// Backoff for the tip when its handler errors. Default
+    /// [`RetrySettings::default`].
+    pub retry_settings: RetrySettings,
+    /// Backstop on how many collected events may share one tip batch.
+    /// Default 100.
+    pub max_batch_size: usize,
+    /// Maximum staleness of a persisted checkpoint over skip-only stretches,
+    /// for the tip and for every lane. Default 5s.
+    pub checkpoint_interval: Duration,
     /// Backstop on how many collected events may share one lane batch.
     /// Default 100.
     pub lane_max_batch_size: usize,
@@ -162,24 +175,43 @@ pub struct JoinableConfig {
     pub max_concurrent_lanes_per_process: Option<usize>,
     /// A join landing drains at most this many sequences past the lane's
     /// position. If the tip is further ahead under the lock, the landing is an
-    /// ordinary one (`join: None`, lock held for this landing only) and the
-    /// lane keeps catching up. Bounds the tip stall by construction;
+    /// ordinary one ([`Scope::CatchUp`], lock held for this landing only) and
+    /// the lane keeps catching up. Bounds the tip stall by construction;
     /// correctness never depends on it. Defaults to
     /// [`lane_max_batch_size`](Self::lane_max_batch_size).
     pub max_join_gap: u64,
 }
 
-impl JoinableConfig {
-    pub fn new(tip: OutboxEventJobConfig) -> Self {
+impl JoinableSubscriberConfig {
+    pub fn new(job_type: JobType) -> Self {
         Self {
-            tip,
-            lane_max_batch_size: DEFAULT_LANE_MAX_BATCH_SIZE,
+            job_type,
+            retry_settings: RetrySettings::default(),
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            lane_max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             lane_retry_settings: RetrySettings::default(),
             max_concurrent_lanes_per_process: None,
-            max_join_gap: DEFAULT_LANE_MAX_BATCH_SIZE as u64,
+            max_join_gap: DEFAULT_MAX_BATCH_SIZE as u64,
         }
     }
 
+    pub fn with_retry_settings(mut self, settings: RetrySettings) -> Self {
+        self.retry_settings = settings;
+        self
+    }
+
+    pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
+        self.max_batch_size = max_batch_size.max(1);
+        self
+    }
+
+    pub fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
+    /// Also resets [`max_join_gap`](Self::max_join_gap) to the new size.
     pub fn with_lane_max_batch_size(mut self, lane_max_batch_size: usize) -> Self {
         self.lane_max_batch_size = lane_max_batch_size.max(1);
         self.max_join_gap = self.lane_max_batch_size as u64;
@@ -202,7 +234,9 @@ impl JoinableConfig {
     }
 }
 
-struct Registered<P, Tables>
+/// One registered joinable: what [`Outbox::register_joinable_subscriber`]
+/// stores on the outbox and every address for its job type resolves to.
+pub(in crate::out) struct Registered<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
@@ -211,6 +245,11 @@ where
     lane_job_type: JobType,
     lane_spawner: job::KeyedJobSpawner<LaneMsg>,
 }
+
+/// The joinables registered on one outbox, by the tip's job type. Shared
+/// across the outbox's clones, like its other registries.
+pub(in crate::out) type Registrations<P, Tables> =
+    Arc<RwLock<HashMap<JobType, Arc<Registered<P, Tables>>>>>;
 
 /// The lanes of one joinable as of a landing op, from
 /// [`JoinableHandle::lanes_in_op`].
@@ -223,38 +262,34 @@ pub struct Lanes<U> {
     pub joined: Vec<(LaneId, U, EventSequence)>,
 }
 
-struct Shared<P, Tables>
+/// An address for one joinable subscription, keyed by the tip's job type.
+///
+/// An address, not a registration: it names the job type and resolves the
+/// registration on the outbox at each call, so it can be minted before
+/// [`register_joinable_subscriber`](Outbox::register_joinable_subscriber)
+/// runs and any address for the job type works once it has. A service that
+/// starts catch-ups can therefore hold one without depending on the handler
+/// that depends on the service, which is also why it is parameterised by the
+/// **unit** and not the handler type. Cheap to clone. Calls that need the
+/// registration fail with a `Fatal` fault until it exists.
+pub struct JoinableHandle<P, U, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     outbox: Outbox<P, Tables>,
     job_type: JobType,
-    registered: OnceLock<Registered<P, Tables>>,
-}
-
-/// An address for one joinable subscription, keyed by the tip's job type.
-///
-/// Cheap to clone and usable before [`spawn`](Self::spawn) — it holds no
-/// registration of its own, so a service that starts catch-ups can hold it
-/// without depending on the handler that depends on the service. It is
-/// parameterised by the **unit**, not the handler type, for that reason.
-/// Calls that need the registration fail with a `Fatal` fault until `spawn`
-/// has run.
-pub struct JoinableHandle<P, U, Tables = DefaultMailboxTables>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    shared: Arc<Shared<P, Tables>>,
     _unit: std::marker::PhantomData<fn() -> U>,
 }
 
 impl<P, U, Tables> Clone for JoinableHandle<P, U, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    Tables: MailboxTables,
 {
     fn clone(&self) -> Self {
         Self {
-            shared: self.shared.clone(),
+            outbox: self.outbox.clone(),
+            job_type: self.job_type.clone(),
             _unit: std::marker::PhantomData,
         }
     }
@@ -267,16 +302,74 @@ where
 {
     /// An address for the joinable subscription whose tip runs as
     /// `job_type`. An address, not a registration: usable before
-    /// [`spawn`](JoinableHandle::spawn), `Clone`, cheap.
+    /// [`register_joinable_subscriber`](Self::register_joinable_subscriber),
+    /// `Clone`, cheap.
     pub fn joinable<U>(&self, job_type: JobType) -> JoinableHandle<P, U, Tables> {
         JoinableHandle {
-            shared: Arc::new(Shared {
-                outbox: self.clone(),
-                job_type,
-                registered: OnceLock::new(),
-            }),
+            outbox: self.clone(),
+            job_type,
             _unit: std::marker::PhantomData,
         }
+    }
+
+    /// The body of
+    /// [`register_joinable_subscriber`](Self::register_joinable_subscriber).
+    pub(in crate::out) async fn register_joinable<S>(
+        &self,
+        jobs: &mut Jobs,
+        config: JoinableSubscriberConfig,
+        handler: S,
+    ) -> Result<JoinableHandle<P, S::Unit, Tables>, ObixFault>
+    where
+        S: JoinableSubscriber<P>,
+    {
+        let job_type = config.job_type.clone();
+        Tables::ensure_tip_row(self.pool(), job_type.as_str()).await?;
+
+        let handler = Arc::new(handler);
+        let tip_initializer =
+            runner::TipJobInitializer::<S, P, Tables>::new(self.clone(), handler.clone(), &config);
+        let tip_spawner = jobs.add_resident_initializer(tip_initializer);
+
+        // Leaked once per registration: the job crate only accepts `&'static str`.
+        let lane_job_type = JobType::new(Box::leak(format!("{job_type}.lane").into_boxed_str()));
+        let lane_initializer = LaneJobInitializer::<S, P, Tables>::new(
+            self.clone(),
+            handler,
+            lane_job_type.clone(),
+            &config,
+        );
+        let lane_spawner = jobs.add_keyed_initializer(lane_initializer);
+
+        let job = tip_spawner.spawn(OutboxEventJobData::default()).await?;
+        let tip = Subscription::new(job, self.pool().clone(), None);
+        self.joinable_registrations
+            .write()
+            .expect("joinable registrations poisoned")
+            .entry(job_type.clone())
+            .or_insert_with(|| {
+                Arc::new(Registered {
+                    tip,
+                    jobs: jobs.clone(),
+                    lane_job_type,
+                    lane_spawner,
+                })
+            });
+        Ok(self.joinable(job_type))
+    }
+
+    fn joinable_registration(
+        &self,
+        job_type: &JobType,
+    ) -> Result<Arc<Registered<P, Tables>>, JoinableFault> {
+        self.joinable_registrations
+            .read()
+            .expect("joinable registrations poisoned")
+            .get(job_type)
+            .cloned()
+            .ok_or_else(|| JoinableFault::NotRegistered {
+                job_type: job_type.clone(),
+            })
     }
 }
 
@@ -285,70 +378,20 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    /// Register the tip (a resident job under the handle's job type) and the
-    /// lane job type (a keyed job under `"<job type>.lane"`) for `handler`.
-    /// Must run before [`Jobs::start_poll`](job::Jobs::start_poll), like the
-    /// other registrations.
-    ///
-    /// Idempotent per job type, as
+    fn registered(&self) -> Result<Arc<Registered<P, Tables>>, JoinableFault> {
+        self.outbox.joinable_registration(&self.job_type)
+    }
+
+    /// The tip as a [`Subscription`]: its checkpoint, frontier, job status
+    /// and the `await_position`/`await_caught_up` barriers, as
     /// [`register_singleton_subscriber`](Outbox::register_singleton_subscriber)
-    /// is. The lane job type's name is leaked once per call: the job crate
-    /// only accepts `&'static str`.
-    #[es_entity::errlanes::instrument(name = "obix.joinable.spawn", skip_all)]
-    pub async fn spawn<S>(
-        &self,
-        jobs: &mut Jobs,
-        config: JoinableConfig,
-        handler: S,
-    ) -> Result<(), ObixFault>
-    where
-        S: JoinableSubscriber<P, Unit = U>,
-    {
-        let shared = &self.shared;
-        Tables::ensure_tip_row(shared.outbox.pool(), shared.job_type.as_str()).await?;
-
-        let handler = Arc::new(handler);
-        let tip_initializer = runner::TipJobInitializer::<S, P, Tables>::new(
-            shared.outbox.clone(),
-            handler.clone(),
-            shared.job_type.clone(),
-            &config,
-        );
-        let tip_spawner = jobs.add_resident_initializer(tip_initializer);
-
-        let lane_job_type = JobType::new(Box::leak(
-            format!("{}.lane", shared.job_type).into_boxed_str(),
-        ));
-        let lane_initializer = LaneJobInitializer::<S, P, Tables>::new(
-            shared.outbox.clone(),
-            handler,
-            shared.job_type.clone(),
-            lane_job_type.clone(),
-            &config,
-        );
-        let lane_spawner = jobs.add_keyed_initializer(lane_initializer);
-
-        let job = tip_spawner.spawn(OutboxEventJobData::default()).await?;
-        let tip = Subscription::new(job, shared.outbox.pool().clone(), None);
-        let _ = shared.registered.set(Registered {
-            tip,
-            jobs: jobs.clone(),
-            lane_job_type,
-            lane_spawner,
-        });
-        Ok(())
+    /// hands back for a singleton.
+    pub fn tip(&self) -> Result<Subscription<P, InsertOrder, Tables>, ObixFault> {
+        Ok(self.registered()?.tip.clone())
     }
 
-    fn registered(&self) -> Result<&Registered<P, Tables>, JoinableFault> {
-        self.shared
-            .registered
-            .get()
-            .ok_or_else(|| JoinableFault::NotSpawned {
-                job_type: self.shared.job_type.clone(),
-            })
-    }
-
-    /// The tip's checkpoint, frontier and job status.
+    /// The tip's checkpoint, frontier and job status:
+    /// [`tip()`](Self::tip)`.load()`.
     #[es_entity::errlanes::instrument(name = "obix.joinable.load", skip_all)]
     pub async fn load(
         &self,
@@ -356,10 +399,12 @@ where
         self.registered()?.tip.load().await
     }
 
-    /// Re-derive a lane handle from a stored id.
+    /// Re-derive a lane handle from a stored id. Pure: nothing is checked
+    /// until the lane is used.
     pub fn lane(&self, id: LaneId) -> CatchUpLane<P, Tables> {
         CatchUpLane {
-            shared: self.shared.clone(),
+            outbox: self.outbox.clone(),
+            job_type: self.job_type.clone(),
             id,
         }
     }
@@ -388,7 +433,7 @@ where
                 >,
             > = Box::pin(Tables::lanes_in_op(
                 &mut *op,
-                self.shared.job_type.as_str(),
+                self.job_type.as_str(),
                 registered.lane_job_type.as_str(),
                 since,
             ));
@@ -428,8 +473,8 @@ where
     /// unit and its lane together or not at all, and holds it until `op`
     /// commits. A birth above the stream frontier is rejected with
     /// [`SubscriptionRejection::BirthAheadOfFrontier`].
-    #[es_entity::errlanes::instrument(name = "obix.joinable.open_lane_in_op", skip_all)]
-    pub async fn open_lane_in_op(
+    #[es_entity::errlanes::instrument(name = "obix.joinable.start_catch_up_in_op", skip_all)]
+    pub async fn start_catch_up_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         unit: U,
@@ -439,7 +484,7 @@ where
         U: Serialize,
     {
         let registered = self.registered()?;
-        let tip_type = self.shared.job_type.as_str();
+        let tip_type = self.job_type.as_str();
 
         {
             let fut: std::pin::Pin<
@@ -503,10 +548,7 @@ where
             .spawn_in_op(op, key.clone(), LaneMsg { lane: key })
             .await?;
 
-        Ok(CatchUpLane {
-            shared: self.shared.clone(),
-            id,
-        })
+        Ok(self.lane(id))
     }
 }
 
@@ -520,17 +562,20 @@ pub struct CatchUpLane<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    shared: Arc<Shared<P, Tables>>,
+    outbox: Outbox<P, Tables>,
+    job_type: JobType,
     id: LaneId,
 }
 
 impl<P, Tables> Clone for CatchUpLane<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
+    Tables: MailboxTables,
 {
     fn clone(&self) -> Self {
         Self {
-            shared: self.shared.clone(),
+            outbox: self.outbox.clone(),
+            job_type: self.job_type.clone(),
             id: self.id,
         }
     }
@@ -545,13 +590,8 @@ where
         self.id
     }
 
-    fn registered(&self) -> Result<&Registered<P, Tables>, JoinableFault> {
-        self.shared
-            .registered
-            .get()
-            .ok_or_else(|| JoinableFault::NotSpawned {
-                job_type: self.shared.job_type.clone(),
-            })
+    fn registered(&self) -> Result<Arc<Registered<P, Tables>>, JoinableFault> {
+        self.outbox.joinable_registration(&self.job_type)
     }
 
     /// The lane's checkpoint, frontier and job status. A joined lane's final
@@ -565,7 +605,7 @@ where
             registered.jobs.clone(),
             registered.lane_job_type.clone(),
             self.id.to_string(),
-            self.shared.outbox.pool().clone(),
+            self.outbox.pool().clone(),
         )
         .load()
         .await
@@ -590,12 +630,8 @@ where
         let deadline = start + timeout;
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
-            if let Some(join) = Tables::lane_join_sequence(
-                self.shared.outbox.pool(),
-                self.shared.job_type.as_str(),
-                &key,
-            )
-            .await?
+            if let Some(join) =
+                Tables::lane_join_sequence(self.outbox.pool(), self.job_type.as_str(), &key).await?
             {
                 return Ok(join);
             }
@@ -629,12 +665,21 @@ where
             Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + '_>,
         > = Box::pin(Tables::retire_lane_in_op(
             &mut *op,
-            self.shared.job_type.as_str(),
+            self.job_type.as_str(),
             registered.lane_job_type.as_str(),
             &key,
             None,
         ));
         fut.await?;
+        Ok(())
+    }
+
+    /// [`cancel_in_op`](Self::cancel_in_op), standalone.
+    #[es_entity::errlanes::instrument(name = "obix.joinable.cancel", skip_all)]
+    pub async fn cancel(&self) -> Result<(), ObixFault> {
+        let mut op = self.outbox.begin_op().await?;
+        self.cancel_in_op(&mut op).await?;
+        op.commit().await?;
         Ok(())
     }
 }

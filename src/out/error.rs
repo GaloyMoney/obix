@@ -149,8 +149,8 @@ pub enum CouldNotDecodeStored {
 #[derive(Debug, errlanes::Classify)]
 pub enum JoinableFault {
     #[classify(fatal(Invariant))]
-    #[error("joinable subscription {job_type} was used before spawn")]
-    NotSpawned { job_type: ::job::JobType },
+    #[error("joinable subscription {job_type} was used before register_joinable_subscriber")]
+    NotRegistered { job_type: ::job::JobType },
     /// A join landing's drain pulled the lane's own stream and it ended
     /// before `through`. The events up to the tip's committed checkpoint are
     /// committed, so a stream that ends there is a closed listener, not a

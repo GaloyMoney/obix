@@ -38,13 +38,13 @@ pub use out::{
     EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent,
     EphemeralOutboxListener, EphemeralSelection, EphemeralSubscriber, EphemeralSubscriberConfig,
     EphemeralSubscription, EventCtx, EventDelivery, FinishedAtFence, FlushError, FlushOp,
-    FlushOutcome, Handled, InsertOrder, IsolatedOp, JoinableConfig, JoinableEventCtx,
-    JoinableHandle, JoinableSubscriber, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
-    Lane, LaneId, LaneMismatch, Lanes, Ordering, Outbox, OutboxEventJobConfig,
-    PartitionMaintainerConfig, Partitions, PostPersistHook, RawPayload, Scope, SingletonSubscriber,
-    StagedOp, StreamPosition, Subscription, SubscriptionDef, SubscriptionRejection,
-    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended, UndecodableDelivery,
-    UndecodableEventError, WakeKey, WakeKeys,
+    FlushOutcome, Handled, InsertOrder, IsolatedOp, JoinableEventCtx, JoinableHandle,
+    JoinableSubscriber, JoinableSubscriberConfig, KeyedEventCtx, KeyedSubscriber,
+    KeyedSubscriberConfig, Lane, LaneId, LaneMismatch, Lanes, Ordering, Outbox,
+    OutboxEventJobConfig, PartitionMaintainerConfig, Partitions, PostPersistHook, RawPayload,
+    Scope, SingletonSubscriber, StagedOp, StreamPosition, Subscription, SubscriptionDef,
+    SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
+    Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
