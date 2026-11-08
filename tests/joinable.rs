@@ -1199,7 +1199,17 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
         h.catch_up_row_checkpoint(&catch_up).await?.unwrap() < 2,
         "and the catch-up parks before the poison row"
     );
-    assert_eq!(h.applied_count().await?, 0);
+    // A retry finds the tip at 4 and lands event 1 as an ordinary landing
+    // (no lock, no drain) before it meets the poison row outside the drain;
+    // nothing at or past the poison row is applied by anyone.
+    assert!(
+        h.applied_by("catch_up", "u")
+            .await?
+            .iter()
+            .all(|sequence| *sequence < 2),
+        "nothing at or past the poison row landed for the catch-up"
+    );
+    assert!(h.applied_by("tip", "u").await?.is_empty());
 
     h.shared.undecodable_ok.store(true, Ordering::SeqCst);
     let join = catch_up.await_join(WAIT).await?;
