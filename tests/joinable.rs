@@ -1,10 +1,10 @@
 //! Contracts for joinable subscriptions: a tip whose every landing takes the
-//! tip row's lock at entry, and catch-up lanes that join it at a sequence no tip
+//! tip row's lock at entry, and catch-ups that join it at a sequence no tip
 //! landing straddles.
 //!
 //! The fixture is the handler contract: a tip applies an event to a unit only
 //! when the unit has joined at a sequence below the event's (read on
-//! the landing op through `lanes_in_op`), and a lane collects only its own
+//! the landing op through `catch_ups_in_op`), and a catch-up collects only its own
 //! unit's events, skipping the rest in `handle`. Every application is a row,
 //! so "applied by whom, in what order" is a query.
 
@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use obix::{
-    CatchUpLane, EventSequence, FlushOp, Handled, InsertOrder, JoinableEventCtx, JoinableHandle,
+    CatchUp, EventSequence, FlushOp, Handled, InsertOrder, JoinableEventCtx, JoinableHandle,
     JoinableSubscriber, JoinableSubscriberConfig, MailboxConfig, Scope, UndecodableDelivery,
     out::Outbox,
 };
@@ -27,13 +27,13 @@ use tokio::sync::{Mutex, Notify};
 use helpers::{TestTables, init_pool, wipeout_outbox_job_tables};
 
 const TIP: &str = "test-joinable-tip";
-const LANE: &str = "test-joinable-tip.lane";
+const CATCH_UP: &str = "test-joinable-tip.catch_up";
 const TEST_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(15);
 
 type TestOutbox = Outbox<TestEvent, TestTables>;
 type TestHandle = JoinableHandle<TestEvent, String, TestTables>;
-type TestLane = CatchUpLane<TestEvent, TestTables>;
+type TestCatchUp = CatchUp<TestEvent, TestTables>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum TestEvent {
@@ -102,7 +102,7 @@ struct Shared {
     tip_flush_failures: Arc<AtomicU64>,
     undecodable_ok: Arc<AtomicBool>,
     undecodable_calls: Arc<AtomicU64>,
-    /// `(sequence, join)` of every event a lane handled under `Scope::Join`.
+    /// `(sequence, join)` of every event a catch-up handled under `Scope::Join`.
     drain_joins: Arc<Mutex<Vec<(u64, u64)>>>,
     tip_lock_held: Arc<Mutex<Vec<bool>>>,
     tip_units: Arc<Mutex<HashMap<String, EventSequence>>>,
@@ -146,7 +146,7 @@ impl JoinableSubscriber<TestEvent> for Applier {
             self.shared.handle_failures.fetch_add(1, Ordering::SeqCst);
             return Err("injected failure in handle".into());
         }
-        // A lane collects its own unit's events only; the tip collects all.
+        // A catch-up collects its own unit's events only; the tip collects all.
         match scope {
             Scope::Tip => {}
             Scope::CatchUp { unit } | Scope::Join { unit, .. } if unit == key => {}
@@ -197,18 +197,22 @@ impl JoinableSubscriber<TestEvent> for Applier {
                     .handle
                     .get()
                     .expect("handle is set before registration");
-                let lanes = handle.lanes_in_op(&mut *op, since).await?;
+                let catch_ups = handle.catch_ups_in_op(&mut *op, since).await?;
                 self.shared.tip_views.lock().await.push(TipView {
                     since: u64::from(since),
-                    catching_up: lanes.catching_up.iter().map(|(_, u)| u.clone()).collect(),
-                    joined: lanes
+                    catching_up: catch_ups
+                        .catching_up
+                        .iter()
+                        .map(|(_, u)| u.clone())
+                        .collect(),
+                    joined: catch_ups
                         .joined
                         .iter()
                         .map(|(_, u, f)| (u.clone(), u64::from(*f)))
                         .collect(),
                 });
                 let mut units = self.shared.tip_units.lock().await;
-                for (_, unit, join) in lanes.joined {
+                for (_, unit, join) in catch_ups.joined {
                     units.insert(unit, join);
                 }
                 for (key, sequence) in batch {
@@ -228,7 +232,7 @@ impl JoinableSubscriber<TestEvent> for Applier {
                 for (key, sequence) in batch {
                     assert_eq!(
                         &key, unit,
-                        "a lane's batch holds its own unit's events only"
+                        "a catch-up's batch holds its own unit's events only"
                     );
                     insert_applied(op, "catch_up", &key, sequence).await?;
                 }
@@ -327,7 +331,7 @@ fn test_config() -> JoinableSubscriberConfig {
     JoinableSubscriberConfig::new(job::JobType::new(TIP))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
         .with_retry_settings(fast_retry_settings())
-        .with_lane_retry_settings(fast_retry_settings())
+        .with_catch_up_retry_settings(fast_retry_settings())
 }
 
 struct Harness {
@@ -349,13 +353,13 @@ impl Harness {
 
         helpers::wipeout_outbox_tables(&pool).await?;
         wipeout_outbox_job_tables(&pool, TIP).await?;
-        wipeout_outbox_job_tables(&pool, LANE).await?;
-        helpers::wipeout_subscriptions(&pool, LANE).await?;
+        wipeout_outbox_job_tables(&pool, CATCH_UP).await?;
+        helpers::wipeout_subscriptions(&pool, CATCH_UP).await?;
         sqlx::query("DELETE FROM joinable_tips WHERE subscriber_type = $1")
             .bind(TIP)
             .execute(&pool)
             .await?;
-        sqlx::query("DELETE FROM joinable_lanes WHERE subscriber_type = $1")
+        sqlx::query("DELETE FROM joinable_catch_ups WHERE subscriber_type = $1")
             .bind(TIP)
             .execute(&pool)
             .await?;
@@ -380,7 +384,7 @@ impl Harness {
 
         let outbox = TestOutbox::init(&pool, MailboxConfig::builder().build()).await?;
         // The address is minted before registration and handed to the handler,
-        // which reads lanes through it: the cycle the address exists to break.
+        // which reads catch-ups through it: the cycle the address exists to break.
         let tip: TestHandle = outbox.joinable(job::JobType::new(TIP));
         let shared = Shared::default();
         shared.undecodable_ok.store(true, Ordering::SeqCst);
@@ -440,14 +444,14 @@ impl Harness {
         Ok(())
     }
 
-    async fn start_catch_up(&self, unit: &str, start_after: u64) -> anyhow::Result<TestLane> {
+    async fn start_catch_up(&self, unit: &str, start_after: u64) -> anyhow::Result<TestCatchUp> {
         let mut op = self.outbox.begin_op().await?;
-        let lane = self
+        let catch_up = self
             .tip
             .start_catch_up_in_op(&mut op, unit.to_string(), EventSequence::from(start_after))
             .await?;
         op.commit().await?;
-        Ok(lane)
+        Ok(catch_up)
     }
 
     async fn tip_row_checkpoint(&self) -> anyhow::Result<Option<i64>> {
@@ -478,8 +482,8 @@ impl Harness {
         )
     }
 
-    /// `(join_sequence, items, lock_held)` of every lane flush, in landing order.
-    async fn lane_flushes(&self) -> anyhow::Result<Vec<(Option<i64>, i64, bool)>> {
+    /// `(join_sequence, items, lock_held)` of every catch-up flush, in landing order.
+    async fn catch_up_flushes(&self) -> anyhow::Result<Vec<(Option<i64>, i64, bool)>> {
         Ok(sqlx::query_as(
             "SELECT join_sequence, items, lock_held FROM test_joinable_flushes \
              WHERE scope = 'catch_up' ORDER BY id",
@@ -496,38 +500,38 @@ impl Harness {
         )
     }
 
-    /// The lane's record in `joinable_tips`'s sibling, `joinable_lanes`:
-    /// `None` while the lane is live, `Some(None)` for a cancelled lane and
+    /// The catch-up's record in `joinable_tips`'s sibling, `joinable_catch_ups`:
+    /// `None` while it is live, `Some(None)` for a cancelled one and
     /// `Some(Some(F))` for one that joined at `F`.
-    async fn lane_record(&self, lane: &TestLane) -> anyhow::Result<Option<Option<i64>>> {
+    async fn catch_up_record(&self, catch_up: &TestCatchUp) -> anyhow::Result<Option<Option<i64>>> {
         Ok(sqlx::query_scalar(
-            "SELECT joined_at_sequence FROM joinable_lanes \
+            "SELECT joined_at_sequence FROM joinable_catch_ups \
              WHERE subscriber_type = $1 AND key = $2",
         )
         .bind(TIP)
-        .bind(lane.id().to_string())
+        .bind(catch_up.id().to_string())
         .fetch_optional(&self.pool)
         .await?)
     }
 
-    /// Whether the lane left the ordinary keyed tombstone behind.
-    async fn has_tombstone(&self, lane: &TestLane) -> anyhow::Result<bool> {
+    /// Whether the catch-up left the ordinary keyed tombstone behind.
+    async fn has_tombstone(&self, catch_up: &TestCatchUp) -> anyhow::Result<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM retired_subscriptions \
              WHERE subscriber_type = $1 AND key = $2)",
         )
-        .bind(LANE)
-        .bind(lane.id().to_string())
+        .bind(CATCH_UP)
+        .bind(catch_up.id().to_string())
         .fetch_one(&self.pool)
         .await?)
     }
 
-    async fn lane_row_checkpoint(&self, lane: &TestLane) -> anyhow::Result<Option<i64>> {
+    async fn catch_up_row_checkpoint(&self, catch_up: &TestCatchUp) -> anyhow::Result<Option<i64>> {
         Ok(sqlx::query_scalar(
             "SELECT checkpoint FROM subscriptions WHERE subscriber_type = $1 AND key = $2",
         )
-        .bind(LANE)
-        .bind(lane.id().to_string())
+        .bind(CATCH_UP)
+        .bind(catch_up.id().to_string())
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -538,12 +542,12 @@ impl Harness {
 
     /// Stage the interleaving most tests share: the tip is parked inside a
     /// landing of events 2..=6 of unit `u` (entry lock held, committed
-    /// checkpoint 1), and unit `u`'s lane has handled event 1 (another
+    /// checkpoint 1), and unit `u`'s catch-up has handled event 1 (another
     /// unit's, skipped) and is released into its first batch, which it can
     /// only land as its join.
     ///
-    /// Returns once the lane is waiting on the tip row's lock.
-    async fn stage_tip_entered_first(&self) -> anyhow::Result<TestLane> {
+    /// Returns once the catch-up is waiting on the tip row's lock.
+    async fn stage_tip_entered_first(&self) -> anyhow::Result<TestCatchUp> {
         self.publish(vec![ping("x", 0)]).await?;
         eventually(WAIT, || async {
             Ok(self.tip_row_checkpoint().await? == Some(1))
@@ -552,7 +556,7 @@ impl Harness {
 
         self.shared.handle_gate_seq.store(1, Ordering::SeqCst);
         self.shared.handle_gate.arm();
-        let lane = self.start_catch_up("u", 0).await?;
+        let catch_up = self.start_catch_up("u", 0).await?;
         eventually(WAIT, || async { Ok(self.shared.handle_gate.is_parked()) }).await?;
 
         self.shared.tip_gate.arm();
@@ -569,9 +573,9 @@ impl Harness {
         assert_eq!(
             self.applied_count().await?,
             0,
-            "the lane's first landing is parked behind the tip's"
+            "the catch-up's first landing is parked behind the tip's"
         );
-        Ok(lane)
+        Ok(catch_up)
     }
 }
 
@@ -584,7 +588,7 @@ fn ping(key: &str, n: u64) -> TestEvent {
 
 fn staged_config() -> JoinableSubscriberConfig {
     test_config()
-        .with_lane_max_batch_size(2)
+        .with_catch_up_max_batch_size(2)
         .with_max_join_gap(100)
 }
 
@@ -632,8 +636,8 @@ async fn the_tip_lands_under_scope_tip_and_mirrors_its_checkpoint() -> anyhow::R
 
     assert!(h.tip_flush_count().await? >= 1);
     assert!(
-        h.lane_flushes().await?.is_empty(),
-        "no lane exists, so every landing is the tip's"
+        h.catch_up_flushes().await?.is_empty(),
+        "no catch-up exists, so every landing is the tip's"
     );
     assert_eq!(h.tip.load().await?.checkpoint(), EventSequence::from(3u64));
     Ok(())
@@ -698,11 +702,11 @@ async fn a_tip_landing_blocks_at_entry_while_the_tip_row_is_locked() -> anyhow::
     Ok(())
 }
 
-// === Catch-up lanes: the §7 contract ===
+// === Catch-ups: the §7 contract ===
 
 #[tokio::test]
 #[file_serial]
-async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
+async fn catch_up_joins_quiet_tip() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
     h.publish(vec![ping("u", 1), ping("v", 2), ping("u", 3), ping("v", 4)])
         .await?;
@@ -711,8 +715,8 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.start_catch_up("u", 0).await?;
-    let join = lane.await_join(WAIT).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
+    let join = catch_up.await_join(WAIT).await?;
 
     assert!(u64::from(join) >= 4);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![1, 3]);
@@ -721,8 +725,8 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
         "no event at or below the join is applied by the tip"
     );
     assert!(h.tip_row_checkpoint().await?.unwrap() <= u64::from(join) as i64);
-    assert_eq!(h.lane_record(&lane).await?, Some(Some(4)));
-    let flushes = h.lane_flushes().await?;
+    assert_eq!(h.catch_up_record(&catch_up).await?, Some(Some(4)));
+    let flushes = h.catch_up_flushes().await?;
     assert_eq!(flushes.len(), 1);
     assert_eq!(
         flushes[0],
@@ -730,7 +734,7 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
         "one join landing, over the unit's own events only, lock held"
     );
 
-    // Control: past the join the tip applies to the unit, and the lane does not.
+    // Control: past the join the tip applies to the unit, and the catch-up does not.
     h.publish(vec![ping("u", 5)]).await?;
     eventually(WAIT, || async {
         Ok(h.applied_by("tip", "u").await? == vec![5])
@@ -744,10 +748,10 @@ async fn lane_joins_quiet_tip() -> anyhow::Result<()> {
 #[file_serial]
 async fn tip_entered_first() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
-    let lane = h.stage_tip_entered_first().await?;
+    let catch_up = h.stage_tip_entered_first().await?;
 
     h.shared.tip_gate.release();
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
 
     assert_eq!(
         u64::from(join),
@@ -757,14 +761,14 @@ async fn tip_entered_first() -> anyhow::Result<()> {
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
         vec![2, 3, 4, 5, 6],
-        "what the tip skipped for the unit was applied by the lane, once"
+        "what the tip skipped for the unit was applied by the catch-up, once"
     );
     assert!(h.applied_by("tip", "u").await?.is_empty());
-    let flushes = h.lane_flushes().await?;
+    let flushes = h.catch_up_flushes().await?;
     assert_eq!(
         flushes,
         vec![(Some(6), 5, true)],
-        "one landing, carrying the join, over the lane's whole batch"
+        "one landing, carrying the join, over the catch-up's whole batch"
     );
     assert_eq!(
         h.shared.drain_joins.lock().await.as_slice(),
@@ -778,16 +782,16 @@ async fn tip_entered_first() -> anyhow::Result<()> {
 #[file_serial]
 async fn join_entered_first() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
-    let lane = h.stage_tip_entered_first().await?;
+    let catch_up = h.stage_tip_entered_first().await?;
 
-    // The lane will hold the lock in its drain, parked at event 4.
+    // The catch-up will hold the lock in its drain, parked at event 4.
     h.shared.handle_gate_seq.store(4, Ordering::SeqCst);
     h.shared.handle_gate.arm();
     h.shared.tip_gate.release();
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
     assert!(
         !h.waits_on_the_tip_row().await?,
-        "control: the lane got the row, so nobody waits yet"
+        "control: the catch-up got the row, so nobody waits yet"
     );
     assert_eq!(
         h.shared.drain_joins.lock().await.as_slice(),
@@ -801,10 +805,10 @@ async fn join_entered_first() -> anyhow::Result<()> {
         h.applied_by("tip", "u").await?.is_empty(),
         "the tip's next landing is parked at entry behind the join"
     );
-    assert_eq!(h.lane_record(&lane).await?, None);
+    assert_eq!(h.catch_up_record(&catch_up).await?, None);
 
     h.shared.handle_gate.release();
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
     assert_eq!(u64::from(join), 6);
     eventually(WAIT, || async {
         Ok(h.applied_by("tip", "u").await? == vec![7])
@@ -813,21 +817,21 @@ async fn join_entered_first() -> anyhow::Result<()> {
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
         vec![2, 3, 4, 5, 6],
-        "the lane applied up to the join and the tip only past it"
+        "the catch-up applied up to the join and the tip only past it"
     );
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
+async fn catch_up_ahead_joins_at_own_position() -> anyhow::Result<()> {
     let slow_tip = JoinableSubscriberConfig::new(job::JobType::new(TIP))
         .with_checkpoint_interval(TEST_CHECKPOINT_INTERVAL)
         .with_retry_settings(retry_settings(
             Duration::from_millis(1000),
             Duration::from_millis(1500),
         ))
-        .with_lane_retry_settings(fast_retry_settings());
+        .with_catch_up_retry_settings(fast_retry_settings());
     let h = Harness::start(slow_tip).await?;
 
     h.publish(vec![ping("x", 0)]).await?;
@@ -836,10 +840,10 @@ async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
     })
     .await?;
 
-    // The lane is held at an event the tip has already passed.
+    // The catch-up is held at an event the tip has already passed.
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.start_catch_up("u", 0).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip is stalled: every landing fails, and the retry backoff keeps it
@@ -852,9 +856,13 @@ async fn lane_ahead_joins_at_own_position() -> anyhow::Result<()> {
     .await?;
 
     h.shared.handle_gate.release();
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
 
-    assert_eq!(u64::from(join), 4, "the lane joined at its own position");
+    assert_eq!(
+        u64::from(join),
+        4,
+        "the catch-up joined at its own position"
+    );
     assert_eq!(
         h.tip_row_checkpoint().await?,
         Some(1),
@@ -895,12 +903,12 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
         let tip = h.tip.clone();
         tokio::spawn(async move {
             let mut op = outbox.begin_op().await?;
-            let lane = tip
+            let catch_up = tip
                 .start_catch_up_in_op(&mut op, "u".to_string(), EventSequence::BEGIN)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             op.commit().await?;
-            anyhow::Ok(lane)
+            anyhow::Ok(catch_up)
         })
     };
     eventually(WAIT, || async { h.waits_on_the_tip_row().await }).await?;
@@ -909,11 +917,11 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
         "the birth waits for the landing in flight"
     );
 
-    // Hold the lane back once it exists, so the tip's next landing meets it live.
+    // Hold the catch-up back once it exists, so the tip's next landing meets it live.
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
     h.shared.tip_gate.release();
-    let lane = tokio::time::timeout(WAIT, birth).await???;
+    let catch_up = tokio::time::timeout(WAIT, birth).await???;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     h.publish(vec![ping("u", 2)]).await?;
@@ -931,11 +939,11 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
         views
             .first()
             .is_some_and(|view| view.catching_up.is_empty()),
-        "the landing that was in flight at birth did not see the lane: {views:?}"
+        "the landing that was in flight at birth did not see the catch-up: {views:?}"
     );
 
     h.shared.handle_gate.release();
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
     assert_eq!(u64::from(join), 2);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![1, 2]);
     assert!(h.applied_by("tip", "u").await?.is_empty());
@@ -945,13 +953,13 @@ async fn birth_is_serialised_with_tip_landings() -> anyhow::Result<()> {
 #[tokio::test]
 #[file_serial]
 async fn join_drain_failure_replays() -> anyhow::Result<()> {
-    let slow_lane_retry = staged_config().with_lane_retry_settings(retry_settings(
+    let slow_catch_up_retry = staged_config().with_catch_up_retry_settings(retry_settings(
         Duration::from_secs(1),
         Duration::from_secs(2),
     ));
-    let h = Harness::start(slow_lane_retry).await?;
-    let lane = h.stage_tip_entered_first().await?;
-    let checkpoint_before = h.lane_row_checkpoint(&lane).await?;
+    let h = Harness::start(slow_catch_up_retry).await?;
+    let catch_up = h.stage_tip_entered_first().await?;
+    let checkpoint_before = h.catch_up_row_checkpoint(&catch_up).await?;
 
     // The first handle of event 4 happens inside the join landing's drain.
     h.shared.fail_handle_seq.store(4, Ordering::SeqCst);
@@ -963,14 +971,17 @@ async fn join_drain_failure_replays() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(
-        h.lane_record(&lane).await?,
+        h.catch_up_record(&catch_up).await?,
         None,
         "a failed join landing leaves no join record"
     );
-    assert_eq!(h.lane_row_checkpoint(&lane).await?, checkpoint_before);
+    assert_eq!(
+        h.catch_up_row_checkpoint(&catch_up).await?,
+        checkpoint_before
+    );
     assert_eq!(h.applied_count().await?, 0, "nothing of it committed");
 
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
     assert!(u64::from(join) >= 6);
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
@@ -991,16 +1002,16 @@ async fn empty_batch_join_landing() -> anyhow::Result<()> {
     })
     .await?;
 
-    let lane = h.start_catch_up("u", 0).await?;
-    let join = lane.await_join(WAIT).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
+    let join = catch_up.await_join(WAIT).await?;
 
     assert_eq!(u64::from(join), 3);
     assert_eq!(
-        h.lane_flushes().await?,
+        h.catch_up_flushes().await?,
         vec![(Some(3), 0, true)],
         "flush ran once, over an empty batch, carrying the join"
     );
-    assert_eq!(h.lane_record(&lane).await?, Some(Some(3)));
+    assert_eq!(h.catch_up_record(&catch_up).await?, Some(Some(3)));
     assert_eq!(h.applied_count().await?, 0);
     Ok(())
 }
@@ -1009,14 +1020,14 @@ async fn empty_batch_join_landing() -> anyhow::Result<()> {
 #[file_serial]
 async fn max_join_gap_declines() -> anyhow::Result<()> {
     let h = Harness::start(staged_config().with_max_join_gap(1)).await?;
-    let lane = h.stage_tip_entered_first().await?;
+    let catch_up = h.stage_tip_entered_first().await?;
 
     h.shared.tip_gate.release();
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
 
     assert_eq!(u64::from(join), 6);
     assert_eq!(h.applied_by("catch_up", "u").await?, vec![2, 3, 4, 5, 6]);
-    let flushes = h.lane_flushes().await?;
+    let flushes = h.catch_up_flushes().await?;
     assert_eq!(
         flushes.first(),
         Some(&(None, 2, true)),
@@ -1025,7 +1036,7 @@ async fn max_join_gap_declines() -> anyhow::Result<()> {
     assert_eq!(
         flushes.last(),
         Some(&(Some(6), 1, true)),
-        "and the lane kept catching up until it joined: {flushes:?}"
+        "and the catch-up kept catching up until it joined: {flushes:?}"
     );
     assert!(
         flushes[..flushes.len() - 1]
@@ -1049,8 +1060,8 @@ async fn tip_replay_after_join() -> anyhow::Result<()> {
         Ok(h.tip_row_checkpoint().await? == Some(2))
     })
     .await?;
-    let lane = h.start_catch_up("u", 0).await?;
-    let join = lane.await_join(WAIT).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
+    let join = catch_up.await_join(WAIT).await?;
     assert_eq!(u64::from(join), 2);
 
     h.shared.fail_tip_flush_once.store(true, Ordering::SeqCst);
@@ -1072,15 +1083,15 @@ async fn tip_replay_after_join() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
+async fn catch_ups_in_op_is_bounded() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
     h.publish_pings("u", 1..4).await?;
     eventually(WAIT, || async {
         Ok(h.tip_row_checkpoint().await? == Some(3))
     })
     .await?;
-    let lane = h.start_catch_up("u", 0).await?;
-    assert_eq!(u64::from(lane.await_join(WAIT).await?), 3);
+    let catch_up = h.start_catch_up("u", 0).await?;
+    assert_eq!(u64::from(catch_up.await_join(WAIT).await?), 3);
 
     h.publish_pings("u", 4..5).await?;
     eventually(WAIT, || async {
@@ -1119,14 +1130,14 @@ async fn lanes_in_op_is_bounded() -> anyhow::Result<()> {
     let mut op = h.outbox.begin_op().await?;
     let at_join = h
         .tip
-        .lanes_in_op(&mut op, EventSequence::from(3u64))
+        .catch_ups_in_op(&mut op, EventSequence::from(3u64))
         .await?;
     assert_eq!(at_join.joined.len(), 1);
-    assert_eq!(at_join.joined[0].0, lane.id());
+    assert_eq!(at_join.joined[0].0, catch_up.id());
     assert_eq!(at_join.joined[0].2, EventSequence::from(3u64));
     let past_join = h
         .tip
-        .lanes_in_op(&mut op, EventSequence::from(4u64))
+        .catch_ups_in_op(&mut op, EventSequence::from(4u64))
         .await?;
     assert!(past_join.joined.is_empty());
     assert!(past_join.catching_up.is_empty());
@@ -1139,12 +1150,12 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     let config = JoinableSubscriberConfig::new(job::JobType::new(TIP))
         .with_checkpoint_interval(Duration::from_secs(3600))
         .with_retry_settings(fast_retry_settings())
-        .with_lane_retry_settings(fast_retry_settings())
-        .with_lane_max_batch_size(1)
+        .with_catch_up_retry_settings(fast_retry_settings())
+        .with_catch_up_max_batch_size(1)
         .with_max_join_gap(100);
     let h = Harness::start(config).await?;
 
-    // The unit's own event at 1, so the lane's first batch is full at 1 and
+    // The unit's own event at 1, so the catch-up's first batch is full at 1 and
     // its first landing attempt is the join that meets the poison row.
     h.publish(vec![ping("u", 0)]).await?;
     eventually(WAIT, || async {
@@ -1154,7 +1165,7 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
 
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.start_catch_up("u", 0).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
     // The tip passes the poison row (event 2) in memory only: its committed
@@ -1180,18 +1191,18 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
     .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        h.lane_record(&lane).await?,
+        h.catch_up_record(&catch_up).await?,
         None,
         "the default handle_undecodable fails the join landing"
     );
     assert!(
-        h.lane_row_checkpoint(&lane).await?.unwrap() < 2,
-        "and the lane parks before the poison row"
+        h.catch_up_row_checkpoint(&catch_up).await?.unwrap() < 2,
+        "and the catch-up parks before the poison row"
     );
     assert_eq!(h.applied_count().await?, 0);
 
     h.shared.undecodable_ok.store(true, Ordering::SeqCst);
-    let join = lane.await_join(WAIT).await?;
+    let join = catch_up.await_join(WAIT).await?;
     assert_eq!(u64::from(join), 4);
     assert_eq!(
         h.applied_by("catch_up", "u").await?,
@@ -1205,10 +1216,10 @@ async fn undecodable_inside_drain() -> anyhow::Result<()> {
 #[file_serial]
 async fn shutdown_between_landings_only() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
-    let lane = h.stage_tip_entered_first().await?;
-    let checkpoint_before = h.lane_row_checkpoint(&lane).await?;
+    let catch_up = h.stage_tip_entered_first().await?;
+    let checkpoint_before = h.catch_up_row_checkpoint(&catch_up).await?;
 
-    // Park the lane inside its drain, then ask the process to shut down.
+    // Park the catch-up inside its drain, then ask the process to shut down.
     h.shared.handle_gate_seq.store(4, Ordering::SeqCst);
     h.shared.handle_gate.arm();
     h.shared.tip_gate.release();
@@ -1221,7 +1232,7 @@ async fn shutdown_between_landings_only() -> anyhow::Result<()> {
     h.shared.handle_gate.release();
     tokio::time::timeout(WAIT, shutdown).await???;
 
-    let record = h.lane_record(&lane).await?;
+    let record = h.catch_up_record(&catch_up).await?;
     match record {
         Some(join) => {
             assert_eq!(join, Some(6), "the landing completed whole, at the join");
@@ -1229,7 +1240,7 @@ async fn shutdown_between_landings_only() -> anyhow::Result<()> {
         }
         None => {
             assert_eq!(
-                h.lane_row_checkpoint(&lane).await?,
+                h.catch_up_row_checkpoint(&catch_up).await?,
                 checkpoint_before,
                 "or it rolled back whole: no checkpoint strictly between P and the join"
             );
@@ -1239,7 +1250,7 @@ async fn shutdown_between_landings_only() -> anyhow::Result<()> {
     Ok(())
 }
 
-// === The rest of the lane surface ===
+// === The rest of the catch-up surface ===
 
 #[tokio::test]
 #[file_serial]
@@ -1266,48 +1277,48 @@ async fn a_birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn cancel_in_op_ends_a_lane_without_a_join() -> anyhow::Result<()> {
+async fn cancel_in_op_ends_a_catch_up_without_a_join() -> anyhow::Result<()> {
     let h = Harness::start(staged_config()).await?;
-    let lane = h.stage_tip_entered_first().await?;
+    let catch_up = h.stage_tip_entered_first().await?;
 
     let mut op = h.outbox.begin_op().await?;
-    lane.cancel_in_op(&mut op).await?;
+    catch_up.cancel_in_op(&mut op).await?;
     op.commit().await?;
     assert_eq!(
-        h.lane_record(&lane).await?,
+        h.catch_up_record(&catch_up).await?,
         Some(None),
-        "a cancelled lane is recorded with no join sequence"
+        "a cancelled catch-up is recorded with no join sequence"
     );
     assert!(
-        h.has_tombstone(&lane).await?,
+        h.has_tombstone(&catch_up).await?,
         "the ordinary keyed tombstone is left behind"
     );
 
-    // The lane is parked on the tip's lock inside its join landing. Once the
+    // The catch-up is parked on the tip's lock inside its join landing. Once the
     // tip commits, that landing must see the cancel, not claim a join.
     h.shared.tip_gate.release();
     eventually(WAIT, || async {
         Ok(h.tip_row_checkpoint().await? == Some(6))
     })
     .await?;
-    let timeout = lane.await_join(Duration::from_millis(600)).await;
+    let timeout = catch_up.await_join(Duration::from_millis(600)).await;
     assert!(
         matches!(
             timeout,
             Err(es_entity::errlanes::Fail::Rejected(
-                obix::SubscriptionRejection::LaneJoinTimeout { .. }
+                obix::SubscriptionRejection::CatchUpJoinTimeout { .. }
             ))
         ),
-        "a cancelled lane never joins"
+        "a cancelled catch-up never joins"
     );
     assert_eq!(
-        h.lane_record(&lane).await?,
+        h.catch_up_record(&catch_up).await?,
         Some(None),
         "the cancel record is not overwritten by a join"
     );
     assert!(
-        h.lane_flushes().await?.is_empty(),
-        "nothing of a cancelled lane lands: no join flush ran"
+        h.catch_up_flushes().await?.is_empty(),
+        "nothing of a cancelled catch-up lands: no join flush ran"
     );
     assert!(
         h.applied_by("catch_up", "u").await?.is_empty(),
@@ -1318,14 +1329,14 @@ async fn cancel_in_op_ends_a_lane_without_a_join() -> anyhow::Result<()> {
         "the landing released the tip's lock"
     );
     let mut op = h.outbox.begin_op().await?;
-    let lanes = h.tip.lanes_in_op(&mut op, EventSequence::BEGIN).await?;
-    assert!(lanes.catching_up.is_empty() && lanes.joined.is_empty());
+    let catch_ups = h.tip.catch_ups_in_op(&mut op, EventSequence::BEGIN).await?;
+    assert!(catch_ups.catching_up.is_empty() && catch_ups.joined.is_empty());
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn cancel_standalone_ends_a_lane_and_is_a_no_op_once_joined() -> anyhow::Result<()> {
+async fn cancel_standalone_ends_a_catch_up_and_is_a_no_op_once_joined() -> anyhow::Result<()> {
     let h = Harness::start(test_config()).await?;
     h.publish(vec![ping("x", 0)]).await?;
     eventually(WAIT, || async {
@@ -1336,27 +1347,27 @@ async fn cancel_standalone_ends_a_lane_and_is_a_no_op_once_joined() -> anyhow::R
     // Held in its first handle, so it is live when cancelled.
     h.shared.handle_gate_seq.store(1, Ordering::SeqCst);
     h.shared.handle_gate.arm();
-    let lane = h.start_catch_up("u", 0).await?;
+    let catch_up = h.start_catch_up("u", 0).await?;
     eventually(WAIT, || async { Ok(h.shared.handle_gate.is_parked()) }).await?;
 
-    lane.cancel().await?;
-    assert_eq!(h.lane_record(&lane).await?, Some(None));
-    assert!(h.has_tombstone(&lane).await?);
+    catch_up.cancel().await?;
+    assert_eq!(h.catch_up_record(&catch_up).await?, Some(None));
+    assert!(h.has_tombstone(&catch_up).await?);
     h.shared.handle_gate.release();
     eventually(WAIT, || async {
-        Ok(h.lane_row_checkpoint(&lane).await?.is_none())
+        Ok(h.catch_up_row_checkpoint(&catch_up).await?.is_none())
     })
     .await?;
 
-    // A lane that joined keeps its join record through a later cancel.
+    // A catch-up that joined keeps its join record through a later cancel.
     let joined = h.start_catch_up("v", 0).await?;
     let join = joined.await_join(WAIT).await?;
-    let re_derived = h.tip.lane(joined.id());
+    let re_derived = h.tip.catch_up(joined.id());
     re_derived.cancel().await?;
     assert_eq!(
-        h.lane_record(&joined).await?,
+        h.catch_up_record(&joined).await?,
         Some(Some(u64::from(join) as i64)),
-        "cancelling a joined lane changes nothing"
+        "cancelling a joined catch-up changes nothing"
     );
     Ok(())
 }

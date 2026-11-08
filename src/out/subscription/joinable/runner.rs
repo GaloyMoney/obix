@@ -22,7 +22,7 @@ use crate::sequence::EventSequence;
 use crate::tables::MailboxTables;
 
 /// The tip's `joinable_tips` row: locked at the start of every tip landing,
-/// when a lane is opened and in a lane's join landing, and written with the
+/// when a catch-up is started and in a catch-up's join landing, and written with the
 /// tip's checkpoint.
 pub(super) struct TipRow<Tables> {
     pub(super) subscriber_type: JobType,

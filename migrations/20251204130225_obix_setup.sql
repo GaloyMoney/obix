@@ -96,7 +96,7 @@ CREATE TABLE joinable_tips (
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE joinable_lanes (
+CREATE TABLE joinable_catch_ups (
   subscriber_type     VARCHAR NOT NULL,
   key                 VARCHAR NOT NULL,
   instance_config     JSONB NOT NULL,

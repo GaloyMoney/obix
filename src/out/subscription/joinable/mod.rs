@@ -1,24 +1,24 @@
 //! Joinable subscriptions — one handler run by a **tip** (the live writer)
-//! and by any number of **catch-up lanes** that catch up and then join it.
+//! and by any number of **catch-ups** that catch up and then join it.
 //!
 //! A consumer that folds many units in one pass cannot add a unit with
 //! history without a second cursor: the tip is at `C`, the new unit needs the
-//! stream from an earlier position. obix owns that seam. A lane is opened at an
-//! earlier position, consumes through the same handler, and ends in a single
-//! **join landing** that joins the tip at a sequence `F`. The join is a fence
-//! on the tip's landings — no tip landing straddles `F`: every tip landing
-//! either began after the join landing committed, or committed before `F` was
-//! read. The handler learns which side of the join each landing is on from
-//! [`Scope`]; it never decides it.
+//! stream from an earlier position. obix owns that seam. A catch-up is started
+//! at an earlier position, consumes through the same handler, and ends in a
+//! single **join landing** that joins the tip at a sequence `F`. The join is a
+//! fence on the tip's landings — no tip landing straddles `F`: every tip
+//! landing either began after the join landing committed, or committed before
+//! `F` was read. The handler learns which side of the join each landing is on
+//! from [`Scope`]; it never decides it.
 //!
 //! The tip's landing takes the tip row's lock as the first statement of its
-//! transaction, before [`flush`](JoinableSubscriber::flush) runs. Opening a
-//! lane and the join landing take the same lock. A commit-time lock would not
+//! transaction, before [`flush`](JoinableSubscriber::flush) runs. Starting a
+//! catch-up and the join landing take the same lock. A commit-time lock would not
 //! do: a tip landing could decide coverage on a snapshot from before the join
 //! and commit after it. The placement at landing **entry** is the whole point, and
 //! it is obix's to enforce, not the handler's.
 
-mod lane;
+mod catch_up;
 mod runner;
 
 use es_entity::errlanes::{Fail, ResultExt, lanes};
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use job::{JobType, Jobs, RetrySettings};
 
-use self::lane::{LaneJobInitializer, LaneMsg};
+use self::catch_up::{CatchUpJobInitializer, CatchUpMsg};
 use crate::error::ObixFault;
 use crate::out::Outbox;
 use crate::out::ctx::{FlushOp, Handled, JoinableEventCtx};
@@ -44,30 +44,30 @@ use crate::out::subscription::{
 use crate::sequence::EventSequence;
 use crate::tables::{DefaultMailboxTables, MailboxTables};
 
-es_entity::entity_id! { LaneId }
+es_entity::entity_id! { CatchUpId }
 
 const DEFAULT_MAX_BATCH_SIZE: usize = 100;
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A handler run by a tip and by catch-up lanes.
+/// A handler run by a tip and by catch-ups.
 ///
 /// # Contract
 ///
 /// 1. [`flush`](Self::flush) must tolerate whole-batch replay, as everywhere.
-/// 2. `flush` may be called with an **empty batch** on a lane's join
-///    landing: the lane caught up on skips alone and the runner lands anyway.
+/// 2. `flush` may be called with an **empty batch** on a catch-up's join
+///    landing: it caught up on skips alone and the runner lands anyway.
 ///    Liveness is the runner's job, not the handler's.
 /// 3. Seam state is read **on `op`** — the handler's own columns written by a
-///    lane's joining `flush`, or [`JoinableHandle::lanes_in_op`] — never from
-///    the pool or from a cache across landings. Any read on the landing op is
-///    after the entry lock by construction; a pool read is not.
+///    catch-up's joining `flush`, or [`JoinableHandle::catch_ups_in_op`] —
+///    never from the pool or from a cache across landings. Any read on the
+///    landing op is after the entry lock by construction; a pool read is not.
 /// 4. Coverage: apply an event to a unit only if its sequence is past the one
-///    the unit joined at, and never while the unit's lane is live. With a lane
-///    ahead of the tip, it joins at its own position and the tip's next
-///    landings contain events at or below it that belong to the lane.
+///    the unit joined at, and never while the unit's catch-up is live. With a
+///    catch-up ahead of the tip, it joins at its own position and the tip's
+///    next landings contain events at or below it that belong to the catch-up.
 ///
 /// One handler instance serves both runners, and both of its methods are told
-/// whose work they are doing through a [`Scope`]: a lane's
+/// whose work they are doing through a [`Scope`]: a catch-up's
 /// [`handle`](Self::handle) can skip events that are not its unit's, and
 /// [`flush`](Self::flush) folds for the tip or for one unit. The ctx offers
 /// [`skip`](JoinableEventCtx::skip) and
@@ -76,17 +76,16 @@ pub trait JoinableSubscriber<P>: Send + Sync + 'static
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
 {
-    /// What one catch-up lane covers, persisted as the lane's instance
-    /// config.
+    /// What one catch-up covers, persisted as its instance config.
     type Unit: Serialize + DeserializeOwned + Send + Sync + 'static;
 
     /// Accumulator for events resolved via
     /// [`collect_with`](JoinableEventCtx::collect_with).
     type Batch: Default + Send + 'static;
 
-    /// One event, on the tip or on a lane. `scope` says which: a lane's
-    /// handler may skip what is not its unit's. The same scope reaches the
-    /// `flush` the event's batch lands in.
+    /// One event, on the tip or on a catch-up. `scope` says which: a
+    /// catch-up's handler may skip what is not its unit's. The same scope
+    /// reaches the `flush` the event's batch lands in.
     fn handle<'inv>(
         &self,
         ctx: JoinableEventCtx<'inv, Self::Batch>,
@@ -96,8 +95,8 @@ where
         Output = Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
 
-    /// One landing. `scope` says whose, and — for a lane — whether this is
-    /// its final landing and where it ends.
+    /// One landing. `scope` says whose, and — for a catch-up — whether this
+    /// is its final landing and where it ends.
     fn flush(
         &self,
         op: &mut FlushOp<'_, InsertOrder>,
@@ -118,21 +117,21 @@ where
     }
 }
 
-/// Whose work a [`JoinableSubscriber`] call is: the tip's, or one catch-up
-/// lane's, and for a lane whether this is the landing in which it joins.
+/// Whose work a [`JoinableSubscriber`] call is: the tip's or one catch-up's,
+/// and for a catch-up whether this is the landing in which it joins.
 ///
-/// `handle` and `flush` receive the same scope for one landing: events a lane
-/// handles under [`Join`](Self::Join) are the ones its join landing's drain
-/// pulled, and they land in the `flush` that carries the same `join`.
+/// `handle` and `flush` receive the same scope for one landing: events a
+/// catch-up handles under [`Join`](Self::Join) are the ones its join landing's
+/// drain pulled, and they land in the `flush` that carries the same `join`.
 #[derive(Debug)]
 pub enum Scope<'a, U> {
     /// The live writer.
     Tip,
-    /// One catch-up lane, still catching up: an ordinary landing of its own.
+    /// One catch-up, still catching up: an ordinary landing of its own.
     CatchUp { unit: &'a U },
-    /// One catch-up lane's final landing, in which it joins the tip at
-    /// `join`: every event at or below `join` has been handled by this lane,
-    /// and the tip has not committed any landing past `join`.
+    /// One catch-up's final landing, in which it joins the tip at `join`:
+    /// every event at or below `join` has been handled by this catch-up, and
+    /// the tip has not committed any landing past `join`.
     Join { unit: &'a U, join: EventSequence },
 }
 
@@ -148,12 +147,12 @@ impl<U> Copy for Scope<'_, U> {}
 
 /// Tuning for one joinable registration: the tip's dials, as for a
 /// singleton's [`OutboxEventJobConfig`](crate::out::OutboxEventJobConfig),
-/// and the lanes'.
+/// and the catch-ups'.
 #[derive(Clone)]
 pub struct JoinableSubscriberConfig {
     /// The tip's job type, and the joinable's identity: the job type an
-    /// address from [`Outbox::joinable`] names. Lanes run under
-    /// `"<job_type>.lane"`.
+    /// address from [`Outbox::joinable`] names. Catch-ups run under
+    /// `"<job_type>.catch_up"`.
     pub job_type: JobType,
     /// Backoff for the tip when its handler errors. Default
     /// [`RetrySettings::default`].
@@ -162,23 +161,23 @@ pub struct JoinableSubscriberConfig {
     /// Default 100.
     pub max_batch_size: usize,
     /// Maximum staleness of a persisted checkpoint over skip-only stretches,
-    /// for the tip and for every lane. Default 5s.
+    /// for the tip and for every catch-up. Default 5s.
     pub checkpoint_interval: Duration,
-    /// Backstop on how many collected events may share one lane batch.
+    /// Backstop on how many collected events may share one catch-up batch.
     /// Default 100.
-    pub lane_max_batch_size: usize,
-    /// Backoff for a lane whose handler errors. Default
+    pub catch_up_max_batch_size: usize,
+    /// Backoff for a catch-up whose handler errors. Default
     /// [`RetrySettings::default`].
-    pub lane_retry_settings: RetrySettings,
-    /// Cap on how many lanes run concurrently on one process. `None` defers
-    /// to the job crate's own default.
-    pub max_concurrent_lanes_per_process: Option<usize>,
-    /// A join landing drains at most this many sequences past the lane's
+    pub catch_up_retry_settings: RetrySettings,
+    /// Cap on how many catch-ups run concurrently on one process. `None`
+    /// defers to the job crate's own default.
+    pub max_concurrent_catch_ups_per_process: Option<usize>,
+    /// A join landing drains at most this many sequences past the catch-up's
     /// position. If the tip is further ahead under the lock, the landing is an
     /// ordinary one ([`Scope::CatchUp`], lock held for this landing only) and
-    /// the lane keeps catching up. Bounds the tip stall by construction;
+    /// the catch-up keeps catching up. Bounds the tip stall by construction;
     /// correctness never depends on it. Defaults to
-    /// [`lane_max_batch_size`](Self::lane_max_batch_size).
+    /// [`catch_up_max_batch_size`](Self::catch_up_max_batch_size).
     pub max_join_gap: u64,
 }
 
@@ -189,9 +188,9 @@ impl JoinableSubscriberConfig {
             retry_settings: RetrySettings::default(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-            lane_max_batch_size: DEFAULT_MAX_BATCH_SIZE,
-            lane_retry_settings: RetrySettings::default(),
-            max_concurrent_lanes_per_process: None,
+            catch_up_max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            catch_up_retry_settings: RetrySettings::default(),
+            max_concurrent_catch_ups_per_process: None,
             max_join_gap: DEFAULT_MAX_BATCH_SIZE as u64,
         }
     }
@@ -212,19 +211,19 @@ impl JoinableSubscriberConfig {
     }
 
     /// Also resets [`max_join_gap`](Self::max_join_gap) to the new size.
-    pub fn with_lane_max_batch_size(mut self, lane_max_batch_size: usize) -> Self {
-        self.lane_max_batch_size = lane_max_batch_size.max(1);
-        self.max_join_gap = self.lane_max_batch_size as u64;
+    pub fn with_catch_up_max_batch_size(mut self, catch_up_max_batch_size: usize) -> Self {
+        self.catch_up_max_batch_size = catch_up_max_batch_size.max(1);
+        self.max_join_gap = self.catch_up_max_batch_size as u64;
         self
     }
 
-    pub fn with_lane_retry_settings(mut self, settings: RetrySettings) -> Self {
-        self.lane_retry_settings = settings;
+    pub fn with_catch_up_retry_settings(mut self, settings: RetrySettings) -> Self {
+        self.catch_up_retry_settings = settings;
         self
     }
 
-    pub fn with_max_concurrent_lanes_per_process(mut self, n: usize) -> Self {
-        self.max_concurrent_lanes_per_process = Some(n);
+    pub fn with_max_concurrent_catch_ups_per_process(mut self, n: usize) -> Self {
+        self.max_concurrent_catch_ups_per_process = Some(n);
         self
     }
 
@@ -242,8 +241,8 @@ where
 {
     tip: Subscription<P, InsertOrder, Tables>,
     jobs: Jobs,
-    lane_job_type: JobType,
-    lane_spawner: job::KeyedJobSpawner<LaneMsg>,
+    catch_up_job_type: JobType,
+    catch_up_spawner: job::KeyedJobSpawner<CatchUpMsg>,
 }
 
 /// The joinables registered on one outbox, by the tip's job type. Shared
@@ -251,15 +250,15 @@ where
 pub(in crate::out) type Registrations<P, Tables> =
     Arc<RwLock<HashMap<JobType, Arc<Registered<P, Tables>>>>>;
 
-/// The lanes of one joinable as of a landing op, from
-/// [`JoinableHandle::lanes_in_op`].
+/// The catch-ups of one joinable as of a landing op, from
+/// [`JoinableHandle::catch_ups_in_op`].
 #[derive(Debug, Clone)]
-pub struct Lanes<U> {
-    /// Lanes that have not joined yet: the tip must not apply their units.
-    pub catching_up: Vec<(LaneId, U)>,
-    /// Lanes that joined at a sequence at or above the `since` asked for: the
+pub struct CatchUps<U> {
+    /// CatchUps that have not joined yet: the tip must not apply their units.
+    pub catching_up: Vec<(CatchUpId, U)>,
+    /// CatchUps that joined at a sequence at or above the `since` asked for: the
     /// tip applies their units from the event after that sequence.
-    pub joined: Vec<(LaneId, U, EventSequence)>,
+    pub joined: Vec<(CatchUpId, U, EventSequence)>,
 }
 
 /// An address for one joinable subscription, keyed by the tip's job type.
@@ -332,14 +331,15 @@ where
         let tip_spawner = jobs.add_resident_initializer(tip_initializer);
 
         // Leaked once per registration: the job crate only accepts `&'static str`.
-        let lane_job_type = JobType::new(Box::leak(format!("{job_type}.lane").into_boxed_str()));
-        let lane_initializer = LaneJobInitializer::<S, P, Tables>::new(
+        let catch_up_job_type =
+            JobType::new(Box::leak(format!("{job_type}.catch_up").into_boxed_str()));
+        let catch_up_initializer = CatchUpJobInitializer::<S, P, Tables>::new(
             self.clone(),
             handler,
-            lane_job_type.clone(),
+            catch_up_job_type.clone(),
             &config,
         );
-        let lane_spawner = jobs.add_keyed_initializer(lane_initializer);
+        let catch_up_spawner = jobs.add_keyed_initializer(catch_up_initializer);
 
         let job = tip_spawner.spawn(OutboxEventJobData::default()).await?;
         let tip = Subscription::new(job, self.pool().clone(), None);
@@ -351,8 +351,8 @@ where
                 Arc::new(Registered {
                     tip,
                     jobs: jobs.clone(),
-                    lane_job_type,
-                    lane_spawner,
+                    catch_up_job_type,
+                    catch_up_spawner,
                 })
             });
         Ok(self.joinable(job_type))
@@ -399,27 +399,27 @@ where
         self.registered()?.tip.load().await
     }
 
-    /// Re-derive a lane handle from a stored id. Pure: nothing is checked
-    /// until the lane is used.
-    pub fn lane(&self, id: LaneId) -> CatchUpLane<P, Tables> {
-        CatchUpLane {
+    /// Re-derive a catch-up handle from a stored id. Pure: nothing is checked
+    /// until the catch-up is used.
+    pub fn catch_up(&self, id: CatchUpId) -> CatchUp<P, Tables> {
+        CatchUp {
             outbox: self.outbox.clone(),
             job_type: self.job_type.clone(),
             id,
         }
     }
 
-    /// Lane state as of `op`. Inside a tip `flush` this is read under the
+    /// Catch-up state as of `op`. Inside a tip `flush` this is read under the
     /// entry lock and is the contract for consumers that keep no seam state of
     /// their own: skip units in `catching_up`, apply past the join sequence
     /// for units in `joined`. `joined` holds joins at or above `since`; a tip passes its
     /// previous checkpoint, which bounds the list by construction.
-    #[es_entity::errlanes::instrument(name = "obix.joinable.lanes_in_op", skip_all)]
-    pub async fn lanes_in_op(
+    #[es_entity::errlanes::instrument(name = "obix.joinable.catch_ups_in_op", skip_all)]
+    pub async fn catch_ups_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         since: EventSequence,
-    ) -> Result<Lanes<U>, ObixFault>
+    ) -> Result<CatchUps<U>, ObixFault>
     where
         U: DeserializeOwned,
     {
@@ -427,50 +427,52 @@ where
         let rows = {
             let fut: std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<crate::tables::LaneRows, sqlx::Error>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::tables::CatchUpRows, sqlx::Error>,
+                        > + Send
                         + '_,
                 >,
-            > = Box::pin(Tables::lanes_in_op(
+            > = Box::pin(Tables::catch_ups_in_op(
                 &mut *op,
                 self.job_type.as_str(),
-                registered.lane_job_type.as_str(),
+                registered.catch_up_job_type.as_str(),
                 since,
             ));
             fut.await?
         };
-        let lane_job_type = &registered.lane_job_type;
-        let decode = |key: String, stored: serde_json::Value| -> Result<(LaneId, U), ObixFault> {
-            let id: LaneId = key
-                .parse()
-                .ok()
-                .ok_or(Undecodable::Key {
-                    job_type: lane_job_type.clone(),
-                })
-                .into_fault()?;
-            let unit: U = serde_json::from_value(stored)
-                .map_err(Undecodable::InstanceConfig)
-                .into_fault()?;
-            Ok((id, unit))
-        };
-        let mut lanes = Lanes {
+        let catch_up_job_type = &registered.catch_up_job_type;
+        let decode =
+            |key: String, stored: serde_json::Value| -> Result<(CatchUpId, U), ObixFault> {
+                let id: CatchUpId = key
+                    .parse()
+                    .ok()
+                    .ok_or(Undecodable::Key {
+                        job_type: catch_up_job_type.clone(),
+                    })
+                    .into_fault()?;
+                let unit: U = serde_json::from_value(stored)
+                    .map_err(Undecodable::InstanceConfig)
+                    .into_fault()?;
+                Ok((id, unit))
+            };
+        let mut catch_ups = CatchUps {
             catching_up: Vec::with_capacity(rows.live.len()),
             joined: Vec::with_capacity(rows.joined.len()),
         };
         for (key, stored) in rows.live {
-            lanes.catching_up.push(decode(key, stored)?);
+            catch_ups.catching_up.push(decode(key, stored)?);
         }
         for (key, stored, join) in rows.joined {
             let (id, unit) = decode(key, stored)?;
-            lanes.joined.push((id, unit, join));
+            catch_ups.joined.push((id, unit, join));
         }
-        Ok(lanes)
+        Ok(catch_ups)
     }
 
     /// Start a catch-up for `unit` from `start_after` (exclusive), in the
     /// caller's op — the one that creates the unit. Takes the tip's lock
     /// exclusively as the first statement on `op`, so a tip landing sees the
-    /// unit and its lane together or not at all, and holds it until `op`
+    /// unit and its catch-up together or not at all, and holds it until `op`
     /// commits. A birth above the stream frontier is rejected with
     /// [`SubscriptionRejection::BirthAheadOfFrontier`].
     #[es_entity::errlanes::instrument(name = "obix.joinable.start_catch_up_in_op", skip_all)]
@@ -479,7 +481,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         unit: U,
         start_after: EventSequence,
-    ) -> Result<CatchUpLane<P, Tables>, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
+    ) -> Result<CatchUp<P, Tables>, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
     where
         U: Serialize,
     {
@@ -497,20 +499,22 @@ where
             fut.await?;
         }
 
-        let id = LaneId::new();
+        let id = CatchUpId::new();
         let key = id.to_string();
-        let lane_type = registered.lane_job_type.as_str();
+        let catch_up_type = registered.catch_up_job_type.as_str();
         let retired = {
             let fut: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>,
             > = Box::pin(Tables::subscription_retired_in_op(
-                &mut *op, lane_type, &key,
+                &mut *op,
+                catch_up_type,
+                &key,
             ));
             fut.await?
         };
         if retired {
             return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
-                subscriber_type: lane_type.to_string(),
+                subscriber_type: catch_up_type.to_string(),
                 key,
             }));
         }
@@ -536,38 +540,38 @@ where
 
         Tables::insert_subscription_in_op(
             op,
-            lane_type,
+            catch_up_type,
             &key,
-            &[LANE_WAKE_KEY.to_string()],
+            &[CATCH_UP_WAKE_KEY.to_string()],
             instance_config,
             start_after,
         )
         .await?;
         registered
-            .lane_spawner
-            .spawn_in_op(op, key.clone(), LaneMsg { lane: key })
+            .catch_up_spawner
+            .spawn_in_op(op, key.clone(), CatchUpMsg { catch_up: key })
             .await?;
 
-        Ok(self.lane(id))
+        Ok(self.catch_up(id))
     }
 }
 
-/// The wake key every lane row carries: the table requires one, and a lane
-/// never passivates, so nothing ever consults it.
-const LANE_WAKE_KEY: &str = "lane";
+/// The wake key every catch-up row carries: the table requires one, and a
+/// catch-up never passivates, so nothing ever consults it.
+const CATCH_UP_WAKE_KEY: &str = "catch_up";
 
-/// One catch-up lane: an address derived from its id, cheap to clone and to
-/// re-derive with [`JoinableHandle::lane`].
-pub struct CatchUpLane<P, Tables = DefaultMailboxTables>
+/// One catch-up: an address derived from its id, cheap to clone and to
+/// re-derive with [`JoinableHandle::catch_up`].
+pub struct CatchUp<P, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     outbox: Outbox<P, Tables>,
     job_type: JobType,
-    id: LaneId,
+    id: CatchUpId,
 }
 
-impl<P, Tables> Clone for CatchUpLane<P, Tables>
+impl<P, Tables> Clone for CatchUp<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
     Tables: MailboxTables,
@@ -581,12 +585,12 @@ where
     }
 }
 
-impl<P, Tables> CatchUpLane<P, Tables>
+impl<P, Tables> CatchUp<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    pub fn id(&self) -> LaneId {
+    pub fn id(&self) -> CatchUpId {
         self.id
     }
 
@@ -594,16 +598,16 @@ where
         self.outbox.joinable_registration(&self.job_type)
     }
 
-    /// The lane's checkpoint, frontier and job status. A joined lane's final
-    /// execution state stays readable.
-    #[es_entity::errlanes::instrument(name = "obix.joinable.lane_load", skip_all)]
+    /// The catch-up's checkpoint, frontier and job status. A joined
+    /// catch-up's final execution state stays readable.
+    #[es_entity::errlanes::instrument(name = "obix.joinable.catch_up_load", skip_all)]
     pub async fn load(
         &self,
     ) -> Result<SubscriptionSnapshot, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
         let registered = self.registered()?;
         Subscription::<P, InsertOrder, Tables>::new_keyed(
             registered.jobs.clone(),
-            registered.lane_job_type.clone(),
+            registered.catch_up_job_type.clone(),
             self.id.to_string(),
             self.outbox.pool().clone(),
         )
@@ -611,10 +615,11 @@ where
         .await
     }
 
-    /// Block until the lane has joined; returns the sequence it joined at. Polls the join
-    /// record as [`Subscription::await_position`] polls a checkpoint, and
-    /// reports its deadline as [`SubscriptionRejection::LaneJoinTimeout`].
-    /// A cancelled lane never joins, so it ends in the same timeout.
+    /// Block until the catch-up has joined; returns the sequence it joined
+    /// at. Polls the join record as [`Subscription::await_position`] polls a
+    /// checkpoint, and reports its deadline as
+    /// [`SubscriptionRejection::CatchUpJoinTimeout`]. A cancelled catch-up
+    /// never joins, so it ends in the same timeout.
     #[es_entity::errlanes::instrument(
         name = "obix.joinable.await_join",
         skip_all,
@@ -631,14 +636,15 @@ where
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
             if let Some(join) =
-                Tables::lane_join_sequence(self.outbox.pool(), self.job_type.as_str(), &key).await?
+                Tables::catch_up_join_sequence(self.outbox.pool(), self.job_type.as_str(), &key)
+                    .await?
             {
                 return Ok(join);
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(Fail::Rejected(SubscriptionRejection::LaneJoinTimeout {
-                    lane: self.id,
+                return Err(Fail::Rejected(SubscriptionRejection::CatchUpJoinTimeout {
+                    catch_up: self.id,
                     waited: now.duration_since(start),
                 }));
             }
@@ -647,13 +653,13 @@ where
         }
     }
 
-    /// Cancel the lane on the caller's own operation — atomic with, e.g.,
-    /// deletion of the unit it covers. Row absence ends the lane: the
-    /// runner's next run-start check completes it, and a join landing
-    /// already waiting for the tip's lock finds the row gone and ends the
-    /// lane without flushing. The lane's record has no join sequence, so it
-    /// never appears among a tip's joined lanes. Cancelling a lane that has
-    /// already joined is a no-op: its row is gone and its join record stands.
+    /// Cancel the catch-up on the caller's own operation — atomic with, e.g.,
+    /// deletion of the unit it covers. Row absence ends it: the runner's
+    /// next run-start check completes it, and a join landing already waiting
+    /// for the tip's lock finds the row gone and ends it without flushing.
+    /// Its record has no join sequence, so it never appears among a tip's
+    /// joined catch-ups. Cancelling a catch-up that has already joined is a
+    /// no-op: its row is gone and its join record stands.
     #[es_entity::errlanes::instrument(name = "obix.joinable.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
@@ -663,10 +669,10 @@ where
         let key = self.id.to_string();
         let fut: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + '_>,
-        > = Box::pin(Tables::retire_lane_in_op(
+        > = Box::pin(Tables::retire_catch_up_in_op(
             &mut *op,
             self.job_type.as_str(),
-            registered.lane_job_type.as_str(),
+            registered.catch_up_job_type.as_str(),
             &key,
             None,
         ));

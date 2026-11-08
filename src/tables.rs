@@ -551,44 +551,45 @@ pub trait MailboxTables: Send + Sync + 'static {
         subscriber_type: &str,
     ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
 
-    /// End a catch-up lane, in one statement: delete its `subscriptions` row
-    /// (under `lane_type`), leave the ordinary tombstone in
-    /// `retired_subscriptions`, and record the lane's end in `joinable_lanes`
+    /// End a catch-up, in one statement: delete its `subscriptions` row
+    /// (under `catch_up_type`), leave the ordinary tombstone in
+    /// `retired_subscriptions`, and record its end in `joinable_catch_ups`
     /// under the tip's `tip_type`, carrying the unit from the deleted row.
-    /// `join` is the sequence it joined at, or `None` for a lane cancelled
-    /// rather than joined. A lane with no live row is left untouched.
-    fn retire_lane_in_op(
+    /// `join` is the sequence it joined at, or `None` for a catch-up
+    /// cancelled rather than joined. A catch-up with no live row is left
+    /// untouched.
+    fn retire_catch_up_in_op(
         op: &mut impl es_entity::AtomicOperation,
         tip_type: &str,
-        lane_type: &str,
+        catch_up_type: &str,
         key: &str,
         join: Option<EventSequence>,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// The lanes of one tip as of `op`: the live ones (rows under `lane_type`
-    /// in `subscriptions`), and the ones in `joinable_lanes` under `tip_type`
-    /// that joined at or above `since`.
-    fn lanes_in_op(
+    /// The catch-ups of one tip as of `op`: the live ones (rows under
+    /// `catch_up_type` in `subscriptions`), and the ones in
+    /// `joinable_catch_ups` under `tip_type` that joined at or above `since`.
+    fn catch_ups_in_op(
         op: &mut impl es_entity::AtomicOperation,
         tip_type: &str,
-        lane_type: &str,
+        catch_up_type: &str,
         since: EventSequence,
-    ) -> impl Future<Output = Result<LaneRows, sqlx::Error>> + Send;
+    ) -> impl Future<Output = Result<CatchUpRows, sqlx::Error>> + Send;
 
-    /// The sequence a lane joined its tip at, read on the pool; `None` while
-    /// the lane is live and for a lane that was cancelled.
-    fn lane_join_sequence(
+    /// The sequence a catch-up joined its tip at, read on the pool; `None`
+    /// while it is live and for one that was cancelled.
+    fn catch_up_join_sequence(
         pool: &sqlx::PgPool,
         tip_type: &str,
         key: &str,
     ) -> impl Future<Output = Result<Option<EventSequence>, sqlx::Error>> + Send;
 }
 
-/// The stored lanes of one tip, as [`MailboxTables::lanes_in_op`] reads
-/// them: `(key, instance_config)` for each live lane and
+/// The stored catch-ups of one tip, as [`MailboxTables::catch_ups_in_op`]
+/// reads them: `(key, instance_config)` for each live one and
 /// `(key, instance_config, joined_at_sequence)` for each join.
 #[derive(Debug, Clone)]
-pub struct LaneRows {
+pub struct CatchUpRows {
     pub live: Vec<(String, serde_json::Value)>,
     pub joined: Vec<(String, serde_json::Value, EventSequence)>,
 }

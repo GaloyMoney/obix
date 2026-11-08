@@ -26,7 +26,8 @@ pub use self::ctx::{
 pub use self::error::{CouldNotDecodeStored, LaneMismatch};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::joinable::{
-    CatchUpLane, JoinableHandle, JoinableSubscriber, JoinableSubscriberConfig, LaneId, Lanes, Scope,
+    CatchUp, CatchUpId, CatchUps, JoinableHandle, JoinableSubscriber, JoinableSubscriberConfig,
+    Scope,
 };
 pub use self::subscription::keyed::{
     KeyedSubscriber, KeyedSubscriberConfig, SubscriptionDef, Subscriptions, WakeKey, WakeKeys,
@@ -524,7 +525,7 @@ where
 
     /// Register a joinable subscriber: one handler run by a **tip** (a
     /// resident job under `config.job_type`, the live writer) and by any
-    /// number of **catch-up lanes** (keyed jobs under `"<job_type>.lane"`),
+    /// number of **catch-ups** (keyed jobs under `"<job_type>.catch_up"`),
     /// each started for one unit with
     /// [`JoinableHandle::start_catch_up_in_op`] and joining the tip at a
     /// sequence no tip landing straddles. Returns the handle; the same

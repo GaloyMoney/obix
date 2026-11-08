@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT key, instance_config, joined_at_sequence AS \"joined_at_sequence!\"\n            FROM joinable_lanes\n            WHERE subscriber_type = $1 AND joined_at_sequence >= $2\n            ORDER BY joined_at_sequence, key",
+  "query": "\n            SELECT key, instance_config, joined_at_sequence AS \"joined_at_sequence!\"\n            FROM joinable_catch_ups\n            WHERE subscriber_type = $1 AND joined_at_sequence >= $2\n            ORDER BY joined_at_sequence, key",
   "describe": {
     "columns": [
       {
@@ -31,5 +31,5 @@
       true
     ]
   },
-  "hash": "eccf25f8f862bc94fda19382bf6fc3eb44337df671219f680db04b514c0af7ca"
+  "hash": "05d13cc3dd77ca48f450a1f41e37cc647102d175da165821ac4238aa0c27386f"
 }

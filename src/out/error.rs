@@ -90,13 +90,13 @@ pub enum SubscriptionRejection {
         target: super::StreamPosition,
         waited: std::time::Duration,
     },
-    /// [`CatchUpLane::await_join`](super::subscription::joinable::CatchUpLane::await_join)
-    /// hit its deadline before the lane joined its tip. A lane that was
-    /// cancelled never joins, so it ends here too.
-    #[error("lane {lane} has not joined its tip after {waited:?}")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_LANE_JOIN_TIMEOUT")]
-    LaneJoinTimeout {
-        lane: super::subscription::joinable::LaneId,
+    /// [`CatchUp::await_join`](super::subscription::joinable::CatchUp::await_join)
+    /// hit its deadline before the catch-up joined its tip. A catch-up that
+    /// was cancelled never joins, so it ends here too.
+    #[error("catch-up {catch_up} has not joined its tip after {waited:?}")]
+    #[rejection(code = "OBIX_SUBSCRIPTION_CATCH_UP_JOIN_TIMEOUT")]
+    CatchUpJoinTimeout {
+        catch_up: super::subscription::joinable::CatchUpId,
         waited: std::time::Duration,
     },
 }
@@ -151,12 +151,12 @@ pub enum JoinableFault {
     #[classify(fatal(Invariant))]
     #[error("joinable subscription {job_type} was used before register_joinable_subscriber")]
     NotRegistered { job_type: ::job::JobType },
-    /// A join landing's drain pulled the lane's own stream and it ended
+    /// A join landing's drain pulled the catch-up's own stream and it ended
     /// before `through`. The events up to the tip's committed checkpoint are
     /// committed, so a stream that ends there is a closed listener, not a
-    /// short stream. The landing rolls back and the lane retries.
+    /// short stream. The landing rolls back and the catch-up retries.
     #[classify(transient(Other))]
-    #[error("the lane's stream ended at {at} before the tip checkpoint {through}")]
+    #[error("the catch-up's stream ended at {at} before the tip checkpoint {through}")]
     DrainEnded {
         at: crate::EventSequence,
         through: crate::EventSequence,
