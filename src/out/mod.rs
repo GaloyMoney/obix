@@ -23,7 +23,10 @@ pub use self::ctx::{
     EventCtx, FinishedAtFence, FlushError, FlushOp, FlushOutcome, Handled, IsolatedOp,
     JoinableEventCtx, KeyedEventCtx, StagedOp, Suspended,
 };
-pub use self::error::{CouldNotDecodeStored, LaneMismatch};
+pub use self::error::{
+    BirthAheadOfFrontier, CatchUpJoinTimeout, CouldNotDecodeStored, KeyRetired, LaneMismatch,
+    NoSuchSubscription, SubscribeRejection,
+};
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::joinable::{
     CatchUp, CatchUpId, CatchUps, JoinableHandle, JoinableSubscriber, JoinableSubscriberConfig,

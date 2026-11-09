@@ -690,10 +690,12 @@ async fn birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
         )
         .await;
     match rejected {
-        Err(Fail::Rejected(obix::SubscriptionRejection::BirthAheadOfFrontier {
-            start_after,
-            frontier,
-        })) => {
+        Err(Fail::Rejected(obix::SubscribeRejection::BirthAheadOfFrontier(
+            obix::BirthAheadOfFrontier {
+                start_after,
+                frontier,
+            },
+        ))) => {
             assert_eq!(start_after, EventSequence::from(6u64));
             assert_eq!(frontier, EventSequence::from(5u64));
         }
@@ -749,7 +751,7 @@ async fn assert_key_retired(
         .subscribe_in_op(&mut op, MemberId(key), plain_config(7), wake_key_for(7))
         .await;
     match via_frontier {
-        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired {
+        Err(Fail::Rejected(obix::KeyRetired {
             subscriber_type,
             key: rejected_key,
         })) => {
@@ -769,10 +771,10 @@ async fn assert_key_retired(
         )
         .await;
     match via_birth {
-        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired {
+        Err(Fail::Rejected(obix::SubscribeRejection::KeyRetired(obix::KeyRetired {
             subscriber_type,
             key: rejected_key,
-        })) => {
+        }))) => {
             assert_eq!(subscriber_type, JOB_TYPE);
             assert_eq!(rejected_key, key.to_string());
         }
@@ -978,7 +980,7 @@ async fn a_subscribe_racing_a_cancel_cannot_resurrect_the_key() -> anyhow::Resul
     cancelling.commit().await?;
 
     match racing.await?? {
-        Err(Fail::Rejected(obix::SubscriptionRejection::KeyRetired { key, .. })) => {
+        Err(Fail::Rejected(obix::KeyRetired { key, .. })) => {
             assert_eq!(key, MemberId(1).to_string());
         }
         Ok(()) => panic!("a subscribe racing a cancel must not resurrect the key"),

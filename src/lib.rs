@@ -34,17 +34,18 @@ pub use inbox::{
 };
 pub use obix_macros::{EphemeralSelection, MailboxTables, OutboxEvent};
 pub use out::{
-    CatchUp, CatchUpId, CatchUps, CommitLaneDisabled, CommitOrder, CouldNotDecodeStored,
-    DecodeFailure, Delivery, EphemeralConfig, EphemeralEvent, EphemeralEventType, EphemeralOutbox,
-    EphemeralOutboxEvent, EphemeralOutboxListener, EphemeralSelection, EphemeralSubscriber,
-    EphemeralSubscriberConfig, EphemeralSubscription, EventCtx, EventDelivery, FinishedAtFence,
-    FlushError, FlushOp, FlushOutcome, Handled, InsertOrder, IsolatedOp, JoinableEventCtx,
-    JoinableHandle, JoinableSubscriber, JoinableSubscriberConfig, KeyedEventCtx, KeyedSubscriber,
-    KeyedSubscriberConfig, Lane, LaneMismatch, Ordering, Outbox, OutboxEventJobConfig,
+    BirthAheadOfFrontier, CatchUp, CatchUpId, CatchUpJoinTimeout, CatchUps, CommitLaneDisabled,
+    CommitOrder, CouldNotDecodeStored, DecodeFailure, Delivery, EphemeralConfig, EphemeralEvent,
+    EphemeralEventType, EphemeralOutbox, EphemeralOutboxEvent, EphemeralOutboxListener,
+    EphemeralSelection, EphemeralSubscriber, EphemeralSubscriberConfig, EphemeralSubscription,
+    EventCtx, EventDelivery, FinishedAtFence, FlushError, FlushOp, FlushOutcome, Handled,
+    InsertOrder, IsolatedOp, JoinableEventCtx, JoinableHandle, JoinableSubscriber,
+    JoinableSubscriberConfig, KeyRetired, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
+    Lane, LaneMismatch, NoSuchSubscription, Ordering, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, RawPayload, Scope, SingletonSubscriber,
-    StagedOp, StreamPosition, Subscription, SubscriptionDef, SubscriptionRejection,
-    SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions, Suspended, UndecodableDelivery,
-    UndecodableEventError, WakeKey, WakeKeys,
+    StagedOp, StreamPosition, SubscribeRejection, Subscription, SubscriptionDef,
+    SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus, Subscriptions,
+    Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]

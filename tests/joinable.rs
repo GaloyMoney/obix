@@ -1277,7 +1277,7 @@ async fn a_birth_ahead_of_the_frontier_is_rejected() -> anyhow::Result<()> {
         matches!(
             rejected,
             Err(es_entity::errlanes::Fail::Rejected(
-                obix::SubscriptionRejection::BirthAheadOfFrontier { .. }
+                obix::BirthAheadOfFrontier { .. }
             ))
         ),
         "a birth above the frontier is a rejection"
@@ -1316,7 +1316,7 @@ async fn cancel_in_op_ends_a_catch_up_without_a_join() -> anyhow::Result<()> {
         matches!(
             timeout,
             Err(es_entity::errlanes::Fail::Rejected(
-                obix::SubscriptionRejection::CatchUpJoinTimeout { .. }
+                obix::CatchUpJoinTimeout { .. }
             ))
         ),
         "a cancelled catch-up never joins"

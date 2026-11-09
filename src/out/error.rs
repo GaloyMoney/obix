@@ -22,13 +22,30 @@ use super::Ordering;
 pub struct CommitLaneDisabled;
 
 // --- rejection families ---
+//
+// Each rejecting method returns a carrier that names only the rejections it
+// can produce: a caller branching on the result, or delegating it into its
+// own family, sees exactly the codes that can reach it. The keyed-lifecycle
+// outcomes therefore live beside the methods that raise them rather than in
+// one subscription-wide enum.
 
 /// Caller-correctable outcomes of the checkpoint read-back and the
-/// caught-up barrier. Everything else — a raw sqlx fault, an undecodable
-/// stored execution state, a stored checkpoint on the wrong lane, the
-/// handler job's own failure — travels as `Transient`/`Fatal` in
+/// caught-up barrier — [`Subscription::load`], [`await_position`] and
+/// [`await_caught_up`], and the tip/catch-up loads that delegate to them.
+/// Everything else — a raw sqlx fault, an undecodable stored execution
+/// state, a stored checkpoint on the wrong lane, the handler job's own
+/// failure — travels as `Transient`/`Fatal` in
 /// `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` instead of as a
 /// variant here.
+///
+/// The keyed-lifecycle rejections are not variants here: the subscribe calls
+/// return [`KeyRetired`] / [`SubscribeRejection`], the catch-up start
+/// [`BirthAheadOfFrontier`], the keyed lookup [`NoSuchSubscription`] and the
+/// join barrier [`CatchUpJoinTimeout`].
+///
+/// [`Subscription::load`]: super::Subscription::load
+/// [`await_position`]: super::Subscription::await_position
+/// [`await_caught_up`]: super::Subscription::await_caught_up
 #[derive(Debug, errlanes::Rejection)]
 pub enum SubscriptionRejection {
     /// A keyed member's job could not be resolved from
@@ -52,32 +69,6 @@ pub enum SubscriptionRejection {
         subscriber_type: String,
         key: String,
     },
-    /// `Subscriptions::subscription(key)`: no subscriptions row has ever
-    /// existed for this key.
-    #[error("no subscription has ever existed for ({subscriber_type}, {key})")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_NO_SUCH_SUBSCRIPTION")]
-    NoSuchSubscription {
-        subscriber_type: String,
-        key: String,
-    },
-    /// `subscribe_from_in_op`: the requested birth position is above the
-    /// stream frontier sampled on the caller's operation. A member may not be
-    /// born owing nothing for events that already exist.
-    #[error("birth position {start_after} is ahead of the stream frontier {frontier}")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER")]
-    BirthAheadOfFrontier {
-        start_after: crate::EventSequence,
-        frontier: crate::EventSequence,
-    },
-    /// `subscribe_in_op` / `subscribe_from_in_op`: the key's previous
-    /// subscription ended (finished or cancelled). A key is never reused —
-    /// mint a new one.
-    #[error("subscription for ({subscriber_type}, {key}) has been retired")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_KEY_RETIRED")]
-    KeyRetired {
-        subscriber_type: String,
-        key: String,
-    },
     /// [`Subscription::await_position`](super::Subscription::await_position) —
     /// or [`await_caught_up`](super::Subscription::await_caught_up),
     /// which delegates to it — hit its deadline. Carries the observed lag so
@@ -90,15 +81,68 @@ pub enum SubscriptionRejection {
         target: super::StreamPosition,
         waited: std::time::Duration,
     },
-    /// [`CatchUp::await_join`](super::subscription::joinable::CatchUp::await_join)
-    /// hit its deadline before the catch-up joined its tip. A catch-up that
-    /// was cancelled never joins, so it ends here too.
-    #[error("catch-up {catch_up} has not joined its tip after {waited:?}")]
-    #[rejection(code = "OBIX_SUBSCRIPTION_CATCH_UP_JOIN_TIMEOUT")]
-    CatchUpJoinTimeout {
-        catch_up: super::subscription::joinable::CatchUpId,
-        waited: std::time::Duration,
-    },
+}
+
+/// [`Subscriptions::subscription`](super::Subscriptions::subscription): no
+/// subscriptions row has ever existed for this key.
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "OBIX_SUBSCRIPTION_NO_SUCH_SUBSCRIPTION")]
+#[error("no subscription has ever existed for ({subscriber_type}, {key})")]
+pub struct NoSuchSubscription {
+    pub subscriber_type: String,
+    pub key: String,
+}
+
+/// [`subscribe_in_op`](super::Subscriptions::subscribe_in_op) /
+/// [`subscribe_from_in_op`](super::Subscriptions::subscribe_from_in_op): the
+/// key's previous subscription ended (finished or cancelled). A key is never
+/// reused — mint a new one.
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "OBIX_SUBSCRIPTION_KEY_RETIRED")]
+#[error("subscription for ({subscriber_type}, {key}) has been retired")]
+pub struct KeyRetired {
+    pub subscriber_type: String,
+    pub key: String,
+}
+
+/// [`subscribe_from_in_op`](super::Subscriptions::subscribe_from_in_op) /
+/// [`start_catch_up_in_op`](super::JoinableHandle::start_catch_up_in_op):
+/// the requested birth position is above the stream frontier sampled on the
+/// caller's operation. A member may not be born owing nothing for events
+/// that already exist.
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER")]
+#[error("birth position {start_after} is ahead of the stream frontier {frontier}")]
+pub struct BirthAheadOfFrontier {
+    pub start_after: crate::EventSequence,
+    pub frontier: crate::EventSequence,
+}
+
+/// The outcomes of
+/// [`subscribe_from_in_op`](super::Subscriptions::subscribe_from_in_op), each
+/// keeping its own code.
+/// [`subscribe_in_op`](super::Subscriptions::subscribe_in_op) can only reject
+/// with [`KeyRetired`], which enters this family by `?`, so a caller that
+/// wraps both subscribe calls can name this one type.
+#[derive(Debug, errlanes::Rejection)]
+pub enum SubscribeRejection {
+    #[rejection(delegate, from)]
+    #[error("{0}")]
+    KeyRetired(KeyRetired),
+    #[rejection(delegate, from)]
+    #[error("{0}")]
+    BirthAheadOfFrontier(BirthAheadOfFrontier),
+}
+
+/// [`CatchUp::await_join`](super::subscription::joinable::CatchUp::await_join)
+/// hit its deadline before the catch-up joined its tip. A catch-up that
+/// was cancelled never joins, so it ends here too.
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "OBIX_SUBSCRIPTION_CATCH_UP_JOIN_TIMEOUT")]
+#[error("catch-up {catch_up} has not joined its tip after {waited:?}")]
+pub struct CatchUpJoinTimeout {
+    pub catch_up: super::subscription::joinable::CatchUpId,
+    pub waited: std::time::Duration,
 }
 
 // --- fault wrappers: the kind says what the operator looks at ---
@@ -186,7 +230,7 @@ mod tests {
         .into();
         assert_eq!(no_such_job, "OBIX_SUBSCRIPTION_NO_SUCH_JOB");
 
-        let no_such_subscription: &'static str = SubscriptionRejection::NoSuchSubscription {
+        let no_such_subscription: &'static str = NoSuchSubscription {
             subscriber_type: String::new(),
             key: String::new(),
         }
@@ -197,7 +241,7 @@ mod tests {
             "OBIX_SUBSCRIPTION_NO_SUCH_SUBSCRIPTION"
         );
 
-        let birth_ahead: &'static str = SubscriptionRejection::BirthAheadOfFrontier {
+        let birth_ahead: &'static str = BirthAheadOfFrontier {
             start_after: crate::EventSequence::BEGIN,
             frontier: crate::EventSequence::BEGIN,
         }
@@ -205,13 +249,21 @@ mod tests {
         .into();
         assert_eq!(birth_ahead, "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER");
 
-        let key_retired: &'static str = SubscriptionRejection::KeyRetired {
+        let key_retired: &'static str = KeyRetired {
             subscriber_type: String::new(),
             key: String::new(),
         }
         .code()
         .into();
         assert_eq!(key_retired, "OBIX_SUBSCRIPTION_KEY_RETIRED");
+
+        let join_timeout: &'static str = CatchUpJoinTimeout {
+            catch_up: super::super::subscription::joinable::CatchUpId::new(),
+            waited: std::time::Duration::ZERO,
+        }
+        .code()
+        .into();
+        assert_eq!(join_timeout, "OBIX_SUBSCRIPTION_CATCH_UP_JOIN_TIMEOUT");
 
         let timeout: &'static str = SubscriptionRejection::CaughtUpTimeout {
             checkpoint: super::super::StreamPosition::Insert(crate::EventSequence::BEGIN),
@@ -223,9 +275,47 @@ mod tests {
         assert_eq!(timeout, "OBIX_SUBSCRIPTION_CAUGHT_UP_TIMEOUT");
     }
 
+    /// `SubscribeRejection` adds no code of its own: each variant reports
+    /// the code of the bare rejection it delegates to, and a `KeyRetired`
+    /// carrier lifts into the family totally.
+    #[test]
+    fn subscribe_rejection_delegates_to_its_members_codes() {
+        let retired: &'static str = SubscribeRejection::from(KeyRetired {
+            subscriber_type: String::new(),
+            key: String::new(),
+        })
+        .code()
+        .into();
+        assert_eq!(retired, "OBIX_SUBSCRIPTION_KEY_RETIRED");
+
+        let birth_ahead: &'static str = SubscribeRejection::from(BirthAheadOfFrontier {
+            start_after: crate::EventSequence::BEGIN,
+            frontier: crate::EventSequence::BEGIN,
+        })
+        .code()
+        .into();
+        assert_eq!(birth_ahead, "OBIX_SUBSCRIPTION_BIRTH_AHEAD_OF_FRONTIER");
+
+        fn only_retired() -> Result<(), Fail<KeyRetired, lanes!(Transient, Fatal)>> {
+            Err(Fail::Rejected(KeyRetired {
+                subscriber_type: "webhooks".to_string(),
+                key: "endpoint-1".to_string(),
+            }))
+        }
+        fn either() -> Result<(), Fail<SubscribeRejection, lanes!(Transient, Fatal)>> {
+            only_retired().lift::<SubscribeRejection>()?;
+            Ok(())
+        }
+        assert!(matches!(
+            either(),
+            Err(Fail::Rejected(SubscribeRejection::KeyRetired(KeyRetired { key, .. })))
+                if key == "endpoint-1"
+        ));
+    }
+
     #[test]
     fn birth_ahead_of_frontier_names_both_positions() {
-        let message = SubscriptionRejection::BirthAheadOfFrontier {
+        let message = BirthAheadOfFrontier {
             start_after: crate::EventSequence::from(6u64),
             frontier: crate::EventSequence::from(5u64),
         }
@@ -238,7 +328,7 @@ mod tests {
 
     #[test]
     fn key_retired_names_the_subscription() {
-        let message = SubscriptionRejection::KeyRetired {
+        let message = KeyRetired {
             subscriber_type: "webhooks".to_string(),
             key: "endpoint-1".to_string(),
         }
