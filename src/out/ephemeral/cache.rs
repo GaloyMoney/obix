@@ -90,18 +90,7 @@ where
         event: CachedEvent,
         ephemeral_event_sender: &broadcast::Sender<CachedEvent>,
     ) -> CachedEvents {
-        // Last-write-wins by recorded_at: notification-triggered fetches for
-        // the same event type can complete out of order — a strictly older
-        // event must never overwrite (or be broadcast after) a newer one.
-        if let Some(cached) = cache.get(&event.event_type)
-            && cached.recorded_at > event.recorded_at
-        {
-            return cache;
-        }
-        let event_type = event.event_type.clone();
-        let cache = cache.update(event_type, event.clone());
-        let _ = ephemeral_event_sender.send(event);
-        cache
+        insert_into_cache_and_broadcast(cache, event, ephemeral_event_sender)
     }
 
     async fn fetch_event_by_type(
@@ -357,3 +346,128 @@ fn record_resync_failed(fault: impl Into<ObixFault>) {
     fields(error = %error),
 )]
 fn record_notification_undecodable(error: &serde_json::Error) {}
+
+/// Fold one fetched or post-commit row into the cache, broadcasting it when
+/// it is news.
+///
+/// Last-write-wins by `recorded_at`: notification-triggered fetches for the
+/// same event type can complete out of order, so a strictly older row never
+/// overwrites (or is broadcast after) a newer one.
+///
+/// The same row can also arrive twice: the publisher hands its row to the
+/// cache straight after commit, and the NOTIFY for that commit triggers a
+/// fetch that returns the identical row. When that fetch was spawned before
+/// the post-commit fill landed, both reach this function. The second copy is
+/// dropped so listeners do not see the one event twice. Only an identical
+/// row is treated as a repeat: `recorded_at` is transaction time, so two
+/// writes of one type inside one transaction share it while carrying
+/// different payloads, and the later one must still replace the earlier.
+///
+/// Payloads are compared as JSON values, not text: the post-commit fill
+/// carries the publisher's own serialisation while a fetch carries the
+/// JSONB round-trip of it, and the two can differ in key order and spacing.
+fn insert_into_cache_and_broadcast(
+    cache: CachedEvents,
+    event: CachedEvent,
+    ephemeral_event_sender: &broadcast::Sender<CachedEvent>,
+) -> CachedEvents {
+    if let Some(cached) = cache.get(&event.event_type) {
+        if cached.recorded_at > event.recorded_at {
+            return cache;
+        }
+        if cached.recorded_at == event.recorded_at
+            && same_json(cached.payload.get(), event.payload.get())
+        {
+            return cache;
+        }
+    }
+    let event_type = event.event_type.clone();
+    let cache = cache.update(event_type, event.clone());
+    let _ = ephemeral_event_sender.send(event);
+    cache
+}
+
+fn same_json(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn row(payload: &str, recorded_at: DateTime<Utc>) -> CachedEvent {
+        Arc::new(EphemeralOutboxEvent {
+            event_type: EphemeralEventType::new("test.status"),
+            payload: serde_json::value::RawValue::from_string(payload.to_string()).unwrap(),
+            tracing_context: None,
+            recorded_at,
+        })
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<CachedEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event.payload.get().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn the_same_row_arriving_twice_is_broadcast_once() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let at = Utc::now();
+        let cache = insert_into_cache_and_broadcast(CachedEvents::new(), row("1", at), &tx);
+        let cache = insert_into_cache_and_broadcast(cache, row("1", at), &tx);
+        assert_eq!(drain(&mut rx), vec!["1"]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn the_jsonb_round_trip_of_the_same_row_is_still_the_same_row() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let at = Utc::now();
+        let cache = insert_into_cache_and_broadcast(
+            CachedEvents::new(),
+            row(r#"{"a":1,"b":[1,2]}"#, at),
+            &tx,
+        );
+        let cache =
+            insert_into_cache_and_broadcast(cache, row(r#"{"b": [1, 2], "a": 1}"#, at), &tx);
+        assert_eq!(drain(&mut rx), vec![r#"{"a":1,"b":[1,2]}"#]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_different_payload_at_the_same_instant_still_replaces_and_broadcasts() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let at = Utc::now();
+        let cache = insert_into_cache_and_broadcast(CachedEvents::new(), row("1", at), &tx);
+        let cache = insert_into_cache_and_broadcast(cache, row("2", at), &tx);
+        assert_eq!(drain(&mut rx), vec!["1", "2"]);
+        assert_eq!(
+            cache[&EphemeralEventType::new("test.status")].payload.get(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn a_strictly_older_row_never_overwrites_a_newer_one() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let newer = Utc::now();
+        let older = newer - chrono::Duration::seconds(1);
+        let cache = insert_into_cache_and_broadcast(CachedEvents::new(), row("2", newer), &tx);
+        let cache = insert_into_cache_and_broadcast(cache, row("1", older), &tx);
+        assert_eq!(drain(&mut rx), vec!["2"]);
+        assert_eq!(
+            cache[&EphemeralEventType::new("test.status")].payload.get(),
+            "2"
+        );
+    }
+}

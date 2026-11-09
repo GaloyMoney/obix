@@ -357,7 +357,10 @@
         ${setupDbDev}/bin/setup-db-dev
 
         echo "Running nextest..."
-        cargo nextest run --workspace --verbose
+        # --hide-progress-bar: Concourse hands the task a pty with no size, and
+        # nextest's progress bar swallows every per-test line on it, leaving
+        # only "error: test run failed" in the build log.
+        cargo nextest run --workspace --verbose --hide-progress-bar --no-fail-fast --failure-output immediate-final
 
         echo "Running doc tests..."
         cargo test --doc --workspace
