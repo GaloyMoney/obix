@@ -1,3 +1,11 @@
+# [obix release v0.18.1](https://github.com/GaloyMoney/obix/releases/tag/0.18.1)
+
+
+
+### Bug Fixes
+
+- Each subscription rejection advertises only what its method can produce (#188)
+
 # [obix release v0.18.0](https://github.com/GaloyMoney/obix/releases/tag/0.18.0)
 
 
