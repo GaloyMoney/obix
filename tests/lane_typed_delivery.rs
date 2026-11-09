@@ -1405,11 +1405,19 @@ async fn toggling_off_then_on_resumes_from_stored_state() -> anyhow::Result<()> 
         vec![4, 5, 6],
         "exactly the new events, and nothing already acknowledged",
     );
-    assert_eq!(
-        subscription.load().await?.checkpoint(),
-        CommitSequence::from(6u64),
-        "the log continued from 3 rather than restarting",
-    );
+    // The checkpoint trails delivery by up to one checkpoint interval, so poll
+    // for it rather than reading it the instant the third group arrives.
+    until(
+        async || {
+            subscription
+                .load()
+                .await
+                .map(|s| s.checkpoint() == CommitSequence::from(6u64))
+                .unwrap_or(false)
+        },
+        "the log continued from 3 to 6 rather than restarting",
+    )
+    .await?;
 
     Ok(())
 }
