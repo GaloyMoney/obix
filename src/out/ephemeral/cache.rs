@@ -362,6 +362,10 @@ fn record_notification_undecodable(error: &serde_json::Error) {}
 /// row is treated as a repeat: `recorded_at` is transaction time, so two
 /// writes of one type inside one transaction share it while carrying
 /// different payloads, and the later one must still replace the earlier.
+///
+/// Payloads are compared as JSON values, not text: the post-commit fill
+/// carries the publisher's own serialisation while a fetch carries the
+/// JSONB round-trip of it, and the two can differ in key order and spacing.
 fn insert_into_cache_and_broadcast(
     cache: CachedEvents,
     event: CachedEvent,
@@ -371,7 +375,9 @@ fn insert_into_cache_and_broadcast(
         if cached.recorded_at > event.recorded_at {
             return cache;
         }
-        if cached.recorded_at == event.recorded_at && cached.payload.get() == event.payload.get() {
+        if cached.recorded_at == event.recorded_at
+            && same_json(cached.payload.get(), event.payload.get())
+        {
             return cache;
         }
     }
@@ -379,6 +385,16 @@ fn insert_into_cache_and_broadcast(
     let cache = cache.update(event_type, event.clone());
     let _ = ephemeral_event_sender.send(event);
     cache
+}
+
+fn same_json(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +426,21 @@ mod tests {
         let cache = insert_into_cache_and_broadcast(CachedEvents::new(), row("1", at), &tx);
         let cache = insert_into_cache_and_broadcast(cache, row("1", at), &tx);
         assert_eq!(drain(&mut rx), vec!["1"]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn the_jsonb_round_trip_of_the_same_row_is_still_the_same_row() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let at = Utc::now();
+        let cache = insert_into_cache_and_broadcast(
+            CachedEvents::new(),
+            row(r#"{"a":1,"b":[1,2]}"#, at),
+            &tx,
+        );
+        let cache =
+            insert_into_cache_and_broadcast(cache, row(r#"{"b": [1, 2], "a": 1}"#, at), &tx);
+        assert_eq!(drain(&mut rx), vec![r#"{"a":1,"b":[1,2]}"#]);
         assert_eq!(cache.len(), 1);
     }
 
