@@ -41,7 +41,7 @@
 //!   cancelled key is not reusable: the job crate retains the final execution
 //!   state under `(subscriber_type, key)`, so a retired key's tombstone in
 //!   `retired_subscriptions` makes both subscribe calls reject it with
-//!   [`SubscriptionRejection::KeyRetired`]. Mint a fresh key.
+//!   [`KeyRetired`]. Mint a fresh key.
 //!
 //! A member finishes only at a landing, and landings need collected items:
 //! decide before subscribing whether there can be nothing to fold. A handler
@@ -51,17 +51,18 @@
 mod runner;
 mod waker;
 
-use es_entity::errlanes::{Fail, lanes};
+use es_entity::errlanes::{Fail, ResultExt, lanes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{marker::PhantomData, time::Duration};
 
 use job::{JobType, RetrySettings};
 
 use crate::error::ObixFault;
+use crate::out::Subscription;
 use crate::out::ctx::{FlushOp, FlushOutcome, Handled, KeyedEventCtx};
+use crate::out::error::{BirthAheadOfFrontier, KeyRetired, NoSuchSubscription, SubscribeRejection};
 use crate::out::event::{EventDelivery, PersistentOutboxEvent, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
-use crate::out::{Subscription, SubscriptionRejection};
 use crate::tables::MailboxTables;
 
 pub(in crate::out) use runner::KeyedSubscriberJobInitializer;
@@ -485,7 +486,8 @@ where
     /// resolves to the existing row (its original `start_after` and
     /// `wake_keys` are never overwritten) and the existing live job. A key
     /// whose previous subscription ended (finished or cancelled) is rejected
-    /// with [`SubscriptionRejection::KeyRetired`] — mint a new key.
+    /// with [`KeyRetired`] — mint a new key. That is the only rejection: the
+    /// birth position is the sampled frontier itself.
     ///
     /// `wake_keys` takes anything convertible into [`WakeKeys`], which is
     /// non-empty by construction — a single [`WakeKey`] converts directly.
@@ -498,12 +500,14 @@ where
         key: D::Key,
         cfg: D::InstanceConfig,
         wake_keys: impl Into<WakeKeys>,
-    ) -> Result<
-        Subscription<P, InsertOrder, Tables>,
-        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
-    > {
-        self.subscribe_born_at(op, key, cfg, wake_keys.into(), None)
-            .await
+    ) -> Result<Subscription<P, InsertOrder, Tables>, Fail<KeyRetired, lanes!(Transient, Fatal)>>
+    {
+        let key_str = key.to_string();
+        self.reject_retired(op, &key_str).await?;
+        let frontier = self.frontier_in_op(op).await?;
+        Ok(self
+            .subscribe_born_at(op, key_str, cfg, wake_keys.into(), frontier)
+            .await?)
     }
 
     /// [`subscribe_in_op`](Self::subscribe_in_op) with a caller-chosen birth
@@ -512,10 +516,10 @@ where
     /// `start_after` is exclusive and must be at or below the frontier sampled
     /// on `op`: a member may not be born owing nothing for events that already
     /// exist, so a higher value is rejected with
-    /// [`SubscriptionRejection::BirthAheadOfFrontier`]. Everything else is
-    /// `subscribe_in_op`: Active from birth, idempotent while subscribed, a
-    /// retired key rejected with [`SubscriptionRejection::KeyRetired`], same
-    /// wake keys.
+    /// [`BirthAheadOfFrontier`]. Everything else is `subscribe_in_op`: Active
+    /// from birth, idempotent while subscribed, a retired key rejected with
+    /// [`KeyRetired`], same wake keys. The two rejections together are
+    /// [`SubscribeRejection`].
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscribe_from_in_op", skip_all)]
     pub async fn subscribe_from_in_op(
         &self,
@@ -526,81 +530,98 @@ where
         start_after: crate::EventSequence,
     ) -> Result<
         Subscription<P, InsertOrder, Tables>,
-        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
-    > {
-        self.subscribe_born_at(op, key, cfg, wake_keys.into(), Some(start_after))
-            .await
-    }
-
-    async fn subscribe_born_at(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        key: D::Key,
-        cfg: D::InstanceConfig,
-        wake_keys: WakeKeys,
-        birth: Option<crate::EventSequence>,
-    ) -> Result<
-        Subscription<P, InsertOrder, Tables>,
-        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+        Fail<SubscribeRejection, lanes!(Transient, Fatal)>,
     > {
         let key_str = key.to_string();
+        // A `Fail` changes its rejection only by an explicit lift; the
+        // family's `From<KeyRetired>` makes it total.
+        self.reject_retired(op, &key_str)
+            .await
+            .lift::<SubscribeRejection>()?;
+        let frontier = self.frontier_in_op(op).await?;
+        if start_after > frontier {
+            return Err(Fail::Rejected(SubscribeRejection::BirthAheadOfFrontier(
+                BirthAheadOfFrontier {
+                    start_after,
+                    frontier,
+                },
+            )));
+        }
+        Ok(self
+            .subscribe_born_at(op, key_str, cfg, wake_keys.into(), start_after)
+            .await?)
+    }
+
+    /// Reject a key whose previous subscription ended. Read on the caller's
+    /// operation, so a subscribe racing a cancel waits on the row the
+    /// uncommitted cancel holds instead of resurrecting the key.
+    async fn reject_retired(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: &str,
+    ) -> Result<(), Fail<KeyRetired, lanes!(Transient, Fatal)>> {
         let retired = {
             let fut: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>,
             > = Box::pin(Tables::subscription_retired_in_op(
                 &mut *op,
                 self.job_type.as_str(),
-                &key_str,
+                key,
             ));
             fut.await?
         };
         if retired {
-            return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
+            return Err(Fail::Rejected(KeyRetired {
                 subscriber_type: self.job_type.to_string(),
-                key: key_str,
+                key: key.to_string(),
             }));
         }
+        Ok(())
+    }
+
+    /// The stream frontier, sampled on the caller's own operation.
+    ///
+    /// Never on the pool: the caller holds a transaction across this call, so
+    /// a pool read here would check out a SECOND connection while the first
+    /// is still held and deadlock a pool under concurrent subscribes.
+    ///
+    /// Reading inside the transaction is if anything more conservative than
+    /// reading beside it — the snapshot frontier can only be at or behind the
+    /// true one, so a racing event is delivered rather than missed.
+    ///
+    /// Boxed for the reason `read_frontier` documents: awaiting the raw
+    /// opaque future behind `&self` makes the subscribe's `Send`-ness
+    /// higher-ranked and breaks `tokio::spawn` at the CALLER. Boxing grounds
+    /// the lifetime to the operation's borrow.
+    async fn frontier_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+    ) -> Result<crate::EventSequence, sqlx::Error> {
+        let fut: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::EventSequence, sqlx::Error>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
+        fut.await
+    }
+
+    /// Insert the row and spawn the key, in `op`, once the key has passed the
+    /// retirement check and `start_after` the frontier check. Cannot reject.
+    async fn subscribe_born_at(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key_str: String,
+        cfg: D::InstanceConfig,
+        wake_keys: WakeKeys,
+        start_after: crate::EventSequence,
+    ) -> Result<Subscription<P, InsertOrder, Tables>, ObixFault> {
         // Non-empty by the type, so there is no emptiness check here — see
         // [`WakeKeys`]. The DB's `CHECK (cardinality(wake_keys) > 0)` remains
         // as the backstop against any other writer to the table.
         let wake_keys = wake_keys.into_strings();
         let instance_config = serde_json::to_value(&cfg)?;
-        // Read on the caller's own operation, never on the pool: the caller
-        // holds a transaction across this call, so a pool read here would
-        // check out a SECOND connection while the first is still held and
-        // deadlock a pool under concurrent subscribes.
-        //
-        // Reading inside the transaction is if anything more conservative
-        // than reading beside it — the snapshot frontier can only be at or
-        // behind the true one, so a racing event is delivered rather than
-        // missed.
-        //
-        // Boxed for the reason `read_frontier` documents: awaiting the raw
-        // opaque future behind `&self` makes this method's `Send`-ness
-        // higher-ranked and breaks `tokio::spawn` at the CALLER. Boxing
-        // grounds the lifetime to the operation's borrow.
-        let frontier = {
-            let fut: std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<crate::EventSequence, sqlx::Error>>
-                        + Send
-                        + '_,
-                >,
-            > = Box::pin(Tables::highest_known_persistent_sequence(&mut *op));
-            fut.await?
-        };
-        let start_after = match birth {
-            None => frontier,
-            Some(start_after) if start_after <= frontier => start_after,
-            Some(start_after) => {
-                return Err(Fail::Rejected(
-                    SubscriptionRejection::BirthAheadOfFrontier {
-                        start_after,
-                        frontier,
-                    },
-                ));
-            }
-        };
 
         Tables::insert_subscription_in_op(
             op,
@@ -636,8 +657,7 @@ where
     /// Cancel a subscription on the caller's own operation — atomic with,
     /// e.g., deletion of the domain entity it belongs to. Row absence ends the
     /// member: no job-kill API exists or is needed. The key is retired: a
-    /// later subscribe of it is rejected with
-    /// [`SubscriptionRejection::KeyRetired`].
+    /// later subscribe of it is rejected with [`KeyRetired`].
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.cancel_in_op", skip_all)]
     pub async fn cancel_in_op(
         &self,
@@ -665,13 +685,16 @@ where
     /// registers with `inherits_state = true`). It is safe to hold — holding
     /// a job handle instead would report checkpoint 0 from the next wake
     /// onward.
+    ///
+    /// A key that was never subscribed is rejected with
+    /// [`NoSuchSubscription`].
     #[es_entity::errlanes::instrument(name = "obix.subscriptions.subscription", skip_all)]
     pub async fn subscription(
         &self,
         key: &D::Key,
     ) -> Result<
         Subscription<P, InsertOrder, Tables>,
-        Fail<SubscriptionRejection, lanes!(Transient, Fatal)>,
+        Fail<NoSuchSubscription, lanes!(Transient, Fatal)>,
     > {
         let key_str = key.to_string();
         // Resolved once here only to report "never subscribed" as an error
@@ -679,7 +702,7 @@ where
         self.jobs
             .keyed_handle(self.job_type.clone(), key_str.clone())
             .await?
-            .ok_or_else(|| SubscriptionRejection::NoSuchSubscription {
+            .ok_or_else(|| NoSuchSubscription {
                 subscriber_type: self.job_type.to_string(),
                 key: key_str.clone(),
             })?;

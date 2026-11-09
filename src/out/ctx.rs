@@ -181,7 +181,7 @@ pub enum FlushOutcome {
     ///
     /// Allowed from any keyed member: it cancels the member from inside and
     /// completes it, atomically, and the key is then retired: subscribing it
-    /// again is rejected with `SubscriptionRejection::KeyRetired`.
+    /// again is rejected with `KeyRetired`.
     ///
     /// A `Finish` landed by a later event's
     /// [`consume`](KeyedEventCtx::consume) ends the member *before* that

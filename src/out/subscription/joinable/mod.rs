@@ -33,7 +33,9 @@ use self::catch_up::{CatchUpJobInitializer, CatchUpMsg};
 use crate::error::ObixFault;
 use crate::out::Outbox;
 use crate::out::ctx::{FlushOp, Handled, JoinableEventCtx};
-use crate::out::error::{CouldNotDecodeStored as Undecodable, JoinableFault};
+use crate::out::error::{
+    BirthAheadOfFrontier, CatchUpJoinTimeout, CouldNotDecodeStored as Undecodable, JoinableFault,
+};
 use crate::out::event::{EventDelivery, UndecodableDelivery};
 use crate::out::lane::InsertOrder;
 use crate::out::subscription::singleton::OutboxEventJobData;
@@ -474,14 +476,16 @@ where
     /// exclusively as the first statement on `op`, so a tip landing sees the
     /// unit and its catch-up together or not at all, and holds it until `op`
     /// commits. A birth above the stream frontier is rejected with
-    /// [`SubscriptionRejection::BirthAheadOfFrontier`].
+    /// [`BirthAheadOfFrontier`] — the only rejection: the catch-up's key is a
+    /// freshly minted id, so a retired one is an invariant, not a caller
+    /// outcome.
     #[es_entity::errlanes::instrument(name = "obix.joinable.start_catch_up_in_op", skip_all)]
     pub async fn start_catch_up_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         unit: U,
         start_after: EventSequence,
-    ) -> Result<CatchUp<P, Tables>, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
+    ) -> Result<CatchUp<P, Tables>, Fail<BirthAheadOfFrontier, lanes!(Transient, Fatal)>>
     where
         U: Serialize,
     {
@@ -513,10 +517,9 @@ where
             fut.await?
         };
         if retired {
-            return Err(Fail::Rejected(SubscriptionRejection::KeyRetired {
-                subscriber_type: catch_up_type.to_string(),
-                key,
-            }));
+            return Err(Fail::from(es_entity::errlanes::Fatal::invariant(
+                "a freshly minted catch-up id is already retired",
+            )));
         }
         let instance_config = serde_json::to_value(&unit)?;
         let frontier = {
@@ -530,12 +533,10 @@ where
             fut.await?
         };
         if start_after > frontier {
-            return Err(Fail::Rejected(
-                SubscriptionRejection::BirthAheadOfFrontier {
-                    start_after,
-                    frontier,
-                },
-            ));
+            return Err(Fail::Rejected(BirthAheadOfFrontier {
+                start_after,
+                frontier,
+            }));
         }
 
         Tables::insert_subscription_in_op(
@@ -617,9 +618,8 @@ where
 
     /// Block until the catch-up has joined; returns the sequence it joined
     /// at. Polls the join record as [`Subscription::await_position`] polls a
-    /// checkpoint, and reports its deadline as
-    /// [`SubscriptionRejection::CatchUpJoinTimeout`]. A cancelled catch-up
-    /// never joins, so it ends in the same timeout.
+    /// checkpoint, and reports its deadline as [`CatchUpJoinTimeout`]. A
+    /// cancelled catch-up never joins, so it ends in the same timeout.
     #[es_entity::errlanes::instrument(
         name = "obix.joinable.await_join",
         skip_all,
@@ -628,7 +628,7 @@ where
     pub async fn await_join(
         &self,
         timeout: Duration,
-    ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>> {
+    ) -> Result<EventSequence, Fail<CatchUpJoinTimeout, lanes!(Transient, Fatal)>> {
         self.registered()?;
         let key = self.id.to_string();
         let start = tokio::time::Instant::now();
@@ -643,7 +643,7 @@ where
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(Fail::Rejected(SubscriptionRejection::CatchUpJoinTimeout {
+                return Err(Fail::Rejected(CatchUpJoinTimeout {
                     catch_up: self.id,
                     waited: now.duration_since(start),
                 }));

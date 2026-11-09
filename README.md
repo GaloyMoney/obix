@@ -179,7 +179,7 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 ### Keyed subscribers: birth position, always-on, finishing
 
-`Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row retirement and job completion commit in one transaction. A finished or cancelled key is retired: both subscribe calls reject it with `SubscriptionRejection::KeyRetired`, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.
+`Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row retirement and job completion commit in one transaction. A finished or cancelled key is retired: both subscribe calls reject it with `KeyRetired`, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.
 
 ### Joinable subscriptions — catch-ups
 
@@ -263,8 +263,17 @@ re-exported from `obix::`, `obix::out::` and
 |---|---|
 | `ObixFault` (`= Fault<lanes!(Transient, Fatal)>`) | every method that cannot reject: `Outbox::init`/`EphemeralOutbox::init`/`EphemeralOutbox::publish*`/`EphemeralOutbox::register_subscriber`/`highest_known_persistent_sequence`/`register_keyed_subscriber`/`register_partition_maintainer`, `Partitions::ensure`/`recover_default`, `Subscriptions::cancel`/`cancel_in_op`, `register_joinable_subscriber`, `JoinableHandle::tip`/`catch_ups_in_op`, `CatchUp::cancel`/`cancel_in_op`, `Inbox::persist_and_queue_job*`/`list_failed` |
 | `Fail<CommitLaneDisabled, lanes!(Transient, Fatal)>` | `Outbox::frontier`, `Outbox::register_singleton_subscriber` |
-| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `Subscriptions::subscription`/`subscribe_in_op`/`subscribe_from_in_op`, `JoinableHandle::load`/`start_catch_up_in_op` (`BirthAheadOfFrontier`), `CatchUp::load`/`await_join` (`CatchUpJoinTimeout`: the `await_position` deadline shape, with the catch-up and the wait) |
+| `Fail<SubscriptionRejection, lanes!(Transient, Fatal)>` | `Subscription::load`/`await_position`/`await_caught_up`, `JoinableHandle::load`, `CatchUp::load` (`NoSuchJob`, `CaughtUpTimeout`) |
+| `Fail<KeyRetired, lanes!(Transient, Fatal)>` | `Subscriptions::subscribe_in_op` |
+| `Fail<SubscribeRejection, lanes!(Transient, Fatal)>` | `Subscriptions::subscribe_from_in_op` (`KeyRetired`, `BirthAheadOfFrontier`; a bare `KeyRetired` enters it by `?`) |
+| `Fail<BirthAheadOfFrontier, lanes!(Transient, Fatal)>` | `JoinableHandle::start_catch_up_in_op` |
+| `Fail<NoSuchSubscription, lanes!(Transient, Fatal)>` | `Subscriptions::subscription` |
+| `Fail<CatchUpJoinTimeout, lanes!(Transient, Fatal)>` | `CatchUp::await_join` (the `await_position` deadline shape, with the catch-up and the wait) |
 | `Fail<InboxRejection, lanes!(Transient, Fatal)>` | `Inbox::find_event_by_id` |
+
+Each rejection type names only the outcomes its method can produce, so a
+downstream family that delegates one of them advertises exactly the codes
+that can reach it.
 
 `ObixFault` is `obix::ObixFault`; `Fail` and `lanes!` come from `errlanes`,
 re-exported as `obix::prelude::es_entity::errlanes` — a downstream signature
