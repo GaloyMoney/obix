@@ -668,10 +668,10 @@ async fn repeated_unrelated_notifications_do_not_delay_an_unresolved_holes_grace
                 .await?;
         }
         inserted_up_to = batch_end;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT pg_notify('persistent_outbox_events', \
              '{{\"min_sequence\": {batch_start}, \"max_sequence\": {batch_end}}}')"
-        ))
+        )))
         .execute(&pool)
         .await?;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -905,10 +905,10 @@ async fn remote_gap_below_a_parked_batch_is_read_bounded_then_memory_resumes() -
     // The remote writer commits for real, and fires the same `pg_notify` a
     // second instance's own debounced notifier would send for it.
     tx.commit().await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT pg_notify('persistent_outbox_events', \
          '{{\"min_sequence\": 1, \"max_sequence\": {BURNED}}}')"
-    ))
+    )))
     .execute(&pool)
     .await?;
 

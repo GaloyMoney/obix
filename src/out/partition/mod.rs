@@ -131,7 +131,7 @@ where
         self.ddl_lock(&mut tx).await?;
         let table = Tables::persistent_outbox_events_table();
         for k in first..=first + self.premake {
-            sqlx::query(&create_partition(table, k))
+            sqlx::query(sqlx::AssertSqlSafe(create_partition(table, k)))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -184,9 +184,9 @@ where
         let default_old = format!("{table}_default_old");
 
         // `MIN`/`MAX` are NULL when DEFAULT is empty — nothing to repair.
-        let bounds = sqlx::query(&format!(
+        let bounds = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT MIN({key}) AS lo, MAX({key}) AS hi FROM {default_child}"
-        ))
+        )))
         .fetch_one(&mut **tx)
         .await?;
         use sqlx::Row;
@@ -202,38 +202,38 @@ where
         // tick has nothing to do and steady state resumes immediately.
         let max_k = (max_key as u64) / DEFAULT_PARTITION_WIDTH + self.premake;
 
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} DETACH PARTITION {default_child}"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {default_child} RENAME TO {table}_default_old"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         for k in min_k..=max_k {
-            sqlx::query(&create_partition(table, k))
+            sqlx::query(sqlx::AssertSqlSafe(create_partition(table, k)))
                 .execute(&mut **tx)
                 .await?;
         }
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE {table}_default PARTITION OF {table} DEFAULT"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         // `SELECT *` supplies the partition key explicitly (no nextval),
         // preserving every stranded row's position.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "WITH moved AS (DELETE FROM {default_old} RETURNING *) \
              INSERT INTO {table} SELECT * FROM moved"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         // Drop the drained artifact in the same transaction: atomic with the
         // repair, so a crash can never leave `{table}_default_old` behind to
         // collide with the next repair's RENAME.
-        sqlx::query(&format!("DROP TABLE {default_old}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {default_old}")))
             .execute(&mut **tx)
             .await?;
         Ok(())
