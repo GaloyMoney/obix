@@ -1,3 +1,15 @@
+# [obix release v0.18.2](https://github.com/GaloyMoney/obix/releases/tag/0.18.2)
+
+
+
+### Bug Fixes
+
+- Ephemeral cache broadcasts an identical row only once; make Concourse test failures visible (#189)
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.21.0, job to 0.19.4, sqlx to 0.9 (#190)
+
 # [obix release v0.18.1](https://github.com/GaloyMoney/obix/releases/tag/0.18.1)
 
 
