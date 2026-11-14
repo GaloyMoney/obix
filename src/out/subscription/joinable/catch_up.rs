@@ -452,8 +452,21 @@ where
             run: &run,
         };
         let mut attempt_pending = true;
+        let signal = catch_up.current_job.quiescence_signal();
+        let quiesce = signal.requested();
+        tokio::pin!(quiesce);
 
         loop {
+            if let Some(pause) = quiesce.as_mut().now_or_never() {
+                pause?;
+                if let Landed::Finished(op) = catch_up.land_ordinary("quiescence").await? {
+                    return Ok(job::JobCompletion::CompleteWithOp(op));
+                }
+                if catch_up.checkpoint_dirty() {
+                    catch_up.persist().await?;
+                }
+                return Ok(job::JobCompletion::RescheduleNow);
+            }
             if catch_up.tracker.collected == 0 {
                 if catch_up
                     .current_job
@@ -508,6 +521,11 @@ where
             } else {
                 tokio::select! {
                     biased;
+                    pause = &mut quiesce => {
+                        pause?;
+                        if catch_up.checkpoint_dirty() { catch_up.persist().await?; }
+                        return Ok(job::JobCompletion::RescheduleNow);
+                    }
                     _ = catch_up.current_job.shutdown_requested() => {
                         if catch_up.checkpoint_dirty() {
                             catch_up.persist().await?;

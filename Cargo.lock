@@ -979,8 +979,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "job"
 version = "0.19.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b0d7feaff084fc7d1165e6e09adec9b38e0c717d750ee9d30ad2ec10ec58622"
+source = "git+https://github.com/GaloyMoney/job?rev=8c5c2161b594251903564923802f719d8e47605a#8c5c2161b594251903564923802f719d8e47605a"
 dependencies = [
  "async-trait",
  "bon",
