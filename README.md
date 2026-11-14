@@ -177,6 +177,29 @@ How many partitions to keep ahead and the maintainer's poll interval come from `
 
 **Registration is optional and the outbox never breaks without it.** If you never register the maintainer, everything keeps working: once `sequence` passes the initial partition's upper bound, new rows land in the `DEFAULT` partition, which is still read, gap-filled, and replayed exactly like any other partition. You only forfeit the per-partition vacuum/freeze/cache-locality benefits (equivalent to the pre-partitioning single-table behaviour). A non-empty `DEFAULT` is a *layout* concern, not a correctness one — alert on it, and use [`Partitions::recover_default`](https://docs.rs/obix) to fold any stranded rows back into explicit partitions in a single transaction (never regressing `MAX(sequence)`).
 
+### Cooperative maintenance quiescence
+
+With `job::JobSvcConfig::execution_control(true)` enabled on every worker,
+subscribers cooperate with `Jobs::execution_control().pause_in_op(...)`.
+Singletons and joinable tips finish the admitted batch and any open commit group,
+flush their effects, persist their checkpoint, and successfully reschedule.
+Keyed subscribers and joinable catch-ups likewise land their current batch before
+yielding. Idle subscribers wake on the real-time quiescence signal; no new event
+or simulated-clock advance is needed. Ephemeral handlers and the partition
+maintainer finish the current invocation before yielding.
+
+A pause never aborts a handler or reports a synthetic failure, so it does not
+consume retry attempts. Pending work and cursors remain available for resume.
+Types explicitly allowed by the job control policy (such as a warehouse relay)
+continue running. Publishers, sequencers, database listeners, and heartbeat and
+finalization tasks are not stopped. Applications must wait for job quiescence
+before capturing their outbox drain target; pausing alone is not a completed
+snapshot barrier.
+
+Without execution control enabled, the signal stays inert and subscriber
+behavior is unchanged. All workers must use compatible versions and participate
+in the protocol before a controller relies on it.
+
 ### Keyed subscribers: birth position, always-on, finishing
 
 `Subscriptions::subscribe_from_in_op(op, key, cfg, wake_keys, start_after)` is `subscribe_in_op` with a birth position you choose at or below the stream frontier (for example `EventSequence::BEGIN` to replay history). Registering a type with `KeyedSubscriberConfig::with_linger(Duration::MAX)` makes its members always-on: they never passivate, so the wake keys they declare are never consulted. A keyed `flush` returns `FlushOutcome` (`Continue` by default); `Finish` ends the member, and its writes, checkpoint, row retirement and job completion commit in one transaction. A finished or cancelled key is retired: both subscribe calls reject it with `KeyRetired`, so mint a fresh key per run. Replaying a long history usually wants a larger `KeyedSubscriberConfig::max_batch_size` than the default of 100.

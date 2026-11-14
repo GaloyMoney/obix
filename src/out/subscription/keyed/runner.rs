@@ -290,8 +290,30 @@ where
         // passivate to Dormant. `None` while `linger` is un-addable is how
         // the documented always-on setting is expressed.
         let mut linger_deadline: Option<tokio::time::Instant> = None;
+        let signal = current_job.quiescence_signal();
+        let quiesce = signal.requested();
+        tokio::pin!(quiesce);
 
         loop {
+            if let Some(pause) = quiesce.as_mut().now_or_never() {
+                pause?;
+                let mut parts = CtxParts {
+                    op_slot: &mut op_slot,
+                    current_job: &mut current_job,
+                    state: &mut state,
+                    tracker: &mut tracker,
+                    landing: Keyed(&mirror),
+                };
+                if let Landed::Finished(op) =
+                    flush_batch(&mut parts, &mut batch, &flusher, "quiescence").await?
+                {
+                    return Ok(job::JobCompletion::CompleteWithOp(op));
+                }
+                if tracker.persisted < StreamPosition::Insert(state.sequence) {
+                    persist_checkpoint(&mut current_job, &state, Some(&mirror)).await?;
+                }
+                return Ok(job::JobCompletion::RescheduleNow);
+            }
             let item = if tracker.collected > 0 {
                 match persistent.next().now_or_never() {
                     Some(Some(item)) => item,
@@ -344,6 +366,13 @@ where
 
                 tokio::select! {
                     biased;
+                    pause = &mut quiesce => {
+                        pause?;
+                        if tracker.persisted < StreamPosition::Insert(state.sequence) {
+                            persist_checkpoint(&mut current_job, &state, Some(&mirror)).await?;
+                        }
+                        return Ok(job::JobCompletion::RescheduleNow);
+                    }
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < StreamPosition::Insert(state.sequence) {
                             persist_checkpoint(&mut current_job, &state, Some(&mirror))

@@ -124,11 +124,18 @@ where
         // loop on shutdown (reschedule to resume after restart) or on an
         // `ensure` error (propagated below — the scheduler then retries per
         // `retry_settings`, which is the alert).
+        let signal = current_job.quiescence_signal();
+        let quiesce = signal.requested();
+        tokio::pin!(quiesce);
         loop {
             self.partitions.ensure().await?;
 
             tokio::select! {
                 biased;
+                pause = &mut quiesce => {
+                    pause?;
+                    return Ok(ResidentJobCompletion::RescheduleNow);
+                }
                 _ = current_job.shutdown_requested() => {
                     return Ok(ResidentJobCompletion::RescheduleNow);
                 }
