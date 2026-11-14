@@ -602,7 +602,7 @@ where
             } else {
                 tokio::select! {
                     biased;
-                    pause = &mut quiesce => {
+                    pause = &mut quiesce, if !in_group => {
                         pause?;
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, mirror).await?;
@@ -664,6 +664,7 @@ where
                             // after every restart.
                             state.sequence = undecodable.sequence;
                             L::record(&mut state.commit_sequence, undecodable.position());
+                            in_group = !undecodable.is_boundary();
                             continue;
                         }
                         Err(error) => {
