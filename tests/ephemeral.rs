@@ -60,11 +60,9 @@ async fn listen_connections(
 }
 
 async fn row_count(pool: &sqlx::PgPool, table: &str) -> anyhow::Result<i64> {
-    Ok(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
-            .fetch_one(pool)
-            .await?,
-    )
+    Ok(sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(pool)
+        .await?)
 }
 
 #[tokio::test]

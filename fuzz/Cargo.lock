@@ -434,9 +434,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.20.5"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91646a8a88a4208b5a3c81f63920d95034f2cde99e8127a6bfd8b9994c719e93"
+checksum = "df50dcc38d38c168c220ae53f6f5cadd73a1812a4ff44f45e2daa1735a77329b"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -446,9 +446,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.20.5"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83702a019fa9b10b7d63a8a03386d8cfaf873a9fdb8a65b3145e38db5a3f7052"
+checksum = "8d0c0e6471b89ca3be64caa038ca5a7377173b81320a4d2634625e34b27bf6e5"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -460,9 +460,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.20.5"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e88e315692589f43def67e3149584346d3b41b06f8bfce52de4fe9949240e153"
+checksum = "4270ada67ac1c5c417b7ed9aa58e2fdf45e051defe1c6acd387849f5827e313a"
 dependencies = [
  "async-stream",
  "chrono",
@@ -486,9 +486,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.20.5"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d71ba62c2b1e1527ac1136a5fb840d853a9f8cbc59e3396f978343130e857d8"
+checksum = "ac93d4f2f0372d60334769d6c7cc1dddbc3232c49721084bdebe6ae922ea0783"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -954,9 +954,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "job"
-version = "0.19.3"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b0d7feaff084fc7d1165e6e09adec9b38e0c717d750ee9d30ad2ec10ec58622"
+checksum = "58c2acac47630ff40d884d7317f45e915067c6f8ce4e4e2624b540163ebe8244"
 dependencies = [
  "async-trait",
  "bon",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "obix"
-version = "0.16.2-dev"
+version = "0.18.3-dev"
 dependencies = [
  "async-trait",
  "bon",
@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "obix-fuzz"
-version = "0.16.2-dev"
+version = "0.18.3-dev"
 dependencies = [
  "chrono",
  "libfuzzer-sys",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "obix-macros"
-version = "0.16.2-dev"
+version = "0.18.3-dev"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",

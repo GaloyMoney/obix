@@ -25,11 +25,9 @@ const BOUNDARY: i64 = WIDTH as i64;
 async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     for table in ["persistent_outbox_events"] {
         // A prior recovery may have left a detached DEFAULT copy.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TABLE IF EXISTS {table}_default_old"
-        )))
-        .execute(pool)
-        .await?;
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}_default_old"))
+            .execute(pool)
+            .await?;
         // Their count varies with `premake`, so enumerate them from the catalog
         // rather than hard-coding names.
         let children = sqlx::query(
@@ -45,15 +43,15 @@ async fn reset_partitions_to_baseline(pool: &sqlx::PgPool) -> anyhow::Result<()>
         .await?;
         for row in children {
             let name: String = row.get("relname");
-            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {name}")))
+            sqlx::query(&format!("DROP TABLE IF EXISTS {name}"))
                 .execute(pool)
                 .await?;
         }
         // Recovery recreates DEFAULT, but guard against a half-run leaving it
         // gone.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx::query(&format!(
             "CREATE TABLE IF NOT EXISTS {table}_default PARTITION OF {table} DEFAULT"
-        )))
+        ))
         .execute(pool)
         .await?;
     }
