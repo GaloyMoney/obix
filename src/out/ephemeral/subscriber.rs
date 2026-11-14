@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -164,9 +164,20 @@ where
         mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut ephemeral = (self.listen)(&self.outbox);
+        let signal = current_job.quiescence_signal();
+        let quiesce = signal.requested();
+        tokio::pin!(quiesce);
         loop {
+            if let Some(pause) = quiesce.as_mut().now_or_never() {
+                pause?;
+                return Ok(ResidentJobCompletion::RescheduleNow);
+            }
             tokio::select! {
                 biased;
+                pause = &mut quiesce => {
+                    pause?;
+                    return Ok(ResidentJobCompletion::RescheduleNow);
+                }
                 _ = current_job.shutdown_requested() => {
                     return Ok(ResidentJobCompletion::RescheduleNow);
                 }
