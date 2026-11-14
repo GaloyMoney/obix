@@ -1,9 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
-// The es-entity 0.21 / job 0.19.4 futures nest deeper than the default limit
-// (128) in release clippy's layout queries for `JoinableHandle::load()`.
-#![recursion_limit = "256"]
 
 pub mod prelude {
     pub use es_entity;

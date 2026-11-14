@@ -54,15 +54,15 @@ obix-macros = { path = "obix-macros", version = "0.18.3-dev" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
-es-entity = "0.21.0"
+es-entity = "0.22.0"
 anyhow = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-sqlx = { version = "0.9", features = ["macros", "runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json" ] }
+sqlx = { version = "0.8.6", features = ["macros", "runtime-tokio-rustls", "postgres", "uuid", "chrono", "json" ] }
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 tracing = { version = "0.1" }
 futures = "0.3"
 imbl = { version = "7.0", features = ["serde"] }
-job = { version = "0.19.4", features = ["es-entity"] }
+job = { version = "0.20.0", features = ["es-entity"] }
 async-trait = "0.1"
 bon = "3"

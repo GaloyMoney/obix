@@ -6,13 +6,7 @@
       {
         "ordinal": 0,
         "name": "key",
-        "type_info": "Varchar",
-        "origin": {
-          "Table": {
-            "table": "subscriptions",
-            "name": "key"
-          }
-        }
+        "type_info": "Varchar"
       }
     ],
     "parameters": {

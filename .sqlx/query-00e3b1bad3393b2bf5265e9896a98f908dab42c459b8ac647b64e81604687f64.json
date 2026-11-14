@@ -6,8 +6,7 @@
       {
         "ordinal": 0,
         "name": "nextval",
-        "type_info": "Int8",
-        "origin": "Expression"
+        "type_info": "Int8"
       }
     ],
     "parameters": {
