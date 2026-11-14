@@ -1,3 +1,12 @@
+# [obix release v0.19.0](https://github.com/GaloyMoney/obix/releases/tag/0.19.0)
+
+
+
+### Miscellaneous Tasks
+
+- [**breaking**] Adopt the SQLx 0.8.6 retry-clock stack (#193)
+- Align toolchain with lana-bank at 1.100.0 (#192)
+
 # [obix release v0.18.2](https://github.com/GaloyMoney/obix/releases/tag/0.18.2)
 
 
