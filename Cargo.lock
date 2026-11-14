@@ -1006,7 +1006,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "job"
 version = "0.19.6-dev"
-source = "git+https://github.com/GaloyMoney/job?rev=ff80c475623bc020e9cd3dcd0f016c6dd924f56c#ff80c475623bc020e9cd3dcd0f016c6dd924f56c"
+source = "git+https://github.com/GaloyMoney/job?rev=b4f330bda4cbb0fc7c785d98625a7688781207e1#b4f330bda4cbb0fc7c785d98625a7688781207e1"
 dependencies = [
  "async-trait",
  "bon",
