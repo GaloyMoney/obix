@@ -7,6 +7,8 @@ description = "Implementation of outbox backed by PG / sqlx"
 repository = "https://github.com/GaloyMoney/obix"
 documentation = "https://docs.rs/obix"
 categories = ["database"]
+# Preserve offline query data when vendoring archives without Git metadata.
+include = ["src/**", "tests/**", "examples/**", "migrations/**", ".sqlx/**", "Cargo.toml", "build.rs", "README*", "LICENSE*"]
 
 [features]
 
