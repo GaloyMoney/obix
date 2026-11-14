@@ -7,6 +7,8 @@ description = "Implementation of outbox backed by PG / sqlx"
 repository = "https://github.com/GaloyMoney/obix"
 documentation = "https://docs.rs/obix"
 categories = ["database"]
+# Preserve offline query data when vendoring archives without Git metadata.
+include = ["src/**", "tests/**", "examples/**", "migrations/**", ".sqlx/**", "Cargo.toml", "build.rs", "README*", "LICENSE*"]
 
 [features]
 
@@ -63,6 +65,6 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 imbl = { version = "7.0", features = ["serde"] }
-job = { git = "https://github.com/GaloyMoney/job", rev = "8c5c2161b594251903564923802f719d8e47605a", features = ["es-entity"] }
+job = { git = "https://github.com/GaloyMoney/job", rev = "9b09832807ada49c2027b412eb79c11f7b5c6040", features = ["es-entity"] }
 async-trait = "0.1"
 bon = "3"
