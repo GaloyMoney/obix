@@ -19,7 +19,15 @@ use tokio::sync::{Mutex, Semaphore};
 struct Event {
     number: u64,
 }
+#[derive(Clone, Copy)]
+enum FirstEvent {
+    Collect,
+    Skip,
+    Consume,
+}
+
 struct Recorder {
+    first: FirstEvent,
     flushes: Arc<Mutex<Vec<Vec<u64>>>>,
     entered: Arc<AtomicBool>,
     release: Option<Arc<Semaphore>>,
@@ -40,6 +48,18 @@ impl SingletonSubscriber<Event, CommitOrder> for Recorder {
                 release.acquire().await?.forget();
             }
         }
+        if event.number < 4 {
+            // Let the pause future become ready while an admitted handler
+            // is still inside a source group with an empty accumulator.
+            if !matches!(self.first, FirstEvent::Collect) {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+            match self.first {
+                FirstEvent::Skip => return Ok(ctx.skip()),
+                FirstEvent::Consume => return Ok(ctx.consume().await?.commit()),
+                FirstEvent::Collect => {}
+            }
+        }
         let number = event.number;
         Ok(ctx.collect_with(move |batch| batch.push(number)))
     }
@@ -57,7 +77,7 @@ impl SingletonSubscriber<Event, CommitOrder> for Recorder {
 
 async fn publish(outbox: &Outbox<Event>, start: u64) -> anyhow::Result<()> {
     let mut op = outbox.begin_op().await?;
-    for number in start..start + 3 {
+    for number in start..start + 4 {
         outbox
             .publish_persisted_in_op(&mut op, Event { number })
             .await?;
@@ -66,9 +86,7 @@ async fn publish(outbox: &Outbox<Event>, start: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() -> anyhow::Result<()>
-{
+async fn pause_scenario(first: FirstEvent) -> anyhow::Result<()> {
     let options: PgConnectOptions = std::env::var("PG_CON")?.parse()?;
     let admin = PgPoolOptions::new()
         .max_connections(2)
@@ -115,6 +133,7 @@ async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() 
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new("business")).with_max_batch_size(1),
                 Recorder {
+                    first,
                     flushes: flushes.clone(),
                     entered: entered.clone(),
                     release: Some(release.clone()),
@@ -126,6 +145,7 @@ async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() 
                 &mut jobs,
                 OutboxEventJobConfig::new(job::JobType::new("relay")).with_max_batch_size(1),
                 Recorder {
+                    first: FirstEvent::Collect,
                     flushes: Arc::new(Mutex::new(Vec::new())),
                     entered: Arc::new(AtomicBool::new(false)),
                     release: None,
@@ -154,8 +174,12 @@ async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() 
             }
         })
         .await?;
-        assert_eq!(*flushes.lock().await, vec![vec![1, 2, 3]]);
-        assert_eq!(u64::from(business.load().await?.checkpoint()), 3);
+        let first_batch = match first {
+            FirstEvent::Collect => vec![1, 2, 3, 4],
+            FirstEvent::Skip | FirstEvent::Consume => vec![4],
+        };
+        assert_eq!(*flushes.lock().await, vec![first_batch.clone()]);
+        assert_eq!(u64::from(business.load().await?.checkpoint()), 4);
         assert!(matches!(
             business.load().await?.job_status(),
             job::JobStatus::Pending {
@@ -165,16 +189,16 @@ async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() 
             }
         ));
 
-        publish(&outbox, 4).await?;
+        publish(&outbox, 5).await?;
         relay.await_caught_up(Duration::from_secs(10)).await?;
-        assert_eq!(u64::from(relay.load().await?.checkpoint()), 6);
-        assert_eq!(u64::from(business.load().await?.checkpoint()), 3);
+        assert_eq!(u64::from(relay.load().await?.checkpoint()), 8);
+        assert_eq!(u64::from(business.load().await?.checkpoint()), 4);
         assert!(control.status().await?.is_quiesced());
         let mut op = DbOp::init_with_clock(&pool, &clock).await?;
         control.resume_in_op(&mut op).await?;
         op.commit().await?;
         business.await_caught_up(Duration::from_secs(10)).await?;
-        assert_eq!(*flushes.lock().await, vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        assert_eq!(*flushes.lock().await, vec![first_batch, vec![5, 6, 7, 8]]);
 
         // An idle stream must also yield; no new event is needed to wake it.
         let mut op = DbOp::init_with_clock(&pool, &clock).await?;
@@ -199,4 +223,20 @@ async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() 
         .await?;
     admin.close().await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_finishes_a_whole_group_checkpoints_and_keeps_the_relay_running() -> anyhow::Result<()>
+{
+    pause_scenario(FirstEvent::Collect).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_finishes_an_open_group_after_a_skipped_event() -> anyhow::Result<()> {
+    pause_scenario(FirstEvent::Skip).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_finishes_an_open_group_after_a_consumed_event() -> anyhow::Result<()> {
+    pause_scenario(FirstEvent::Consume).await
 }

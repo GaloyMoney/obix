@@ -65,6 +65,6 @@ chrono = { version = "0.4", features = ["clock", "serde"], default-features = fa
 tracing = { version = "0.1" }
 futures = "0.3"
 imbl = { version = "7.0", features = ["serde"] }
-job = { git = "https://github.com/GaloyMoney/job", rev = "9b09832807ada49c2027b412eb79c11f7b5c6040", features = ["es-entity"] }
+job = { git = "https://github.com/GaloyMoney/job", rev = "bef210cada4ebc73bd0a4cb046d580c34987491d", features = ["es-entity"] }
 async-trait = "0.1"
 bon = "3"
