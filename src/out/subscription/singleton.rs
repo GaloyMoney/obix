@@ -526,6 +526,9 @@ where
         checkpoint_interval,
     } = cadence;
     let mirror = landing.mirror();
+    let signal = current_job.quiescence_signal();
+    let quiesce = signal.requested();
+    tokio::pin!(quiesce);
     {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
         let mut tracker = BatchTracker {
@@ -537,6 +540,21 @@ where
         let mut batch = D::Batch::default();
 
         loop {
+            if !in_group && let Some(pause) = quiesce.as_mut().now_or_never() {
+                pause?;
+                let mut parts = CtxParts {
+                    op_slot: &mut op_slot,
+                    current_job: &mut current_job,
+                    state: &mut state,
+                    tracker: &mut tracker,
+                    landing,
+                };
+                flush_batch(&mut parts, &mut batch, flusher, "quiescence").await?;
+                if tracker.persisted < checkpoint_of::<L>(&state) {
+                    persist_checkpoint(&mut current_job, &state, mirror).await?;
+                }
+                return Ok(ResidentJobCompletion::RescheduleNow);
+            }
             let item = if tracker.collected > 0 {
                 // A batch is pending (collected items awaiting a flush):
                 // only take persistent events that are already buffered —
@@ -584,6 +602,13 @@ where
             } else {
                 tokio::select! {
                     biased;
+                    pause = &mut quiesce, if !in_group => {
+                        pause?;
+                        if tracker.persisted < checkpoint_of::<L>(&state) {
+                            persist_checkpoint(&mut current_job, &state, mirror).await?;
+                        }
+                        return Ok(ResidentJobCompletion::RescheduleNow);
+                    }
                     _ = current_job.shutdown_requested() => {
                         if tracker.persisted < checkpoint_of::<L>(&state) {
                             persist_checkpoint(&mut current_job, &state, mirror)
@@ -639,6 +664,7 @@ where
                             // after every restart.
                             state.sequence = undecodable.sequence;
                             L::record(&mut state.commit_sequence, undecodable.position());
+                            in_group = !undecodable.is_boundary();
                             continue;
                         }
                         Err(error) => {
