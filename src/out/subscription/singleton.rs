@@ -11,6 +11,7 @@ use job::{
 };
 
 use crate::out::ctx::*;
+use crate::out::error::ResumeAheadOfCheckpoint;
 use crate::out::lane::{InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
 use crate::out::{Outbox, event::*};
@@ -116,6 +117,40 @@ where
     {
         let error = error.inner().clone();
         async move { Err(error.into()) }
+    }
+
+    /// Where this run resumes, chosen by the handler.
+    ///
+    /// Called at the start of every run, before the stream is opened, with the
+    /// stored checkpoint on lane `L`. A subscriber that has never
+    /// checkpointed receives `L`'s beginning.
+    ///
+    /// Returns the position to resume after. Returning `stored` changes
+    /// nothing.
+    ///
+    /// Returning an earlier position rewinds the subscriber: the runner
+    /// commits that position as the checkpoint before delivering anything, and
+    /// every event after it is delivered again. The handler's work must
+    /// tolerate that redelivery. `L`'s beginning rewinds to the start of the
+    /// stream.
+    ///
+    /// Returning a later position is refused: the run fails with
+    /// [`ResumeAheadOfCheckpoint`](crate::out::ResumeAheadOfCheckpoint) and
+    /// the checkpoint is unchanged.
+    ///
+    /// Returning `Err` fails the run and leaves the checkpoint unchanged; the
+    /// job retries under its retry settings.
+    ///
+    /// It runs on every run start, including the reschedule after a shutdown
+    /// request or a closed stream, so it must be cheap and must not assume it
+    /// runs once per process.
+    fn resume_from(
+        &self,
+        stored: L::Position,
+    ) -> impl std::future::Future<
+        Output = Result<L::Position, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send {
+        async move { Ok(stored) }
     }
 
     /// Apply everything collected since the last flush. Called at most once
@@ -413,9 +448,35 @@ where
 
     async fn run_persistent(
         &self,
-        current_job: CurrentJob,
+        mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let state = decode_execution_state(&current_job)?.unwrap_or_default();
+        let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
+
+        // Validates the lane exactly as `select_lane` does.
+        let stored = L::resume_from(state.sequence, state.commit_sequence)?;
+
+        let resume = self.handler.resume_from(stored).await?;
+
+        if resume > stored {
+            return Err(ObixFault::from(ResumeAheadOfCheckpoint {
+                stored: stored.into(),
+                requested: resume.into(),
+            })
+            .into());
+        }
+
+        if resume < stored {
+            // Committed before the stream opens, so a crash after the first
+            // flush cannot resume from the old cursor.
+            state = L::rewound(&state, resume);
+            persist_checkpoint(&mut current_job, &state, None).await?;
+            tracing::info!(
+                from = %stored,
+                to = %resume,
+                "outbox subscriber rewound by its handler"
+            );
+        }
+
         let persistent = self.select_lane(&state)?;
         let flusher = SubscriberFlusher::<H, P, L> {
             handler: self.handler.clone(),
@@ -705,6 +766,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::out::lane::CommitOrder;
 
     #[test]
     fn insert_lane_stays_on_the_insert_cursor() {
@@ -762,6 +824,65 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("register a new job type"));
+    }
+
+    fn state(
+        sequence: u64,
+        commit: Option<u64>,
+        paused: bool,
+    ) -> crate::out::ctx::OutboxEventJobState {
+        crate::out::ctx::OutboxEventJobState {
+            sequence: EventSequence::from(sequence),
+            commit_sequence: commit.map(CommitSequence::from),
+            paused: paused.then(|| crate::out::ctx::PausedState {
+                sequence: EventSequence::from(sequence),
+                until: chrono::Utc::now(),
+            }),
+        }
+    }
+
+    fn is_fresh(state: &crate::out::ctx::OutboxEventJobState) -> bool {
+        state.sequence == EventSequence::BEGIN
+            && state.commit_sequence.is_none()
+            && state.paused.is_none()
+    }
+
+    #[test]
+    fn rewinding_either_lane_to_its_beginning_is_a_never_run_state() {
+        let insert = InsertOrder::rewound(&state(9, None, true), EventSequence::BEGIN);
+        assert!(is_fresh(&insert));
+        assert!(decide_lane(insert.commit_sequence, insert.sequence, Ordering::Insert).is_ok());
+
+        let commit = CommitOrder::rewound(&state(9, Some(4), true), CommitSequence::BEGIN);
+        assert!(is_fresh(&commit));
+        assert_eq!(
+            decide_lane(commit.commit_sequence, commit.sequence, Ordering::Commit),
+            Ok(LaneChoice::Commit(CommitSequence::BEGIN))
+        );
+    }
+
+    #[test]
+    fn rewinding_the_insert_lane_sets_the_sequence_and_clears_the_rest() {
+        let rewound = InsertOrder::rewound(&state(9, None, true), EventSequence::from(3u64));
+        assert_eq!(rewound.sequence, EventSequence::from(3u64));
+        assert!(rewound.commit_sequence.is_none());
+        assert!(rewound.paused.is_none());
+        assert_eq!(
+            decide_lane(rewound.commit_sequence, rewound.sequence, Ordering::Insert),
+            Ok(LaneChoice::Insert(EventSequence::from(3u64)))
+        );
+    }
+
+    #[test]
+    fn rewinding_the_commit_lane_sets_the_cursor_and_keeps_the_sequence() {
+        let rewound = CommitOrder::rewound(&state(9, Some(6), true), CommitSequence::from(2u64));
+        assert_eq!(rewound.commit_sequence, Some(CommitSequence::from(2u64)));
+        assert_eq!(rewound.sequence, EventSequence::from(9u64));
+        assert!(rewound.paused.is_none());
+        assert_eq!(
+            decide_lane(rewound.commit_sequence, rewound.sequence, Ordering::Commit),
+            Ok(LaneChoice::Commit(CommitSequence::from(2u64)))
+        );
     }
 
     #[test]

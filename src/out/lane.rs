@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::Outbox;
 pub use super::error::CommitLaneDisabled;
+use super::ctx::OutboxEventJobState;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
@@ -86,6 +87,11 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
 
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
+
+    /// `state` with its cursor on this lane moved to `position`. At this
+    /// lane's beginning that is the state of a subscriber that never ran.
+    #[doc(hidden)]
+    fn rewound(state: &OutboxEventJobState, position: Self::Position) -> OutboxEventJobState;
 
     /// This lane's frontier: the sequence generator, or this process's fold head.
     #[doc(hidden)]
@@ -188,6 +194,17 @@ impl Lane for InsertOrder {
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
+    fn rewound(_state: &OutboxEventJobState, position: EventSequence) -> OutboxEventJobState {
+        if position == EventSequence::BEGIN {
+            return OutboxEventJobState::default();
+        }
+        OutboxEventJobState {
+            sequence: position,
+            commit_sequence: None,
+            paused: None,
+        }
+    }
+
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
     ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
@@ -277,6 +294,20 @@ impl Lane for CommitOrder {
 
     fn record(commit_cursor: &mut Option<CommitSequence>, position: CommitSequence) {
         *commit_cursor = Some(position);
+    }
+
+    /// `sequence` is kept: a commit position does not say which insert
+    /// sequence it matches, and on this lane `sequence` is trace-only until
+    /// the loop overwrites it with the next handled event.
+    fn rewound(state: &OutboxEventJobState, position: CommitSequence) -> OutboxEventJobState {
+        if position == CommitSequence::BEGIN {
+            return OutboxEventJobState::default();
+        }
+        OutboxEventJobState {
+            sequence: state.sequence,
+            commit_sequence: Some(position),
+            paused: None,
+        }
     }
 
     async fn frontier<P, Tables>(
