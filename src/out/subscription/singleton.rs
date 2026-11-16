@@ -468,7 +468,13 @@ where
         if resume < stored {
             // Committed before the stream opens, so a crash after the first
             // flush cannot resume from the old cursor.
-            state = L::rewound(&state, resume);
+            let (sequence, commit_sequence) =
+                L::rewound(state.sequence, state.commit_sequence, resume);
+            state = OutboxEventJobState {
+                sequence,
+                commit_sequence,
+                paused: None,
+            };
             persist_checkpoint(&mut current_job, &state, None).await?;
             tracing::info!(
                 from = %stored,
@@ -826,61 +832,48 @@ mod tests {
         assert!(error.to_string().contains("register a new job type"));
     }
 
-    fn state(
-        sequence: u64,
-        commit: Option<u64>,
-        paused: bool,
-    ) -> crate::out::ctx::OutboxEventJobState {
-        crate::out::ctx::OutboxEventJobState {
-            sequence: EventSequence::from(sequence),
-            commit_sequence: commit.map(CommitSequence::from),
-            paused: paused.then(|| crate::out::ctx::PausedState {
-                sequence: EventSequence::from(sequence),
-                until: chrono::Utc::now(),
-            }),
-        }
-    }
-
-    fn is_fresh(state: &crate::out::ctx::OutboxEventJobState) -> bool {
-        state.sequence == EventSequence::BEGIN
-            && state.commit_sequence.is_none()
-            && state.paused.is_none()
-    }
-
     #[test]
     fn rewinding_either_lane_to_its_beginning_is_a_never_run_state() {
-        let insert = InsertOrder::rewound(&state(9, None, true), EventSequence::BEGIN);
-        assert!(is_fresh(&insert));
-        assert!(decide_lane(insert.commit_sequence, insert.sequence, Ordering::Insert).is_ok());
+        let (sequence, commit) =
+            InsertOrder::rewound(EventSequence::from(9u64), None, EventSequence::BEGIN);
+        assert_eq!((sequence, commit), (EventSequence::BEGIN, None));
+        assert!(decide_lane(commit, sequence, Ordering::Insert).is_ok());
 
-        let commit = CommitOrder::rewound(&state(9, Some(4), true), CommitSequence::BEGIN);
-        assert!(is_fresh(&commit));
+        let (sequence, commit) = CommitOrder::rewound(
+            EventSequence::from(9u64),
+            Some(CommitSequence::from(4u64)),
+            CommitSequence::BEGIN,
+        );
+        assert_eq!((sequence, commit), (EventSequence::BEGIN, None));
         assert_eq!(
-            decide_lane(commit.commit_sequence, commit.sequence, Ordering::Commit),
+            decide_lane(commit, sequence, Ordering::Commit),
             Ok(LaneChoice::Commit(CommitSequence::BEGIN))
         );
     }
 
     #[test]
-    fn rewinding_the_insert_lane_sets_the_sequence_and_clears_the_rest() {
-        let rewound = InsertOrder::rewound(&state(9, None, true), EventSequence::from(3u64));
-        assert_eq!(rewound.sequence, EventSequence::from(3u64));
-        assert!(rewound.commit_sequence.is_none());
-        assert!(rewound.paused.is_none());
+    fn rewinding_the_insert_lane_sets_the_sequence_and_clears_the_commit_cursor() {
+        let (sequence, commit) =
+            InsertOrder::rewound(EventSequence::from(9u64), None, EventSequence::from(3u64));
+        assert_eq!(sequence, EventSequence::from(3u64));
+        assert!(commit.is_none());
         assert_eq!(
-            decide_lane(rewound.commit_sequence, rewound.sequence, Ordering::Insert),
+            decide_lane(commit, sequence, Ordering::Insert),
             Ok(LaneChoice::Insert(EventSequence::from(3u64)))
         );
     }
 
     #[test]
     fn rewinding_the_commit_lane_sets_the_cursor_and_keeps_the_sequence() {
-        let rewound = CommitOrder::rewound(&state(9, Some(6), true), CommitSequence::from(2u64));
-        assert_eq!(rewound.commit_sequence, Some(CommitSequence::from(2u64)));
-        assert_eq!(rewound.sequence, EventSequence::from(9u64));
-        assert!(rewound.paused.is_none());
+        let (sequence, commit) = CommitOrder::rewound(
+            EventSequence::from(9u64),
+            Some(CommitSequence::from(6u64)),
+            CommitSequence::from(2u64),
+        );
+        assert_eq!(commit, Some(CommitSequence::from(2u64)));
+        assert_eq!(sequence, EventSequence::from(9u64));
         assert_eq!(
-            decide_lane(rewound.commit_sequence, rewound.sequence, Ordering::Commit),
+            decide_lane(commit, sequence, Ordering::Commit),
             Ok(LaneChoice::Commit(CommitSequence::from(2u64)))
         );
     }

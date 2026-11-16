@@ -15,7 +15,6 @@ use std::sync::{
 use std::time::Duration;
 
 use super::Outbox;
-use super::ctx::OutboxEventJobState;
 pub use super::error::CommitLaneDisabled;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
@@ -88,10 +87,15 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
 
-    /// `state` with its cursor on this lane moved to `position`. At this
-    /// lane's beginning that is the state of a subscriber that never ran.
+    /// The `(sequence, commit_sequence)` cursors after moving this lane's
+    /// cursor to `position`, given the stored ones. At this lane's beginning
+    /// that is the pair of a subscriber that never ran.
     #[doc(hidden)]
-    fn rewound(state: &OutboxEventJobState, position: Self::Position) -> OutboxEventJobState;
+    fn rewound(
+        sequence: EventSequence,
+        commit: Option<CommitSequence>,
+        position: Self::Position,
+    ) -> (EventSequence, Option<CommitSequence>);
 
     /// This lane's frontier: the sequence generator, or this process's fold head.
     #[doc(hidden)]
@@ -194,15 +198,12 @@ impl Lane for InsertOrder {
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
-    fn rewound(_state: &OutboxEventJobState, position: EventSequence) -> OutboxEventJobState {
-        if position == EventSequence::BEGIN {
-            return OutboxEventJobState::default();
-        }
-        OutboxEventJobState {
-            sequence: position,
-            commit_sequence: None,
-            paused: None,
-        }
+    fn rewound(
+        _sequence: EventSequence,
+        _commit: Option<CommitSequence>,
+        position: EventSequence,
+    ) -> (EventSequence, Option<CommitSequence>) {
+        (position, None)
     }
 
     async fn frontier<P, Tables>(
@@ -299,15 +300,15 @@ impl Lane for CommitOrder {
     /// `sequence` is kept: a commit position does not say which insert
     /// sequence it matches, and on this lane `sequence` is trace-only until
     /// the loop overwrites it with the next handled event.
-    fn rewound(state: &OutboxEventJobState, position: CommitSequence) -> OutboxEventJobState {
+    fn rewound(
+        sequence: EventSequence,
+        _commit: Option<CommitSequence>,
+        position: CommitSequence,
+    ) -> (EventSequence, Option<CommitSequence>) {
         if position == CommitSequence::BEGIN {
-            return OutboxEventJobState::default();
+            return (EventSequence::BEGIN, None);
         }
-        OutboxEventJobState {
-            sequence: state.sequence,
-            commit_sequence: Some(position),
-            paused: None,
-        }
+        (sequence, Some(position))
     }
 
     async fn frontier<P, Tables>(
