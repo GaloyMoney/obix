@@ -11,6 +11,7 @@ use job::{
 };
 
 use crate::out::ctx::*;
+use crate::out::error::ResumeAheadOfCheckpoint;
 use crate::out::lane::{InsertOrder, Lane};
 use crate::out::subscription::StreamPosition;
 use crate::out::{Outbox, event::*};
@@ -116,6 +117,40 @@ where
     {
         let error = error.inner().clone();
         async move { Err(error.into()) }
+    }
+
+    /// Where this run resumes, chosen by the handler.
+    ///
+    /// Called at the start of every run, before the stream is opened, with the
+    /// stored checkpoint on lane `L`. A subscriber that has never
+    /// checkpointed receives `L`'s beginning.
+    ///
+    /// Returns the position to resume after. Returning `stored` changes
+    /// nothing.
+    ///
+    /// Returning an earlier position rewinds the subscriber: the runner
+    /// commits that position as the checkpoint before delivering anything, and
+    /// every event after it is delivered again. The handler's work must
+    /// tolerate that redelivery. `L`'s beginning rewinds to the start of the
+    /// stream.
+    ///
+    /// Returning a later position is refused: the run fails with
+    /// [`ResumeAheadOfCheckpoint`](crate::out::ResumeAheadOfCheckpoint) and
+    /// the checkpoint is unchanged.
+    ///
+    /// Returning `Err` fails the run and leaves the checkpoint unchanged; the
+    /// job retries under its retry settings.
+    ///
+    /// It runs on every run start, including the reschedule after a shutdown
+    /// request or a closed stream, so it must be cheap and must not assume it
+    /// runs once per process.
+    fn resume_from(
+        &self,
+        stored: L::Position,
+    ) -> impl std::future::Future<
+        Output = Result<L::Position, Box<dyn std::error::Error + Send + Sync>>,
+    > + Send {
+        async move { Ok(stored) }
     }
 
     /// Apply everything collected since the last flush. Called at most once
@@ -413,9 +448,41 @@ where
 
     async fn run_persistent(
         &self,
-        current_job: CurrentJob,
+        mut current_job: CurrentJob,
     ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let state = decode_execution_state(&current_job)?.unwrap_or_default();
+        let mut state = decode_execution_state(&current_job)?.unwrap_or_default();
+
+        // Validates the lane exactly as `select_lane` does.
+        let stored = L::resume_from(state.sequence, state.commit_sequence)?;
+
+        let resume = self.handler.resume_from(stored).await?;
+
+        if resume > stored {
+            return Err(ObixFault::from(ResumeAheadOfCheckpoint {
+                stored: stored.into(),
+                requested: resume.into(),
+            })
+            .into());
+        }
+
+        if resume < stored {
+            // Committed before the stream opens, so a crash after the first
+            // flush cannot resume from the old cursor.
+            let (sequence, commit_sequence) =
+                L::rewound(state.sequence, state.commit_sequence, resume);
+            state = OutboxEventJobState {
+                sequence,
+                commit_sequence,
+                paused: None,
+            };
+            persist_checkpoint(&mut current_job, &state, None).await?;
+            tracing::info!(
+                from = %stored,
+                to = %resume,
+                "outbox subscriber rewound by its handler"
+            );
+        }
+
         let persistent = self.select_lane(&state)?;
         let flusher = SubscriberFlusher::<H, P, L> {
             handler: self.handler.clone(),
@@ -705,6 +772,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::out::lane::CommitOrder;
 
     #[test]
     fn insert_lane_stays_on_the_insert_cursor() {
@@ -762,6 +830,52 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("register a new job type"));
+    }
+
+    #[test]
+    fn rewinding_either_lane_to_its_beginning_is_a_never_run_state() {
+        let (sequence, commit) =
+            InsertOrder::rewound(EventSequence::from(9u64), None, EventSequence::BEGIN);
+        assert_eq!((sequence, commit), (EventSequence::BEGIN, None));
+        assert!(decide_lane(commit, sequence, Ordering::Insert).is_ok());
+
+        let (sequence, commit) = CommitOrder::rewound(
+            EventSequence::from(9u64),
+            Some(CommitSequence::from(4u64)),
+            CommitSequence::BEGIN,
+        );
+        assert_eq!((sequence, commit), (EventSequence::BEGIN, None));
+        assert_eq!(
+            decide_lane(commit, sequence, Ordering::Commit),
+            Ok(LaneChoice::Commit(CommitSequence::BEGIN))
+        );
+    }
+
+    #[test]
+    fn rewinding_the_insert_lane_sets_the_sequence_and_clears_the_commit_cursor() {
+        let (sequence, commit) =
+            InsertOrder::rewound(EventSequence::from(9u64), None, EventSequence::from(3u64));
+        assert_eq!(sequence, EventSequence::from(3u64));
+        assert!(commit.is_none());
+        assert_eq!(
+            decide_lane(commit, sequence, Ordering::Insert),
+            Ok(LaneChoice::Insert(EventSequence::from(3u64)))
+        );
+    }
+
+    #[test]
+    fn rewinding_the_commit_lane_sets_the_cursor_and_keeps_the_sequence() {
+        let (sequence, commit) = CommitOrder::rewound(
+            EventSequence::from(9u64),
+            Some(CommitSequence::from(6u64)),
+            CommitSequence::from(2u64),
+        );
+        assert_eq!(commit, Some(CommitSequence::from(2u64)));
+        assert_eq!(sequence, EventSequence::from(9u64));
+        assert_eq!(
+            decide_lane(commit, sequence, Ordering::Commit),
+            Ok(LaneChoice::Commit(CommitSequence::from(2u64)))
+        );
     }
 
     #[test]

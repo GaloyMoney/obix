@@ -3,6 +3,7 @@
 use es_entity::errlanes;
 
 use super::Ordering;
+use super::subscription::StreamPosition;
 
 // --- bare rejections (no fault lanes at the sites that return them) ---
 
@@ -159,6 +160,19 @@ pub struct CatchUpJoinTimeout {
 pub struct LaneMismatch {
     pub stored: Ordering,
     pub configured: Ordering,
+}
+
+/// A singleton subscriber's `resume_from` returned a position after its
+/// stored checkpoint. The hook may only rewind, so this is a handler bug and
+/// the checkpoint is left untouched. Carries positions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, errlanes::Classify)]
+#[classify(fatal(Invariant))]
+#[error(
+    "subscriber asked to resume at {requested}, which is after its stored checkpoint {stored}; resume_from may only rewind"
+)]
+pub struct ResumeAheadOfCheckpoint {
+    pub stored: StreamPosition,
+    pub requested: StreamPosition,
 }
 
 /// Persisted state that no longer decodes. One variant per stored value so
@@ -354,6 +368,33 @@ mod tests {
                 assert!(f.source().unwrap().downcast_ref::<LaneMismatch>().is_some());
             }
             other => panic!("expected Fatal(Config), got {other:?}"),
+        }
+    }
+
+    /// A forward `resume_from` is a handler bug: `Fatal(Invariant)`, with the
+    /// positions in the message and nothing else.
+    #[test]
+    fn resume_ahead_of_checkpoint_is_fatal_invariant() {
+        let ahead = ResumeAheadOfCheckpoint {
+            stored: StreamPosition::Commit(crate::CommitSequence::from(3u64)),
+            requested: StreamPosition::Commit(crate::CommitSequence::from(9u64)),
+        };
+        assert_eq!(
+            ahead.to_string(),
+            "subscriber asked to resume at commit:9, which is after its stored checkpoint commit:3; resume_from may only rewind"
+        );
+        let err: ObixFault = ahead.into();
+        match err {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Invariant);
+                assert!(
+                    f.source()
+                        .unwrap()
+                        .downcast_ref::<ResumeAheadOfCheckpoint>()
+                        .is_some()
+                );
+            }
+            other => panic!("expected Fatal(Invariant), got {other:?}"),
         }
     }
 

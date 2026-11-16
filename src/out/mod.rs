@@ -25,7 +25,7 @@ pub use self::ctx::{
 };
 pub use self::error::{
     BirthAheadOfFrontier, CatchUpJoinTimeout, CouldNotDecodeStored, KeyRetired, LaneMismatch,
-    NoSuchSubscription, SubscribeRejection,
+    NoSuchSubscription, ResumeAheadOfCheckpoint, SubscribeRejection,
 };
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::joinable::{

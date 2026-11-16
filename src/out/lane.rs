@@ -87,6 +87,16 @@ pub trait Lane: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn record(commit_cursor: &mut Option<CommitSequence>, position: Self::Position);
 
+    /// The `(sequence, commit_sequence)` cursors after moving this lane's
+    /// cursor to `position`, given the stored ones. At this lane's beginning
+    /// that is the pair of a subscriber that never ran.
+    #[doc(hidden)]
+    fn rewound(
+        sequence: EventSequence,
+        commit: Option<CommitSequence>,
+        position: Self::Position,
+    ) -> (EventSequence, Option<CommitSequence>);
+
     /// This lane's frontier: the sequence generator, or this process's fold head.
     #[doc(hidden)]
     fn frontier<'a, P, Tables>(
@@ -188,6 +198,14 @@ impl Lane for InsertOrder {
 
     fn record(_commit_cursor: &mut Option<CommitSequence>, _position: EventSequence) {}
 
+    fn rewound(
+        _sequence: EventSequence,
+        _commit: Option<CommitSequence>,
+        position: EventSequence,
+    ) -> (EventSequence, Option<CommitSequence>) {
+        (position, None)
+    }
+
     async fn frontier<P, Tables>(
         subscription: &Subscription<P, Self, Tables>,
     ) -> Result<EventSequence, Fail<SubscriptionRejection, lanes!(Transient, Fatal)>>
@@ -277,6 +295,20 @@ impl Lane for CommitOrder {
 
     fn record(commit_cursor: &mut Option<CommitSequence>, position: CommitSequence) {
         *commit_cursor = Some(position);
+    }
+
+    /// `sequence` is kept: a commit position does not say which insert
+    /// sequence it matches, and on this lane `sequence` is trace-only until
+    /// the loop overwrites it with the next handled event.
+    fn rewound(
+        sequence: EventSequence,
+        _commit: Option<CommitSequence>,
+        position: CommitSequence,
+    ) -> (EventSequence, Option<CommitSequence>) {
+        if position == CommitSequence::BEGIN {
+            return (EventSequence::BEGIN, None);
+        }
+        (sequence, Some(position))
     }
 
     async fn frontier<P, Tables>(
