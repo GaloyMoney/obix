@@ -195,14 +195,13 @@ impl<L: Lane> Run<L> {
             )
             .await?;
         jobs.start_poll().await?;
-        Ok(Self {
-            jobs,
-            subscription,
-        })
+        Ok(Self { jobs, subscription })
     }
 
     async fn checkpoint(&self) -> anyhow::Result<u64> {
-        Ok(L::position_to_u64(self.subscription.load().await?.checkpoint()))
+        Ok(L::position_to_u64(
+            self.subscription.load().await?.checkpoint(),
+        ))
     }
 
     async fn checkpoint_reaches(&self, position: u64) -> anyhow::Result<()> {

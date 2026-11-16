@@ -15,8 +15,8 @@ use std::sync::{
 use std::time::Duration;
 
 use super::Outbox;
-pub use super::error::CommitLaneDisabled;
 use super::ctx::OutboxEventJobState;
+pub use super::error::CommitLaneDisabled;
 use super::event::Transport;
 use super::subscription::singleton::{LaneChoice, Ordering, decide_lane};
 use super::subscription::{
