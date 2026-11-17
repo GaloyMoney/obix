@@ -25,7 +25,7 @@ pub use self::ctx::{
 };
 pub use self::error::{
     BirthAheadOfFrontier, CatchUpJoinTimeout, CouldNotDecodeStored, KeyRetired, LaneMismatch,
-    NoSuchSubscription, ResumeAheadOfCheckpoint, SubscribeRejection,
+    NoSuchSubscription, ResumeAheadOfCheckpoint, ResumeProbeFailed, SubscribeRejection,
 };
 pub use self::lane::{CommitLaneDisabled, CommitOrder, InsertOrder, Lane};
 pub use self::subscription::joinable::{
@@ -430,6 +430,12 @@ where
         L: Lane,
     {
         L::require(self)?;
+        let handler = Arc::new(handler);
+        let probe_handler = handler.clone();
+        let resume: subscription::ResumeProbe<L> = Arc::new(move |stored| {
+            let handler = probe_handler.clone();
+            Box::pin(async move { handler.resume_from(stored).await })
+        });
         let initializer =
             subscription::singleton::OutboxEventJobInitializer::<H, P, Tables, L>::new(
                 self.clone(),
@@ -444,6 +450,7 @@ where
             handle,
             self.pool.clone(),
             self.sequencer.as_ref().map(|s| s.positions()),
+            Some(resume),
         ))
     }
 
