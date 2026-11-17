@@ -43,9 +43,10 @@ pub use out::{
     JoinableSubscriberConfig, KeyRetired, KeyedEventCtx, KeyedSubscriber, KeyedSubscriberConfig,
     Lane, LaneMismatch, NoSuchSubscription, Ordering, Outbox, OutboxEventJobConfig,
     PartitionMaintainerConfig, Partitions, PostPersistHook, RawPayload, ResumeAheadOfCheckpoint,
-    Scope, SingletonSubscriber, StagedOp, StreamPosition, SubscribeRejection, Subscription,
-    SubscriptionDef, SubscriptionRejection, SubscriptionSnapshot, SubscriptionStreamStatus,
-    Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError, WakeKey, WakeKeys,
+    ResumeProbeFailed, Scope, SingletonSubscriber, StagedOp, StreamPosition, SubscribeRejection,
+    Subscription, SubscriptionDef, SubscriptionRejection, SubscriptionSnapshot,
+    SubscriptionStreamStatus, Subscriptions, Suspended, UndecodableDelivery, UndecodableEventError,
+    WakeKey, WakeKeys,
 };
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]

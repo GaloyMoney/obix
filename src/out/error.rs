@@ -175,6 +175,35 @@ pub struct ResumeAheadOfCheckpoint {
     pub requested: StreamPosition,
 }
 
+/// A singleton subscriber's `resume_from` failed while a caught-up barrier
+/// asked whether the subscriber would rewind. The barrier cannot tell, so it
+/// reports a fault rather than caught up; retrying may succeed.
+///
+/// The message does not include the handler's error — it is the fault's
+/// `source()`, and may carry anything the handler put in it.
+#[derive(Debug, errlanes::Classify)]
+#[classify(transient(Other))]
+#[error("the subscriber's resume_from failed while a barrier asked whether it would rewind")]
+pub struct ResumeProbeFailed(#[source] pub HandlerFailure);
+
+/// A handler's boxed error as a sized [`std::error::Error`], so it can be a
+/// `#[source]` (a `Box<dyn Error>` is not itself an `Error`). Displays as the
+/// handler's error does.
+#[derive(Debug)]
+pub struct HandlerFailure(pub Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for HandlerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for HandlerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 /// Persisted state that no longer decodes. One variant per stored value so
 /// the operator-facing chain names which row to look at; the serde error (or
 /// nothing, for a non-serde decode) is the variant's source and appears
@@ -225,7 +254,7 @@ pub enum JoinableFault {
 mod tests {
     use super::*;
     use crate::error::ObixFault;
-    use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, ResultExt, lanes};
+    use es_entity::errlanes::{Fail, FatalKind, Fault, Rejection, ResultExt, TransientKind, lanes};
     use std::error::Error as _;
 
     #[test]
@@ -395,6 +424,27 @@ mod tests {
                 );
             }
             other => panic!("expected Fatal(Invariant), got {other:?}"),
+        }
+    }
+
+    /// A failed probe is transient, keeps the handler's error as its source,
+    /// and does not repeat that error in its own message.
+    #[test]
+    fn resume_probe_failure_is_transient_and_keeps_the_source() {
+        let probe = ResumeProbeFailed(HandlerFailure("bucket-path-secret".into()));
+        assert!(!probe.to_string().contains("bucket-path-secret"));
+        let err: Fail<SubscriptionRejection, lanes!(Transient, Fatal)> = probe.into();
+        match err {
+            Fail::Transient(t) => {
+                assert_eq!(t.kind, TransientKind::Other);
+                let wrapper = t.source().expect("the wrapper is the Transient's source");
+                assert!(wrapper.downcast_ref::<ResumeProbeFailed>().is_some());
+                assert_eq!(
+                    wrapper.source().expect("the handler's error").to_string(),
+                    "bucket-path-secret"
+                );
+            }
+            other => panic!("expected Transient, got {other:?}"),
         }
     }
 

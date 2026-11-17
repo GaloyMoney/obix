@@ -44,9 +44,10 @@ pub(crate) mod keyed;
 pub(crate) mod singleton;
 
 use es_entity::errlanes::{Fail, lanes};
+use futures::future::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 
-use std::{marker::PhantomData, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use crate::out::ctx::OutboxEventJobState;
 use crate::out::lane::{CommitOrder, InsertOrder, Lane};
@@ -57,6 +58,27 @@ use crate::{
 };
 
 use self::singleton::Ordering;
+
+/// A singleton handler's `resume_from`, type-erased so a [`Subscription`] can
+/// ask it without naming the handler.
+pub(crate) type ResumeProbe<L> = Arc<
+    dyn Fn(
+            <L as Lane>::Position,
+        ) -> BoxFuture<
+            'static,
+            Result<<L as Lane>::Position, Box<dyn std::error::Error + Send + Sync>>,
+        > + Send
+        + Sync,
+>;
+
+/// The barrier's verdict once the stored checkpoint has been read twice
+/// around one `resume_from` answer.
+///
+/// `resumed > before` cannot happen for a correct handler; it is treated as
+/// agreement, since the runner, not the barrier, refuses a forward move.
+fn caught_up_after_probe<P: Ord>(target: P, before: P, resumed: P, after: P) -> bool {
+    before >= target && resumed >= before && after >= target
+}
 
 /// First poll interval used by [`Subscription::await_caught_up`], doubling
 /// up to [`MAX_POLL_INTERVAL`].
@@ -293,6 +315,12 @@ where
 ///    process's fold to pass the sampled insert frontier, then for the
 ///    subscriber's cursor to reach the head that fold produced. One timeout
 ///    covers both halves; the error says which was outstanding.
+/// 7. **A singleton barrier also asks the handler.** It returns only when the
+///    stored checkpoint has reached the target *and* the handler's
+///    [`resume_from`](crate::SingletonSubscriber::resume_from) would not move
+///    it back: the checkpoint is read, the handler is asked, and the checkpoint
+///    is read again, and all three must agree. [`load`](Self::load) reports the
+///    durable checkpoint and does not ask the handler.
 pub struct Subscription<P, L = InsertOrder, Tables = DefaultMailboxTables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -303,6 +331,9 @@ where
     /// `Some` only for a resident job on an outbox running the commit lane,
     /// whose fence is the only reader.
     positions: Option<SequencerPositions>,
+    /// `Some` only for a singleton subscriber; the barrier asks it before
+    /// reporting caught up.
+    resume: Option<ResumeProbe<L>>,
     _phantom: PhantomData<(P, L, Tables)>,
 }
 
@@ -355,6 +386,7 @@ where
             anchor: self.anchor.clone(),
             pool: self.pool.clone(),
             positions: self.positions.clone(),
+            resume: self.resume.clone(),
             _phantom: PhantomData,
         }
     }
@@ -388,11 +420,13 @@ where
         job: ::job::JobHandle,
         pool: sqlx::PgPool,
         positions: Option<SequencerPositions>,
+        resume: Option<ResumeProbe<L>>,
     ) -> Self {
         Self {
             anchor: JobAnchor::Resident(job),
             pool,
             positions,
+            resume,
             _phantom: PhantomData,
         }
     }
@@ -414,6 +448,7 @@ where
             })),
             pool,
             positions: None,
+            resume: None,
             _phantom: PhantomData,
         }
     }
@@ -509,6 +544,9 @@ where
     /// handler cannot satisfy until the stream reaches it; it times out
     /// honestly like any other unmet target.
     ///
+    /// Once the checkpoint has reached `target`, the handler is asked whether
+    /// it would rewind (semantics 7).
+    ///
     /// The timeout is REQUIRED: the wait is structurally bounded, so a
     /// stopped handler surfaces as an alertable error rather than a silent
     /// hang.
@@ -517,7 +555,8 @@ where
     ///
     /// Returns [`SubscriptionRejection::CaughtUpTimeout`] — carrying the
     /// observed checkpoint, the target and the elapsed wait — if the deadline
-    /// passes first.
+    /// passes first. A failing `resume_from` surfaces as the transient fault
+    /// [`ResumeProbeFailed`](crate::out::ResumeProbeFailed).
     #[es_entity::errlanes::instrument(
         name = "obix.registered_handler.await_position",
         skip_all,
@@ -546,14 +585,25 @@ where
         let mut interval = INITIAL_POLL_INTERVAL;
         loop {
             let checkpoint = self.checkpoint().await?;
-            if checkpoint >= target {
-                return Ok(());
-            }
+            let observed = match (&self.resume, checkpoint >= target) {
+                (Some(resume), true) => {
+                    let resumed = resume(checkpoint).await.map_err(|e| {
+                        super::error::ResumeProbeFailed(super::error::HandlerFailure(e))
+                    })?;
+                    let after = self.checkpoint().await?;
+                    if caught_up_after_probe(target, checkpoint, resumed, after) {
+                        return Ok(());
+                    }
+                    resumed.min(after)
+                }
+                (None, true) => return Ok(()),
+                (_, false) => checkpoint,
+            };
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout {
-                    checkpoint: checkpoint.into(),
+                    checkpoint: observed.into(),
                     target: target.into(),
                     waited: now.duration_since(start),
                 }));
@@ -579,6 +629,9 @@ where
     /// awaited past the sampled insert frontier, then the subscriber's cursor to
     /// the head that fold reached.
     ///
+    /// On either lane, once the checkpoint has reached the target the handler
+    /// is asked whether it would rewind (semantics 7).
+    ///
     /// The frontier read happens before the deadline starts, so the reported
     /// `waited` measures the polling, and total call time is that read plus
     /// at most `timeout`.
@@ -586,7 +639,9 @@ where
     /// # Errors
     ///
     /// Returns [`SubscriptionRejection::CaughtUpTimeout`] — where `target`
-    /// is the sampled frontier — if the deadline passes first.
+    /// is the sampled frontier — if the deadline passes first. A failing
+    /// `resume_from` surfaces as the transient fault
+    /// [`ResumeProbeFailed`](crate::out::ResumeProbeFailed).
     #[es_entity::errlanes::instrument(
         name = "obix.registered_handler.await_caught_up",
         skip_all,
@@ -749,6 +804,29 @@ fn decode_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_barrier_behind_its_target_is_not_caught_up() {
+        assert!(!caught_up_after_probe(5u64, 4, 4, 4));
+    }
+
+    #[test]
+    fn a_handler_that_agrees_with_a_checkpoint_at_the_target_is_caught_up() {
+        assert!(caught_up_after_probe(5u64, 9, 9, 9));
+        assert!(caught_up_after_probe(5u64, 5, 5, 7));
+    }
+
+    #[test]
+    fn a_handler_that_would_rewind_is_not_caught_up() {
+        assert!(!caught_up_after_probe(5u64, 9, 0, 9));
+    }
+
+    /// The race the second read closes: the handler agreed, but the rewind had
+    /// been committed in between.
+    #[test]
+    fn a_checkpoint_that_dropped_below_the_target_during_the_probe_is_not_caught_up() {
+        assert!(!caught_up_after_probe(5u64, 9, 9, 0));
+    }
 
     /// A raw sqlx fault never rejects — it enters the subscription carrier's
     /// fault lanes through errlanes' own blanket classification, with no

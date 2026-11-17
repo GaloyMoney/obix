@@ -144,6 +144,20 @@ where
     /// It runs on every run start, including the reschedule after a shutdown
     /// request or a closed stream, so it must be cheap and must not assume it
     /// runs once per process.
+    ///
+    /// It is also called by
+    /// [`Subscription::await_caught_up`](crate::Subscription::await_caught_up)
+    /// and [`Subscription::await_position`](crate::Subscription::await_position),
+    /// on any process holding the subscription, whenever the stored checkpoint
+    /// has reached the barrier's target. Such a call may happen outside a run
+    /// and concurrently with one, and an `Err` from it fails the barrier with
+    /// [`ResumeProbeFailed`](crate::out::ResumeProbeFailed). The barrier treats
+    /// an earlier answer as "not caught up".
+    ///
+    /// So the answer must depend only on the stored position passed in and on
+    /// durable state the handler can read, and the call must not have effects
+    /// that a barrier call would repeat harmfully. It may run many times, from
+    /// runs and from barriers.
     fn resume_from(
         &self,
         stored: L::Position,
@@ -353,10 +367,10 @@ where
     Tables: MailboxTables,
     L: Lane,
 {
-    pub fn new(outbox: Outbox<P, Tables>, handler: H, config: &OutboxEventJobConfig) -> Self {
+    pub fn new(outbox: Outbox<P, Tables>, handler: Arc<H>, config: &OutboxEventJobConfig) -> Self {
         Self {
             outbox,
-            handler: Arc::new(handler),
+            handler,
             job_type: config.job_type.clone(),
             retry_settings: config.retry_settings.clone(),
             max_batch_size: config.max_batch_size,

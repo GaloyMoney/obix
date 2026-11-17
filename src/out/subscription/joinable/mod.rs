@@ -344,7 +344,7 @@ where
         let catch_up_spawner = jobs.add_keyed_initializer(catch_up_initializer);
 
         let job = tip_spawner.spawn(OutboxEventJobData::default()).await?;
-        let tip = Subscription::new(job, self.pool().clone(), None);
+        let tip = Subscription::new(job, self.pool().clone(), None, None);
         self.joinable_registrations
             .write()
             .expect("joinable registrations poisoned")

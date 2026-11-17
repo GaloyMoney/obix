@@ -5,11 +5,13 @@ mod helpers;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use obix::{
     CommitLane, CommitOrder, EventCtx, EventDelivery, FlushOp, Handled, InsertOrder, Lane,
-    MailboxConfig, OutboxEventJobConfig, SingletonSubscriber, Subscription, out::Outbox,
+    MailboxConfig, OutboxEventJobConfig, ResumeProbeFailed, SingletonSubscriber, StreamPosition,
+    Subscription, SubscriptionRejection, out::Outbox, prelude::es_entity::errlanes::Fail,
 };
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
@@ -183,18 +185,29 @@ impl<L: Lane> Run<L> {
         outbox: &Outbox<TestEvent, TestTables>,
         control: &Arc<Control>,
     ) -> anyhow::Result<Self> {
+        let mut run = Self::register(
+            pool,
+            outbox,
+            Rewinder::<L> {
+                control: control.clone(),
+                _lane: std::marker::PhantomData,
+            },
+        )
+        .await?;
+        run.jobs.start_poll().await?;
+        Ok(run)
+    }
+
+    /// Registered but not polling: the window before a run's first start.
+    async fn register<H: SingletonSubscriber<TestEvent, L>>(
+        pool: &sqlx::PgPool,
+        outbox: &Outbox<TestEvent, TestTables>,
+        handler: H,
+    ) -> anyhow::Result<Self> {
         let mut jobs = init_jobs(pool).await?;
         let subscription = outbox
-            .register_singleton_subscriber(
-                &mut jobs,
-                config(),
-                Rewinder::<L> {
-                    control: control.clone(),
-                    _lane: std::marker::PhantomData,
-                },
-            )
+            .register_singleton_subscriber(&mut jobs, config(), handler)
             .await?;
-        jobs.start_poll().await?;
         Ok(Self { jobs, subscription })
     }
 
@@ -489,6 +502,262 @@ async fn hook_runs_once_per_run<L: Lane>() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A handler that imitates an external landing store: it records the position
+/// of its last flush in `landed`, and asks for a rewind when that store is
+/// empty beside a stored checkpoint that is not at the beginning.
+struct LandingHandler<L: Lane> {
+    landed: Arc<AtomicU64>,
+    calls: Arc<AtomicUsize>,
+    delivered: Arc<AtomicUsize>,
+    last_position: Arc<AtomicU64>,
+    /// `resume_from` fails while the store is empty.
+    refuse_when_empty: bool,
+    _lane: std::marker::PhantomData<L>,
+}
+
+#[derive(Clone)]
+struct LandingProbe {
+    landed: Arc<AtomicU64>,
+    calls: Arc<AtomicUsize>,
+    delivered: Arc<AtomicUsize>,
+    last_position: Arc<AtomicU64>,
+}
+
+impl LandingProbe {
+    fn new() -> Self {
+        Self {
+            landed: Arc::new(AtomicU64::new(0)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            delivered: Arc::new(AtomicUsize::new(0)),
+            last_position: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn handler<L: Lane>(&self, refuse_when_empty: bool) -> LandingHandler<L> {
+        LandingHandler {
+            landed: self.landed.clone(),
+            calls: self.calls.clone(),
+            delivered: self.delivered.clone(),
+            last_position: self.last_position.clone(),
+            refuse_when_empty,
+            _lane: std::marker::PhantomData,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// The store was lost: empty it and forget what was delivered.
+    fn lose_the_store(&self) {
+        self.landed.store(0, Ordering::SeqCst);
+        self.delivered.store(0, Ordering::SeqCst);
+    }
+}
+
+impl<L: Lane> SingletonSubscriber<TestEvent, L> for LandingHandler<L> {
+    type Batch = Vec<u64>;
+
+    async fn resume_from(
+        &self,
+        stored: L::Position,
+    ) -> Result<L::Position, Box<dyn std::error::Error + Send + Sync>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.landed.load(Ordering::SeqCst) != 0 || stored <= L::begin() {
+            return Ok(stored);
+        }
+        if self.refuse_when_empty {
+            return Err("landing-store-unreadable".into());
+        }
+        Ok(L::begin())
+    }
+
+    async fn handle_persistent<'inv>(
+        &self,
+        ctx: EventCtx<'inv, Vec<u64>>,
+        event: &EventDelivery<TestEvent, L>,
+    ) -> Result<Handled<'inv>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(TestEvent::Ping(n)) = &event.payload else {
+            return Ok(ctx.skip());
+        };
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        self.last_position
+            .store(L::position_to_u64(event.position()), Ordering::SeqCst);
+        let n = *n;
+        Ok(ctx.collect_with(move |batch| batch.push(n)))
+    }
+
+    async fn flush(
+        &self,
+        op: &mut FlushOp<'_, L>,
+        items: Vec<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !items.is_empty() {
+            self.landed
+                .store(L::position_to_u64(op.position()), Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Land events 1..=5 through a first run and stop it, leaving the checkpoint at
+/// their last position and the landing store filled. Returns that position.
+async fn land_five_and_stop<L: Lane>(
+    pool: &sqlx::PgPool,
+    outbox: &Outbox<TestEvent, TestTables>,
+    probe: &LandingProbe,
+) -> anyhow::Result<u64> {
+    let mut run = Run::<L>::register(pool, outbox, probe.handler::<L>(false)).await?;
+    run.jobs.start_poll().await?;
+    publish(outbox, 1..=5).await?;
+    until(
+        async || probe.delivered.load(Ordering::SeqCst) >= 5,
+        "five deliveries",
+    )
+    .await?;
+    let last = probe.last_position.load(Ordering::SeqCst);
+    run.checkpoint_reaches(last).await?;
+    run.stop().await;
+    Ok(last)
+}
+
+fn begin_position<L: Lane>() -> StreamPosition {
+    L::begin().into()
+}
+
+/// B2-B4, B10: a stored checkpoint at the head beside a lost landing store is
+/// not "caught up" until the rewind has been replayed.
+async fn pending_rewind_blocks_the_barrier<L: Lane>(by_position: bool) -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool).await?;
+    let probe = LandingProbe::new();
+    let last = land_five_and_stop::<L>(&pool, &outbox, &probe).await?;
+    probe.lose_the_store();
+
+    let mut run = Run::<L>::register(&pool, &outbox, probe.handler::<L>(false)).await?;
+
+    // B10: the snapshot reports the durable checkpoint, not the pending rewind.
+    assert_eq!(
+        L::position_to_u64(run.subscription.load().await?.checkpoint()),
+        last
+    );
+
+    // The run has not started, so nothing has rewound the cursor yet.
+    let subscription = run.subscription.clone();
+    let barrier = async |timeout: Duration| {
+        if by_position {
+            subscription
+                .await_position(L::position_from_u64(last), timeout)
+                .await
+        } else {
+            subscription.await_caught_up(timeout).await
+        }
+    };
+    match barrier(Duration::from_millis(500)).await {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout { checkpoint, .. })) => {
+            assert_eq!(checkpoint, begin_position::<L>());
+        }
+        other => anyhow::bail!("expected CaughtUpTimeout at the beginning, got {other:?}"),
+    }
+    assert_eq!(probe.delivered.load(Ordering::SeqCst), 0);
+
+    run.jobs.start_poll().await?;
+    barrier(Duration::from_secs(20)).await?;
+    assert_eq!(
+        probe.delivered.load(Ordering::SeqCst),
+        5,
+        "the barrier returned before the history was replayed"
+    );
+    run.stop().await;
+    Ok(())
+}
+
+async fn pending_rewind_blocks_await_caught_up<L: Lane>() -> anyhow::Result<()> {
+    pending_rewind_blocks_the_barrier::<L>(false).await
+}
+
+async fn pending_rewind_blocks_await_position<L: Lane>() -> anyhow::Result<()> {
+    pending_rewind_blocks_the_barrier::<L>(true).await
+}
+
+/// B5: a failing `resume_from` is a transient fault of the barrier.
+async fn probe_failure_is_a_transient_fault<L: Lane>() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool).await?;
+    let probe = LandingProbe::new();
+    land_five_and_stop::<L>(&pool, &outbox, &probe).await?;
+    probe.lose_the_store();
+
+    let run = Run::<L>::register(&pool, &outbox, probe.handler::<L>(true)).await?;
+    match run
+        .subscription
+        .await_caught_up(Duration::from_millis(500))
+        .await
+    {
+        Err(Fail::Transient(t)) => {
+            let source = std::error::Error::source(&t).expect("the fault is the source");
+            let fault = source
+                .downcast_ref::<ResumeProbeFailed>()
+                .expect("a ResumeProbeFailed");
+            assert!(
+                !fault.to_string().contains("landing-store-unreadable"),
+                "the handler's error stays behind source()"
+            );
+            assert_eq!(
+                std::error::Error::source(fault)
+                    .expect("the handler's error")
+                    .to_string(),
+                "landing-store-unreadable"
+            );
+        }
+        other => anyhow::bail!("expected a transient fault, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// B6: a caught-up subscriber costs the barrier exactly one `resume_from`.
+async fn caught_up_barrier_asks_once<L: Lane>() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool).await?;
+    let probe = LandingProbe::new();
+    let last = land_five_and_stop::<L>(&pool, &outbox, &probe).await?;
+
+    let mut run = Run::<L>::register(&pool, &outbox, probe.handler::<L>(false)).await?;
+    run.jobs.start_poll().await?;
+    run.checkpoint_reaches(last).await?;
+    // The run asks once at its start; let that happen before counting.
+    until(async || probe.calls() >= 1, "the run's own call").await?;
+    let before = probe.calls();
+    run.subscription
+        .await_caught_up(Duration::from_secs(20))
+        .await?;
+    assert_eq!(probe.calls() - before, 1);
+    run.stop().await;
+    Ok(())
+}
+
+/// B7: a barrier that is still behind never asks the handler.
+async fn a_barrier_that_is_behind_does_not_ask<L: Lane>() -> anyhow::Result<()> {
+    let pool = init_pool().await?;
+    let outbox = init_outbox(&pool).await?;
+    let probe = LandingProbe::new();
+    land_five_and_stop::<L>(&pool, &outbox, &probe).await?;
+    publish(&outbox, 6..=8).await?;
+
+    let run = Run::<L>::register(&pool, &outbox, probe.handler::<L>(false)).await?;
+    let before = probe.calls();
+    match run
+        .subscription
+        .await_caught_up(Duration::from_millis(500))
+        .await
+    {
+        Err(Fail::Rejected(SubscriptionRejection::CaughtUpTimeout { .. })) => {}
+        other => anyhow::bail!("expected CaughtUpTimeout, got {other:?}"),
+    }
+    assert_eq!(probe.calls(), before);
+    Ok(())
+}
+
 macro_rules! on_both_lanes {
     ($($scenario:ident => $insert:ident, $commit:ident;)*) => {$(
         #[tokio::test]
@@ -514,4 +783,9 @@ on_both_lanes! {
     rewind_is_visible_to_load => insert_lane_rewind_is_visible_to_load, commit_lane_rewind_is_visible_to_load;
     fresh_subscriber_gets_the_beginning => insert_lane_fresh_subscriber_gets_the_beginning, commit_lane_fresh_subscriber_gets_the_beginning;
     hook_runs_once_per_run => insert_lane_calls_the_hook_once_per_run, commit_lane_calls_the_hook_once_per_run;
+    pending_rewind_blocks_await_caught_up => insert_lane_caught_up_waits_for_a_pending_rewind, commit_lane_caught_up_waits_for_a_pending_rewind;
+    pending_rewind_blocks_await_position => insert_lane_await_position_waits_for_a_pending_rewind, commit_lane_await_position_waits_for_a_pending_rewind;
+    probe_failure_is_a_transient_fault => insert_lane_probe_failure_is_transient, commit_lane_probe_failure_is_transient;
+    caught_up_barrier_asks_once => insert_lane_barrier_asks_once, commit_lane_barrier_asks_once;
+    a_barrier_that_is_behind_does_not_ask => insert_lane_behind_barrier_does_not_ask, commit_lane_behind_barrier_does_not_ask;
 }
