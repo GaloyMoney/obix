@@ -1,3 +1,11 @@
+# [obix release v0.19.2](https://github.com/GaloyMoney/obix/releases/tag/0.19.2)
+
+
+
+### Bug Fixes
+
+- The caught-up barrier asks resume_from before reporting caught up (#196)
+
 # [obix release v0.19.1](https://github.com/GaloyMoney/obix/releases/tag/0.19.1)
 
 
