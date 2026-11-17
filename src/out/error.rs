@@ -184,7 +184,25 @@ pub struct ResumeAheadOfCheckpoint {
 #[derive(Debug, errlanes::Classify)]
 #[classify(transient(Other))]
 #[error("the subscriber's resume_from failed while a barrier asked whether it would rewind")]
-pub struct ResumeProbeFailed(#[source] pub Box<dyn std::error::Error + Send + Sync>);
+pub struct ResumeProbeFailed(#[source] pub HandlerFailure);
+
+/// A handler's boxed error as a sized [`std::error::Error`], so it can be a
+/// `#[source]` (a `Box<dyn Error>` is not itself an `Error`). Displays as the
+/// handler's error does.
+#[derive(Debug)]
+pub struct HandlerFailure(pub Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for HandlerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for HandlerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
 
 /// Persisted state that no longer decodes. One variant per stored value so
 /// the operator-facing chain names which row to look at; the serde error (or
@@ -413,7 +431,7 @@ mod tests {
     /// and does not repeat that error in its own message.
     #[test]
     fn resume_probe_failure_is_transient_and_keeps_the_source() {
-        let probe = ResumeProbeFailed("bucket-path-secret".into());
+        let probe = ResumeProbeFailed(HandlerFailure("bucket-path-secret".into()));
         assert!(!probe.to_string().contains("bucket-path-secret"));
         let err: Fail<SubscriptionRejection, lanes!(Transient, Fatal)> = probe.into();
         match err {

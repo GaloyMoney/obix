@@ -587,9 +587,9 @@ where
             let checkpoint = self.checkpoint().await?;
             let observed = match (&self.resume, checkpoint >= target) {
                 (Some(resume), true) => {
-                    let resumed = resume(checkpoint)
-                        .await
-                        .map_err(super::error::ResumeProbeFailed)?;
+                    let resumed = resume(checkpoint).await.map_err(|e| {
+                        super::error::ResumeProbeFailed(super::error::HandlerFailure(e))
+                    })?;
                     let after = self.checkpoint().await?;
                     if caught_up_after_probe(target, checkpoint, resumed, after) {
                         return Ok(());
