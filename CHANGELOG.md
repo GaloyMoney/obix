@@ -1,3 +1,11 @@
+# [obix release v0.19.1](https://github.com/GaloyMoney/obix/releases/tag/0.19.1)
+
+
+
+### Features
+
+- Singleton subscribers choose where each run resumes (#194)
+
 # [obix release v0.19.0](https://github.com/GaloyMoney/obix/releases/tag/0.19.0)
 
 
