@@ -39,10 +39,12 @@ use crate::tables::MailboxTables;
 ///   write. The runner applies the whole accumulator via
 ///   [`flush`](Self::flush) exactly once per batch landing, inside the
 ///   transaction that commits the checkpoint — N per-event statements
-///   become one batched flush. The batch lands when the ready persistent
-///   backlog is drained (it is never held open waiting on the network), when
-///   `max_batch_size` is reached, when a later event consumes, or on
-///   shutdown. Requires the work to tolerate whole-batch replay after a
+///   become one batched flush. By default the batch lands when the ready
+///   persistent backlog is drained, when `max_batch_size` is reached, when a
+///   later event consumes, or on shutdown. An opt-in
+///   [`batch window`](OutboxEventJobConfig::with_batch_window) coalesces across
+///   temporary stream pauses and delays all nonempty landings before opening
+///   their transaction. Requires the work to tolerate whole-batch replay after a
 ///   mid-batch failure.
 /// - [`consume`](EventCtx::consume) then [`commit`](IsolatedOp::commit) — my
 ///   event is its own atomic unit: the pending batch (items + checkpoint)
@@ -302,6 +304,8 @@ pub struct OutboxEventJobConfig {
     pub retry_settings: RetrySettings,
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
+    /// Fixed first-collect window; see [`Self::with_batch_window`].
+    pub batch_window: std::time::Duration,
 }
 
 impl OutboxEventJobConfig {
@@ -311,6 +315,7 @@ impl OutboxEventJobConfig {
             retry_settings: RetrySettings::default(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            batch_window: std::time::Duration::ZERO,
         }
     }
 
@@ -328,6 +333,23 @@ impl OutboxEventJobConfig {
     /// pending batch.
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size.max(1);
+        self
+    }
+
+    /// Coalesce collected items for a fixed window starting at the first
+    /// collect. Later arrivals never extend the deadline. Temporary stream
+    /// pauses do not flush early; at the deadline the runner flushes at the
+    /// next source commit-group boundary, even with continuously ready input.
+    ///
+    /// A full batch stops fetching at a group boundary but waits out the
+    /// window before opening its landing transaction. All other nonempty
+    /// landing triggers (including consume, undecodable events and shutdown)
+    /// honor the same deadline. The next window starts only after the prior
+    /// batch lands. Skip-only checkpoint cadence and isolated consume ops are
+    /// unchanged. Zero (the default) preserves immediate backlog-drained
+    /// flushing. Collected work must tolerate whole-batch replay on failure.
+    pub fn with_batch_window(mut self, window: std::time::Duration) -> Self {
+        self.batch_window = window;
         self
     }
 
@@ -357,6 +379,7 @@ where
     retry_settings: RetrySettings,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
+    batch_window: std::time::Duration,
     _lane: std::marker::PhantomData<fn() -> L>,
 }
 
@@ -375,6 +398,7 @@ where
             retry_settings: config.retry_settings.clone(),
             max_batch_size: config.max_batch_size,
             checkpoint_interval: config.checkpoint_interval,
+            batch_window: config.batch_window,
             _lane: std::marker::PhantomData,
         }
     }
@@ -406,6 +430,7 @@ where
             handler: self.handler.clone(),
             max_batch_size: self.max_batch_size,
             checkpoint_interval: self.checkpoint_interval,
+            batch_window: self.batch_window,
             _lane: std::marker::PhantomData,
         }))
     }
@@ -422,6 +447,7 @@ where
     handler: Arc<H>,
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
+    batch_window: std::time::Duration,
     _lane: std::marker::PhantomData<fn() -> L>,
 }
 
@@ -512,6 +538,7 @@ where
             LoopCadence {
                 max_batch_size: self.max_batch_size,
                 checkpoint_interval: self.checkpoint_interval,
+                batch_window: self.batch_window,
             },
         )
         .await
@@ -576,12 +603,13 @@ where
     ) -> impl std::future::Future<Output = Result<(), HandlerError>> + Send;
 }
 
-/// When the shared loop lands on its own initiative: a full batch, and a
-/// skip-only stretch that has gone unpersisted for the interval.
+/// When the shared loop lands on its own initiative: a full batch, an opt-in
+/// batch window deadline, or a skip-only stretch unpersisted for the interval.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LoopCadence {
     pub(crate) max_batch_size: usize,
     pub(crate) checkpoint_interval: std::time::Duration,
+    pub(crate) batch_window: std::time::Duration,
 }
 
 /// The loop behind every always-on persistent runner: batching, landing
@@ -605,20 +633,71 @@ where
     let LoopCadence {
         max_batch_size,
         checkpoint_interval,
+        batch_window,
     } = cadence;
     let mirror = landing.mirror();
     {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
-        let mut tracker = BatchTracker {
-            collected: 0,
-            persisted: checkpoint_of::<L>(&state),
-            last_persist: tokio::time::Instant::now(),
-        };
+        let mut tracker = BatchTracker::new(checkpoint_of::<L>(&state), batch_window);
         let mut in_group = false;
         let mut batch = D::Batch::default();
 
         loop {
-            let item = if tracker.collected > 0 {
+            let item = if let Some(deadline) = tracker.deadline() {
+                // Check before polling ready input: neither an endless stream
+                // nor skipped events may starve a due/full collected batch.
+                // Never cut a source commit group for these triggers.
+                let reason = if !in_group && tracker.collected >= max_batch_size {
+                    Some("batch_full")
+                } else if !in_group && tokio::time::Instant::now() >= deadline {
+                    Some("batch_window")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    let mut parts = CtxParts {
+                        op_slot: &mut op_slot,
+                        current_job: &mut current_job,
+                        state: &mut state,
+                        tracker: &mut tracker,
+                        landing,
+                    };
+                    flush_batch(&mut parts, &mut batch, flusher, reason).await?;
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = current_job.shutdown_requested(), if !in_group => {
+                        let mut parts = CtxParts {
+                            op_slot: &mut op_slot,
+                            current_job: &mut current_job,
+                            state: &mut state,
+                            tracker: &mut tracker,
+                            landing,
+                        };
+                        flush_batch(&mut parts, &mut batch, flusher, "shutdown").await?;
+                        return Ok(ResidentJobCompletion::RescheduleNow);
+                    }
+                    _ = tokio::time::sleep_until(deadline), if !in_group => {
+                        // The top-of-loop check lands without fetching again.
+                        continue;
+                    }
+                    next = persistent.next() => match next {
+                        Some(item) => item,
+                        None => {
+                            let mut parts = CtxParts {
+                                op_slot: &mut op_slot,
+                                current_job: &mut current_job,
+                                state: &mut state,
+                                tracker: &mut tracker,
+                                landing,
+                            };
+                            flush_batch(&mut parts, &mut batch, flusher, "stream_closed").await?;
+                            return Ok(ResidentJobCompletion::RescheduleNow);
+                        }
+                    }
+                }
+            } else if tracker.collected > 0 {
                 // A batch is pending (collected items awaiting a flush):
                 // only take persistent events that are already buffered —
                 // the batch is never held open waiting on the network. A
@@ -890,6 +969,14 @@ mod tests {
             decide_lane(commit, sequence, Ordering::Commit),
             Ok(LaneChoice::Commit(CommitSequence::from(2u64)))
         );
+    }
+
+    #[test]
+    fn batch_window_is_opt_in() {
+        let config = OutboxEventJobConfig::new(JobType::new("singleton-window-default"));
+        assert_eq!(config.batch_window, std::time::Duration::ZERO);
+        let window = std::time::Duration::from_secs(2);
+        assert_eq!(config.with_batch_window(window).batch_window, window);
     }
 
     #[test]
