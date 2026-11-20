@@ -39,6 +39,7 @@ bon = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 anyhow = { workspace = true }
 serial_test = { version = "4", features = ["file_locks"] }
 

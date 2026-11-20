@@ -437,11 +437,10 @@ where
             _marker: PhantomData,
         };
         let persistent = self.outbox.listen_persisted(Some(state.sequence));
-        let tracker = BatchTracker {
-            collected: 0,
-            persisted: StreamPosition::Insert(state.sequence),
-            last_persist: tokio::time::Instant::now(),
-        };
+        let tracker = BatchTracker::new(
+            StreamPosition::Insert(state.sequence),
+            std::time::Duration::ZERO,
+        );
         let mut catch_up = CatchUpLoop {
             current_job,
             state,
