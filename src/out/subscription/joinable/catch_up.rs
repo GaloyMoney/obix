@@ -440,6 +440,7 @@ where
         let tracker = BatchTracker::new(
             StreamPosition::Insert(state.sequence),
             std::time::Duration::ZERO,
+            self.max_batch_size,
         );
         let mut catch_up = CatchUpLoop {
             current_job,

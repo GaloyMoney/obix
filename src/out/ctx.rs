@@ -20,8 +20,10 @@
 //! ready persistent backlog, adding no latency at low traffic. Singleton
 //! subscribers can opt into a fixed first-collect batch window via
 //! [`with_batch_window`](super::OutboxEventJobConfig::with_batch_window):
-//! collection then spans temporary stream pauses, and every nonempty landing
-//! waits for that deadline **before** opening its transaction.
+//! collection then spans temporary stream pauses, and a nonempty landing
+//! waits for that deadline **before** opening its transaction — unless the
+//! batch already reached `max_batch_size`, which has nothing left to
+//! coalesce and lands at its next commit-group boundary.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
 //! items to the handler's [`flush`](super::SingletonSubscriber::flush) inside
@@ -132,16 +134,24 @@ pub(crate) struct BatchTracker {
     /// When the checkpoint was last persisted (any flush or standalone write).
     pub(crate) last_persist: tokio::time::Instant,
     batch_window: std::time::Duration,
+    /// The runner's ceiling on one batch, so the landing fence can tell a
+    /// batch that is still filling from one that cannot grow any further.
+    max_batch_size: usize,
     deadline: Option<tokio::time::Instant>,
 }
 
 impl BatchTracker {
-    pub(crate) fn new(persisted: StreamPosition, batch_window: std::time::Duration) -> Self {
+    pub(crate) fn new(
+        persisted: StreamPosition,
+        batch_window: std::time::Duration,
+        max_batch_size: usize,
+    ) -> Self {
         Self {
             collected: 0,
             persisted,
             last_persist: tokio::time::Instant::now(),
             batch_window,
+            max_batch_size: max_batch_size.max(1),
             deadline: None,
         }
     }
@@ -157,9 +167,22 @@ impl BatchTracker {
         self.deadline
     }
 
+    /// Whether the accumulator has reached the runner's batch ceiling. The
+    /// window exists to fill a batch, so a batch that cannot grow has
+    /// nothing left to wait for: a catch-up replaying a backlog builds full
+    /// batches back to back, and making each one sit out the window adds the
+    /// window to every landing (measured at ~17% of a backfill flush) without
+    /// coalescing a single extra event.
+    pub(crate) fn holds_full_batch(&self) -> bool {
+        self.collected >= self.max_batch_size
+    }
+
     /// Only memory is pending while this runs. Cancellation leaves the batch
     /// unacknowledged, so a subsequent run re-collects it from durable events.
     async fn wait_for_window(&self) {
+        if self.holds_full_batch() {
+            return;
+        }
         if let Some(deadline) = self.deadline {
             tokio::time::sleep_until(deadline).await;
         }
@@ -752,6 +775,8 @@ async fn land_batch<B: Default, L: Landing>(
         // A singleton consume fences and drains the accumulator before it
         // opens an isolated op. Keyed/joinable trackers have a zero window
         // (catch-up may already own a join op), so they never wait here.
+        // A batch that already hit `max_batch_size` lands without waiting
+        // (see `BatchTracker::holds_full_batch`).
         assert!(parts.op_slot.is_none(), "batch window requires no open op");
         parts.tracker.wait_for_window().await;
     }
@@ -1271,6 +1296,7 @@ mod tests {
         let mut tracker = BatchTracker::new(
             StreamPosition::Insert(EventSequence::BEGIN),
             Duration::from_secs(2),
+            MAX_BATCH,
         );
         assert_eq!(tracker.deadline(), None);
         tracker.collect();
@@ -1291,7 +1317,7 @@ mod tests {
     async fn cancelled_window_wait_keeps_items_and_checkpoint_unacknowledged() {
         use std::time::Duration;
         let persisted = StreamPosition::Insert(EventSequence::from(7u64));
-        let mut tracker = BatchTracker::new(persisted, Duration::from_secs(2));
+        let mut tracker = BatchTracker::new(persisted, Duration::from_secs(2), MAX_BATCH);
         tracker.collect();
         let deadline = tracker.deadline();
         // Poll and drop the wait, as when a runner future is cancelled. No
@@ -1306,11 +1332,55 @@ mod tests {
         assert_eq!(Some(tokio::time::Instant::now()), deadline);
     }
 
+    /// A ceiling the partial-batch cases never reach, so the window's own
+    /// waiting behaviour stays under test.
+    const MAX_BATCH: usize = 1_000;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_batch_lands_without_waiting_out_the_window() {
+        use std::time::Duration;
+        let mut tracker = BatchTracker::new(
+            StreamPosition::Insert(EventSequence::BEGIN),
+            Duration::from_secs(2),
+            2,
+        );
+        tracker.collect();
+        assert!(!tracker.holds_full_batch());
+        // One short of the ceiling still coalesces.
+        assert!(tracker.wait_for_window().now_or_never().is_none());
+        let armed = tokio::time::Instant::now();
+        tracker.collect();
+        assert!(tracker.holds_full_batch());
+        // At the ceiling the wait is a no-op, and time has not moved.
+        tracker.wait_for_window().await;
+        assert_eq!(tokio::time::Instant::now(), armed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_that_shrinks_back_below_the_ceiling_waits_again() {
+        use std::time::Duration;
+        let mut tracker = BatchTracker::new(
+            StreamPosition::Insert(EventSequence::BEGIN),
+            Duration::from_secs(2),
+            2,
+        );
+        tracker.collect();
+        tracker.collect();
+        assert!(tracker.holds_full_batch());
+        // A landing drains the accumulator and clears the deadline.
+        tracker.collected = 0;
+        tracker.deadline = None;
+        tracker.collect();
+        assert!(!tracker.holds_full_batch());
+        assert!(tracker.wait_for_window().now_or_never().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn zero_window_never_arms_a_timer() {
         let mut tracker = BatchTracker::new(
             StreamPosition::Insert(EventSequence::BEGIN),
             std::time::Duration::ZERO,
+            MAX_BATCH,
         );
         let now = tokio::time::Instant::now();
         tracker.collect();

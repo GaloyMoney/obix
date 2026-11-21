@@ -43,9 +43,10 @@ use crate::tables::MailboxTables;
 ///   persistent backlog is drained, when `max_batch_size` is reached, when a
 ///   later event consumes, or on shutdown. An opt-in
 ///   [`batch window`](OutboxEventJobConfig::with_batch_window) coalesces across
-///   temporary stream pauses and delays all nonempty landings before opening
-///   their transaction. Requires the work to tolerate whole-batch replay after a
-///   mid-batch failure.
+///   temporary stream pauses and delays nonempty landings before opening their
+///   transaction, except a batch that already reached `max_batch_size` — it
+///   lands without waiting. Requires the work to tolerate whole-batch replay
+///   after a mid-batch failure.
 /// - [`consume`](EventCtx::consume) then [`commit`](IsolatedOp::commit) — my
 ///   event is its own atomic unit: the pending batch (items + checkpoint)
 ///   lands before my work starts, and my op commits at return. Use for
@@ -341,13 +342,14 @@ impl OutboxEventJobConfig {
     /// pauses do not flush early; at the deadline the runner flushes at the
     /// next source commit-group boundary, even with continuously ready input.
     ///
-    /// A full batch stops fetching at a group boundary but waits out the
-    /// window before opening its landing transaction. All other nonempty
-    /// landing triggers (including consume, undecodable events and shutdown)
-    /// honor the same deadline. The next window starts only after the prior
-    /// batch lands. Skip-only checkpoint cadence and isolated consume ops are
-    /// unchanged. Zero (the default) preserves immediate backlog-drained
-    /// flushing. Collected work must tolerate whole-batch replay on failure.
+    /// A full batch stops fetching at a group boundary and lands there
+    /// without waiting: it cannot grow, so the window would only delay it.
+    /// Every other nonempty landing trigger (including consume, undecodable
+    /// events and shutdown) honors the deadline. The next window starts only
+    /// after the prior batch lands. Skip-only checkpoint cadence and isolated
+    /// consume ops are unchanged. Zero (the default) preserves immediate
+    /// backlog-drained flushing. Collected work must tolerate whole-batch
+    /// replay on failure.
     pub fn with_batch_window(mut self, window: std::time::Duration) -> Self {
         self.batch_window = window;
         self
@@ -638,7 +640,8 @@ where
     let mirror = landing.mirror();
     {
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
-        let mut tracker = BatchTracker::new(checkpoint_of::<L>(&state), batch_window);
+        let mut tracker =
+            BatchTracker::new(checkpoint_of::<L>(&state), batch_window, max_batch_size);
         let mut in_group = false;
         let mut batch = D::Batch::default();
 

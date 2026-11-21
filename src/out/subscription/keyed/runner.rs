@@ -280,6 +280,7 @@ where
         let mut tracker = BatchTracker::new(
             StreamPosition::Insert(state.sequence),
             std::time::Duration::ZERO,
+            self.max_batch_size,
         );
         let mut batch = <D::Subscriber as KeyedSubscriber<P>>::Batch::default();
 

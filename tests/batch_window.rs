@@ -273,19 +273,11 @@ async fn sparse_arrivals_coalesce_without_resetting_the_deadline() -> anyhow::Re
 
 #[tokio::test]
 #[file_serial]
-async fn full_batches_stop_fetching_and_wait_before_opening_an_op() -> anyhow::Result<()> {
+async fn full_batches_land_without_waiting_out_the_window() -> anyhow::Result<()> {
     let observed = Arc::new(Observed::default());
     let mut h = Harness::new::<InsertOrder>(WINDOW, 2, Recorder::new(observed)).await?;
     h.publish((1..=4).map(TestEvent::Ping)).await?;
     h.jobs.start_poll().await?;
-    h.wait_collected(2).await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        h.observed.collected.lock().await.len(),
-        2,
-        "full batch stops admission"
-    );
-    h.assert_unlanded().await?;
     h.wait_checkpoint(4).await?;
     let attempts = h.observed.attempts.lock().await;
     let collected = h.observed.collected.lock().await;
@@ -293,11 +285,43 @@ async fn full_batches_stop_fetching_and_wait_before_opening_an_op() -> anyhow::R
         attempts.iter().map(|a| a.0.clone()).collect::<Vec<_>>(),
         vec![vec![1, 2], vec![3, 4]]
     );
-    assert!(attempts[0].1.duration_since(collected[0].1) >= WINDOW);
-    assert!(attempts[1].1.duration_since(collected[2].1) >= WINDOW);
+    // A batch at the ceiling cannot coalesce another event: it lands at its
+    // next commit-group boundary instead of sitting out the window.
     assert!(
-        attempts[1].1.duration_since(attempts[0].1) >= WINDOW,
-        "new window starts after landing"
+        attempts[0].1.duration_since(collected[0].1) < WINDOW,
+        "a full batch does not wait out the window"
+    );
+    assert!(
+        attempts[1].1.duration_since(collected[2].1) < WINDOW,
+        "the next full batch does not wait either"
+    );
+    drop(collected);
+    drop(attempts);
+    h.jobs.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn a_partial_tail_batch_still_waits_out_the_window() -> anyhow::Result<()> {
+    let observed = Arc::new(Observed::default());
+    let mut h = Harness::new::<InsertOrder>(WINDOW, 3, Recorder::new(observed)).await?;
+    h.publish((1..=4).map(TestEvent::Ping)).await?;
+    h.jobs.start_poll().await?;
+    h.wait_checkpoint(4).await?;
+    let attempts = h.observed.attempts.lock().await;
+    let collected = h.observed.collected.lock().await;
+    assert_eq!(
+        attempts.iter().map(|a| a.0.clone()).collect::<Vec<_>>(),
+        vec![vec![1, 2, 3], vec![4]]
+    );
+    assert!(
+        attempts[0].1.duration_since(collected[0].1) < WINDOW,
+        "the full batch landed at its boundary"
+    );
+    assert!(
+        attempts[1].1.duration_since(collected[3].1) >= WINDOW,
+        "the partial tail coalesced for the whole window"
     );
     drop(collected);
     drop(attempts);
@@ -461,7 +485,9 @@ async fn failed_landing_replays_the_whole_batch_with_a_fresh_window() -> anyhow:
     let observed = Arc::new(Observed::default());
     let recorder = Recorder::new(observed);
     recorder.fail_flush_once.store(true, Ordering::SeqCst);
-    let mut h = Harness::new::<InsertOrder>(WINDOW, 2, recorder).await?;
+    // A partial batch: the window (not the ceiling) is what delays the
+    // landing, so the retry's own fresh window stays under test.
+    let mut h = Harness::new::<InsertOrder>(WINDOW, 100, recorder).await?;
     h.publish([TestEvent::Ping(1), TestEvent::Ping(2)]).await?;
     h.jobs.start_poll().await?;
     h.wait_collected(4).await?;
