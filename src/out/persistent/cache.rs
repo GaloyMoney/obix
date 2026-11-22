@@ -248,7 +248,10 @@ where
             highest_known_sequence,
             backfill_request_send: backfill_send,
             persistent_event_sender,
-            backfill_buffer_size: config.backfill_page_size.max(1),
+            backfill_buffer_size: config
+                .backfill_page_size
+                .max(1)
+                .saturating_mul(config.backfill_read_ahead.max(1)),
             cache_fill_sender: cache_fill_send,
             feeder,
             _cache_loop_handle: cache_loop_handle,
