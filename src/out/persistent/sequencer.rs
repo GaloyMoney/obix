@@ -388,6 +388,7 @@ async fn serve_commit_backfill<P, Tables>(
         None => (EventSequence::BEGIN, CommitSequence::BEGIN, HashMap::new()),
     };
     record_backfill_started(u64::from(after), u64::from(from), u64::from(head));
+    let serving = std::time::Instant::now();
 
     let mut listener = PersistentOutboxListener::transport_stream(cache.handle(), Some(from), page);
     let mut sequencer = Sequencer::<P, Tables> {
@@ -408,14 +409,22 @@ async fn serve_commit_backfill<P, Tables>(
         _phantom: std::marker::PhantomData,
     };
 
+    let from_commit = sequencer.head;
     loop {
         let Some(batch) = next_batch(&mut listener, page).await else {
-            return;
+            break;
         };
         if !sequencer.fold_batch(batch).await {
-            return;
+            break;
         }
     }
+    record_backfill_finished(
+        u64::from(after),
+        u64::from(until),
+        u64::from(from),
+        u64::from(sequencer.head).saturating_sub(u64::from(from_commit)),
+        serving.elapsed().as_millis() as u64,
+    );
 }
 
 /// Wait for one delivery, then take whatever else is already buffered, up to
@@ -566,6 +575,33 @@ fn record_started(from_sequence: u64, insert_frontier: u64, behind: u64) {}
     fields(after = after, from_sequence = from_sequence, from_commit_seq = from_commit_seq),
 )]
 fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64) {}
+
+/// What one commit-lane backfill cost: the rows it re-folded (`rows`, the
+/// insert-lane reads behind them) against the rows it actually owed
+/// (`owed = until - after`). A `rows` far above `owed` means the re-fold
+/// started well below the request, which is the price of reconstructing the
+/// numbering from a checkpoint.
+#[tracing::instrument(
+    name = "obix.sequencer.backfill_finished",
+    level = "info",
+    skip_all,
+    fields(
+        after = after,
+        until = until,
+        from_sequence = from_sequence,
+        rows = rows,
+        owed = until.saturating_sub(after),
+        elapsed_ms = elapsed_ms,
+    ),
+)]
+fn record_backfill_finished(
+    after: u64,
+    until: u64,
+    from_sequence: u64,
+    rows: u64,
+    elapsed_ms: u64,
+) {
+}
 
 #[tracing::instrument(
     name = "obix.sequencer.fetch_failed",
