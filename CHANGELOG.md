@@ -1,3 +1,11 @@
+# [obix release v0.19.4](https://github.com/GaloyMoney/obix/releases/tag/0.19.4)
+
+
+
+### Performance
+
+- Read each payload once when backfilling (#199)
+
 # [obix release v0.19.3](https://github.com/GaloyMoney/obix/releases/tag/0.19.3)
 
 
