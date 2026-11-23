@@ -277,11 +277,11 @@ where
         let mut persistent = self.outbox.listen_persisted(Some(state.sequence));
 
         let mut op_slot: Option<es_entity::DbOp<'static>> = None;
-        let mut tracker = BatchTracker {
-            collected: 0,
-            persisted: StreamPosition::Insert(state.sequence),
-            last_persist: tokio::time::Instant::now(),
-        };
+        let mut tracker = BatchTracker::new(
+            StreamPosition::Insert(state.sequence),
+            std::time::Duration::ZERO,
+            self.max_batch_size,
+        );
         let mut batch = <D::Subscriber as KeyedSubscriber<P>>::Batch::default();
 
         // Armed while nothing is pending; disarmed when THIS MEMBER does
