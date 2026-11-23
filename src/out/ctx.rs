@@ -23,7 +23,10 @@
 //! collection then spans temporary stream pauses, and a nonempty landing
 //! waits for that deadline **before** opening its transaction — unless the
 //! batch already reached `max_batch_size`, which has nothing left to
-//! coalesce and lands at its next commit-group boundary.
+//! coalesce and lands at its next commit-group boundary, or the landing is
+//! a [`consume`](EventCtx::consume) entry: the runner reads nothing while
+//! that fence lands, so waiting there would stall the consuming event
+//! without coalescing anything.
 //!
 //! Every flush — whichever of the triggers fires — first hands all collected
 //! items to the handler's [`flush`](super::SingletonSubscriber::flush) inside
@@ -175,6 +178,15 @@ impl BatchTracker {
     /// coalescing a single extra event.
     pub(crate) fn holds_full_batch(&self) -> bool {
         self.collected >= self.max_batch_size
+    }
+
+    /// Disarm the window ahead of a `consume` entry's landing. The runner is
+    /// suspended in the fence until the batch lands, so no further event can
+    /// join it: like a full batch, it has nothing left to wait for, and
+    /// sitting out the window would only stall the consuming event and
+    /// everything queued behind it.
+    pub(crate) fn close_window(&mut self) {
+        self.deadline = None;
     }
 
     /// Only memory is pending while this runs. Cancellation leaves the batch
@@ -575,6 +587,7 @@ impl<'inv, B> EventCtx<'inv, B> {
             batch,
             flusher,
         } = self;
+        parts.tracker.close_window();
         flush_batch(&mut parts, batch, flusher, "consume_entry").await?;
         *parts.op_slot = Some(open_landing_op(parts.current_job, parts.landing).await?);
         let op = parts.op_slot.as_mut().expect("just materialized above");
@@ -773,8 +786,10 @@ async fn land_batch<B: Default, L: Landing>(
     }
     if parts.tracker.collected > 0 && parts.tracker.deadline().is_some() {
         // A singleton consume fences and drains the accumulator before it
-        // opens an isolated op. Keyed/joinable trackers have a zero window
-        // (catch-up may already own a join op), so they never wait here.
+        // opens an isolated op, and it closes the window first (see
+        // `BatchTracker::close_window`), so it never waits here either.
+        // Keyed/joinable trackers have a zero window (catch-up may already
+        // own a join op), so they never wait here.
         // A batch that already hit `max_batch_size` lands without waiting
         // (see `BatchTracker::holds_full_batch`).
         assert!(parts.op_slot.is_none(), "batch window requires no open op");
@@ -1373,6 +1388,28 @@ mod tests {
         tracker.collect();
         assert!(!tracker.holds_full_batch());
         assert!(tracker.wait_for_window().now_or_never().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_window_lands_without_waiting_and_the_next_batch_rearms() {
+        use std::time::Duration;
+        let mut tracker = BatchTracker::new(
+            StreamPosition::Insert(EventSequence::BEGIN),
+            Duration::from_secs(2),
+            MAX_BATCH,
+        );
+        tracker.collect();
+        assert!(tracker.wait_for_window().now_or_never().is_none());
+        let closed_at = tokio::time::Instant::now();
+        tracker.close_window();
+        assert_eq!(tracker.deadline(), None);
+        tracker.wait_for_window().await;
+        assert_eq!(tokio::time::Instant::now(), closed_at);
+        // The fence's landing drains the accumulator; the next batch gets a
+        // fresh window of its own.
+        tracker.collected = 0;
+        tracker.collect();
+        assert_eq!(tracker.deadline(), Some(closed_at + Duration::from_secs(2)));
     }
 
     #[tokio::test(start_paused = true)]

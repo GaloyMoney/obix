@@ -417,25 +417,25 @@ async fn shutdown_does_not_bypass_a_nonempty_window() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[file_serial]
-async fn consume_entry_waits_for_the_prior_batch_window() -> anyhow::Result<()> {
+async fn consume_entry_lands_the_prior_batch_without_waiting() -> anyhow::Result<()> {
     let observed = Arc::new(Observed::default());
     let mut recorder = Recorder::new(observed);
     recorder.isolate_on = Some(2);
     let mut h = Harness::new::<InsertOrder>(WINDOW, 100, recorder).await?;
     h.publish([TestEvent::Ping(1), TestEvent::Ping(2)]).await?;
     h.jobs.start_poll().await?;
-    h.wait_collected(1).await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    h.assert_unlanded().await?;
     h.wait_checkpoint(2).await?;
     let attempts = h.observed.attempts.lock().await;
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].0, vec![1]);
+    // The runner reads nothing while the fence lands, so the window could
+    // not coalesce another event: the fenced batch lands at once.
     assert!(
         attempts[0]
             .1
             .duration_since(h.observed.collected.lock().await[0].1)
-            >= WINDOW
+            < WINDOW,
+        "a consume fence does not wait out the window"
     );
     drop(attempts);
     h.jobs.shutdown().await?;

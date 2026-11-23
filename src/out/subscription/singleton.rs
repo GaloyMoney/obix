@@ -44,9 +44,10 @@ use crate::tables::MailboxTables;
 ///   later event consumes, or on shutdown. An opt-in
 ///   [`batch window`](OutboxEventJobConfig::with_batch_window) coalesces across
 ///   temporary stream pauses and delays nonempty landings before opening their
-///   transaction, except a batch that already reached `max_batch_size` — it
-///   lands without waiting. Requires the work to tolerate whole-batch replay
-///   after a mid-batch failure.
+///   transaction, except a batch that already reached `max_batch_size` or one
+///   landed by a later event's `consume` entry — those land without waiting.
+///   Requires the work to tolerate whole-batch replay after a mid-batch
+///   failure.
 /// - [`consume`](EventCtx::consume) then [`commit`](IsolatedOp::commit) — my
 ///   event is its own atomic unit: the pending batch (items + checkpoint)
 ///   lands before my work starts, and my op commits at return. Use for
@@ -344,8 +345,11 @@ impl OutboxEventJobConfig {
     ///
     /// A full batch stops fetching at a group boundary and lands there
     /// without waiting: it cannot grow, so the window would only delay it.
-    /// Every other nonempty landing trigger (including consume, undecodable
-    /// events and shutdown) honors the deadline. The next window starts only
+    /// A [`consume`](crate::out::EventCtx::consume) entry also lands the
+    /// pending batch without waiting: the runner reads nothing while the
+    /// fence lands, so the window would only stall the consuming event.
+    /// Every other nonempty landing trigger (including undecodable events
+    /// and shutdown) honors the deadline. The next window starts only
     /// after the prior batch lands. Skip-only checkpoint cadence and isolated
     /// consume ops are unchanged. Zero (the default) preserves immediate
     /// backlog-drained flushing. Collected work must tolerate whole-batch
