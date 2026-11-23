@@ -1,3 +1,15 @@
+# [obix release v0.19.3](https://github.com/GaloyMoney/obix/releases/tag/0.19.3)
+
+
+
+### Features
+
+- Add opt-in persistent batch windows (#197)
+
+### Miscellaneous Tasks
+
+- Bump syn (#195)
+
 # [obix release v0.19.2](https://github.com/GaloyMoney/obix/releases/tag/0.19.2)
 
 
