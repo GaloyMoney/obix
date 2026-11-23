@@ -1,6 +1,5 @@
-//! A commit-lane backfill must deliver the same numbering, row for row, under
-//! every combination of `backfill_read_ahead`, `commit_backfill_scan` and
-//! `commit_backfill_concurrency`.
+//! A commit-lane backfill re-folds from a checkpoint off payload-free order
+//! pages. It must deliver the numbering the live fold delivered, row for row.
 
 mod helpers;
 
@@ -8,7 +7,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::stream::StreamExt;
-use obix::{CommitBackfillScan, CommitLane, CommitSequence, MailboxConfig, out::Outbox};
+use obix::{
+    CommitLane, CommitSequence, MailboxConfig,
+    out::{CommitOrderedListener, Outbox},
+};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
@@ -23,15 +25,14 @@ enum TestEvent {
 /// `(commit position, insert sequence, is-last-in-group)`.
 type Row = (i64, i64, bool);
 
-fn config(read_ahead: usize, scan: CommitBackfillScan, concurrency: usize) -> MailboxConfig {
+fn config(read_ahead: usize) -> MailboxConfig {
     MailboxConfig::builder()
         .commit_lane(CommitLane::Enabled)
         .commit_checkpoint_every(3)
-        .event_buffer_size(16)
+        // Deep enough that the reference listener never lags into a backfill.
+        .event_buffer_size(4096)
         .backfill_page_size(20)
         .backfill_read_ahead(read_ahead)
-        .commit_backfill_scan(scan)
-        .commit_backfill_concurrency(concurrency)
         .gap_fill_grace(Duration::from_millis(100))
         .build()
 }
@@ -119,12 +120,10 @@ async fn publish_data_set(
     Ok(committed)
 }
 
-async fn replay(
-    outbox: &Outbox<TestEvent, TestTables>,
-    after: i64,
+async fn collect(
+    listener: &mut CommitOrderedListener<TestEvent>,
     count: usize,
 ) -> anyhow::Result<Vec<Row>> {
-    let mut listener = outbox.listen_commit_ordered(CommitSequence::from(after as u64))?;
     let mut rows = Vec::with_capacity(count);
     while rows.len() < count {
         let item = tokio::time::timeout(Duration::from_secs(30), listener.next())
@@ -140,6 +139,15 @@ async fn replay(
     Ok(rows)
 }
 
+async fn replay(
+    outbox: &Outbox<TestEvent, TestTables>,
+    after: i64,
+    count: usize,
+) -> anyhow::Result<Vec<Row>> {
+    let mut listener = outbox.listen_commit_ordered(CommitSequence::from(after as u64))?;
+    collect(&mut listener, count).await
+}
+
 async fn checkpoint_commit_seqs(pool: &sqlx::PgPool) -> anyhow::Result<Vec<i64>> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT commit_seq FROM persistent_outbox_commit_checkpoints ORDER BY commit_seq",
@@ -148,13 +156,15 @@ async fn checkpoint_commit_seqs(pool: &sqlx::PgPool) -> anyhow::Result<Vec<i64>>
     .await?)
 }
 
-/// Publish the data set and take the reference numbering from a default
-/// outbox, once its checkpoints are in.
+/// Publish the data set and take the reference numbering from the live fold:
+/// a listener registered on the empty table before anything is published,
+/// so it is fed from the broadcast and never backfills.
 async fn seed(pool: &sqlx::PgPool) -> anyhow::Result<(usize, Vec<Row>)> {
     wipeout_outbox_tables(pool).await?;
-    let outbox = open(pool, config(1, CommitBackfillScan::Wide, 1)).await?;
+    let outbox = open(pool, config(1)).await?;
+    let mut live = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
     let total = publish_data_set(pool, &outbox).await?;
-    let reference = replay(&outbox, 0, total).await?;
+    let reference = collect(&mut live, total).await?;
 
     // The data set must exercise what the test claims to.
     assert!(
@@ -189,7 +199,7 @@ async fn seed(pool: &sqlx::PgPool) -> anyhow::Result<(usize, Vec<Row>)> {
 
 #[tokio::test]
 #[file_serial]
-async fn every_knob_combination_replays_identically() -> anyhow::Result<()> {
+async fn backfill_replays_the_live_numbering() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let (total, reference) = seed(&pool).await?;
 
@@ -210,16 +220,9 @@ async fn every_knob_combination_replays_identically() -> anyhow::Result<()> {
     }
 
     for read_ahead in [1, 3] {
-        for scan in [CommitBackfillScan::Wide, CommitBackfillScan::Narrow] {
-            for concurrency in [1, 4] {
-                let outbox = open(&pool, config(read_ahead, scan, concurrency)).await?;
-                let rows = replay(&outbox, 0, total).await?;
-                assert_eq!(
-                    rows, reference,
-                    "read_ahead={read_ahead} scan={scan:?} concurrency={concurrency}"
-                );
-            }
-        }
+        let outbox = open(&pool, config(read_ahead)).await?;
+        let rows = replay(&outbox, 0, total).await?;
+        assert_eq!(rows, reference, "read_ahead={read_ahead}");
     }
     Ok(())
 }
@@ -232,51 +235,41 @@ async fn resuming_mid_range_delivers_the_exact_tail() -> anyhow::Result<()> {
     let boundary = checkpoint_commit_seqs(&pool).await?[4];
     let off_boundary = boundary + 2;
 
-    for concurrency in [1, 4] {
-        for scan in [CommitBackfillScan::Wide, CommitBackfillScan::Narrow] {
-            let outbox = open(&pool, config(1, scan, concurrency)).await?;
-            for after in [boundary, off_boundary] {
-                let tail = &reference[after as usize..];
-                let rows = replay(&outbox, after, total - after as usize).await?;
-                assert_eq!(rows[0].0, after + 1);
-                assert_eq!(
-                    &rows, tail,
-                    "after={after} scan={scan:?} concurrency={concurrency}"
-                );
-            }
-        }
+    let outbox = open(&pool, config(1)).await?;
+    for after in [boundary, off_boundary] {
+        let tail = &reference[after as usize..];
+        let rows = replay(&outbox, after, total - after as usize).await?;
+        assert_eq!(rows[0].0, after + 1);
+        assert_eq!(&rows, tail, "after={after}");
     }
     Ok(())
 }
 
 #[tokio::test]
 #[file_serial]
-async fn dropping_the_subscriber_ends_the_backfill_tasks() -> anyhow::Result<()> {
+async fn dropping_the_subscriber_ends_the_backfill() -> anyhow::Result<()> {
     let pool = init_pool().await?;
     let (_, _) = seed(&pool).await?;
 
-    for scan in [CommitBackfillScan::Wide, CommitBackfillScan::Narrow] {
-        let outbox = open(&pool, config(1, scan, 4)).await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let held = |pool: &sqlx::PgPool| pool.size() as usize - pool.num_idle();
-        let baseline = held(&pool);
+    let outbox = open(&pool, config(1)).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held = |pool: &sqlx::PgPool| pool.size() as usize - pool.num_idle();
+    let baseline = held(&pool);
 
-        let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
-        // Take one row, so the backfill is under way and its segments are
-        // filling their channels; then hang up.
-        let _ = tokio::time::timeout(Duration::from_secs(10), listener.next())
-            .await?
-            .expect("the stream stays open")?;
-        drop(listener);
+    let mut listener = outbox.listen_commit_ordered(CommitSequence::BEGIN)?;
+    // Take one row, so the backfill is under way; then hang up.
+    let _ = tokio::time::timeout(Duration::from_secs(10), listener.next())
+        .await?
+        .expect("the stream stays open")?;
+    drop(listener);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while held(&pool) > baseline && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            held(&pool) <= baseline,
-            "backfill tasks still hold pool connections ({scan:?})"
-        );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while held(&pool) > baseline && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        held(&pool) <= baseline,
+        "the backfill still holds pool connections"
+    );
     Ok(())
 }

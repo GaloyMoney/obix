@@ -2,10 +2,10 @@ use crate::error::ObixFault;
 use es_entity::errlanes::Laned;
 use futures::{FutureExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -14,17 +14,12 @@ use std::sync::{
 use super::cache::PersistentOutboxEventCache;
 use super::listener::{PersistentOutboxListener, TransportStream};
 use crate::{
-    config::CommitBackfillScan,
     handle::{OwnedTaskHandle, spawn_supervised},
     out::event::*,
     out::lane::{CommitOrder, InsertOrder, LaneHandle},
     sequence::{CommitGroupId, CommitSequence, EventSequence},
     tables::{CommitCheckpoint, GroupOrderRow, MailboxTables, PersistentEventRows},
 };
-
-/// Checkpoints read per statement when a parallel backfill lists its segment
-/// boundaries.
-const CHECKPOINT_PAGE: usize = 1_000;
 
 /// How long a failed group fetch waits before retrying the same group.
 const FETCH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -387,17 +382,6 @@ where
     page: usize,
     checkpoint_every: usize,
     checkpoint_interval: std::time::Duration,
-    scan: CommitBackfillScan,
-    concurrency: usize,
-}
-
-/// How a commit-lane backfill reads and parallelises its re-fold; see
-/// [`MailboxConfig::commit_backfill_scan`](crate::MailboxConfig) and
-/// `commit_backfill_concurrency`.
-#[derive(Clone, Copy)]
-pub(crate) struct BackfillTuning {
-    pub(crate) scan: CommitBackfillScan,
-    pub(crate) concurrency: usize,
 }
 
 impl<P, Tables> Clone for BackfillSource<P, Tables>
@@ -411,8 +395,6 @@ where
             page: self.page,
             checkpoint_every: self.checkpoint_every,
             checkpoint_interval: self.checkpoint_interval,
-            scan: self.scan,
-            concurrency: self.concurrency,
         }
     }
 }
@@ -444,9 +426,9 @@ impl From<CommitCheckpoint> for FoldSeed {
     }
 }
 
-/// What one segment's fold did: the commit positions it advanced and how it
+/// What a backfill's re-fold did: the commit positions it advanced and how it
 /// ended (see [`record_backfill_finished`]).
-struct SegmentReport {
+struct FoldReport {
     rows: u64,
     outcome: &'static str,
 }
@@ -478,9 +460,12 @@ where
     }
 }
 
-/// The fold's ordering input for one backfill segment: either the insert-lane
-/// transport stream (`Wide`) or payload-free pages read straight from the table
-/// (`Narrow`), which hands over to `Wide` on a page it cannot trust.
+/// A backfill's ordering input. It reads payload-free pages of
+/// `(sequence, group, has-payload)` straight from the table, so each payload is
+/// read once, by the group fetch. On a page it cannot trust (a hole, or nothing
+/// where the fold still needs rows) it hands over to the insert-lane transport
+/// stream from the last contiguous row, which waits out holes the way the live
+/// fold does.
 struct FoldInput<P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -488,17 +473,10 @@ where
     pool: sqlx::PgPool,
     cache: Arc<PersistentOutboxEventCache<P, Tables>>,
     page: usize,
-    /// The highest sequence handed to the fold so far (`Narrow` only).
+    /// The highest sequence handed to the fold so far.
     cursor: EventSequence,
-    mode: InputMode<P>,
-}
-
-enum InputMode<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    Narrow,
-    Wide(TransportStream<InsertOrder, P>),
+    /// Set once the input has fallen back to the transport stream.
+    stream: Option<TransportStream<InsertOrder, P>>,
 }
 
 impl<P, Tables> FoldInput<P, Tables>
@@ -507,61 +485,47 @@ where
     Tables: MailboxTables,
 {
     fn new(source: &BackfillSource<P, Tables>, from: EventSequence) -> Self {
-        let mode = match source.scan {
-            CommitBackfillScan::Wide => {
-                InputMode::Wide(Self::wide(&source.cache, from, source.page))
-            }
-            CommitBackfillScan::Narrow => InputMode::Narrow,
-        };
         Self {
             pool: source.pool.clone(),
             cache: source.cache.clone(),
             page: source.page,
             cursor: from,
-            mode,
+            stream: None,
         }
-    }
-
-    fn wide(
-        cache: &PersistentOutboxEventCache<P, Tables>,
-        after: EventSequence,
-        page: usize,
-    ) -> TransportStream<InsertOrder, P> {
-        PersistentOutboxListener::transport_stream(cache.handle(), Some(after), page)
     }
 
     /// The next batch of ordering facts. `None` means the input ended.
     async fn next_batch(&mut self) -> Option<Vec<GroupOrderRow>> {
         let page = self.page;
         loop {
-            match &mut self.mode {
-                InputMode::Wide(stream) => {
-                    let batch = next_batch(stream, page).await?;
-                    return Some(batch.iter().map(order_row).collect());
-                }
-                InputMode::Narrow => {
-                    let mut rows = self.read_order_page().await;
-                    // Never skip: keep the trusted prefix, and carry on from
-                    // the last row of it on the wide stream.
-                    let run = contiguous_run(self.cursor, &rows);
-                    let intact = run > 0 && run == rows.len();
-                    rows.truncate(run);
-                    if let Some(last) = rows.last() {
-                        self.cursor = last.sequence;
-                    }
-                    if !intact {
-                        record_narrow_scan_fallback(u64::from(self.cursor));
-                        self.mode = InputMode::Wide(Self::wide(&self.cache, self.cursor, page));
-                    }
-                    if !rows.is_empty() {
-                        return Some(rows);
-                    }
-                }
+            if let Some(stream) = &mut self.stream {
+                let batch = next_batch(stream, page).await?;
+                return Some(batch.iter().map(order_row).collect());
+            }
+            let mut rows = self.read_order_page().await;
+            // Never skip: keep the trusted prefix, and carry on from the last
+            // row of it on the transport stream.
+            let run = contiguous_run(self.cursor, &rows);
+            let intact = run > 0 && run == rows.len();
+            rows.truncate(run);
+            if let Some(last) = rows.last() {
+                self.cursor = last.sequence;
+            }
+            if !intact {
+                record_order_scan_fallback(u64::from(self.cursor));
+                self.stream = Some(PersistentOutboxListener::transport_stream(
+                    self.cache.handle(),
+                    Some(self.cursor),
+                    page,
+                ));
+            }
+            if !rows.is_empty() {
+                return Some(rows);
             }
         }
     }
 
-    /// One narrow page, retried on error and never skipped.
+    /// One order page, retried on error and never skipped.
     async fn read_order_page(&self) -> Vec<GroupOrderRow> {
         loop {
             let span = tracing::debug_span!(
@@ -587,15 +551,15 @@ where
     }
 }
 
-/// Fold one stretch of the insert lane from `seed` until the sink's `until`,
-/// delivering the positions above `after` into `sender`.
-async fn fold_segment<P, Tables>(
+/// Fold the insert lane from `seed` until the sink's `until`, delivering the
+/// positions above `after` into `sender`.
+async fn refold<P, Tables>(
     source: &BackfillSource<P, Tables>,
     seed: FoldSeed,
     after: CommitSequence,
     until: CommitSequence,
     sender: mpsc::Sender<CommitTransport<P>>,
-) -> SegmentReport
+) -> FoldReport
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
@@ -630,148 +594,10 @@ where
             FoldStep::ConsumerGone => break "consumer_gone",
         }
     };
-    SegmentReport {
+    FoldReport {
         rows: u64::from(sequencer.head).saturating_sub(u64::from(from_commit)),
         outcome,
     }
-}
-
-/// The checkpoints strictly between a backfill's seed and its target, read a
-/// page at a time. A failed read ends the list, which only makes the last
-/// segment longer.
-struct Boundaries<Tables> {
-    pool: sqlx::PgPool,
-    last: CommitSequence,
-    until: CommitSequence,
-    buffer: VecDeque<CommitCheckpoint>,
-    drained: bool,
-    _phantom: std::marker::PhantomData<Tables>,
-}
-
-impl<Tables: MailboxTables> Boundaries<Tables> {
-    async fn next(&mut self) -> Option<CommitCheckpoint> {
-        if self.buffer.is_empty() && !self.drained {
-            match Tables::load_commit_checkpoints_between(
-                &self.pool,
-                self.last,
-                self.until,
-                CHECKPOINT_PAGE,
-            )
-            .await
-            {
-                Ok(page) => {
-                    self.drained = page.len() < CHECKPOINT_PAGE;
-                    if let Some(last) = page.last() {
-                        self.last = last.commit_seq;
-                    }
-                    self.buffer.extend(page);
-                }
-                Err(error) => {
-                    record_checkpoint_read_failed(error, u64::from(self.last));
-                    self.drained = true;
-                }
-            }
-        }
-        self.buffer.pop_front()
-    }
-}
-
-/// One in-flight segment: its output, its report, and the task, which is
-/// aborted when this is dropped.
-struct RunningSegment<P>
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    deliveries: mpsc::Receiver<CommitTransport<P>>,
-    report: oneshot::Receiver<SegmentReport>,
-    _task: OwnedTaskHandle,
-}
-
-/// Fold the backfill as checkpoint-to-checkpoint segments, at most
-/// `concurrency` at a time, and forward their output in segment order. Returns
-/// the summed rows, the number of segments started and the outcome.
-async fn fold_segments<P, Tables>(
-    source: &BackfillSource<P, Tables>,
-    seed: FoldSeed,
-    after: CommitSequence,
-    until: CommitSequence,
-    sender: &mpsc::Sender<CommitTransport<P>>,
-    concurrency: usize,
-) -> (u64, u64, &'static str)
-where
-    P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
-    Tables: MailboxTables,
-{
-    let mut boundaries = Boundaries::<Tables> {
-        pool: source.pool.clone(),
-        last: seed.head,
-        until,
-        buffer: VecDeque::new(),
-        drained: false,
-        _phantom: std::marker::PhantomData,
-    };
-    let mut next_seed = Some(seed);
-    let mut running: VecDeque<RunningSegment<P>> = VecDeque::new();
-    let mut rows = 0;
-    let mut segments = 0;
-    let mut outcome = "reached_until";
-
-    loop {
-        while running.len() < concurrency {
-            let Some(seed) = next_seed.take() else {
-                break;
-            };
-            let end = match boundaries.next().await {
-                Some(checkpoint) => {
-                    let end = checkpoint.commit_seq;
-                    next_seed = Some(FoldSeed::from(checkpoint));
-                    end
-                }
-                None => until,
-            };
-            let (deliveries_tx, deliveries) = mpsc::channel(source.page);
-            let (report_tx, report) = oneshot::channel();
-            let source = source.clone();
-            let task = tokio::spawn(async move {
-                let result = fold_segment(&source, seed, after, end, deliveries_tx).await;
-                let _ = report_tx.send(result);
-            });
-            running.push_back(RunningSegment {
-                deliveries,
-                report,
-                _task: OwnedTaskHandle::new(task),
-            });
-            segments += 1;
-        }
-        let Some(mut segment) = running.pop_front() else {
-            break;
-        };
-        loop {
-            tokio::select! {
-                _ = sender.closed() => return (rows, segments, "consumer_gone"),
-                delivery = segment.deliveries.recv() => match delivery {
-                    Some(delivery) => {
-                        if sender.send(delivery).await.is_err() {
-                            return (rows, segments, "consumer_gone");
-                        }
-                    }
-                    None => break,
-                },
-            }
-        }
-        match segment.report.await {
-            Ok(report) => {
-                rows += report.rows;
-                outcome = report.outcome;
-            }
-            Err(_) => outcome = "stream_ended",
-        }
-        if outcome != "reached_until" {
-            // A short segment would leave a hole in the positions delivered.
-            break;
-        }
-    }
-    (rows, segments, outcome)
 }
 
 /// Serve one commit-lane backfill by re-folding from the nearest checkpoint at
@@ -797,21 +623,14 @@ async fn serve_commit_backfill<P, Tables>(
     record_backfill_started(u64::from(after), u64::from(from), u64::from(seed.head));
     let serving = std::time::Instant::now();
 
-    let concurrency = source.concurrency.max(1);
-    let (rows, segments, outcome) = if concurrency == 1 {
-        let report = fold_segment(&source, seed, after, until, sender).await;
-        (report.rows, 1, report.outcome)
-    } else {
-        fold_segments(&source, seed, after, until, &sender, concurrency).await
-    };
+    let report = refold(&source, seed, after, until, sender).await;
     record_backfill_finished(
         u64::from(after),
         u64::from(until),
         u64::from(from),
-        rows,
+        report.rows,
         serving.elapsed().as_millis() as u64,
-        outcome,
-        segments,
+        report.outcome,
     );
 }
 
@@ -844,7 +663,6 @@ pub(crate) async fn spawn<P, Tables>(
     page: usize,
     checkpoint_every: usize,
     checkpoint_interval: std::time::Duration,
-    backfill: BackfillTuning,
 ) -> Result<SequencerHandle<P>, sqlx::Error>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
@@ -877,8 +695,6 @@ where
         page,
         checkpoint_every: checkpoint_every.max(1),
         checkpoint_interval,
-        scan: backfill.scan,
-        concurrency: backfill.concurrency.max(1),
     };
     let backfill_head = commit_head.clone();
 
@@ -978,9 +794,6 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
 /// numbering from a checkpoint. Groups are emitted whole, so `rows` can exceed
 /// `owed` slightly even when a checkpoint sat exactly at `after`.
 ///
-/// Recorded once per backfill, not per segment: `rows` is the sum across
-/// segments and `segments` how many the backfill was split into.
-///
 /// `outcome` says how the re-fold ended: `reached_until`, `consumer_gone` (the
 /// sink's receiver hung up) or `stream_ended` (the input ended). Only the
 /// first is a complete backfill.
@@ -996,7 +809,6 @@ fn record_backfill_started(after: u64, from_sequence: u64, from_commit_seq: u64)
         owed = until.saturating_sub(after),
         elapsed_ms = elapsed_ms,
         outcome = outcome,
-        segments = segments,
     ),
 )]
 fn record_backfill_finished(
@@ -1006,20 +818,19 @@ fn record_backfill_finished(
     rows: u64,
     elapsed_ms: u64,
     outcome: &'static str,
-    segments: u64,
 ) {
 }
 
-/// The narrow scan met a page it cannot trust — a hole, or nothing where the
-/// fold still needed rows — and handed the rest of the fold to the wide
-/// stream. Carries the sequence only.
+/// A backfill's order scan met a page it cannot trust — a hole, or nothing
+/// where the fold still needed rows — and handed the rest of the fold to the
+/// insert-lane transport stream. Carries the sequence only.
 #[tracing::instrument(
-    name = "obix.sequencer.narrow_scan_fallback",
+    name = "obix.sequencer.order_scan_fallback",
     level = "warn",
     skip_all,
     fields(sequence = sequence),
 )]
-fn record_narrow_scan_fallback(sequence: u64) {}
+fn record_order_scan_fallback(sequence: u64) {}
 
 #[tracing::instrument(
     name = "obix.sequencer.order_page_failed",

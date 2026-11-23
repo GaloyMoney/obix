@@ -193,10 +193,6 @@ where
                     config.backfill_page_size,
                     config.commit_checkpoint_every,
                     config.commit_checkpoint_interval,
-                    persistent::BackfillTuning {
-                        scan: config.commit_backfill_scan,
-                        concurrency: config.commit_backfill_concurrency,
-                    },
                 )
                 .await?,
             )),

@@ -134,28 +134,6 @@ pub enum CommitLane {
     Enabled,
 }
 
-/// What a commit-lane backfill's re-fold reads to learn the insert order.
-/// Either way the numbering it delivers is identical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommitBackfillScan {
-    /// Read whole event rows through the persistent cache's insert-lane
-    /// backfill stream, then read each group's members again. Every payload is
-    /// read twice; the stream is shared with the cache and honours
-    /// `backfill_read_ahead`.
-    #[default]
-    Wide,
-    /// Read only `(sequence, group, has-payload)` straight from the table,
-    /// bypassing the cache, so each payload is read once (by the group fetch).
-    /// A non-contiguous page falls back to `Wide` from the last contiguous
-    /// row. `backfill_read_ahead` does not apply to this read.
-    Narrow,
-}
-
-/// How many commit-lane backfill segments run concurrently unless configured:
-/// one, i.e. a single fold from the seed checkpoint to the target.
-pub const DEFAULT_COMMIT_BACKFILL_CONCURRENCY: usize = 1;
-
 pub type EventContextSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
 
 #[derive(Clone, bon::Builder)]
@@ -177,10 +155,10 @@ pub struct MailboxConfig {
     /// see [`DEFAULT_BACKFILL_READ_AHEAD`]. `0` is treated as `1`.
     ///
     /// Scope: this deepens the insert-lane backfill channel (capacity
-    /// `backfill_page_size * backfill_read_ahead`), which also feeds the
-    /// re-fold of a commit-lane backfill when `commit_backfill_scan` is
-    /// `Wide`. It does not deepen the commit-lane delivery channel, which
-    /// stays `backfill_page_size` deep. Memory cost is about
+    /// `backfill_page_size * backfill_read_ahead`). A commit-lane backfill
+    /// reads its own payload-free order pages instead, and uses that channel
+    /// only if it falls back on a gap. It does not deepen the commit-lane
+    /// delivery channel, which stays `backfill_page_size` deep. Memory cost is about
     /// `backfill_page_size * backfill_read_ahead` events. Measured at
     /// `backfill_page_size(1000)`: 1 -> 2 took a 400k-event replay from
     /// 15.21s to 13.95s (min of 8), 4 pages to 13.70s.
@@ -219,27 +197,6 @@ pub struct MailboxConfig {
     /// Defaults to [`Disabled`](CommitLane::Disabled).
     #[builder(default)]
     pub commit_lane: CommitLane,
-    /// What a commit-lane backfill's re-fold reads; see
-    /// [`CommitBackfillScan`]. Defaults to `Wide`. Ignored when the lane is
-    /// `Disabled`.
-    #[builder(default)]
-    pub commit_backfill_scan: CommitBackfillScan,
-    /// How many checkpoint-to-checkpoint segments of one commit-lane backfill
-    /// run concurrently; see [`DEFAULT_COMMIT_BACKFILL_CONCURRENCY`]. `0` is
-    /// treated as `1`, which is a single fold with no checkpoint listing.
-    /// Segments are folded independently and delivered in order.
-    ///
-    /// Costs: each in-flight segment holds a pool connection while it reads,
-    /// so this multiplies a backfill's connection use by up to the value; and
-    /// each buffers up to `backfill_page_size` deliveries ahead of the
-    /// in-order forwarder, so a backfill holds at most
-    /// `commit_backfill_concurrency * backfill_page_size` deliveries beyond
-    /// what the single-fold path holds. A segment spans about
-    /// `commit_checkpoint_every` groups, so a `backfill_page_size` well below
-    /// that leaves later segments waiting on the forwarder. Ignored when the
-    /// lane is `Disabled`.
-    #[builder(default = DEFAULT_COMMIT_BACKFILL_CONCURRENCY)]
-    pub commit_backfill_concurrency: usize,
     /// Groups between sparse checkpoints of the commit-lane fold; see
     /// [`DEFAULT_COMMIT_CHECKPOINT_EVERY`]. Ignored when the lane is
     /// `Disabled`.

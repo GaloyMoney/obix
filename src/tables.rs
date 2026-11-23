@@ -344,17 +344,6 @@ pub trait MailboxTables: Send + Sync + 'static {
         at_or_below: CommitSequence,
     ) -> impl Future<Output = Result<Option<CommitCheckpoint>, sqlx::Error>> + Send;
 
-    /// Up to `limit` checkpoints with `after < commit_seq < before`, oldest
-    /// first — the interior boundaries of a backfill's re-fold, which split it
-    /// into independent segments. Callers page by passing the last
-    /// `commit_seq` they received as the next `after`.
-    fn load_commit_checkpoints_between(
-        pool: &sqlx::PgPool,
-        after: CommitSequence,
-        before: CommitSequence,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<CommitCheckpoint>, sqlx::Error>> + Send;
-
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
 

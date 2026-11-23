@@ -613,19 +613,6 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
-        // The checkpoints strictly between two commit positions, oldest first;
-        // paged by the caller advancing `$1`.
-        let load_commit_checkpoints_between_query = format!(
-            r#"
-            SELECT sequence AS "sequence!: i64", commit_seq AS "commit_seq!: i64",
-                   open_groups
-            FROM {tbl}persistent_outbox_commit_checkpoints
-            WHERE commit_seq > $1 AND commit_seq < $2
-            ORDER BY commit_seq
-            LIMIT $3"#,
-            tbl = table_prefix,
-        );
-
         // INVARIANT: untargeted `DO NOTHING`, not `ON CONFLICT (sequence)`. Two
         // different sequences can share a `commit_seq`, so naming one target
         // would collide with the `commit_seq` UNIQUE and fail the write; either
@@ -752,36 +739,6 @@ FROM {}persistent_outbox_events_sequence_seq",
                                 has_payload: row.has_payload,
                             })
                             .collect())
-                    }
-                }
-
-                fn load_commit_checkpoints_between(
-                    pool: &#crate_name::prelude::sqlx::PgPool,
-                    after: #crate_name::CommitSequence,
-                    before: #crate_name::CommitSequence,
-                    limit: usize,
-                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::CommitCheckpoint>, #crate_name::prelude::sqlx::Error>> + Send
-                {
-                    let pool = pool.clone();
-
-                    async move {
-                        let rows = sqlx::query!(
-                            #load_commit_checkpoints_between_query,
-                            after as #crate_name::CommitSequence,
-                            before as #crate_name::CommitSequence,
-                            limit as i64,
-                        ).fetch_all(&pool).await?;
-                        rows.into_iter()
-                            .map(|row| {
-                                let open_groups = #crate_name::prelude::serde_json::from_value(row.open_groups)
-                                    .map_err(|e| #crate_name::prelude::sqlx::Error::Decode(Box::new(e)))?;
-                                Ok(#crate_name::CommitCheckpoint {
-                                    sequence: #crate_name::EventSequence::from(row.sequence as u64),
-                                    commit_seq: #crate_name::CommitSequence::from(row.commit_seq as u64),
-                                    open_groups,
-                                })
-                            })
-                            .collect()
                     }
                 }
 

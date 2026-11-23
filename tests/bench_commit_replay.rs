@@ -1,6 +1,6 @@
-//! Benchmark: replay a commit-lane backlog under each combination of the three
-//! backfill knobs, and print a comparison table. `#[ignore]`d; run it with
-//! `make bench-replay`.
+//! Benchmark: replay a commit-lane backlog under a few backfill page settings,
+//! and print a comparison table with the rows each statement kind read.
+//! `#[ignore]`d; run it with `make bench-replay`.
 //!
 //! Parameters (environment): `OBIX_BENCH_EVENTS` (default 100000),
 //! `OBIX_BENCH_ROUNDS` (3) and `OBIX_BENCH_GROUP_SIZES` (`1,1,1,5,20`, cycled).
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
-use obix::{CommitBackfillScan, CommitLane, CommitSequence, MailboxConfig, out::Outbox};
+use obix::{CommitLane, CommitSequence, MailboxConfig, out::Outbox};
 use serde::{Deserialize, Serialize};
 use serial_test::file_serial;
 
@@ -153,45 +153,22 @@ struct Variant {
     name: String,
     page: usize,
     read_ahead: usize,
-    scan: CommitBackfillScan,
-    concurrency: usize,
 }
 
-fn variant(
-    name: &str,
-    page: usize,
-    read_ahead: usize,
-    scan: CommitBackfillScan,
-    concurrency: usize,
-) -> Variant {
+fn variant(name: &str, page: usize, read_ahead: usize) -> Variant {
     Variant {
         name: name.to_string(),
         page,
         read_ahead,
-        scan,
-        concurrency,
     }
 }
 
+/// The first variant is the baseline the ratios are taken against.
 fn variants() -> Vec<Variant> {
-    use CommitBackfillScan::{Narrow, Wide};
     vec![
-        variant("baseline", 1000, 1, Wide, 1),
-        variant("A", 1000, 2, Wide, 1),
-        variant("B", 1000, 1, Narrow, 1),
-        variant("C", 1000, 1, Wide, 4),
-        variant("A+B", 1000, 2, Narrow, 1),
-        variant("B+C", 1000, 1, Narrow, 4),
-        variant("A+B+C", 1000, 2, Narrow, 4),
-        variant("C x2", 1000, 1, Wide, 2),
-        variant("C x8", 1000, 1, Wide, 8),
-        variant("B+C x2", 1000, 1, Narrow, 2),
-        variant("B+C x8", 1000, 1, Narrow, 8),
-        // The segment channel capacity is `backfill_page_size`, so this also
-        // deepens the page reads: compare against its own baseline.
-        variant("baseline page=5000", 5000, 1, Wide, 1),
-        variant("C page=5000", 5000, 1, Wide, 4),
-        variant("B+C page=5000", 5000, 1, Narrow, 4),
+        variant("page=1000", 1000, 1),
+        variant("page=1000 read_ahead=2", 1000, 2),
+        variant("page=5000", 5000, 1),
     ]
 }
 
@@ -200,8 +177,6 @@ fn config(v: &Variant) -> MailboxConfig {
         .commit_lane(CommitLane::Enabled)
         .backfill_page_size(v.page)
         .backfill_read_ahead(v.read_ahead)
-        .commit_backfill_scan(v.scan)
-        .commit_backfill_concurrency(v.concurrency)
         .build()
 }
 
@@ -326,15 +301,8 @@ fn print_table(mode: &str, total: usize, rows: &[(Variant, Measured)]) {
     let per_event = |rows: u64| rows as f64 / total as f64;
     for (v, m) in rows {
         let min = m.times.iter().min().unwrap().as_secs_f64();
-        // Ratio against the baseline with the same page size.
         let base = rows
-            .iter()
-            .find(|(b, _)| {
-                b.page == v.page
-                    && b.read_ahead == 1
-                    && b.scan == CommitBackfillScan::Wide
-                    && b.concurrency == 1
-            })
+            .first()
             .map(|(_, b)| b.times.iter().min().unwrap().as_secs_f64())
             .unwrap_or(min);
         println!(
@@ -421,18 +389,15 @@ async fn bench_commit_replay() -> anyhow::Result<()> {
                 );
                 m.times.push(elapsed);
                 (m.page, m.group, m.order, m.live_group) = (page, group, order, live_group);
-                if mode == Mode::Warm && v.scan == CommitBackfillScan::Narrow {
-                    // Exact: the narrow scan bypasses the page stream, and
+                if mode == Mode::Warm {
+                    // Exact: the order scan bypasses the page stream, and
                     // nothing else reads it once the live fold sits at the tip.
-                    assert_eq!(page.rows, 0, "{}: narrow read payload pages", v.name);
+                    assert_eq!(page.rows, 0, "{}: backfill read payload pages", v.name);
                     assert!(
                         order.rows >= total as u64,
-                        "{}: narrow read nothing",
+                        "{}: the order scan read nothing",
                         v.name
                     );
-                }
-                if v.scan == CommitBackfillScan::Wide {
-                    assert_eq!(order.statements, 0, "{}: wide read order pages", v.name);
                 }
             }
         }
@@ -443,7 +408,7 @@ async fn bench_commit_replay() -> anyhow::Result<()> {
         );
     }
 
-    explain_narrow_scan(&pool, total as i64).await?;
+    explain_order_scan(&pool, total as i64).await?;
     Ok(())
 }
 
@@ -454,7 +419,7 @@ fn total_slack(sizes: &[u64]) -> u64 {
     (1000.0 * avg * 2.0).ceil() as u64
 }
 
-async fn explain_narrow_scan(pool: &sqlx::PgPool, total: i64) -> anyhow::Result<()> {
+async fn explain_order_scan(pool: &sqlx::PgPool, total: i64) -> anyhow::Result<()> {
     let lines: Vec<String> = sqlx::query_scalar(
         "EXPLAIN (ANALYZE, BUFFERS)
          SELECT sequence, commit_xid, (payload IS NOT NULL) AS has_payload
@@ -466,7 +431,7 @@ async fn explain_narrow_scan(pool: &sqlx::PgPool, total: i64) -> anyhow::Result<
     .bind(1000i64)
     .fetch_all(pool)
     .await?;
-    println!("\n### EXPLAIN (ANALYZE, BUFFERS) of the narrow scan\n\n```");
+    println!("\n### EXPLAIN (ANALYZE, BUFFERS) of the order scan\n\n```");
     for line in lines {
         println!("{line}");
     }
