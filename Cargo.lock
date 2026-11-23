@@ -440,9 +440,8 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df50dcc38d38c168c220ae53f6f5cadd73a1812a4ff44f45e2daa1735a77329b"
+version = "0.22.1"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -452,9 +451,8 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d0c0e6471b89ca3be64caa038ca5a7377173b81320a4d2634625e34b27bf6e5"
+version = "0.22.1"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -466,9 +464,8 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4270ada67ac1c5c417b7ed9aa58e2fdf45e051defe1c6acd387849f5827e313a"
+version = "0.22.1"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
 dependencies = [
  "async-stream",
  "chrono",
@@ -492,9 +489,8 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac93d4f2f0372d60334769d6c7cc1dddbc3232c49721084bdebe6ae922ea0783"
+version = "0.22.1"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -1105,6 +1101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "num-bigint-dig"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1168,6 +1173,8 @@ dependencies = [
  "imbl",
  "job",
  "obix-macros",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "serial_test",
@@ -1175,6 +1182,9 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2371,6 +2381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-opentelemetry"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2378,8 +2399,10 @@ checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",
+ "smallvec",
  "tracing",
  "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]
@@ -2390,9 +2413,12 @@ version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
 dependencies = [
+ "nu-ansi-term",
  "sharded-slab",
+ "smallvec",
  "thread_local",
  "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]
