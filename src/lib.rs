@@ -21,7 +21,8 @@ mod tables;
 pub mod test_utils;
 
 pub use config::{
-    CommitLane, DEFAULT_BACKFILL_PAGE_SIZE, DEFAULT_COMMIT_CHECKPOINT_EVERY,
+    CommitBackfillScan, CommitLane, DEFAULT_BACKFILL_PAGE_SIZE,
+    DEFAULT_COMMIT_BACKFILL_CONCURRENCY, DEFAULT_COMMIT_CHECKPOINT_EVERY,
     DEFAULT_COMMIT_CHECKPOINT_INTERVAL, DEFAULT_GAP_FILL_GRACE, DEFAULT_IDLE_RESYNC_INTERVAL,
     DEFAULT_NOTIFY_DEBOUNCE, DEFAULT_PARTITION_MAINTAINER_INTERVAL, DEFAULT_PARTITION_PREMAKE,
     DEFAULT_PARTITION_WIDTH, DEFAULT_PERSIST_EVENTS_BATCH_SIZE, EventContextSource, MailboxConfig,
@@ -51,6 +52,8 @@ pub use out::{
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
 pub use tables::CommitCheckpoint;
+#[doc(hidden)]
+pub use tables::GroupOrderRow;
 pub use tables::MailboxTables;
 pub use tables::{CatchUpRows, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]

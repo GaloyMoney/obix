@@ -170,6 +170,12 @@ impl StallAction {
     }
 }
 
+/// Capacity of an insert-lane backfill channel: `page_size * read_ahead`
+/// events, with `0` read as `1` on both factors.
+fn backfill_channel_capacity(page_size: usize, read_ahead: usize) -> usize {
+    page_size.max(1).saturating_mul(read_ahead.max(1))
+}
+
 #[derive(Debug)]
 pub struct PersistentOutboxEventCache<P, Tables>
 where
@@ -248,10 +254,10 @@ where
             highest_known_sequence,
             backfill_request_send: backfill_send,
             persistent_event_sender,
-            backfill_buffer_size: config
-                .backfill_page_size
-                .max(1)
-                .saturating_mul(config.backfill_read_ahead.max(1)),
+            backfill_buffer_size: backfill_channel_capacity(
+                config.backfill_page_size,
+                config.backfill_read_ahead,
+            ),
             cache_fill_sender: cache_fill_send,
             feeder,
             _cache_loop_handle: cache_loop_handle,
@@ -1005,6 +1011,16 @@ mod tests {
     use super::*;
 
     const THRESHOLD: u64 = 1000;
+
+    #[test]
+    fn backfill_channel_capacity_is_page_times_read_ahead_with_zero_as_one() {
+        assert_eq!(backfill_channel_capacity(1000, 1), 1000);
+        assert_eq!(backfill_channel_capacity(1000, 3), 3000);
+        assert_eq!(backfill_channel_capacity(0, 3), 3);
+        assert_eq!(backfill_channel_capacity(1000, 0), 1000);
+        assert_eq!(backfill_channel_capacity(0, 0), 1);
+        assert_eq!(backfill_channel_capacity(usize::MAX, 2), usize::MAX);
+    }
 
     fn seq(n: u64) -> EventSequence {
         EventSequence::from(n)

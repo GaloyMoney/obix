@@ -311,6 +311,18 @@ pub trait MailboxTables: Send + Sync + 'static {
     where
         P: Serialize + DeserializeOwned + Send;
 
+    /// The next `limit` rows of the insert lane after `after`, narrowed to the
+    /// three facts the commit-lane fold orders by — no payload, tracing or
+    /// event context columns. Rows arrive in `sequence` order and are bounded
+    /// to `(after, after + limit]`, so the read is a per-partition range scan.
+    /// Unlike [`load_next_contiguous_page`](Self::load_next_contiguous_page)
+    /// it does not cut at a gap: the caller checks contiguity.
+    fn load_group_order_page(
+        pool: &sqlx::PgPool,
+        after: EventSequence,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<GroupOrderRow>, sqlx::Error>> + Send;
+
     /// Record a sparse checkpoint of the commit-lane fold. A conflict is a
     /// no-op: a peer's row for the same position is the same row.
     fn write_commit_checkpoint(
@@ -331,6 +343,17 @@ pub trait MailboxTables: Send + Sync + 'static {
         pool: &sqlx::PgPool,
         at_or_below: CommitSequence,
     ) -> impl Future<Output = Result<Option<CommitCheckpoint>, sqlx::Error>> + Send;
+
+    /// Up to `limit` checkpoints with `after < commit_seq < before`, oldest
+    /// first — the interior boundaries of a backfill's re-fold, which split it
+    /// into independent segments. Callers page by passing the last
+    /// `commit_seq` they received as the next `after`.
+    fn load_commit_checkpoints_between(
+        pool: &sqlx::PgPool,
+        after: CommitSequence,
+        before: CommitSequence,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<CommitCheckpoint>, sqlx::Error>> + Send;
 
     fn persistent_outbox_events_channel() -> &'static str;
     fn ephemeral_outbox_events_channel() -> &'static str;
@@ -604,6 +627,16 @@ pub struct CommitCheckpoint {
     pub commit_seq: CommitSequence,
     /// `(group, highest member)` per straddling group.
     pub open_groups: Vec<(CommitGroupId, EventSequence)>,
+}
+
+/// The three facts about an insert-lane row that the commit-lane fold orders
+/// by. A row with `has_payload == false` is a gap-filler placeholder, which
+/// never reaches the commit lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupOrderRow {
+    pub sequence: EventSequence,
+    pub commit_group: CommitGroupId,
+    pub has_payload: bool,
 }
 
 /// One subscription's identity and terms, as stored — everything but the
