@@ -79,7 +79,8 @@ tracing-subscriber = "0.3"
 uuid = "1"
 
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73" }
-es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "bbc38b722f6902de7194796ec9452b3b5cdf3310" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "bbc38b722f6902de7194796ec9452b3b5cdf3310" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "bbc38b722f6902de7194796ec9452b3b5cdf3310" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "bbc38b722f6902de7194796ec9452b3b5cdf3310" }
+job = { git = "https://github.com/GaloyMoney/job", rev = "c773c6e4a3e98c4fe5a980e89ef3d4c7be7ec7d3" }

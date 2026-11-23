@@ -441,7 +441,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "errlanes"
 version = "0.22.1"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=bbc38b722f6902de7194796ec9452b3b5cdf3310#bbc38b722f6902de7194796ec9452b3b5cdf3310"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "errlanes-derive"
 version = "0.22.1"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=bbc38b722f6902de7194796ec9452b3b5cdf3310#bbc38b722f6902de7194796ec9452b3b5cdf3310"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "es-entity"
 version = "0.22.1"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=bbc38b722f6902de7194796ec9452b3b5cdf3310#bbc38b722f6902de7194796ec9452b3b5cdf3310"
 dependencies = [
  "async-stream",
  "chrono",
@@ -490,7 +490,7 @@ dependencies = [
 [[package]]
 name = "es-entity-macros"
 version = "0.22.1"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73#1b1aadf76a93f7ef5fe51e4452dbf67b647a1f73"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=bbc38b722f6902de7194796ec9452b3b5cdf3310#bbc38b722f6902de7194796ec9452b3b5cdf3310"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -975,14 +975,14 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "job"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58c2acac47630ff40d884d7317f45e915067c6f8ce4e4e2624b540163ebe8244"
+source = "git+https://github.com/GaloyMoney/job?rev=c773c6e4a3e98c4fe5a980e89ef3d4c7be7ec7d3#c773c6e4a3e98c4fe5a980e89ef3d4c7be7ec7d3"
 dependencies = [
  "async-trait",
  "bon",
  "chrono",
  "es-entity",
  "futures",
+ "opentelemetry",
  "rand 0.10.3",
  "serde",
  "serde_json",

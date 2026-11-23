@@ -433,12 +433,4 @@ where
             let _ = context.apply_parent(span);
         }
     }
-
-    #[cfg(feature = "tracing")]
-    #[deprecated(
-        note = "create the consumer span first and call apply_trace_parent before activating it"
-    )]
-    pub fn inject_trace_parent(&self) {
-        self.apply_trace_parent(&tracing::Span::current());
-    }
 }
