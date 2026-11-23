@@ -599,6 +599,20 @@ FROM {}persistent_outbox_events_sequence_seq",
             tbl = table_prefix,
         );
 
+        // The commit fold's ordering input without its payload: sequence, group
+        // and whether the row is a placeholder. The redundant
+        // `sequence <= $1 + $2` bound keeps it a per-partition range scan, as in
+        // `load_next_contiguous_page`.
+        let load_group_order_page_query = format!(
+            r#"
+            SELECT sequence AS "sequence!: i64", commit_xid,
+                   (payload IS NOT NULL) AS "has_payload!"
+            FROM {tbl}persistent_outbox_events
+            WHERE sequence > $1 AND sequence <= $1 + $2
+            ORDER BY sequence"#,
+            tbl = table_prefix,
+        );
+
         // INVARIANT: untargeted `DO NOTHING`, not `ON CONFLICT (sequence)`. Two
         // different sequences can share a `commit_seq`, so naming one target
         // would collide with the `commit_seq` UNIQUE and fail the write; either
@@ -700,6 +714,31 @@ FROM {}persistent_outbox_events_sequence_seq",
                             }
                         }
                         Ok(grouped)
+                    }
+                }
+
+                fn load_group_order_page(
+                    pool: &#crate_name::prelude::sqlx::PgPool,
+                    after: #crate_name::EventSequence,
+                    limit: usize,
+                ) -> impl std::future::Future<Output = Result<Vec<#crate_name::GroupOrderRow>, #crate_name::prelude::sqlx::Error>> + Send
+                {
+                    let pool = pool.clone();
+
+                    async move {
+                        let rows = sqlx::query!(
+                            #load_group_order_page_query,
+                            after as #crate_name::EventSequence,
+                            limit as i64,
+                        ).fetch_all(&pool).await?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|row| #crate_name::GroupOrderRow {
+                                sequence: #crate_name::EventSequence::from(row.sequence as u64),
+                                commit_group: #crate_name::CommitGroupId::from(row.commit_xid),
+                                has_payload: row.has_payload,
+                            })
+                            .collect())
                     }
                 }
 

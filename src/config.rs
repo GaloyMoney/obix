@@ -110,6 +110,15 @@ pub const DEFAULT_COMMIT_CHECKPOINT_EVERY: usize = 1_000;
 pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// Pages of look-ahead the backfill reader keeps in flight. One is the
+/// historical behaviour (the reader blocks on `send` before the next read,
+/// so the DB is idle while the consumer drains); two leaves the next page's
+/// query overlapping that drain, and each further page trades memory for a
+/// smaller share of the read/consume stagger. Off by default because the
+/// extra buffering changes how many rows a backfill has in hand, which
+/// read-count-sensitive callers should opt into deliberately.
+pub const DEFAULT_BACKFILL_READ_AHEAD: usize = 1;
+
 /// Whether this outbox runs the commit-ordered lane. Opt-in: the fold passes
 /// over every event, in every process that runs the outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -142,6 +151,19 @@ pub struct MailboxConfig {
     /// have room before issuing a read, but the read itself is this size.
     #[builder(default = DEFAULT_BACKFILL_PAGE_SIZE)]
     pub backfill_page_size: usize,
+    /// Pages the backfill reader may hold in flight ahead of the consumer;
+    /// see [`DEFAULT_BACKFILL_READ_AHEAD`]. `0` is treated as `1`.
+    ///
+    /// Scope: this deepens the insert-lane backfill channel (capacity
+    /// `backfill_page_size * backfill_read_ahead`). A commit-lane backfill
+    /// reads its own payload-free order pages instead, and uses that channel
+    /// only if it falls back on a gap. It does not deepen the commit-lane
+    /// delivery channel, which stays `backfill_page_size` deep. Memory cost is about
+    /// `backfill_page_size * backfill_read_ahead` events. Measured at
+    /// `backfill_page_size(1000)`: 1 -> 2 took a 400k-event replay from
+    /// 15.21s to 13.95s (min of 8), 4 pages to 13.70s.
+    #[builder(default = DEFAULT_BACKFILL_READ_AHEAD)]
+    pub backfill_read_ahead: usize,
     /// Grace period before the first proactive gap-fill attempt for a
     /// stalled broadcast sequence; see [`DEFAULT_GAP_FILL_GRACE`]. Retries
     /// after a fill attempt are unaffected (fixed 1s interval).

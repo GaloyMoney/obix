@@ -51,6 +51,8 @@ pub use out::{
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
 pub use tables::CommitCheckpoint;
+#[doc(hidden)]
+pub use tables::GroupOrderRow;
 pub use tables::MailboxTables;
 pub use tables::{CatchUpRows, PersistentEventRows, SubscriptionRow};
 #[doc(hidden)]
