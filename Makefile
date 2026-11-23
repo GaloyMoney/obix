@@ -3,7 +3,7 @@ NIX_DEPS_DIR := .nix-deps
 # Seconds the fuzz target runs in `make fuzz`.
 FUZZ_TIME := 60
 
-.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code fuzz
+.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code fuzz bench-replay
 
 start-deps:
 	@mkdir -p $(NIX_DEPS_DIR)
@@ -43,3 +43,9 @@ sqlx-prepare:
 # `cargo fuzz list`; runs them for $(FUZZ_TIME)s. Corpus in fuzz/corpus/ (gitignored).
 fuzz:
 	SQLX_OFFLINE=true FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh
+
+# Commit-lane backfill replay benchmark against the local Postgres from
+# `make start-deps`; prints markdown tables. Tune with OBIX_BENCH_EVENTS,
+# OBIX_BENCH_ROUNDS and OBIX_BENCH_GROUP_SIZES.
+bench-replay:
+	nix develop -c cargo nextest run --run-ignored ignored-only --no-capture --test bench_commit_replay
