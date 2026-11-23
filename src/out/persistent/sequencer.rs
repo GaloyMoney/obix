@@ -435,7 +435,7 @@ struct FoldReport {
 
 /// How many leading rows of `page` continue the gapless run above `cursor`.
 /// The insert lane is gapless up to what the live fold has passed, so a short
-/// run means the page cannot be trusted as fold input past that point.
+/// run means the page cannot be fed to the fold past that point.
 fn contiguous_run(cursor: EventSequence, page: &[GroupOrderRow]) -> usize {
     let mut expected = cursor;
     let mut run = 0;
@@ -460,43 +460,39 @@ where
     }
 }
 
-/// A backfill's ordering input. It reads payload-free pages of
-/// `(sequence, group, has-payload)` straight from the table, so each payload is
-/// read once, by the group fetch. On a page it cannot trust (a hole, or nothing
-/// where the fold still needs rows) it hands over to the insert-lane transport
-/// stream from the last contiguous row, which waits out holes the way the live
-/// fold does.
-struct FoldInput<P, Tables>
+/// A backfill's walk of the insert lane, in order. It reads payload-free pages
+/// of `(sequence, group, has-payload)` straight from the table, so each payload
+/// is read once, by the group fetch. On a page it cannot trust (a hole, or
+/// nothing where the fold still needs rows) it hands over to the insert-lane
+/// transport stream from the last contiguous row, which waits out holes the
+/// way the live fold does.
+struct OrderScan<'a, P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    pool: sqlx::PgPool,
-    cache: Arc<PersistentOutboxEventCache<P, Tables>>,
-    page: usize,
+    source: &'a BackfillSource<P, Tables>,
     /// The highest sequence handed to the fold so far.
     cursor: EventSequence,
-    /// Set once the input has fallen back to the transport stream.
+    /// Set once the scan has fallen back to the transport stream.
     stream: Option<TransportStream<InsertOrder, P>>,
 }
 
-impl<P, Tables> FoldInput<P, Tables>
+impl<'a, P, Tables> OrderScan<'a, P, Tables>
 where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    fn new(source: &BackfillSource<P, Tables>, from: EventSequence) -> Self {
+    fn new(source: &'a BackfillSource<P, Tables>, from: EventSequence) -> Self {
         Self {
-            pool: source.pool.clone(),
-            cache: source.cache.clone(),
-            page: source.page,
+            source,
             cursor: from,
             stream: None,
         }
     }
 
-    /// The next batch of ordering facts. `None` means the input ended.
+    /// The next batch of ordering facts. `None` means the scan ended.
     async fn next_batch(&mut self) -> Option<Vec<GroupOrderRow>> {
-        let page = self.page;
+        let page = self.source.page;
         loop {
             if let Some(stream) = &mut self.stream {
                 let batch = next_batch(stream, page).await?;
@@ -514,7 +510,7 @@ where
             if !intact {
                 record_order_scan_fallback(u64::from(self.cursor));
                 self.stream = Some(PersistentOutboxListener::transport_stream(
-                    self.cache.handle(),
+                    self.source.cache.handle(),
                     Some(self.cursor),
                     page,
                 ));
@@ -531,12 +527,13 @@ where
             let span = tracing::debug_span!(
                 "obix.sequencer.group_order_page",
                 after = u64::from(self.cursor),
-                limit = self.page,
+                limit = self.source.page,
                 rows = tracing::field::Empty,
             );
-            let loaded = Tables::load_group_order_page(&self.pool, self.cursor, self.page)
-                .instrument(span.clone())
-                .await;
+            let loaded =
+                Tables::load_group_order_page(&self.source.pool, self.cursor, self.source.page)
+                    .instrument(span.clone())
+                    .await;
             match loaded {
                 Ok(rows) => {
                     span.record("rows", rows.len());
@@ -564,7 +561,7 @@ where
     P: Serialize + DeserializeOwned + Send + Sync + 'static + Unpin,
     Tables: MailboxTables,
 {
-    let mut input = FoldInput::new(source, seed.from);
+    let mut scan = OrderScan::new(source, seed.from);
     let mut sequencer = Sequencer::<P, Tables> {
         pool: source.pool.clone(),
         head: seed.head,
@@ -585,7 +582,7 @@ where
 
     let from_commit = sequencer.head;
     let outcome = loop {
-        let Some(batch) = input.next_batch().await else {
+        let Some(batch) = scan.next_batch().await else {
             break "stream_ended";
         };
         match sequencer.fold_batch(batch).await {
