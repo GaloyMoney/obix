@@ -3,7 +3,7 @@ mod helpers;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,10 @@ enum TestEvent {
 struct Observed {
     collected: Mutex<Vec<(u64, Instant)>>,
     attempts: Mutex<Vec<(Vec<i64>, Instant)>>,
+    /// The cadence the subscriber answers with (`None` = the registered one).
+    window: Mutex<Option<Duration>>,
+    /// How often the runner asked, proving the cadence is re-read per iteration.
+    window_consults: AtomicUsize,
 }
 
 struct Recorder {
@@ -53,6 +57,13 @@ impl Recorder {
 
 impl<L: Lane> SingletonSubscriber<TestEvent, L> for Recorder {
     type Batch = Vec<i64>;
+
+    fn batch_window(&self) -> Option<Duration> {
+        self.observed
+            .window_consults
+            .fetch_add(1, Ordering::Relaxed);
+        *self.observed.window.try_lock().expect("uncontended")
+    }
 
     async fn handle_persistent<'inv>(
         &self,
@@ -508,6 +519,57 @@ async fn failed_landing_replays_the_whole_batch_with_a_fresh_window() -> anyhow:
     assert!(attempts[1].1.duration_since(collected[2].1) >= WINDOW);
     drop(collected);
     drop(attempts);
+    h.jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A subscriber that knows what it is doing can change its cadence mid-run.
+///
+/// Registered with a window far longer than this test's patience, the
+/// subscriber answers with a short one, and a batch lands on *that*; when the
+/// answer goes back to `None` the registered window governs again — all
+/// without a restart, because the runner re-reads the cadence every
+/// iteration.
+#[tokio::test]
+#[file_serial]
+async fn a_subscriber_can_change_its_window_while_the_subscription_runs() -> anyhow::Result<()> {
+    const REGISTERED: Duration = Duration::from_secs(30);
+    const OWN: Duration = Duration::from_millis(150);
+
+    let observed = Arc::new(Observed::default());
+    *observed.window.lock().await = Some(OWN);
+    let mut h = Harness::new::<InsertOrder>(REGISTERED, 100, Recorder::new(observed)).await?;
+    h.jobs.start_poll().await?;
+
+    // Nothing can land under the registered 30s window inside WAIT, so a
+    // landed batch is the subscriber's own cadence at work.
+    h.publish([TestEvent::Ping(1)]).await?;
+    h.publish([TestEvent::Ping(2)]).await?;
+    h.wait_checkpoint(2).await?;
+    let consults_after_landing = h.observed.window_consults.load(Ordering::Relaxed);
+    assert!(
+        consults_after_landing >= 2,
+        "the runner re-reads the cadence per iteration, saw {consults_after_landing}"
+    );
+
+    // Back to the registered window. A batch that already armed keeps its
+    // window, so the flip is observed by the next batch that *starts* after
+    // an iteration has read it: event 3 arms under the short window still,
+    // and event 4 — published once that batch has landed — waits out 30s.
+    *h.observed.window.lock().await = None;
+    h.publish([TestEvent::Ping(3)]).await?;
+    h.wait_checkpoint(3).await?;
+    h.publish([TestEvent::Ping(4)]).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        h.checkpoint().await?,
+        Some(3),
+        "with the registered window back in force an event waits for it"
+    );
+    assert!(
+        h.observed.window_consults.load(Ordering::Relaxed) > consults_after_landing,
+        "the runner keeps consulting the cadence while a batch collects"
+    );
     h.jobs.shutdown().await?;
     Ok(())
 }
