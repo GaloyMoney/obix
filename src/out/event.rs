@@ -424,10 +424,13 @@ where
         }
     }
 
+    /// Apply the persisted producer to `span` before the span is activated.
+    /// The tracing-opentelemetry bridge cannot change a span's parent after
+    /// its OTel context has started.
     #[cfg(feature = "tracing")]
-    pub fn inject_trace_parent(&self) {
+    pub fn apply_trace_parent(&self, span: &tracing::Span) {
         if let Some(context) = &self.tracing_context {
-            context.inject_as_parent();
+            let _ = context.apply_parent(span);
         }
     }
 }
