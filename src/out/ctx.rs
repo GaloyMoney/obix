@@ -170,6 +170,18 @@ impl BatchTracker {
         self.deadline
     }
 
+    /// The window the *next* batch arms with.
+    ///
+    /// The runner re-reads what its subscriber wants every iteration, so a
+    /// cadence that depends on what the subscriber is doing — a backfill
+    /// wants a window long enough to fill a batch, a caught-up stream wants
+    /// its own staleness back — changes without a restart. A batch already
+    /// collecting keeps the deadline it armed: moving it mid-batch would
+    /// break a promise the runner has already waited against.
+    pub(crate) fn set_batch_window(&mut self, batch_window: std::time::Duration) {
+        self.batch_window = batch_window;
+    }
+
     /// Whether the accumulator has reached the runner's batch ceiling. The
     /// window exists to fill a batch, so a batch that cannot grow has
     /// nothing left to wait for: a catch-up replaying a backlog builds full
@@ -1326,6 +1338,44 @@ mod tests {
         tracker.wait_for_window().await;
         assert_eq!(tokio::time::Instant::now(), deadline);
         assert_eq!(tracker.collected, 4);
+    }
+
+    /// A window the subscriber changes mid-run applies to the *next* batch:
+    /// the batch already collecting keeps the deadline it armed, so a runner
+    /// never moves a promise it has already waited against.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_window_applies_to_the_next_batch() {
+        use std::time::Duration;
+        let mut tracker = BatchTracker::new(
+            StreamPosition::Insert(EventSequence::BEGIN),
+            Duration::from_secs(5),
+            MAX_BATCH,
+        );
+        tracker.collect();
+        let armed = tracker.deadline().unwrap();
+        tracker.set_batch_window(Duration::from_secs(1));
+        tracker.collect();
+        assert_eq!(
+            tracker.deadline(),
+            Some(armed),
+            "the batch in flight keeps its armed window"
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tracker.wait_for_window().await;
+        // The next batch arms with the window that is now in force.
+        tracker.collected = 0;
+        tracker.deadline = None;
+        tracker.collect();
+        assert_eq!(
+            tracker.deadline(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1))
+        );
+        // And a zero window arms nothing at all: the batch lands on its ceiling.
+        tracker.set_batch_window(Duration::ZERO);
+        tracker.collected = 0;
+        tracker.deadline = None;
+        tracker.collect();
+        assert_eq!(tracker.deadline(), None);
     }
 
     #[tokio::test(start_paused = true)]

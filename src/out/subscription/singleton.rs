@@ -86,6 +86,18 @@ where
         async move { Ok(ctx.skip()) }
     }
 
+    /// The coalescing window this subscriber wants *now*, or `None` to use
+    /// the one it was registered with ([`OutboxEventJobConfig::with_batch_window`]).
+    ///
+    /// The runner asks once per iteration, so the answer may change while the
+    /// subscription runs and applies from the next batch on — a subscriber
+    /// that knows what it is doing (replaying a backlog vs following a live
+    /// stream) can pick a window that fits, without a restart or a second
+    /// job. A batch already collecting keeps the deadline it armed.
+    fn batch_window(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Handle a persistent event whose stored payload could not be decoded
     /// into `P` — delivered as the persistent stream's `Err` arm and never
     /// as an ordinary event, so it cannot reach
@@ -306,7 +318,9 @@ pub struct OutboxEventJobConfig {
     pub retry_settings: RetrySettings,
     pub max_batch_size: usize,
     pub checkpoint_interval: std::time::Duration,
-    /// Fixed first-collect window; see [`Self::with_batch_window`].
+    /// The default coalescing window, armed on a batch's first collect; see
+    /// [`Self::with_batch_window`]. A subscriber that wants to change cadence
+    /// while it runs answers [`SingletonSubscriber::batch_window`] instead.
     pub batch_window: std::time::Duration,
 }
 
@@ -354,6 +368,15 @@ impl OutboxEventJobConfig {
     /// consume ops are unchanged. Zero (the default) preserves immediate
     /// backlog-drained flushing. Collected work must tolerate whole-batch
     /// replay on failure.
+    /// Coalesce a batch for up to `window` after its first event, so a quiet
+    /// stream lands one piece and one checkpoint per burst instead of one per
+    /// event; a batch that fills `max_batch_size` lands without waiting.
+    ///
+    /// This is the *registered* window. A subscriber whose cadence depends on
+    /// what it is doing (replaying a backlog wants a window long enough to
+    /// fill a batch; following a live stream wants its own staleness back)
+    /// answers [`SingletonSubscriber::batch_window`] and the runner re-reads
+    /// it every iteration, so the change needs no restart.
     pub fn with_batch_window(mut self, window: std::time::Duration) -> Self {
         self.batch_window = window;
         self
@@ -581,6 +604,10 @@ where
     async fn undecodable(&self, error: &UndecodableDelivery<L>) -> Result<(), HandlerError> {
         self.handler.handle_undecodable(error).await
     }
+
+    fn batch_window(&self) -> Option<std::time::Duration> {
+        self.handler.batch_window()
+    }
 }
 
 /// What the shared persistent loop calls into: the one place a runner decides
@@ -607,6 +634,13 @@ where
         &self,
         error: &UndecodableDelivery<L>,
     ) -> impl std::future::Future<Output = Result<(), HandlerError>> + Send;
+
+    /// The window the next batch should arm with, or `None` for the
+    /// registered one. Read once per iteration, so a subscriber can change
+    /// cadence mid-run; see [`SingletonSubscriber::batch_window`].
+    fn batch_window(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// When the shared loop lands on its own initiative: a full batch, an opt-in
@@ -650,6 +684,10 @@ where
         let mut batch = D::Batch::default();
 
         loop {
+            // Re-read the cadence every iteration: the window applies from the
+            // next batch on, so a subscriber that changed what it is doing
+            // (caught up, started replaying) is followed without a restart.
+            tracker.set_batch_window(dispatch.batch_window().unwrap_or(batch_window));
             let item = if let Some(deadline) = tracker.deadline() {
                 // Check before polling ready input: neither an endless stream
                 // nor skipped events may starve a due/full collected batch.
