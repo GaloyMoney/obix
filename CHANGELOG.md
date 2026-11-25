@@ -1,3 +1,11 @@
+# [obix release v0.21.0](https://github.com/GaloyMoney/obix/releases/tag/0.21.0)
+
+
+
+### Miscellaneous Tasks
+
+- [**breaking**] Adopt es-entity 0.24.0 and job 0.21.0 span parents (#200)
+
 # [obix release v0.20.0](https://github.com/GaloyMoney/obix/releases/tag/0.20.0)
 
 
