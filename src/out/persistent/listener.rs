@@ -62,6 +62,24 @@ where
         }
     }
 
+    /// Approximately how many events are still to come after the last
+    /// delivered one: the lane's known head ahead of it, plus, on a derived
+    /// lane, what its source holds that the derivation has not reached yet.
+    /// An upper bound on the insert lane (the head counts allocated but
+    /// uncommitted sequences, and rolled-back sequences leave holes); on the
+    /// commit lane the second term carries the same over-count while the fold
+    /// catches up after a boot.
+    pub(crate) fn backlog(&self) -> u64 {
+        // Upstream first, then the head, both live: the fold advances its
+        // position only after the head, so a fold step landing between the
+        // two reads is counted twice rather than not at all.
+        let upstream = self.handle.upstream_pending();
+        let head = self.latest_known.max(self.handle.head());
+        L::position_to_u64(head)
+            .saturating_sub(L::position_to_u64(self.last_returned))
+            .saturating_add(upstream)
+    }
+
     /// Take a delivery into the local view. Evicting the *highest* is what makes
     /// the backstop safe: never the event blocking the cursor.
     fn maybe_add_to_cache(&mut self, delivery: Transport<L, P>) {
@@ -257,3 +275,56 @@ fn record_persistent_lagged(dropped: u64, last_returned_sequence: u64, latest_kn
 
 #[tracing::instrument(name = "obix.commit_listener.lagged", level = "warn")]
 fn record_commit_lagged(dropped: u64, last_returned: u64, latest_known: u64) {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use tokio::sync::{broadcast, mpsc};
+
+    use super::*;
+    use crate::out::lane::Upstream;
+    use crate::sequence::{CommitSequence, EventSequence};
+
+    fn handle<L: Lane>(head: &Arc<AtomicU64>) -> LaneHandle<L, serde_json::Value> {
+        let (sender, receiver) = broadcast::channel(1);
+        drop(sender);
+        let (backfill, _) = mpsc::unbounded_channel();
+        LaneHandle::new(head.clone(), receiver, backfill, 1)
+    }
+
+    #[tokio::test]
+    async fn backlog_is_the_head_ahead_of_the_cursor() {
+        let head = Arc::new(AtomicU64::new(175));
+        let listener = PersistentOutboxListener::new(handle(&head), EventSequence::from(25), 1);
+        assert_eq!(listener.backlog(), 150);
+        // Read live, not only at the last poll.
+        head.store(200, Ordering::Relaxed);
+        assert_eq!(listener.backlog(), 175);
+    }
+
+    #[tokio::test]
+    async fn a_derived_lane_counts_what_its_fold_has_not_reached() {
+        // A fresh boot with no commit checkpoint: the commit head is at zero
+        // while 175 insert rows wait for the fold.
+        let commit_head = Arc::new(AtomicU64::new(0));
+        let insert_head = Arc::new(AtomicU64::new(175));
+        let fold_position = Arc::new(AtomicU64::new(0));
+        let upstream = Upstream {
+            source_head: insert_head.clone(),
+            derived_through: fold_position.clone(),
+        };
+        let listener = CommitOrderedListener::new(
+            handle(&commit_head).with_upstream(upstream),
+            CommitSequence::BEGIN,
+            1,
+        );
+        assert_eq!(listener.backlog(), 175);
+        // The fold positions 100 rows: the backlog moves between the terms.
+        commit_head.store(100, Ordering::Relaxed);
+        fold_position.store(100, Ordering::Relaxed);
+        assert_eq!(listener.backlog(), 175);
+    }
+}

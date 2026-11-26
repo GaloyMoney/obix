@@ -16,7 +16,7 @@ use super::listener::{PersistentOutboxListener, TransportStream};
 use crate::{
     handle::{OwnedTaskHandle, spawn_supervised},
     out::event::*,
-    out::lane::{CommitOrder, InsertOrder, LaneHandle},
+    out::lane::{CommitOrder, InsertOrder, LaneHandle, Upstream},
     sequence::{CommitGroupId, CommitSequence, EventSequence},
     tables::{CommitCheckpoint, GroupOrderRow, MailboxTables, PersistentEventRows},
 };
@@ -55,6 +55,9 @@ where
     backfill_request: mpsc::UnboundedSender<(CommitSequence, mpsc::Sender<CommitTransport<P>>)>,
     backfill_buffer_size: usize,
     positions: SequencerPositions,
+    /// The insert head against this fold's position: what the commit head
+    /// does not show yet while the fold catches up after a boot.
+    upstream: Upstream,
     _task: OwnedTaskHandle,
 }
 
@@ -86,6 +89,7 @@ where
             self.backfill_request.clone(),
             self.backfill_buffer_size,
         )
+        .with_upstream(self.upstream.clone())
     }
 }
 
@@ -760,6 +764,10 @@ where
         commit_sender,
         backfill_request,
         backfill_buffer_size: page,
+        upstream: Upstream {
+            source_head: cache.head_counter(),
+            derived_through: fold_position.clone(),
+        },
         positions: SequencerPositions {
             fold_position,
             commit_head,

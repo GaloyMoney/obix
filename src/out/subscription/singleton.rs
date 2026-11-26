@@ -46,6 +46,9 @@ use crate::tables::MailboxTables;
 ///   temporary stream pauses and delays nonempty landings before opening their
 ///   transaction, except a batch that already reached `max_batch_size` or one
 ///   landed by a later event's `consume` entry — those land without waiting.
+///   An opt-in
+///   [`full batches during catch-up`](OutboxEventJobConfig::with_full_batches_during_catch_up)
+///   holds a batch the lane's backlog can still fill until it is full.
 ///   Requires the work to tolerate whole-batch replay after a mid-batch
 ///   failure.
 /// - [`consume`](EventCtx::consume) then [`commit`](IsolatedOp::commit) — my
@@ -308,6 +311,9 @@ pub struct OutboxEventJobConfig {
     pub checkpoint_interval: std::time::Duration,
     /// Fixed first-collect window; see [`Self::with_batch_window`].
     pub batch_window: std::time::Duration,
+    /// Hold batches until full while catching up; see
+    /// [`Self::with_full_batches_during_catch_up`].
+    pub full_batches_during_catch_up: bool,
 }
 
 impl OutboxEventJobConfig {
@@ -318,6 +324,7 @@ impl OutboxEventJobConfig {
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             batch_window: std::time::Duration::ZERO,
+            full_batches_during_catch_up: false,
         }
     }
 
@@ -353,9 +360,54 @@ impl OutboxEventJobConfig {
     /// after the prior batch lands. Skip-only checkpoint cadence and isolated
     /// consume ops are unchanged. Zero (the default) preserves immediate
     /// backlog-drained flushing. Collected work must tolerate whole-batch
-    /// replay on failure.
+    /// replay on failure. The window caps the landing rate of the live
+    /// stream; to land full batches while replaying a backlog instead, see
+    /// [`Self::with_full_batches_during_catch_up`].
     pub fn with_batch_window(mut self, window: std::time::Duration) -> Self {
         self.batch_window = window;
+        self
+    }
+
+    /// Land only full batches while the subscriber is catching up.
+    ///
+    /// By default a subscriber is real-time: a pending batch lands as soon as
+    /// nothing more is ready to read, or at its
+    /// [`batch window`](Self::with_batch_window) if one is set. During a
+    /// replay that lands a batch at every pause in reads, so a batch larger
+    /// than one backfill page lands at about one page, whatever
+    /// `max_batch_size` says.
+    ///
+    /// With this switch on, while the lane has enough known events to fill
+    /// the open batch, the batch lands only when it is full: neither the
+    /// window deadline nor a pause in reads lands it. Catching up means
+    /// `backlog >= max_batch_size - seen`, where `backlog` is how many events
+    /// the lane knows of past the last delivered one, and `seen` is how many
+    /// events were delivered since the open batch armed, skips included.
+    /// Once the lane can no longer fill the batch, the real-time rules apply
+    /// again: the window deadline if one is armed (an already passed one
+    /// lands at once), otherwise landing as soon as nothing is ready. It is
+    /// independent of the window and never applies to a batch the lane
+    /// cannot fill.
+    ///
+    /// The hold also ends once `seen` reaches `max_batch_size`, so a
+    /// subscriber that skips most events holds a small batch (and its
+    /// checkpoint) for at most `max_batch_size` deliveries.
+    ///
+    /// There is no timeout: if reads stop while backlog exists, the runner
+    /// waits for them, as it already does inside a source commit group. The
+    /// read path owns its own liveness (gap filling, backfill wake-ups,
+    /// retries), and a timer here would mask a read-path fault. Shutdown
+    /// still interrupts the wait.
+    ///
+    /// The backlog is approximate. On the insert lane the head counts
+    /// sequences allocated to transactions that have not committed, so a
+    /// nearly full batch at the tip can be held until that writer commits or
+    /// the gap filler's grace period fills the hole. The commit lane counts
+    /// the insert rows its fold has not reached yet, so it knows the whole
+    /// backlog from the start of a fresh boot, and inherits the same tip
+    /// behaviour.
+    pub fn with_full_batches_during_catch_up(mut self) -> Self {
+        self.full_batches_during_catch_up = true;
         self
     }
 
@@ -386,6 +438,7 @@ where
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
     batch_window: std::time::Duration,
+    full_batches_during_catch_up: bool,
     _lane: std::marker::PhantomData<fn() -> L>,
 }
 
@@ -405,6 +458,7 @@ where
             max_batch_size: config.max_batch_size,
             checkpoint_interval: config.checkpoint_interval,
             batch_window: config.batch_window,
+            full_batches_during_catch_up: config.full_batches_during_catch_up,
             _lane: std::marker::PhantomData,
         }
     }
@@ -437,6 +491,7 @@ where
             max_batch_size: self.max_batch_size,
             checkpoint_interval: self.checkpoint_interval,
             batch_window: self.batch_window,
+            full_batches_during_catch_up: self.full_batches_during_catch_up,
             _lane: std::marker::PhantomData,
         }))
     }
@@ -454,6 +509,7 @@ where
     max_batch_size: usize,
     checkpoint_interval: std::time::Duration,
     batch_window: std::time::Duration,
+    full_batches_during_catch_up: bool,
     _lane: std::marker::PhantomData<fn() -> L>,
 }
 
@@ -545,6 +601,7 @@ where
                 max_batch_size: self.max_batch_size,
                 checkpoint_interval: self.checkpoint_interval,
                 batch_window: self.batch_window,
+                full_batches_during_catch_up: self.full_batches_during_catch_up,
             },
         )
         .await
@@ -616,6 +673,18 @@ pub(crate) struct LoopCadence {
     pub(crate) max_batch_size: usize,
     pub(crate) checkpoint_interval: std::time::Duration,
     pub(crate) batch_window: std::time::Duration,
+    /// Hold a batch the lane can still fill; see
+    /// [`OutboxEventJobConfig::with_full_batches_during_catch_up`].
+    pub(crate) full_batches_during_catch_up: bool,
+}
+
+/// Whether the lane has enough known events to fill the open batch: the
+/// catch-up hold of
+/// [`OutboxEventJobConfig::with_full_batches_during_catch_up`]. False once
+/// `seen` reaches the ceiling, which bounds how long a mostly-skipping
+/// subscriber holds a small batch.
+fn lane_can_fill(max_batch_size: usize, seen: usize, backlog: u64) -> bool {
+    seen < max_batch_size && backlog >= (max_batch_size - seen) as u64
 }
 
 /// The loop behind every always-on persistent runner: batching, landing
@@ -640,6 +709,7 @@ where
         max_batch_size,
         checkpoint_interval,
         batch_window,
+        full_batches_during_catch_up,
     } = cadence;
     let mirror = landing.mirror();
     {
@@ -647,16 +717,25 @@ where
         let mut tracker =
             BatchTracker::new(checkpoint_of::<L>(&state), batch_window, max_batch_size);
         let mut in_group = false;
+        // Events delivered since the open batch armed, skips included.
+        let mut seen: usize = 0;
         let mut batch = D::Batch::default();
 
         loop {
+            // Every landing empties the accumulator, so an empty one means
+            // no batch is open and the count restarts.
+            if tracker.collected == 0 {
+                seen = 0;
+            }
+            let holding = full_batches_during_catch_up
+                && lane_can_fill(max_batch_size, seen, persistent.backlog());
             let item = if let Some(deadline) = tracker.deadline() {
                 // Check before polling ready input: neither an endless stream
                 // nor skipped events may starve a due/full collected batch.
                 // Never cut a source commit group for these triggers.
                 let reason = if !in_group && tracker.collected >= max_batch_size {
                     Some("batch_full")
-                } else if !in_group && tokio::time::Instant::now() >= deadline {
+                } else if !in_group && !holding && tokio::time::Instant::now() >= deadline {
                     Some("batch_window")
                 } else {
                     None
@@ -685,7 +764,7 @@ where
                         flush_batch(&mut parts, &mut batch, flusher, "shutdown").await?;
                         return Ok(ResidentJobCompletion::RescheduleNow);
                     }
-                    _ = tokio::time::sleep_until(deadline), if !in_group => {
+                    _ = tokio::time::sleep_until(deadline), if !in_group && !holding => {
                         // The top-of-loop check lands without fetching again.
                         continue;
                     }
@@ -736,6 +815,41 @@ where
                             return Ok(ResidentJobCompletion::RescheduleNow);
                         }
                     },
+                    // Catching up: the lane can still fill this batch, so a
+                    // pause in reads is not a landing trigger. No timeout —
+                    // the read path owns its liveness — but shutdown still
+                    // interrupts the wait.
+                    None if holding => {
+                        tokio::select! {
+                            biased;
+                            _ = current_job.shutdown_requested() => {
+                                let mut parts = CtxParts {
+                                    op_slot: &mut op_slot,
+                                    current_job: &mut current_job,
+                                    state: &mut state,
+                                    tracker: &mut tracker,
+                                    landing,
+                                };
+                                flush_batch(&mut parts, &mut batch, flusher, "shutdown").await?;
+                                return Ok(ResidentJobCompletion::RescheduleNow);
+                            }
+                            next = persistent.next() => match next {
+                                Some(item) => item,
+                                None => {
+                                    let mut parts = CtxParts {
+                                        op_slot: &mut op_slot,
+                                        current_job: &mut current_job,
+                                        state: &mut state,
+                                        tracker: &mut tracker,
+                                        landing,
+                                    };
+                                    flush_batch(&mut parts, &mut batch, flusher, "stream_closed")
+                                        .await?;
+                                    return Ok(ResidentJobCompletion::RescheduleNow);
+                                }
+                            }
+                        }
+                    }
                     None => {
                         let mut parts = CtxParts {
                             op_slot: &mut op_slot,
@@ -831,6 +945,9 @@ where
             state.sequence = event.sequence;
             L::record(&mut state.commit_sequence, event.position());
             in_group = !event.is_boundary();
+            if tracker.collected > 0 {
+                seen = seen.saturating_add(1);
+            }
             match outcome {
                 Outcome::Skip => {}
                 Outcome::Commit => {
@@ -976,6 +1093,33 @@ mod tests {
             decide_lane(commit, sequence, Ordering::Commit),
             Ok(LaneChoice::Commit(CommitSequence::from(2u64)))
         );
+    }
+
+    #[test]
+    fn lane_can_fill_needs_the_remaining_capacity() {
+        assert!(lane_can_fill(10, 4, 6));
+        assert!(lane_can_fill(10, 0, 1_000));
+        assert!(!lane_can_fill(10, 4, 5));
+        assert!(!lane_can_fill(10, 0, 0));
+    }
+
+    #[test]
+    fn lane_can_fill_ends_once_a_batch_of_deliveries_was_seen() {
+        assert!(!lane_can_fill(10, 10, u64::MAX));
+        // No underflow past the ceiling.
+        assert!(!lane_can_fill(10, 11, u64::MAX));
+    }
+
+    #[test]
+    fn full_batches_during_catch_up_is_opt_in() {
+        let config = OutboxEventJobConfig::new(JobType::new("test"));
+        assert!(!config.full_batches_during_catch_up);
+        let window = std::time::Duration::from_millis(250);
+        let config = config
+            .with_batch_window(window)
+            .with_full_batches_during_catch_up();
+        assert!(config.full_batches_during_catch_up);
+        assert_eq!(config.batch_window, window);
     }
 
     #[test]
