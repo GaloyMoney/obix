@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod handle;
 pub mod inbox;
+pub mod migrate;
 pub mod out;
 mod sequence;
 mod tables;
@@ -51,6 +52,7 @@ pub use out::{
 pub use sequence::{CommitGroupId, CommitSequence, EventSequence};
 #[doc(hidden)]
 pub use tables::CommitCheckpoint;
+pub use tables::DefaultMailboxTables;
 #[doc(hidden)]
 pub use tables::GroupOrderRow;
 pub use tables::MailboxTables;

@@ -125,38 +125,35 @@ while let Some(event) = listener.next().await {
 
 ### Setup
 
-The outbox pattern requires two PostgreSQL tables (`persistent_outbox_events` and `ephemeral_outbox_events`). You must apply the migration to create these tables before using the library.
+The outbox pattern requires several PostgreSQL tables (`persistent_outbox_events`, `ephemeral_outbox_events`, and their companions). obix ships its schema as an embedded migration — run it before using the library.
 
 > **Breaking change:** `persistent_outbox_events` is **range-partitioned by `sequence`** (primary key on `sequence`, `id` demoted to a plain column). Upgrading from a pre-partitioning version is a breaking schema change with no in-place data migration — recreate the table from the shipped migration. See [Partition maintenance](#partition-maintenance) below.
 
-#### Option 1: Copy the migration file
+Each `MailboxTables` set records its migrations in a tracking table of its own — `_sqlx_migrations_obix` for the default tables, `_sqlx_migrations_obix_<prefix>` for a custom `tbl_prefix` — so multiple obix instances can share one database without version or checksum collisions.
 
-Copy the migration file into your project's migrations directory:
-```bash
-cp ./migrations/20251204130225_obix_setup.sql <path>/<to>/<your>/<project>/migrations/
-```
+For the default tables:
 
-Then run your migrations as usual with sqlx:
 ```rust
-sqlx::migrate!("./migrations").run(&pool).await?;
+// obix tables only:
+obix::migrate::MIGRATOR.run(&pool).await?;
+// or, also running the `job` crate's migrations (tracked in `_sqlx_migrations_job`):
+obix::migrate::run::<obix::DefaultMailboxTables>(&pool).await?;
 ```
 
-#### Option 2: Use a custom table prefix
-
-If you need to avoid table name conflicts or want to namespace your outbox tables, you can define custom tables with a prefix:
+For tables with a custom prefix (tables become `myapp_persistent_outbox_events`, `myapp_ephemeral_outbox_events`, ...):
 
 ```rust
 #[derive(obix::MailboxTables)]
 #[obix(tbl_prefix = "myapp")]
 struct MyAppTables;
 
-// Initialize with custom tables
-let outbox = Outbox::<MyEvent, MyAppTables>::init(&pool, MailboxConfig::builder().build()).await?;
+// obix tables only, recorded in `_sqlx_migrations_obix_myapp`:
+obix::migrate::migrator::<MyAppTables>().run(&pool).await?;
+// or, including the `job` migrations:
+obix::migrate::run::<MyAppTables>(&pool).await?;
 ```
 
-When using a custom prefix, you'll need to create a modified migration with your prefix. For example, with prefix `myapp`, the tables would be named `myapp_persistent_outbox_events` and `myapp_ephemeral_outbox_events`.
-
-You can copy the default migration and add your prefix to all table names, sequence names, and channel names in the SQL.
+> **Upgrading a database whose obix tables were applied via copied SQL:** if they were recorded in `_sqlx_migrations` (or another crate's tracking table), the obix tracking table starts empty and running the migration fails with "already exists". Recreate the tables, or seed/skip the record (e.g. `sqlx::migrate::Migrator::skip`).
 
 ### Partition maintenance
 
