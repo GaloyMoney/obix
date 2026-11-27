@@ -101,6 +101,11 @@ impl ToTokens for MailboxTables {
             .map(|p| format!("{}_", p.value()))
             .unwrap_or_default();
 
+        let migration_table = match &self.prefix {
+            Some(prefix) => format!("_sqlx_migrations_obix_{}", prefix.value()),
+            None => "_sqlx_migrations_obix".to_string(),
+        };
+
         // === Outbox queries ===
         let persistent_outbox_events_channel = format!("{}persistent_outbox_events", table_prefix);
         let ephemeral_outbox_events_channel = format!("{}ephemeral_outbox_events", table_prefix);
@@ -650,6 +655,9 @@ FROM {}persistent_outbox_events_sequence_seq",
 
         tokens.append_all(quote! {
             impl #crate_name::MailboxTables for #ident {
+                const TABLE_PREFIX: &'static str = #table_prefix;
+                const MIGRATION_TABLE: &'static str = #migration_table;
+
                 // === Outbox channel names ===
 
                 fn persistent_outbox_events_channel() -> &'static str {

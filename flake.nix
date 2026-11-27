@@ -94,6 +94,9 @@
         filter = path: type:
           (builtins.match ".*\.sqlx/.*" path != null)
           || (builtins.match ".*deny\.toml$" path != null)
+          # obix's setup SQL is embedded at compile time via include_str! in
+          # src/migrate.rs, so crane builds need it in the filtered source.
+          || (builtins.match ".*/migrations_templates/.*\.sql$" path != null)
           || (craneLib.filterCargoSources path type);
       };
       commonArgs = {
@@ -106,6 +109,8 @@
         rustToolchain
         alejandra
         sqlx-cli
+        # Used by dev/bin/sqlx-prepare.sh to regenerate the .sqlx cache.
+        python3
         cargo-nextest
         cargo-audit
         cargo-deny
@@ -224,12 +229,15 @@
         '';
       };
 
+      # Kept for `make setup-db` / CI compatibility. There is no sqlx CLI
+      # migration step left: the schema (obix's prefix-parameterized migrator
+      # plus job's MIGRATOR) is applied in-process by obix::migrate::run at
+      # runtime, and running raw SQL here would collide with the
+      # _sqlx_migrations_obix / _sqlx_migrations_job bookkeeping.
       setupDbDev = pkgs.writeShellApplication {
         name = "setup-db-dev";
-        runtimeInputs = [pkgs.sqlx-cli pkgs.coreutils];
         text = ''
-          eval "$(${devEnv}/bin/obix-dev-env)"
-          exec sqlx migrate run
+          echo "setup-db-dev: nothing to do — migrations are applied by obix::migrate::run at runtime"
         '';
       };
 
@@ -271,9 +279,10 @@
         };
       };
 
-      # Only long-running services live in process-compose. Migrations are run
-      # synchronously by callers (Makefile start-deps / nextest-runner) after
-      # core-pg is healthy, so tests never start mid-migration.
+      # Only long-running services live in process-compose. Migrations are
+      # applied by obix::migrate::run inside the test binaries themselves
+      # (obix's prefix-parameterized migrator + job's MIGRATOR) once core-pg
+      # is healthy, so tests never start mid-migration.
       baseProcesses = {
         core-pg = mkPg {
           name = "core-pg";
@@ -300,8 +309,12 @@
       nextest-runner = pkgs.writeShellScriptBin "nextest-runner" ''
         set -e
 
+        # Compile-time sqlx::query! macros resolve from the committed .sqlx/
+        # cache; the live schema is applied later, in-process, by
+        # obix::migrate::run::<TestTables> inside the test binaries.
+        export SQLX_OFFLINE=true
+
         export PATH="${pkgs.lib.makeBinPath [
-          pkgs.sqlx-cli
           pkgs.cargo-nextest
           pkgs.coreutils
           pkgs.gnumake
@@ -353,10 +366,9 @@
           sleep 5
         done
 
-        echo "Running database migrations..."
-        ${setupDbDev}/bin/setup-db-dev
-
         echo "Running nextest..."
+        # Migrations are applied in-process by obix::migrate::run inside the
+        # test binaries — no sqlx CLI step here.
         # --hide-progress-bar: Concourse hands the task a pty with no size, and
         # nextest's progress bar swallows every per-test line on it, leaving
         # only "error: test run failed" in the build log.

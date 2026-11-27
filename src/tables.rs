@@ -127,6 +127,15 @@ pub fn record_tracing_context_undecodable(error: &serde_json::Error) {}
 pub type PersistentEventRows<P> = Vec<Result<PersistentOutboxEvent<P>, UndecodableEventError>>;
 
 pub trait MailboxTables: Send + Sync + 'static {
+    /// Prefix applied to every object created by the obix migration template:
+    /// `""` for the unprefixed tables, otherwise `"{tbl_prefix}_"`.
+    const TABLE_PREFIX: &'static str;
+    /// Tracking table for this outbox's migrations, so co-hosted outboxes can
+    /// advance independently: `_sqlx_migrations_obix`, or
+    /// `_sqlx_migrations_obix_{tbl_prefix}` when
+    /// [`TABLE_PREFIX`](Self::TABLE_PREFIX) is non-empty.
+    const MIGRATION_TABLE: &'static str;
+
     fn highest_known_persistent_sequence<'a>(
         op: impl es_entity::IntoOneTimeExecutor<'a>,
     ) -> impl Future<Output = Result<EventSequence, sqlx::Error>> + Send;
