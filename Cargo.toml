@@ -74,6 +74,6 @@ tracing-opentelemetry = "0.34"
 tracing-subscriber = "0.3"
 uuid = "1"
 imbl = { version = "7.0", features = ["serde"] }
-job = { version = "0.21.0", features = ["es-entity"] }
+job = { git = "https://github.com/GaloyMoney/job", branch = "sqlx-09", features = ["es-entity"] }
 async-trait = "0.1"
 bon = "3"
