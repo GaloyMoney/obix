@@ -1,3 +1,11 @@
+# [obix release v0.21.1](https://github.com/GaloyMoney/obix/releases/tag/0.21.1)
+
+
+
+### Features
+
+- Opt-in full batches while a subscriber catches up (#204)
+
 # [obix release v0.21.0](https://github.com/GaloyMoney/obix/releases/tag/0.21.0)
 
 
