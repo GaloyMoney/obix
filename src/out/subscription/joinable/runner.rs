@@ -208,6 +208,7 @@ where
                 max_batch_size: self.max_batch_size,
                 checkpoint_interval: self.checkpoint_interval,
                 batch_window: std::time::Duration::ZERO,
+                full_batches_during_catch_up: false,
             },
         )
         .await

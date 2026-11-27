@@ -357,6 +357,28 @@ where
     receiver: Option<broadcast::Receiver<Transport<L, P>>>,
     backfill_request: BackfillRequests<L, P>,
     backfill_buffer_size: usize,
+    upstream: Option<Upstream>,
+}
+
+/// A computed lane's view of the stream it is derived from: the source's
+/// head and how far the derivation has got. The commit lane is folded from
+/// the insert lane, so on a fresh boot its own head starts at the newest
+/// checkpoint and climbs as the fold proceeds; the gap between these two
+/// counters is the backlog its head does not show yet.
+#[derive(Clone)]
+pub(crate) struct Upstream {
+    pub(crate) source_head: Arc<AtomicU64>,
+    pub(crate) derived_through: Arc<AtomicU64>,
+}
+
+impl Upstream {
+    /// Source positions not yet derived. Approximate: the insert head counts
+    /// allocated but uncommitted sequences and rolled-back holes.
+    fn pending(&self) -> u64 {
+        self.source_head
+            .load(atomic::Ordering::Relaxed)
+            .saturating_sub(self.derived_through.load(atomic::Ordering::Relaxed))
+    }
 }
 
 /// A listener's "serve me everything after this position" channel.
@@ -379,12 +401,25 @@ where
             receiver: Some(receiver),
             backfill_request,
             backfill_buffer_size,
+            upstream: None,
         }
+    }
+
+    /// Attach the source this lane is derived from; see [`Upstream`].
+    pub(crate) fn with_upstream(mut self, upstream: Upstream) -> Self {
+        self.upstream = Some(upstream);
+        self
     }
 
     /// The highest position this source has handed out.
     pub(crate) fn head(&self) -> L::Position {
         L::position_from_u64(self.head.load(atomic::Ordering::Relaxed))
+    }
+
+    /// Events known to exist upstream that this lane has not positioned yet:
+    /// zero for a lane read straight from the database.
+    pub(crate) fn upstream_pending(&self) -> u64 {
+        self.upstream.as_ref().map_or(0, Upstream::pending)
     }
 
     /// Take the live fan-out. Once per handle — a listener owns its receiver.

@@ -113,11 +113,32 @@ struct Harness {
     observed: Arc<Observed>,
 }
 
+/// Catch-up options for [`Harness::with_catch_up`].
+#[derive(Default)]
+struct CatchUp {
+    /// Turn on `with_full_batches_during_catch_up`.
+    full_batches: bool,
+    /// Override the outbox's backfill page size.
+    page: Option<usize>,
+    /// Published one per source transaction by another outbox before the
+    /// harness's outbox boots: a backlog a fresh process starts behind.
+    before_boot: Vec<TestEvent>,
+}
+
 impl Harness {
     async fn new<L: Lane>(
         window: Duration,
         max: usize,
         recorder: Recorder,
+    ) -> anyhow::Result<Self> {
+        Self::with_catch_up::<L>(window, max, recorder, CatchUp::default()).await
+    }
+
+    async fn with_catch_up<L: Lane>(
+        window: Duration,
+        max: usize,
+        recorder: Recorder,
+        catch_up: CatchUp,
     ) -> anyhow::Result<Self> {
         let pool = init_pool().await?;
         wipeout_outbox_tables(&pool).await?;
@@ -128,10 +149,21 @@ impl Harness {
         sqlx::query("TRUNCATE batch_window_effects")
             .execute(&pool)
             .await?;
+        if !catch_up.before_boot.is_empty() {
+            let earlier =
+                Outbox::<TestEvent, TestTables>::init(&pool, MailboxConfig::builder().build())
+                    .await?;
+            for event in catch_up.before_boot {
+                let mut op = earlier.begin_op().await?;
+                earlier.publish_persisted_in_op(&mut op, event).await?;
+                op.commit().await?;
+            }
+        }
         let outbox = Outbox::init(
             &pool,
             MailboxConfig::builder()
                 .commit_lane(CommitLane::Enabled)
+                .maybe_backfill_page_size(catch_up.page)
                 .build(),
         )
         .await?;
@@ -142,7 +174,11 @@ impl Harness {
                 .unwrap(),
         )
         .await?;
-        let config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE))
+        let mut config = OutboxEventJobConfig::new(job::JobType::new(JOB_TYPE));
+        if catch_up.full_batches {
+            config = config.with_full_batches_during_catch_up();
+        }
+        let config = config
             .with_batch_window(window)
             .with_max_batch_size(max)
             .with_checkpoint_interval(Duration::from_millis(10))
@@ -507,6 +543,170 @@ async fn failed_landing_replays_the_whole_batch_with_a_fresh_window() -> anyhow:
     assert!(attempts[0].1.duration_since(collected[0].1) >= WINDOW);
     assert!(attempts[1].1.duration_since(collected[2].1) >= WINDOW);
     drop(collected);
+    drop(attempts);
+    h.jobs.shutdown().await?;
+    Ok(())
+}
+
+async fn attempt_sizes(h: &Harness) -> Vec<usize> {
+    h.observed
+        .attempts
+        .lock()
+        .await
+        .iter()
+        .map(|a| a.0.len())
+        .collect()
+}
+
+#[tokio::test]
+#[file_serial]
+async fn catch_up_lands_full_batches_past_the_window() -> anyhow::Result<()> {
+    let observed = Arc::new(Observed::default());
+    let mut recorder = Recorder::new(observed);
+    // Filling the batch takes about 600 ms, four windows.
+    recorder.delay = Duration::from_millis(30);
+    let mut h = Harness::with_catch_up::<InsertOrder>(
+        Duration::from_millis(150),
+        20,
+        recorder,
+        CatchUp {
+            full_batches: true,
+            before_boot: (1..=20).map(TestEvent::Ping).collect(),
+            ..CatchUp::default()
+        },
+    )
+    .await?;
+    h.jobs.start_poll().await?;
+    h.wait_checkpoint(20).await?;
+    let attempts = h.observed.attempts.lock().await;
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the window did not cut the catch-up batch"
+    );
+    assert_eq!(attempts[0].0, (1..=20).collect::<Vec<_>>());
+    drop(attempts);
+    h.jobs.shutdown().await?;
+    Ok(())
+}
+
+/// 175 events behind on a fresh boot, read in pages of 10, batches of 50.
+async fn replay_from_a_fresh_boot<L: Lane>(full_batches: bool) -> anyhow::Result<Vec<usize>> {
+    let observed = Arc::new(Observed::default());
+    let mut h = Harness::with_catch_up::<L>(
+        Duration::ZERO,
+        50,
+        Recorder::new(observed),
+        CatchUp {
+            full_batches,
+            page: Some(10),
+            before_boot: (1..=175).map(TestEvent::Ping).collect(),
+        },
+    )
+    .await?;
+    h.jobs.start_poll().await?;
+    h.wait_checkpoint(175).await?;
+    let sizes = attempt_sizes(&h).await;
+    h.jobs.shutdown().await?;
+    Ok(sizes)
+}
+
+fn assert_full_batches_while_the_lane_could_fill_them(sizes: &[usize]) {
+    assert_eq!(sizes.iter().sum::<usize>(), 175);
+    // Once 25 remain the lane cannot fill a batch of 50, so the real-time
+    // rules land the tail as reads pause, in one landing or several.
+    assert!(
+        sizes.len() >= 4 && sizes[..3] == [50, 50, 50],
+        "full batches while catching up, got {sizes:?}"
+    );
+}
+
+#[tokio::test]
+#[file_serial]
+async fn catch_up_lands_full_batches_with_no_window() -> anyhow::Result<()> {
+    let sizes = replay_from_a_fresh_boot::<InsertOrder>(true).await?;
+    assert_full_batches_while_the_lane_could_fill_them(&sizes);
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn commit_lane_catch_up_lands_full_batches_from_a_fresh_boot() -> anyhow::Result<()> {
+    // The commit lane's own head starts at zero here (no commit checkpoint)
+    // and climbs with the fold: only the not-yet-folded insert rows tell the
+    // runner the backlog is there.
+    let sizes = replay_from_a_fresh_boot::<CommitOrder>(true).await?;
+    assert_full_batches_while_the_lane_could_fill_them(&sizes);
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn without_the_switch_a_replay_lands_at_read_pauses() -> anyhow::Result<()> {
+    // Control: the real-time default lands partial batches mid-replay.
+    let sizes = replay_from_a_fresh_boot::<InsertOrder>(false).await?;
+    assert_eq!(sizes.iter().sum::<usize>(), 175);
+    assert!(
+        sizes[..sizes.len() - 1].iter().any(|&size| size < 50),
+        "expected a partial batch before the last, got {sizes:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn real_time_is_unchanged_when_the_lane_cannot_fill_the_batch() -> anyhow::Result<()> {
+    let observed = Arc::new(Observed::default());
+    let mut h = Harness::with_catch_up::<InsertOrder>(
+        WINDOW,
+        100,
+        Recorder::new(observed),
+        CatchUp {
+            full_batches: true,
+            ..CatchUp::default()
+        },
+    )
+    .await?;
+    h.jobs.start_poll().await?;
+    for n in 1..=3 {
+        h.publish([TestEvent::Ping(n)]).await?;
+    }
+    h.wait_checkpoint(3).await?;
+    let attempts = h.observed.attempts.lock().await;
+    let collected = h.observed.collected.lock().await;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].0, vec![1, 2, 3]);
+    let waited = attempts[0].1.duration_since(collected[0].1);
+    assert!(waited >= WINDOW, "the window still applies");
+    assert!(waited < WAIT);
+    drop(collected);
+    drop(attempts);
+    h.jobs.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[file_serial]
+async fn a_skipping_subscriber_is_not_held_past_a_batch_of_deliveries() -> anyhow::Result<()> {
+    let observed = Arc::new(Observed::default());
+    let mut before_boot = vec![TestEvent::Ping(1)];
+    before_boot.extend(std::iter::repeat_n(TestEvent::Skip, 20));
+    let mut h = Harness::with_catch_up::<InsertOrder>(
+        Duration::ZERO,
+        5,
+        Recorder::new(observed),
+        CatchUp {
+            full_batches: true,
+            before_boot,
+            ..CatchUp::default()
+        },
+    )
+    .await?;
+    h.jobs.start_poll().await?;
+    h.wait_checkpoint(21).await?;
+    let attempts = h.observed.attempts.lock().await;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].0, vec![1]);
     drop(attempts);
     h.jobs.shutdown().await?;
     Ok(())

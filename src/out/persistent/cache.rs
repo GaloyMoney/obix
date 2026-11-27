@@ -206,6 +206,11 @@ where
         )
     }
 
+    /// The insert lane's head counter, shared, for a lane derived from it.
+    pub(crate) fn head_counter(&self) -> Arc<AtomicU64> {
+        self.highest_known_sequence.clone()
+    }
+
     pub fn cache_fill_sender(&self) -> broadcast::Sender<InsertTransport<P>> {
         self.cache_fill_sender.clone()
     }
